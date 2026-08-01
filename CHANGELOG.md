@@ -68,6 +68,24 @@ Entries record **why** a change was needed. What changed is in the diff.
   implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
   and `min`; `mean` always divides by the axis length. Callers who get those
   wrong get them wrong quietly, which is why they are written down.
+- `stft` / `istft` — windowed transform and its inverse, the pair ONNX cannot
+  express, since it has no complex tensors and so cannot carry the spectrogram a
+  vocoder head emits. Every convention follows `torch.stft` / `torch.istft` and
+  is checked against it numerically rather than read off the documentation:
+  centred by default, reflect padding without repeating the edge sample,
+  one-sided, unnormalised, `hannWindow` periodic like `torch.hann_window` and
+  `scipy.signal.get_window` rather than symmetric like `np.hanning`. Named
+  because each has more than one defensible answer and picking silently means
+  half the callers get a subtly wrong waveform. `istft` divides by the
+  overlap-added `w²` envelope instead of assuming the window is COLA — a
+  periodic Hann at 50% overlap is COLA in `w` but **not** in `w²`, so a
+  reconstruction that skipped the division is wrong by up to 2x and still sounds
+  like audio. Two departures from torch, both in `ops/stft/reference.ts`: the
+  layout is frame-major `[frames, bins]` because a vocoder head emits one row
+  per frame, and asking for more samples than the frames reach raises instead of
+  quietly returning a zero tail. Speed is **unmeasured**, and the kernels are a
+  naive DFT rather than an FFT: 1920 is not a power of two, this sits beside a
+  transformer, and correctness came first.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
