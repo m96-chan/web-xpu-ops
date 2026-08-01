@@ -60,5 +60,13 @@ Entries record **why** a change was needed. What changed is in the diff.
   which the obvious one-line version does for the read only. Shapes that do not
   divide by 16 are the case that matters — the leftover threads address inside
   the buffer, so an unguarded write replaces a real value instead of faulting.
+- `reduce` — `sum` / `max` / `min` / `mean` along one axis, over a tensor viewed
+  as `[outer, axis, inner]` so that any axis of any rank fits. rmsnorm and
+  softmax each carry their own copy of the workgroup tree reduction, and a third
+  copy was about to be written; this is that reduction with the combiner and the
+  identity lifted out. The edges follow PyTorch and are stated rather than
+  implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
+  and `min`; `mean` always divides by the axis length. Callers who get those
+  wrong get them wrong quietly, which is why they are written down.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
