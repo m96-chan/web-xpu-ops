@@ -6,7 +6,7 @@
   "license": "MIT",
   "author": "Yusuke Harada",
   "repository": { "type": "git", "url": "git+https://github.com/m96-chan/web-xpu-ops.git" },
-  "files": ["ops", "harness", "README.md"],
+  "files": ["ops", "harness", "README.md", "CHANGELOG.md"],
   "exports": {
     "./harness": "./harness/index.ts",
     "./ops/*": "./ops/*/index.ts"
