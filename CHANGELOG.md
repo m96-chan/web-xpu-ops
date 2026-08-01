@@ -18,6 +18,14 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- The harness refuses a shader that does not compile instead of reading back
+  zeros. Output buffers start zeroed, so a dispatch that never ran produced a
+  result — and where an expected value contains zeros, that is a passing test
+  over a kernel that executed nothing. Every correctness claim here is "it agrees
+  with the reference", so a silent no-op reading as agreement could have hollowed
+  out all of them at once. Compiled modules are now cached by source as well, so
+  the check costs one await per distinct shader rather than one per dispatch.
+
 - The per-file timeout in `npm test` actually fires. It never had: `npx` starts
   vitest as a grandchild that keeps the stdout pipe open, so killing the child
   left `"close"` unfired and the run waited forever. A hanging file took an outer

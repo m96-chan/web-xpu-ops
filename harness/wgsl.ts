@@ -26,6 +26,26 @@ export interface Runner {
   destroy(): void;
 }
 
+/**
+ * The reason a shader could not be used, or null when it compiled.
+ *
+ * Split out as a pure function so it can be tested without a device. The half
+ * that needs a GPU — whether Dawn reports a bad shader at all — is platform
+ * behaviour and is measured in `harness/README` notes and issue #46. The half
+ * that is ours is this: given messages, do we refuse. That distinction matters
+ * because provoking a real compile failure crashes this binding in roughly four
+ * runs in five, so an end-to-end test of it cannot be kept green, while this
+ * can.
+ */
+export function compilationFailure(
+  messages: readonly Pick<GPUCompilationMessage, "type" | "lineNum" | "linePos" | "message">[],
+): string | null {
+  const errors = messages.filter((message) => message.type === "error");
+  if (errors.length === 0) return null;
+  const where = (m: (typeof errors)[number]) => `${m.lineNum}:${m.linePos}: ${m.message}`;
+  return `shader failed to compile\n${errors.map(where).join("\n")}`;
+}
+
 /** Resolves to null when no adapter is available, so suites can skip. */
 export async function createRunner(): Promise<Runner | null> {
   Object.assign(globalThis, globals);
@@ -34,8 +54,42 @@ export async function createRunner(): Promise<Runner | null> {
   if (!adapter) return null;
   const device = await adapter.requestDevice();
 
+  /**
+   * Compiled modules, keyed by source.
+   *
+   * Validation costs an await, and a test file dispatches the same shader many
+   * times over. Paying it per dispatch adds latency to every one of them, and
+   * on this binding elapsed time before a dispatch is itself destabilising
+   * (issue #49) — so the check is done once per distinct shader rather than
+   * once per call.
+   */
+  const compiled = new Map<string, GPUShaderModule>();
+
   return {
     async run({ code, entry = "main", bindings, workgroups }) {
+      // Checked before a single buffer exists. A dispatch that fails after
+      // `queue.writeBuffer` leaves writes queued against buffers that are then
+      // abandoned unsubmitted, and that was measured to destabilise this
+      // binding; validating first means the failure path allocates nothing.
+      //
+      // Why it matters at all: without this a shader that never ran still
+      // produces a readback — of the zeros its output buffer was created with.
+      // Where the expected value contains zeros that is a passing test over a
+      // kernel that did nothing, and since every correctness claim here is "it
+      // agrees with the reference", a silent no-op reading as agreement is the
+      // one failure that could hollow out all of them at once. Issue #46.
+      //
+      // Compilation is read through `getCompilationInfo` rather than an error
+      // scope: both report it, but wrapping module creation in a scope was
+      // measured at 1 pass in 5 here against 5 in 5 for this.
+      let module = compiled.get(code);
+      if (!module) {
+        module = device.createShaderModule({ code });
+        const failure = compilationFailure((await module.getCompilationInfo()).messages);
+        if (failure) throw new Error(failure);
+        compiled.set(code, module);
+      }
+
       const created: GPUBuffer[] = [];
       const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];
 
@@ -66,14 +120,21 @@ export async function createRunner(): Promise<Runner | null> {
         return buffer;
       });
 
+      // The other route in: `layout: "auto"` omits a binding the shader never
+      // mentions, and the bind group then fails validation. Not hypothetical —
+      // it is why `attention` is two WGSL files rather than one file with two
+      // entry points.
+      device.pushErrorScope("validation");
       const pipeline = device.createComputePipeline({
         layout: "auto",
-        compute: { module: device.createShaderModule({ code }), entryPoint: entry },
+        compute: { module, entryPoint: entry },
       });
       const bindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries: bound.map((buffer, binding) => ({ binding, resource: { buffer } })),
       });
+      const invalid = await device.popErrorScope();
+      if (invalid) throw new Error(`dispatch is not valid: ${invalid.message}`);
 
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
