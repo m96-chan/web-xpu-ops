@@ -53,5 +53,12 @@ Entries record **why** a change was needed. What changed is in the diff.
   their own device happened to give. Accumulation is the only rule that is the
   same for every ordering, and it is what gradient accumulation, MoE dispatch
   and bincount need. Matches `scatter_add_` in PyTorch, not `scatter_`.
+- `transpose` — 2D, staged through a 16x16 workgroup tile. The tile is there
+  because transpose computes nothing: the only thing it can get wrong is where a
+  value lands, and the only thing it can be slow at is reaching memory. Turning
+  the tile inside the workgroup keeps both the read and the write consecutive,
+  which the obvious one-line version does for the read only. Shapes that do not
+  divide by 16 are the case that matters — the leftover threads address inside
+  the buffer, so an unguarded write replaces a real value instead of faulting.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
