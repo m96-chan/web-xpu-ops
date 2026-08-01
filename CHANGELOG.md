@@ -211,5 +211,42 @@ Entries record **why** a change was needed. What changed is in the diff.
   same `queryOffset` mask — and the arg type is imported rather than restated so
   the two cannot drift. Speed is **unmeasured**: the roofline harness is #3 / #4.
   Memory is measured, because memory is what this op is a claim about.
+- `alibi` and `pope` — two more position encodings, so that position encoding is
+  a family in this repository rather than a synonym for `rope`. Models pick
+  differently and none of the three can be substituted for another: `rope`
+  rotates Q and K, `alibi` biases the attention scores, `pope` builds a table
+  that is added to the embeddings. They run on different tensors at different
+  points in the layer.
+
+  `alibi` ships as two kernels because its two halves fail differently. The
+  per-head slopes are where implementations quietly disagree, and the
+  disagreement is invisible at 8 heads: for a power-of-two head count everyone
+  produces the same geometric run, and for anything else the paper appends
+  every other slope of the *next* run rather than interpolating — so the
+  sequence is not monotonic, and an implementation that sorts or truncates is
+  wrong only at head counts nobody tests. The slopes therefore have their own
+  kernel, their own GPU test, and a reference test that pins the published
+  numbers, so a fault in the slopes cannot hide inside a correct bias and the
+  convention is checked against the paper rather than against the kernel. The
+  bias itself follows the paper's relative form, `m * (j - i)`; BLOOM's
+  `m * j` differs by a per-row constant that the following softmax erases, but
+  this op returns the tensor and not the softmax, so the two are not
+  interchangeable here. Masking is left to the caller — writing `-inf` above
+  the diagonal would fold a masking policy into a bias op.
+
+  `pope` records where its paper is silent instead of guessing. The polynomial
+  order is the token position and the argument sweeps the feature index across
+  `[-1, 1)`, which is the paper's Equation (14); whether positions start at 0
+  or 1 is not stated, and it matters, because at order 0 the polynomial is the
+  constant 1 and the first token would carry no position at all. That is a
+  required `posOffset` argument rather than a default, the same way `rope`
+  takes one. It is evaluated by the three-term recurrence, not by Rodrigues'
+  formula, and the reason an f32 kernel can walk the recurrence is that
+  `|P_n(x)| <= 1` holds on the domain — measured, not assumed: the f32
+  recurrence sits 4.1e-6 from f64 at order 70 and 1.6e-5 at order 128, so the
+  tolerance is stated for the order range the tests reach and not beyond it.
+
+  Speed is **unmeasured** for both; the roofline to report against does not
+  exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
