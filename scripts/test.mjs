@@ -35,6 +35,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const OPS = "ops";
+const HARNESS = "harness";
 
 /** Test files, discovered the same way `vitest.config.ts` globs them. */
 function testFiles() {
@@ -45,6 +46,12 @@ function testFiles() {
     for (const file of readdirSync(dir)) {
       if (file.endsWith(".test.ts")) found.push(join(dir, file));
     }
+  }
+  // The harness has tests of its own — kernel resolution, target detection —
+  // and they live flat rather than one directory per op. Most need no GPU, but
+  // they get a process each anyway: the alternative is a second code path.
+  for (const file of readdirSync(HARNESS)) {
+    if (file.endsWith(".test.ts")) found.push(join(HARNESS, file));
   }
   return found.sort();
 }

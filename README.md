@@ -152,10 +152,10 @@ ops/matmul/
   reference.ts
   wgsl/
     kernel.wgsl           portable, correct, unremarkable
-    apple.wgsl            unified memory, wide subgroups
-    nvidia.wgsl
-    amd.wgsl
-    soc.wgsl              tight power and bandwidth budgets
+    kernel.apple.wgsl     unified memory, wide subgroups
+    kernel.nvidia.wgsl
+    kernel.amd.wgsl
+    kernel.soc.wgsl       tight power and bandwidth budgets
   webnn/graph.ts
   wasm/kernel.ts
 ```
@@ -166,15 +166,83 @@ Selection resolves in order, first hit wins:
 explicit override  →  target + dtype  →  target  →  dtype  →  portable
 ```
 
+**The resolution is implemented** (`harness/resolve.ts`, `harness/target.ts`);
+the per-target kernels are not — no op ships a variant yet, so every op resolves
+to its portable kernel today.
+
+An op's `wgsl/` directory holds one or more **entry points**, and each may have
+variants. The filename is the whole grammar — `<entry>[.<target>][.<dtype>].wgsl`:
+
+```
+kernel.wgsl              the default entry point, portable
+inverse.wgsl             a second entry point, portable         (ops/stft)
+scores.wgsl              one of two entry points, portable      (ops/attention)
+kernel.nvidia.wgsl       a target variant of kernel
+inverse.f16.wgsl         a dtype variant of inverse
+scores.apple.f16.wgsl    both
+```
+
+Every entry point needs its own portable kernel, and **resolution never leaves
+the entry point it was asked about** — `istft` falling back to the forward
+transform because the chain ran off the end would be a wrong answer that still
+looks like a result.
+
+Entry points are named rather than inferred because an op genuinely may need
+several kernels that are not variants of each other: `stft` computes the inverse
+transform with different arithmetic, and `attention` is two dispatches with a
+buffer between them, deliberately split so `layout: "auto"` cannot drop bindings
+an entry point does not reference.
+
+A suffix that is not a known target or dtype is an error, so `kernel.nvidai.wgsl`
+is rejected rather than left in the tree looking tuned. A **bare** `nvidia.wgsl`
+is rejected too, as ambiguous: it is far likelier to be a mis-written variant
+than an entry point that happens to be called "nvidia".
+
+What that cannot catch is a misspelt entry point — `inverze.wgsl` reads as a new
+one. The asymmetry is deliberate. A misspelt variant fails silently, because
+resolution falls back to portable and everything still runs; a misspelt entry
+point fails loudly the moment its test asks for it by name. Only the silent one
+needs a guard.
+
 **Overrides are a first-class input, not an escape hatch.** Anyone integrating
 this will eventually know something the library cannot — that their sequence
 length is always 1, that their weights are static, that they would rather have
 lower peak memory than higher throughput. Refusing that knowledge makes the
-library something to work around.
+library something to work around. An override that names a variant which does
+not exist raises; falling back to portable would hand the caller a kernel they
+did not ask for and never say so.
 
 Target detection has to be honest about how little is knowable. `adapter.info`
 gives a vendor and an architecture string and not much else, so detection is a
 hint, and the override exists partly because the hint will sometimes be wrong.
+It is allowed to answer "I don't know", and that answer is portable rather than
+a guess: `intel` covers both an on-die iGPU and a discrete Arc card, and nothing
+in `adapter.info` says which, so it resolves to no target at all. A fallback
+adapter is treated the same way — the vendor string there names silicon the code
+is not running on.
+
+Nothing picks a target-specific kernel silently. `describeAdapter(adapter)`
+reports what the device said, which target was detected and why, and `resolve()`
+returns the rung that hit along with every candidate it tried. A wrong guess that
+is invisible is worse than a portable kernel.
+
+It is a call the caller makes, not something the runner does on the way past.
+`createRunner`'s job is to run a kernel and read the result back; which target a
+device looks like is a question about the device, and the two do not have to be
+answered at the same moment.
+
+Adding a variant cannot skip the reference test. `eachVariant(url, entry, …)`
+builds an op's test loop from its `wgsl/` directory rather than from a list
+someone has to remember to extend, and `unguardedOps` fails the suite for an
+entry point that grows a variant no test iterates. The check is per entry point,
+not per op: looping `scores` says nothing about `context`. A target-specific
+kernel that is fast and wrong is the failure this axis exists to design against.
+
+All of it lives outside `harness/index.ts` — import `harness/variants.js`,
+`harness/resolve.js` and `harness/target.js` directly. `index.ts` is what every
+op's test imports, so anything re-exported from it lands on the import graph of
+every GPU test; keeping resolution off it leaves `index.ts` and `suite.ts`
+byte-identical to what they were before any of this existed.
 
 ---
 

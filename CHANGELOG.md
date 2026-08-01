@@ -112,6 +112,39 @@ Entries record **why** a change was needed. What changed is in the diff.
   quietly returning a zero tail. Speed is **unmeasured**, and the kernels are a
   naive DFT rather than an FFT: 1920 is not a power of two, this sits beside a
   transformer, and correctness came first.
+- Kernel resolution — an op's `wgsl/` directory holds one or more **entry
+  points**, each of which may have variants, and which file runs is decided by
+  `resolve()`: `explicit override → target + dtype → target → dtype → portable`,
+  first hit wins, **within one entry point**. The filename carries it:
+  `<entry>[.<target>][.<dtype>].wgsl`, so `kernel.wgsl` and `inverse.wgsl` are
+  two entry points and `kernel.nvidia.wgsl` is a variant of the first. Entry
+  points are named rather than assumed because ops already need them — `stft`
+  computes the inverse transform with different arithmetic, `attention` is two
+  dispatches split into two files so `layout: "auto"` cannot drop bindings an
+  entry point does not reference — and because resolution must never leave the
+  entry point it was asked about: `istft` falling back to the forward transform
+  would be a wrong answer that still looks like a result. A suffix that is not a
+  known target or dtype is an error, and so is a bare `nvidia.wgsl`, which is far
+  likelier to be a mis-written variant than an entry point called "nvidia".
+  Target detection reads `adapter.info` and is
+  allowed to answer "I don't know", because a vendor string does not say what a
+  device is good at; an unknown adapter gets the portable kernel rather than
+  someone else's. Intel is the standing example — the same vendor string covers
+  an on-die iGPU and a discrete Arc card. Because the hint will sometimes be
+  wrong, the override beats detection outright, and one that names a variant that
+  does not exist raises instead of quietly falling back. The choice is readable
+  through `describeAdapter(adapter)` and the returned `Choice`, which names the
+  rung that hit and every candidate tried: a wrong guess nobody can see is worse
+  than a portable kernel. Reading the adapter is a call the caller makes rather
+  than something `createRunner` does on the way past, so nothing changes for ops
+  that only want a kernel run.
+  Adding a variant cannot skip the reference test — `eachVariant(url, entry, …)`
+  builds an op's test loop from its `wgsl/` directory rather than from a list, and
+  `unguardedOps` fails the suite for an entry point that grows a variant no test
+  iterates. Per entry point, not per op: looping `scores` says nothing about
+  `context`. None of it is re-exported from `harness/index.ts`, which every op's
+  test imports, so `index.ts` and `suite.ts` are byte-identical to what they were
+  before this landed and no existing op's test loads anything new.
 - `ctc_decode` — greedy CTC decoding: argmax per frame, collapse repeats, then
   drop blanks, **in that order**. The order is the whole op. Stripping blanks
   first and collapsing afterwards is the implementation everyone reaches for,
