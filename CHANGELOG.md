@@ -137,5 +137,25 @@ Entries record **why** a change was needed. What changed is in the diff.
   at `0` and `causal_lower_right` at `S - L` without a second flag.
   Speed is **unmeasured**: the roofline harness it should be reported against
   does not exist yet.
+- `flash_attention` — the same function as `attention`, in one dispatch, with the
+  `[B, H, L, S]` score matrix never allocated. That is the entire difference and
+  the entire reason it is a kernel rather than a composition: at any sequence
+  length worth fusing for, the score matrix is the largest thing in the
+  computation. Tiled online softmax — a running max and a running sum, so a tile
+  of 64 keys folds in without a second pass — and the only score storage anywhere
+  is that one tile in workgroup memory, which does not depend on `S`.
+  Both halves of the claim are tested, because the first half alone would pass a
+  kernel that materialised the matrix and read it back. Agreement is checked
+  against **both** references, this op's and the unfused one's. Allocation is
+  checked by counting the bytes behind the dispatches that produced those
+  answers, at shapes where `L` and `S` grow together — the only sweep where
+  `seq x seq` and `seq` can be told apart — and holding the total to a second
+  difference of zero. Bound bytes at `B=H=1, L=S=n, D=Dv=8`: `128n + 32` here
+  against `4n² + 64n + 28` unfused, which is 32_800 against 278_556 at n = 256
+  and doubles its advantage with every doubling of the sequence.
+  Conventions are inherited from `attention` unchanged — same `scale` default,
+  same `queryOffset` mask — and the arg type is imported rather than restated so
+  the two cannot drift. Speed is **unmeasured**: the roofline harness is #3 / #4.
+  Memory is measured, because memory is what this op is a claim about.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
