@@ -249,4 +249,26 @@ Entries record **why** a change was needed. What changed is in the diff.
   Speed is **unmeasured** for both; the roofline to report against does not
   exist yet.
 
+- `moe` — MoE routing: `router` (top-k over expert logits and the gate weights),
+  `moeDispatch` (tokens reordered into per-expert contiguous runs) and
+  `moeGather` (results back in token order, weighted). One op rather than three
+  because none of them is usable without the other two, and because the
+  decisions that matter are decisions *between* them. Three of those had to be
+  made rather than inherited, and all three change the model's output:
+  **ties in top-k go to the lower expert index**, which `torch.topk` explicitly
+  leaves open and a GPU cannot — otherwise the same token reaches different
+  experts on different runs; **capacity overflow drops by rank first, then by
+  token index** (GShard, the Switch Transformer, fairseq `top2gating`), so a
+  token's first-choice expert outranks another token's second choice, and not
+  by arrival order, which would make the set of dropped tokens depend on the
+  scheduler; and the **gate is applied in gather and only there**, since
+  weighting on the way in puts it inside the expert FFN and weighting at both
+  ends squares it, which stays plausible while being wrong everywhere.
+  Renormalising the k gates is a caller's flag with no default, because Mixtral
+  renormalises and the Switch Transformer must not — at `k = 1` renormalisation
+  makes every gate exactly 1 and deletes the gate entirely. Nothing divides by
+  an expert's token count: with 64 experts and a short sequence, most experts
+  receive nothing on most steps, and that division is `0/0`. Speed is
+  **unmeasured**.
+
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
