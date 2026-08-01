@@ -31,6 +31,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | --- | --- |
 | `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row |
+| `layernorm` | two workgroup reductions; **biased** variance (`1/D`) and `eps` inside the `sqrt`, as `torch.nn.functional.layer_norm`. Speed unmeasured |
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
@@ -259,7 +260,7 @@ target-specific tuning pays off most.
 
 ### `kernel/` — one fused, named operation
 
-`rope` ✅ · `rmsnorm` ✅ · `layernorm` · `softmax` ✅ · `activation` ✅ ·
+`rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
 `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
 `flash_attention` · `ctc_decode` · `mel` · `stft` / `istft` ✅
 
