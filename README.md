@@ -25,7 +25,7 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Eight ops, WGSL only, verified against their references on a real GPU.
+Thirteen ops, WGSL only, verified against their references on a real GPU.
 
 | op | notes |
 | --- | --- |
@@ -37,6 +37,10 @@ Eight ops, WGSL only, verified against their references on a real GPU.
 | `rope` | rotary position embedding, with KV-cache offset |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
+| `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
+| `transpose` | turned through workgroup memory so both read and write stay consecutive |
+| `reduce` | `sum` / `max` / `min` / `mean` along an axis |
+| `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 
 ### `scatter`: colliding indices accumulate
@@ -208,8 +212,8 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ·
-`scatter` ✅ · `transpose` · `reduce`
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ✅ ·
+`scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
 Small, total, boring. Everything else is built from these, and they are where
 target-specific tuning pays off most.
