@@ -68,6 +68,41 @@ Entries record **why** a change was needed. What changed is in the diff.
   implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
   and `min`; `mean` always divides by the axis length. Callers who get those
   wrong get them wrong quietly, which is why they are written down.
+- `layernorm` — mean-subtracted normalisation with a bias term, following
+  `torch.nn.functional.layer_norm`: the variance is **biased** (`1/D`, not
+  `1/(D-1)`) and `eps` sits inside the square root. Both were checked against
+  PyTorch in float64 rather than read off the documentation, because the two
+  variance conventions differ by less than a percent on a wide row and a caller
+  would never notice which one they got. The variance is computed in two passes
+  — mean, then the mean of the squared deviations — instead of the one-pass
+  `E[x²] - E[x]²`. That identity is not a performance choice with a numerical
+  footnote; it is broken where LayerNorm is most often used. Measured on this
+  device by running both shaders: on a row of `8192 ± 4`, true variance 6.678162,
+  the two-pass kernel returns 6.67816 and the one-pass identity returns a
+  *negative* number — the squares land past 2^26 where f32 steps by 8, the
+  subtraction cancels every digit the spread had, and `inverseSqrt` of that is
+  NaN. The same test at `1024 ± 4` is the more dangerous half: 6.62347 against
+  6.678162, 0.8% low, a number nobody would look at twice. Both rows are in the
+  suite, and with the one-pass form in place they are the only test of the eight
+  that fails — which is the whole reason they had to be written.
+- `stft` / `istft` — windowed transform and its inverse, the pair ONNX cannot
+  express, since it has no complex tensors and so cannot carry the spectrogram a
+  vocoder head emits. Every convention follows `torch.stft` / `torch.istft` and
+  is checked against it numerically rather than read off the documentation:
+  centred by default, reflect padding without repeating the edge sample,
+  one-sided, unnormalised, `hannWindow` periodic like `torch.hann_window` and
+  `scipy.signal.get_window` rather than symmetric like `np.hanning`. Named
+  because each has more than one defensible answer and picking silently means
+  half the callers get a subtly wrong waveform. `istft` divides by the
+  overlap-added `w²` envelope instead of assuming the window is COLA — a
+  periodic Hann at 50% overlap is COLA in `w` but **not** in `w²`, so a
+  reconstruction that skipped the division is wrong by up to 2x and still sounds
+  like audio. Two departures from torch, both in `ops/stft/reference.ts`: the
+  layout is frame-major `[frames, bins]` because a vocoder head emits one row
+  per frame, and asking for more samples than the frames reach raises instead of
+  quietly returning a zero tail. Speed is **unmeasured**, and the kernels are a
+  naive DFT rather than an FFT: 1920 is not a power of two, this sits beside a
+  transformer, and correctness came first.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
