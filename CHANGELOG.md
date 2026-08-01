@@ -137,5 +137,26 @@ Entries record **why** a change was needed. What changed is in the diff.
   at `0` and `causal_lower_right` at `S - L` without a second flag.
   Speed is **unmeasured**: the roofline harness it should be reported against
   does not exist yet.
+- `gqa` — grouped-query and multi-query attention: `kvHeads` query heads share
+  one K and one V. One op rather than two, because MQA is GQA with `kvHeads = 1`
+  and MHA is GQA with `kvHeads = H` — splitting them would mean two copies of the
+  same index arithmetic, one of them less tested.
+  The reason to reach for it is a memory number, so here is the number. One
+  Llama-3-8B decoder layer, batch 1, 8192 cached positions, 32 query heads, head
+  dim 128, f32: the KV cache is **268,435,456 bytes** at `kvHeads = 32` (MHA),
+  **67,108,864 bytes** at `kvHeads = 8` (GQA) and **8,388,608 bytes** at
+  `kvHeads = 1` (MQA). Over the model's 32 layers that is 8 GiB against 2 GiB — a
+  saving of **6,442,450,944 bytes**, which during decoding is usually the
+  difference between the model fitting and not. `kvCacheBytes()` is exported so
+  the figure stays a computation rather than a claim in a document.
+  The head mapping is **contiguous** groups, `kvHead = h / (H / kvHeads)`,
+  matching `enable_gqa=True` on torch 2.10 — measured, because the alternative
+  reading (strided, `h % kvHeads`) agrees with it at both `kvHeads = H` and
+  `kvHeads = 1` and disagrees everywhere in between, which is how an
+  implementation passes the two configurations people test and fails the ones
+  they ship. `H % kvHeads != 0` throws rather than picking a grouping for the
+  caller, as torch does.
+  Speed is **unmeasured**: the roofline harness it should be reported against
+  does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD

@@ -46,6 +46,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. Speed unmeasured |
 | `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
 | `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
+| `gqa` | grouped-query **and** multi-query attention: one op, parameterised by `kvHeads` — `kvHeads = 1` is MQA and `kvHeads = H` is `attention` unchanged. **Contiguous** groups (`kvHead = h / (H / kvHeads)`), as `enable_gqa=True` in torch; `H % kvHeads != 0` throws rather than guessing a grouping. What it buys, in bytes: one Llama-3-8B decoder layer (`B=1, S=8192, D=Dv=128`, f32) caches **268,435,456** at `kvHeads=32`, **67,108,864** at `8`, **8,388,608** at `1` — over 32 layers, 32→8 saves **6,442,450,944** bytes. `kvCacheBytes()` computes it. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -280,7 +281,7 @@ unable to carry complex tensors.
 
 Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` · `NTK scaling` · `rotary cache`
 
-Sharing: `GQA` · `MQA`
+Sharing: `GQA` ✅ · `MQA` ✅ (one op — `gqa`, parameterised by `kvHeads`)
 
 Routing: `MoE router` · `MoE dispatch` · `MoE gather`
 
