@@ -39,5 +39,12 @@ Entries record **why** a change was needed. What changed is in the diff.
   nothing to capture here. Autoregressive decoding is this shape at every step.
   Speed is **unmeasured**: the bandwidth roofline it should be reported against
   does not exist yet.
+- `matmul` — GEMM (`C = A @ B`) with a shared-memory tiled WGSL kernel. Separate
+  from GEMV because the reuse a tile buys is the only reason this shape can be
+  compute-bound, and none of it applies to a batch of one. Shapes that do not
+  divide by the tile are where tiled kernels are fast and wrong, so the ragged
+  tails are tested on their own and together — including against buffers longer
+  than the operands, because this device reads past the end of a buffer as zero
+  and would otherwise hide a missing tail guard.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
