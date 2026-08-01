@@ -152,5 +152,17 @@ Entries record **why** a change was needed. What changed is in the diff.
   at `0` and `causal_lower_right` at `S - L` without a second flag.
   Speed is **unmeasured**: the roofline harness it should be reported against
   does not exist yet.
+- `rope` gains NTK and YaRN context scaling, as an optional `scaling` argument
+  rather than as new ops. Neither scheme changes the rotation — they change
+  which frequency each pair rotates at — so forking `rope` would have left three
+  copies of the same rotation to keep in step. There is no PyTorch definition to
+  follow, so the convention is `jquesnelle/yarn` and `transformers`, which
+  agree; YaRN's attention temperature (`0.1·ln(s) + 1`) **is** included, folded
+  into `cos`/`sin` as both of those do, and can be overridden for checkpoints
+  fine-tuned with a different one. Omitting `scaling` leaves plain RoPE
+  identical bit for bit, which is a property of the arithmetic rather than a
+  tolerance: the unscaled path multiplies an exact IEEE zero. Speed is
+  **unmeasured** — scaling costs one multiply-add per element over plain RoPE,
+  and the roofline it should be reported against does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD

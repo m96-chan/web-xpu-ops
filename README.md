@@ -35,7 +35,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
-| `rope` | rotary position embedding, with KV-cache offset |
+| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
@@ -279,7 +279,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` · `NTK scaling` · `rotary cache`
+Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
 
 Sharing: `GQA` · `MQA`
 
