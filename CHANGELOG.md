@@ -68,6 +68,23 @@ Entries record **why** a change was needed. What changed is in the diff.
   implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
   and `min`; `mean` always divides by the axis length. Callers who get those
   wrong get them wrong quietly, which is why they are written down.
+- Kernel resolution — an op may carry more than one WGSL file, and which one
+  runs is decided by `resolve()`: `explicit override → target + dtype → target →
+  dtype → portable`, first hit wins. Target detection reads `adapter.info` and is
+  allowed to answer "I don't know", because a vendor string does not say what a
+  device is good at; an unknown adapter gets the portable kernel rather than
+  someone else's. Intel is the standing example — the same vendor string covers
+  an on-die iGPU and a discrete Arc card. Because the hint will sometimes be
+  wrong, the override beats detection outright, and one that names a variant that
+  does not exist raises instead of quietly falling back. The choice is readable
+  through `describeAdapter(adapter)` and the returned `Choice`, which names the
+  rung that hit and every candidate tried: a wrong guess nobody can see is worse
+  than a portable kernel. Reading the adapter is a call the caller makes rather
+  than something `createRunner` does on the way past, so nothing changes for ops
+  that only want a kernel run.
+  Adding a variant cannot skip the reference test — `eachVariant`
+  builds an op's test loop from its `wgsl/` directory rather than from a list, and
+  `unguardedOps` fails the suite for an op that grows a variant no test iterates.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
