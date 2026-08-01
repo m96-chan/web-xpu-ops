@@ -35,7 +35,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
-| `rope` | rotary position embedding, with KV-cache offset |
+| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
@@ -44,6 +44,10 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. Speed unmeasured |
+| `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
+| `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
+| `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
+| `flash_attention` | the same function as `attention`, one dispatch, tiled online softmax; the `[B, H, L, S]` score matrix is never allocated, which is tested by counting bound bytes and not only by the answer. `128n + 32` bytes at `L = S = n, D = Dv = 8` against unfused `4n² + 64n + 28`. Speed unmeasured |
 | `mel` | filterbank construction and its application, as two kernels. Defaults are `torchaudio.transforms.MelSpectrogram`: **HTK** mel scale, **unnormalised** triangles, **power** spectrum, and `AmplitudeToDB(stype="power")` for the log — base 10, scaled by `20/power`, flooring its *argument* at `1e-10` rather than adding an epsilon. `{ scale: "slaney", norm: "slaney" }` gives **`librosa.filters.mel`**'s defaults instead; on the same audio the two differ by 200x, so neither is a default worth leaving unstated. No `top_db` — it needs a reduction over the whole spectrogram. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
@@ -253,7 +257,7 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ✅ ·
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D) · `add` · `mul` · `gather` ✅ ·
 `scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
 Small, total, boring. Everything else is built from these, and they are where
@@ -262,8 +266,8 @@ target-specific tuning pays off most.
 ### `kernel/` — one fused, named operation
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
-`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
-`flash_attention` · `ctc_decode` · `mel` ✅ · `stft` / `istft` ✅
+`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
+`flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ · `stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
@@ -277,7 +281,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` · `NTK scaling` · `rotary cache`
+Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
 
 Sharing: `GQA` · `MQA`
 
