@@ -43,10 +43,10 @@ const wave = (n: number, k: number, phase = 0) =>
  * observed across every case in this file, from an instrumented run with the
  * tolerance disabled:
  *
- *   probs   rel 1.32e-6   abs 2.38e-7
+ *   probs   rel 1.71e-6   abs 2.38e-7
  *   output  rel 1.88e-3   abs 9.54e-7
  *
- * Identical across three runs, to every digit — this device's f32 reduction
+ * Identical across repeated runs, to every digit — this device's f32 reduction
  * order is fixed, so these are the numbers and not a sample of them.
  *
  * `abs` is the measure that carries this op, for the reason `attention` records:
@@ -198,6 +198,34 @@ const GROUPINGS = [
 });
 
 /**
+ * Scores large enough that `exp` overflows f32 unless the row max comes off
+ * first — `exp(89)` is already past 3.4e38, and the row below reaches 375.
+ *
+ * Present because it was measured to be missing. Deleting `- row_max` from the
+ * kernel left every other test in this file green: the sine-wave inputs produce
+ * logits of order 1, where subtracting the max is arithmetically a no-op. Rule 1
+ * says a line no test can fail is a line that should not be there, and this one
+ * has to be there, so the test is what changes. With this case, the same
+ * deletion returns NaN.
+ *
+ * Kept GQA-shaped (4 query heads over 2 KV heads, with a different ramp per KV
+ * head) rather than single-head, so it is one more grouping case as well.
+ */
+const OVERFLOW = (() => {
+  const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 2, 6, 4, 4];
+  const k = new Float32Array(B * kvHeads * S * D);
+  for (let g = 0; g < kvHeads; g += 1) {
+    for (let j = 0; j < S; j += 1) k[(g * S + j) * D] = (j + g) * 5;
+  }
+  return prepare("survives scores that would overflow exp", {
+    q: new Float32Array(B * H * L * D).fill(30), // dot = 150 * (j + g), scaled by 1/sqrt(4)
+    k,
+    v: wave(B * kvHeads * S * Dv, 0.9),
+    B, H, kvHeads, L, S, D, Dv,
+  });
+})();
+
+/**
  * Reads that leave the buffer entirely, which nothing else here covers.
  *
  * Measured on this device: a storage read past the end of a buffer returns 0,
@@ -235,7 +263,7 @@ const PADDED = (() => {
   };
 })();
 
-const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, PADDED];
+const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED];
 
 /**
  * Runs the real two-dispatch pipeline and checks both halves.
