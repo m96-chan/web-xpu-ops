@@ -22,5 +22,12 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `matmul` — GEMM (`C = A @ B`) with a shared-memory tiled WGSL kernel. Separate
+  from GEMV because the reuse a tile buys is the only reason this shape can be
+  compute-bound, and none of it applies to a batch of one. Shapes that do not
+  divide by the tile are where tiled kernels are fast and wrong, so the ragged
+  tails are tested on their own and together — including against buffers longer
+  than the operands, because this device reads past the end of a buffer as zero
+  and would otherwise hide a missing tail guard.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
