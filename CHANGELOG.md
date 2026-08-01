@@ -7,6 +7,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The per-file timeout in `npm test` actually fires. It never had: `npx` starts
+  vitest as a grandchild that keeps the stdout pipe open, so killing the child
+  left `"close"` unfired and the run waited forever. A hanging file took an outer
+  120s kill instead of the 6s limit it was given. It hid because a *GPU* hang
+  brings the worker down within seconds on its own, which looked like the timeout
+  working — the suite could not tell "wedged" from "slow".
+
 ### Changed
 
 - `npm test` runs one test file per vitest process. A single process cannot cross
@@ -85,6 +94,57 @@ Entries record **why** a change was needed. What changed is in the diff.
   6.678162, 0.8% low, a number nobody would look at twice. Both rows are in the
   suite, and with the one-pass form in place they are the only test of the eight
   that fails — which is the whole reason they had to be written.
+- `stft` / `istft` — windowed transform and its inverse, the pair ONNX cannot
+  express, since it has no complex tensors and so cannot carry the spectrogram a
+  vocoder head emits. Every convention follows `torch.stft` / `torch.istft` and
+  is checked against it numerically rather than read off the documentation:
+  centred by default, reflect padding without repeating the edge sample,
+  one-sided, unnormalised, `hannWindow` periodic like `torch.hann_window` and
+  `scipy.signal.get_window` rather than symmetric like `np.hanning`. Named
+  because each has more than one defensible answer and picking silently means
+  half the callers get a subtly wrong waveform. `istft` divides by the
+  overlap-added `w²` envelope instead of assuming the window is COLA — a
+  periodic Hann at 50% overlap is COLA in `w` but **not** in `w²`, so a
+  reconstruction that skipped the division is wrong by up to 2x and still sounds
+  like audio. Two departures from torch, both in `ops/stft/reference.ts`: the
+  layout is frame-major `[frames, bins]` because a vocoder head emits one row
+  per frame, and asking for more samples than the frames reach raises instead of
+  quietly returning a zero tail. Speed is **unmeasured**, and the kernels are a
+  naive DFT rather than an FFT: 1920 is not a power of two, this sits beside a
+  transformer, and correctness came first.
+- `ctc_decode` — greedy CTC decoding: argmax per frame, collapse repeats, then
+  drop blanks, **in that order**. The order is the whole op. Stripping blanks
+  first and collapsing afterwards is the implementation everyone reaches for,
+  and it turns `a ␣ a` into a single `a` — losing the doubled letter that the
+  blank symbol exists to make expressible. The two orders agree on every other
+  input, which is what lets the wrong one survive being tested. Blank defaults
+  to `0`, as `torch.nn.CTCLoss` has it, and is a parameter because TensorFlow's
+  `ctc_greedy_decoder` puts it last and models trained that way exist. The
+  result never leaves the GPU: labels come back as `[B, T]` padded with `-1`,
+  and the true lengths in their own `[B]` buffer, both written by the kernel —
+  a greedy decode emits at most one label per frame, so the allocation never
+  depends on the answer. Reading the labels back to find out how long they are
+  would be the per-step readback this op exists to avoid. Beam search is
+  deliberately absent: it is a different algorithm and needs its own decision
+  about where the beam lives.
+- `mel` — the filterbank and its application, in two kernels because the matrix
+  depends only on scalars and is built once per configuration while the
+  application runs per frame. The other half of the DSP gap next to `stft`: no
+  ML kernel library ships it because it is not machine learning, so every voice
+  encoder reimplements it in numpy, and that numpy is exactly what has to be
+  rewritten to move a pipeline into a browser. Four conventions have more than
+  one answer in wide use and all four are named rather than picked silently —
+  the HTK mel scale, unnormalised triangles, a power spectrum, and a dB log
+  flooring its argument at `1e-10`, which together are
+  `torchaudio.transforms.MelSpectrogram` + `AmplitudeToDB(stype="power")`.
+  Asking for `{ scale: "slaney", norm: "slaney" }` gives `librosa.filters.mel`'s
+  defaults instead, and on the same audio those two differ by a factor of 200,
+  which is what silently picking one would have cost a caller. Checked against
+  torchaudio 2.10 and librosa 0.11 on a real recorded voice, not on a formula.
+  `top_db` is deliberately absent: it clamps against the maximum over the whole
+  spectrogram, so it cannot be computed before the last frame exists and it
+  makes the answer depend on how the caller chunked their audio — that is
+  `reduce` then `elementwise`. Speed is **unmeasured**.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
@@ -92,6 +152,65 @@ Entries record **why** a change was needed. What changed is in the diff.
   PyTorch raises there and a kernel cannot, and the alternatives — clamping or
   wrapping — hand back a real embedding for a token that was never in the
   vocabulary, which looks plausible all the way downstream.
+- `conv` — 1D only, matching `torch.nn.functional.conv1d`, with `stride`,
+  `padding`, `dilation`, `groups` and an optional `bias`. The convention worth
+  stating out loud is that PyTorch's `conv1d` is a **cross-correlation**: it does
+  not flip the kernel. `F.conv1d([[[1,2,3,4]]], [[[1,10,100]]])` is `[[[321,
+  432]]]`, not `[[[123, 234]]]`. The two definitions agree on every symmetric
+  kernel, so a library that quietly picks the mathematical one passes every
+  hand-written test and then disagrees with PyTorch on real weights. `groups` is
+  in from the start because `groups = Cin = Cout` is a depthwise conv, which is
+  what the speech front-ends this op exists for actually run. 2D is deliberately
+  absent until something asks for it. Speed is **unmeasured**: the roofline it
+  should be reported against does not exist yet.
+- `attention` — unfused scaled dot-product attention, in two dispatches:
+  `softmax(mask(scale * Q @ K^T))` writes the attention matrix, then `@ V` reads
+  it. Slower than a fused kernel by construction, and worth having anyway,
+  because it is what makes the fused one verifiable — `flash_attention` has no
+  other definition of correct to be measured against.
+  Conventions follow `torch.nn.functional.scaled_dot_product_attention`, checked
+  against torch 2.10 rather than read off the docs, because the two that matter
+  both have a plausible wrong answer: `scale` defaults to `1/sqrt(D)` from the
+  **query's** head dim even when V's differs, and `causal` is **upper-left**
+  aligned, so with a KV cache longer than the query it keeps keys `0..i` rather
+  than the most recent `i+1`. That second one is a trap for the case the op
+  exists to serve, so masking is parameterised by `queryOffset` — the absolute
+  position of query row 0 in the key sequence — which reaches `is_causal=True`
+  at `0` and `causal_lower_right` at `S - L` without a second flag.
+  Speed is **unmeasured**: the roofline harness it should be reported against
+  does not exist yet.
+- `rope` gains NTK and YaRN context scaling, as an optional `scaling` argument
+  rather than as new ops. Neither scheme changes the rotation — they change
+  which frequency each pair rotates at — so forking `rope` would have left three
+  copies of the same rotation to keep in step. There is no PyTorch definition to
+  follow, so the convention is `jquesnelle/yarn` and `transformers`, which
+  agree; YaRN's attention temperature (`0.1·ln(s) + 1`) **is** included, folded
+  into `cos`/`sin` as both of those do, and can be overridden for checkpoints
+  fine-tuned with a different one. Omitting `scaling` leaves plain RoPE
+  identical bit for bit, which is a property of the arithmetic rather than a
+  tolerance: the unscaled path multiplies an exact IEEE zero. Speed is
+  **unmeasured** — scaling costs one multiply-add per element over plain RoPE,
+  and the roofline it should be reported against does not exist yet.
+- `flash_attention` — the same function as `attention`, in one dispatch, with the
+  `[B, H, L, S]` score matrix never allocated. That is the entire difference and
+  the entire reason it is a kernel rather than a composition: at any sequence
+  length worth fusing for, the score matrix is the largest thing in the
+  computation. Tiled online softmax — a running max and a running sum, so a tile
+  of 64 keys folds in without a second pass — and the only score storage anywhere
+  is that one tile in workgroup memory, which does not depend on `S`.
+  Both halves of the claim are tested, because the first half alone would pass a
+  kernel that materialised the matrix and read it back. Agreement is checked
+  against **both** references, this op's and the unfused one's. Allocation is
+  checked by counting the bytes behind the dispatches that produced those
+  answers, at shapes where `L` and `S` grow together — the only sweep where
+  `seq x seq` and `seq` can be told apart — and holding the total to a second
+  difference of zero. Bound bytes at `B=H=1, L=S=n, D=Dv=8`: `128n + 32` here
+  against `4n² + 64n + 28` unfused, which is 32_800 against 278_556 at n = 256
+  and doubles its advantage with every doubling of the sequence.
+  Conventions are inherited from `attention` unchanged — same `scale` default,
+  same `queryOffset` mask — and the arg type is imported rather than restated so
+  the two cannot drift. Speed is **unmeasured**: the roofline harness is #3 / #4.
+  Memory is measured, because memory is what this op is a claim about.
 - `alibi` and `pope` — two more position encodings, so that position encoding is
   a family in this repository rather than a synonym for `rope`. Models pick
   differently and none of the three can be substituted for another: `rope`

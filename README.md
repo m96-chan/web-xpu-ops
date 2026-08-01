@@ -35,7 +35,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
-| `rope` | rotary position embedding, with KV-cache offset |
+| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included |
 | `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's. Speed unmeasured |
 | `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
@@ -45,6 +45,12 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
+| `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. Speed unmeasured |
+| `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
+| `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
+| `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
+| `flash_attention` | the same function as `attention`, one dispatch, tiled online softmax; the `[B, H, L, S]` score matrix is never allocated, which is tested by counting bound bytes and not only by the answer. `128n + 32` bytes at `L = S = n, D = Dv = 8` against unfused `4n² + 64n + 28`. Speed unmeasured |
+| `mel` | filterbank construction and its application, as two kernels. Defaults are `torchaudio.transforms.MelSpectrogram`: **HTK** mel scale, **unnormalised** triangles, **power** spectrum, and `AmplitudeToDB(stype="power")` for the log — base 10, scaled by `20/power`, flooring its *argument* at `1e-10` rather than adding an epsilon. `{ scale: "slaney", norm: "slaney" }` gives **`librosa.filters.mel`**'s defaults instead; on the same audio the two differ by 200x, so neither is a default worth leaving unstated. No `top_db` — it needs a reduction over the whole spectrogram. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -69,6 +75,44 @@ What stays order-dependent is the last bit or two of a collided sum — f32
 addition is not associative. Measured on this GPU at 75 collisions per slot: up
 to 4.1e-7 relative, about three f32 epsilons, which is the tolerance those tests
 are set from.
+
+### `stft` / `istft`: the conventions, and what they match
+
+Window, hop, centring, padding and normalisation each have more than one
+reasonable answer. Choosing silently means every caller has a 50% chance of a
+subtly wrong waveform, so all of them are named here and every one follows
+**`torch.stft` / `torch.istft`**, checked against torch 2.10 numerically rather
+than read off the documentation:
+
+| thing | here | matches |
+| --- | --- | --- |
+| centring | `center = true`: frame `f` centres on sample `f * hop` | `torch.stft(center=True)` |
+| padding | reflect, without repeating the edge sample | `pad_mode="reflect"` |
+| frames | `1 + floor(L / hop)` centred | torch |
+| sidedness | one-sided, `floor(nFft / 2) + 1` bins | `onesided=True` |
+| scaling | none forward, `1 / nFft` inverse | `normalized=False` |
+| `hannWindow` | periodic | `torch.hann_window`, `scipy.signal.get_window("hann")`, librosa — **not** `np.hanning`, which is symmetric |
+| Nyquist bin | counted once, imaginary part dropped | `torch.fft.irfft` |
+
+**`istft` divides by the overlap-added `w²` envelope** rather than assuming the
+window is COLA. That inverts any window satisfying NOLA — the same least-squares
+inverse torch computes — and it matters for the ordinary case: a periodic Hann at
+50% overlap is COLA in `w` but **not** in `w²`, since `sin⁴θ + cos⁴θ` runs
+between 0.5 and 1. Skipping the division is wrong by up to 2x and still sounds
+like audio. The reference refuses a window whose envelope drops below `1e-11`,
+which is torch's own threshold, bracketed by bisection against it.
+
+Two deliberate departures, both explained in `ops/stft/reference.ts`: the layout
+is frame-major `[frames, bins]` where torch is `[bins, frames]`, because a
+vocoder head emits one row per frame — MioCodec's `istft_head` is a
+`Linear[.., 1922]` with `1922 = 2 * (1920 / 2 + 1)` — and because it lets the
+kernel write consecutively. And asking for more output samples than the frames
+reach raises, where torch pads the tail with zeros and warns; a silent zero tail
+is indistinguishable from silence in a vocoder output.
+
+The kernels are a naive DFT per frame, not an FFT. 1920 is `2^7 * 15`, so radix-2
+does not apply, and this runs beside a transformer over a few hundred frames.
+Speed is **unmeasured**.
 
 Everything below this line is design, not code. It is written down so the shape
 is decided before there is enough built for the shape to be hard to change.
@@ -215,7 +259,7 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ✅ ·
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D) · `add` · `mul` · `gather` ✅ ·
 `scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
 Small, total, boring. Everything else is built from these, and they are where
@@ -224,8 +268,8 @@ target-specific tuning pays off most.
 ### `kernel/` — one fused, named operation
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
-`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
-`flash_attention` · `ctc_decode` · `mel` · `stft` / `istft`
+`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
+`flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ · `stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
@@ -239,7 +283,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` · `NTK scaling` · `rotary cache`
+Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
 
 Sharing: `GQA` · `MQA`
 
