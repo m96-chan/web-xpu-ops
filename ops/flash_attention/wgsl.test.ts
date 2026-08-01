@@ -318,6 +318,9 @@ const ALL: Prepared[] = [...SHAPE_TESTS, ...GROWTH, RESCALE, CAUSAL_DIRECTION, O
  */
 function bindingBytes(binding: Binding): number {
   if (binding.kind === "out") return binding.length * 4;
+  // Scratch is storage the harness neither uploads nor reads back, but the
+  // device still allocates it, so it counts toward what this op costs.
+  if (binding.kind === "scratch") return Math.max(4, binding.length * 4);
   if (binding.kind === "uniform") return Math.max(16, binding.data.byteLength);
   return Math.max(4, binding.data.byteLength);
 }
