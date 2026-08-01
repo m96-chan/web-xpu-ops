@@ -68,6 +68,23 @@ Entries record **why** a change was needed. What changed is in the diff.
   implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
   and `min`; `mean` always divides by the axis length. Callers who get those
   wrong get them wrong quietly, which is why they are written down.
+- `layernorm` — mean-subtracted normalisation with a bias term, following
+  `torch.nn.functional.layer_norm`: the variance is **biased** (`1/D`, not
+  `1/(D-1)`) and `eps` sits inside the square root. Both were checked against
+  PyTorch in float64 rather than read off the documentation, because the two
+  variance conventions differ by less than a percent on a wide row and a caller
+  would never notice which one they got. The variance is computed in two passes
+  — mean, then the mean of the squared deviations — instead of the one-pass
+  `E[x²] - E[x]²`. That identity is not a performance choice with a numerical
+  footnote; it is broken where LayerNorm is most often used. Measured on this
+  device by running both shaders: on a row of `8192 ± 4`, true variance 6.678162,
+  the two-pass kernel returns 6.67816 and the one-pass identity returns a
+  *negative* number — the squares land past 2^26 where f32 steps by 8, the
+  subtraction cancels every digit the spread had, and `inverseSqrt` of that is
+  NaN. The same test at `1024 ± 4` is the more dangerous half: 6.62347 against
+  6.678162, 0.8% low, a number nobody would look at twice. Both rows are in the
+  suite, and with the one-pass form in place they are the only test of the eight
+  that fails — which is the whole reason they had to be written.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
