@@ -127,6 +127,24 @@ Entries record **why** a change was needed. What changed is in the diff.
   would be the per-step readback this op exists to avoid. Beam search is
   deliberately absent: it is a different algorithm and needs its own decision
   about where the beam lives.
+- `mel` — the filterbank and its application, in two kernels because the matrix
+  depends only on scalars and is built once per configuration while the
+  application runs per frame. The other half of the DSP gap next to `stft`: no
+  ML kernel library ships it because it is not machine learning, so every voice
+  encoder reimplements it in numpy, and that numpy is exactly what has to be
+  rewritten to move a pipeline into a browser. Four conventions have more than
+  one answer in wide use and all four are named rather than picked silently —
+  the HTK mel scale, unnormalised triangles, a power spectrum, and a dB log
+  flooring its argument at `1e-10`, which together are
+  `torchaudio.transforms.MelSpectrogram` + `AmplitudeToDB(stype="power")`.
+  Asking for `{ scale: "slaney", norm: "slaney" }` gives `librosa.filters.mel`'s
+  defaults instead, and on the same audio those two differ by a factor of 200,
+  which is what silently picking one would have cost a caller. Checked against
+  torchaudio 2.10 and librosa 0.11 on a real recorded voice, not on a formula.
+  `top_db` is deliberately absent: it clamps against the maximum over the whole
+  spectrogram, so it cannot be computed before the last frame exists and it
+  makes the answer depend on how the caller chunked their audio — that is
+  `reduce` then `elementwise`. Speed is **unmeasured**.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to

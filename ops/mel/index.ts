@@ -1,0 +1,15 @@
+export {
+  hzToMel,
+  melBins,
+  melFilterbank,
+  melFilterbankHasEmptyBand,
+  melFrequencies,
+  melSpectrogram,
+  melToHz,
+  type MelFilterbankArgs,
+  type MelFrequenciesArgs,
+  type MelNorm,
+  type MelPower,
+  type MelScale,
+  type MelSpectrogramArgs,
+} from "./reference.js";
