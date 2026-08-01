@@ -233,6 +233,12 @@ entry point that grows a variant no test iterates. The check is per entry point,
 not per op: looping `scores` says nothing about `context`. A target-specific
 kernel that is fast and wrong is the failure this axis exists to design against.
 
+All of it lives outside `harness/index.ts` — import `harness/variants.js`,
+`harness/resolve.js` and `harness/target.js` directly. `index.ts` is what every
+op's test imports, so anything re-exported from it lands on the import graph of
+every GPU test; keeping resolution off it leaves `index.ts` and `suite.ts`
+byte-identical to what they were before any of this existed.
+
 ---
 
 ## Dtypes

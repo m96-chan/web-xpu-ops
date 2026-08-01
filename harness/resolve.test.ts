@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { DEFAULT_ENTRY, parseVariant, resolve, variantSuites, variantsIn } from "./resolve.js";
-import { eachVariant } from "./suite.js";
+import { eachVariant } from "./variants.js";
 
 /**
  * The targets here are deliberately fake.

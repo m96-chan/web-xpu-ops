@@ -133,7 +133,9 @@ Entries record **why** a change was needed. What changed is in the diff.
   builds an op's test loop from its `wgsl/` directory rather than from a list, and
   `unguardedOps` fails the suite for an entry point that grows a variant no test
   iterates. Per entry point, not per op: looping `scores` says nothing about
-  `context`.
+  `context`. None of it is re-exported from `harness/index.ts`, which every op's
+  test imports, so `index.ts` and `suite.ts` are byte-identical to what they were
+  before this landed and no existing op's test loads anything new.
 - `ctc_decode` — greedy CTC decoding: argmax per frame, collapse repeats, then
   drop blanks, **in that order**. The order is the whole op. Stripping blanks
   first and collapsing afterwards is the implementation everyone reaches for,

@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
-import { DEFAULT_ENTRY, TARGETS, describeAdapter, resolve } from "./index.js";
+import { DEFAULT_ENTRY, resolve } from "./resolve.js";
+import { TARGETS, describeAdapter } from "./target.js";
 
 /**
  * The one part of resolution that cannot be checked with a fake: that a real

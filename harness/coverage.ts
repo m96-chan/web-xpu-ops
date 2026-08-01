@@ -23,11 +23,14 @@ import { variantsIn } from "./resolve.js";
  * `npm test` gives each file its own process (see `scripts/test.mjs`), so there
  * is no point at which one process could see which variants the others touched.
  *
- * Import it directly, from the one test that runs it. It is deliberately absent
- * from `harness/index.ts`, which is the package's public entry and what every
- * op's test imports: this is a check on this repository's own tree, not
- * something a consumer of the package calls, and there is no reason for it to be
- * on the import graph of every GPU test.
+ * Import it directly, from the one test that runs it. Nothing in this file, in
+ * `resolve.ts` or in `variants.ts` is re-exported from `harness/index.ts`, and
+ * that is deliberate: `index.ts` is what every op's test imports, so anything
+ * re-exported there lands on the import graph of every GPU test. Keeping
+ * resolution off it leaves `index.ts` and `suite.ts` byte-identical to what they
+ * were before this feature existed — adding it changed nothing about how an
+ * existing op's test is loaded, which is the cheapest way to be sure it changed
+ * nothing about how one runs.
  */
 const LOOP = "eachVariant";
 
