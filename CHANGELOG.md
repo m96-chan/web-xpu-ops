@@ -75,5 +75,16 @@ Entries record **why** a change was needed. What changed is in the diff.
   PyTorch raises there and a kernel cannot, and the alternatives — clamping or
   wrapping — hand back a real embedding for a token that was never in the
   vocabulary, which looks plausible all the way downstream.
+- `conv` — 1D only, matching `torch.nn.functional.conv1d`, with `stride`,
+  `padding`, `dilation`, `groups` and an optional `bias`. The convention worth
+  stating out loud is that PyTorch's `conv1d` is a **cross-correlation**: it does
+  not flip the kernel. `F.conv1d([[[1,2,3,4]]], [[[1,10,100]]])` is `[[[321,
+  432]]]`, not `[[[123, 234]]]`. The two definitions agree on every symmetric
+  kernel, so a library that quietly picks the mathematical one passes every
+  hand-written test and then disagrees with PyTorch on real weights. `groups` is
+  in from the start because `groups = Cin = Cout` is a depthwise conv, which is
+  what the speech front-ends this op exists for actually run. 2D is deliberately
+  absent until something asks for it. Speed is **unmeasured**: the roofline it
+  should be reported against does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
