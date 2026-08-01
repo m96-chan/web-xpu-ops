@@ -35,7 +35,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
-| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included |
+| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included. An optional precomputed angle table (`ropeCache`); past its end the angle is recomputed rather than wrapped |
 | `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's. Speed unmeasured |
 | `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |

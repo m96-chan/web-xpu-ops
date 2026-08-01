@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rope, ropeFrequencyParams } from "./reference.js";
+import { rope, ropeCache, ropeFrequencyParams, type RoPEScaling } from "./reference.js";
 
 /**
  * The parts of RoPE scaling a kernel cannot be asked about.
@@ -227,5 +227,236 @@ describe("rope / reference", () => {
     expect(gap(ntk, plain)).toBeGreaterThan(1);
     expect(gap(yarn, plain)).toBeGreaterThan(1);
     expect(gap(yarn, ntk)).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * The rotary cache: what the table holds, what happens past its end, and what
+ * the whole thing actually saves.
+ *
+ * The last one is a measurement rather than a claim. `Math.sin`, `Math.cos` and
+ * `Math.pow` are counted here for real, because "precomputing saves
+ * transcendentals" is the kind of statement that is obviously true and
+ * quantitatively wrong as often as not.
+ *
+ * Touches no GPU. `wgsl.test.ts` runs the same boundary against the kernel.
+ */
+describe("rope / cache", () => {
+  const headDim = 16;
+  const halfDim = headDim / 2;
+  const thetaBase = 10000;
+  const wave = (n: number) => Float32Array.from({ length: n }, (_, i) => Math.sin(i * 0.29) * 2);
+  const gap = (a: Float32Array, b: ArrayLike<number>) =>
+    Math.max(...Array.from(a, (v, k) => Math.abs(v - b[k]!)));
+
+  const schemes: [string, RoPEScaling | undefined][] = [
+    ["plain", undefined],
+    ["ntk", { kind: "ntk", factor: 8 }],
+    ["yarn", { kind: "yarn", factor: 8, originalContextLength: 64 }],
+  ];
+
+  it("tabulates the angles the uncached path computes, for every scheme", () => {
+    // Written out from the papers' formulas rather than read back from a run,
+    // and separately per scheme — NTK moves the base and YaRN moves the ramp
+    // and the gain, so a table that ignored `scaling` would agree with plain
+    // RoPE and with nothing else. That is the failure this covers: the table
+    // depends on the frequencies, so scaling has to reach it.
+    for (const [name, scaling] of schemes) {
+      const p = ropeFrequencyParams(headDim, thetaBase, scaling);
+      const cache = ropeCache({ headDim, thetaBase, positions: 5, scaling });
+      expect(cache.positions, name).toBe(5);
+      expect(cache.table.length, name).toBe(5 * halfDim * 2);
+
+      for (let pos = 0; pos < 5; pos += 1) {
+        for (let pair = 0; pair < halfDim; pair += 1) {
+          const extrapolation = Math.pow(p.effectiveBase, (-2 * pair) / headDim);
+          const interpolation = extrapolation / p.interpolationFactor;
+          const ramp = Math.min(Math.max((pair - p.rampLow) / (p.rampHigh - p.rampLow), 0), 1);
+          const theta = pos * (extrapolation + (interpolation - extrapolation) * ramp);
+          // Exact, not close: the table is f32 and this is the f64 value it was
+          // rounded from, so `Math.fround` is the entire difference between the
+          // two. Anything else here would be a different angle.
+          const at = (pos * halfDim + pair) * 2;
+          expect(cache.table[at], `${name} cos pos=${pos} pair=${pair}`).toBe(
+            Math.fround(Math.cos(theta) * p.attentionFactor),
+          );
+          expect(cache.table[at + 1], `${name} sin pos=${pos} pair=${pair}`).toBe(
+            Math.fround(Math.sin(theta) * p.attentionFactor),
+          );
+        }
+      }
+    }
+  });
+
+  it("puts cos before sin, and the position stride outside the pair stride", () => {
+    // Layout, pinned without repeating the formula. Position 0 has theta = 0 at
+    // every pair, so its whole row is (gain, 0) repeated — which is true of the
+    // cos slots and of no other arrangement of the same numbers. Swap cos and
+    // sin, or transpose the two strides, and this row stops looking like that.
+    const scaling = { kind: "yarn", factor: 8, originalContextLength: 64 } as const;
+    const gain = ropeFrequencyParams(headDim, thetaBase, scaling).attentionFactor;
+    expect(gain).toBeGreaterThan(1.2); // so that "cos at pos 0" is not just 1
+
+    const cache = ropeCache({ headDim, thetaBase, positions: 3, scaling });
+    expect(Array.from(cache.table.slice(0, halfDim * 2))).toEqual(
+      Array.from({ length: halfDim * 2 }, (_, k) => (k % 2 === 0 ? Math.fround(gain) : 0)),
+    );
+    // And position 1 starts right after position 0, rather than the pairs of
+    // position 0 being strided across the table.
+    expect(cache.table[halfDim * 2]).toBe(Math.fround(Math.cos(1) * gain));
+  });
+
+  it("agrees with the uncached path when every position is in the table", () => {
+    // The done-when condition from the issue — and on its own it is a weak
+    // test, which is worth saying out loud: an implementation that ignored the
+    // cache entirely would pass it. The two tests below are what separate "read
+    // the table" from "recomputed anyway". This one is here to catch the
+    // opposite mistake, a table that is used but built wrong.
+    //
+    // Not exact. The table is f32 and the uncached path keeps cos and sin in
+    // f64, so the cached result is the same angle rounded one step earlier.
+    // Measured max absolute difference, the same 2.384e-7 for all three
+    // schemes on inputs of magnitude 2 — one f32 ulp at that size, which is
+    // where the rounding was moved to and nothing else.
+    const [N, numHeads, posOffset] = [6, 3, 4];
+    const input = wave(N * numHeads * headDim);
+    for (const [name, scaling] of schemes) {
+      const cache = ropeCache({ headDim, thetaBase, positions: N + posOffset, scaling });
+      const cached = rope({ input, N, numHeads, headDim, posOffset, thetaBase, scaling, cache });
+      const uncached = rope({ input, N, numHeads, headDim, posOffset, thetaBase, scaling });
+      expect(gap(cached, uncached), name).toBeLessThan(1e-6);
+    }
+  });
+
+  it("reads the table below its length and computes directly past it", () => {
+    // The boundary, observed with a table that is deliberately wrong: every
+    // entry halved. Nothing else can tell the two paths apart, because when the
+    // table is right they agree by construction.
+    //
+    // Positions 2..7 against a table of 4, so the run starts inside the table
+    // and leaves it: tokens 0..1 must come back halved, tokens 2..5 must come
+    // back as the uncached op. An off-by-one at the boundary moves exactly one
+    // token across that line and fails both halves at once.
+    const [N, numHeads, posOffset, positions] = [6, 2, 2, 4];
+    const perToken = numHeads * headDim;
+    const input = wave(N * perToken);
+    const built = ropeCache({ headDim, thetaBase, positions });
+    const poisoned = { ...built, table: built.table.map((v) => v * 0.5) };
+
+    const out = rope({ input, N, numHeads, headDim, posOffset, thetaBase, cache: poisoned });
+    const uncached = rope({ input, N, numHeads, headDim, posOffset, thetaBase });
+
+    for (let token = 0; token < N; token += 1) {
+      const from = token * perToken;
+      const mine = out.slice(from, from + perToken);
+      const theirs = uncached.slice(from, from + perToken);
+      if (token + posOffset < positions) {
+        // Halved: the rotation is linear in cos and sin, so halving both halves
+        // the output. Close to half, not merely different from the uncached
+        // value, so that "used some other table entry" fails too.
+        expect(gap(mine, Array.from(theirs, (v) => v * 0.5)), `token ${token}`).toBeLessThan(1e-6);
+        expect(gap(mine, theirs), `token ${token}`).toBeGreaterThan(0.5);
+      } else {
+        // Past the end it is the uncached op exactly — same expression, same
+        // f64 arithmetic, so equality rather than a tolerance.
+        expect(Array.from(mine), `token ${token}`).toEqual(Array.from(theirs));
+      }
+    }
+  });
+
+  it("does not wrap past the end of the table", () => {
+    // Wrapping is the failure the issue names: `pos % positions` is a real
+    // angle for some other position, so the output is a plausible tensor rather
+    // than an error. With a table of 4, position 4 would wrap to position 0,
+    // whose angles are cos = gain, sin = 0 — the identity rotation. So a
+    // wrapping implementation returns that token unrotated.
+    //
+    // The halved table makes the counterfactual concrete: wrapping would return
+    // exactly half the input for this token, and it must not.
+    const [numHeads, posOffset, positions] = [2, 4, 4];
+    const perToken = numHeads * headDim;
+    const input = wave(perToken);
+    const built = ropeCache({ headDim, thetaBase, positions });
+    const poisoned = { ...built, table: built.table.map((v) => v * 0.5) };
+
+    const out = rope({ input, N: 1, numHeads, headDim, posOffset, thetaBase, cache: poisoned });
+    expect(gap(out, Array.from(input, (v) => v * 0.5))).toBeGreaterThan(0.5);
+    // What it does instead: rotate by position 4, like the uncached op.
+    expect(Array.from(out)).toEqual(
+      Array.from(rope({ input, N: 1, numHeads, headDim, posOffset, thetaBase })),
+    );
+  });
+
+  it("refuses a table built for a different rotation", () => {
+    // The other way to get plausible garbage. A table is just numbers; nothing
+    // about it says which base or which scaling produced it, so a caller who
+    // keeps two models in one process can hand over the wrong one and get a
+    // tensor back. The five scalars travel with the table so that this is an
+    // error instead.
+    const args = { input: wave(headDim), N: 1, numHeads: 1, headDim, posOffset: 0, thetaBase };
+    const cache = ropeCache({ headDim, thetaBase, positions: 4 });
+
+    expect(() => rope({ ...args, cache })).not.toThrow();
+    // A different base: the same call shape, a table of different angles.
+    expect(() => rope({ ...args, thetaBase: 500000, cache })).toThrow(/effectiveBase/);
+    // Scaling asked for, table built without it. This is the one the kernel
+    // cannot catch and the one #22 made reachable.
+    expect(() => rope({ ...args, cache, scaling: { kind: "ntk", factor: 8 } })).toThrow(
+      /effectiveBase/,
+    );
+    expect(() =>
+      rope({ ...args, cache, scaling: { kind: "yarn", factor: 8, originalContextLength: 64 } }),
+    ).toThrow(/interpolationFactor/);
+    // Wrong geometry, which would also read past the end of the table.
+    expect(() => rope({ ...args, headDim: 8, cache })).toThrow(/headDim/);
+  });
+
+  it("saves a measured number of transcendental calls, not an assumed one", () => {
+    // Counted, per rule 9. `Math.sin`, `Math.cos` and `Math.pow` are wrapped and
+    // the calls tallied, so these numbers come from the code rather than from
+    // the loop bounds read off the page.
+    //
+    // The shape is a decode: 64 steps of one token each, at Llama-2's geometry
+    // (8 heads, head_dim 128). Plain RoPE, so `ropeFrequencyParams` itself
+    // contributes nothing to the count and the tally is all rotation.
+    const [steps, numHeads, decodeDim] = [64, 8, 128];
+    const input = wave(numHeads * decodeDim);
+    const step = { input, N: 1, numHeads, headDim: decodeDim, thetaBase };
+
+    const count = (body: () => void) => {
+      const real = { sin: Math.sin, cos: Math.cos, pow: Math.pow };
+      let calls = 0;
+      Math.sin = (x: number) => (calls += 1, real.sin(x));
+      Math.cos = (x: number) => (calls += 1, real.cos(x));
+      Math.pow = (x: number, y: number) => (calls += 1, real.pow(x, y));
+      try {
+        body();
+      } finally {
+        Object.assign(Math, real);
+      }
+      return calls;
+    };
+
+    const uncached = count(() => {
+      for (let pos = 0; pos < steps; pos += 1) rope({ ...step, posOffset: pos });
+    });
+    let cache!: ReturnType<typeof ropeCache>;
+    const build = count(() => {
+      cache = ropeCache({ headDim: decodeDim, thetaBase, positions: steps });
+    });
+    const reads = count(() => {
+      for (let pos = 0; pos < steps; pos += 1) rope({ ...step, posOffset: pos, cache });
+    });
+
+    // Three calls — pow, cos, sin — per (token, head, pair), every step.
+    expect(uncached).toBe(steps * numHeads * (decodeDim / 2) * 3);
+    expect(uncached).toBe(98304);
+    // The table is indexed by position and pair and by nothing else, so the
+    // heads are where the saving is: one table serves all eight of them.
+    expect(build).toBe(steps * (decodeDim / 2) * 3);
+    expect(build).toBe(12288);
+    // And the steps themselves become free.
+    expect(reads).toBe(0);
+    expect(uncached / (build + reads)).toBe(numHeads);
   });
 });
