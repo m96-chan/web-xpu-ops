@@ -1,0 +1,25 @@
+{
+  "name": "web-xpu-ops",
+  "version": "0.0.0",
+  "description": "Web primitive layer implementations for xPU: one reference per op, one implementation per backend, and tests that hold them together.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Yusuke Harada",
+  "repository": { "type": "git", "url": "git+https://github.com/m96-chan/web-xpu-ops.git" },
+  "files": ["ops", "harness", "README.md"],
+  "exports": {
+    "./harness": "./harness/index.ts",
+    "./ops/*": "./ops/*/index.ts"
+  },
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "webgpu": "^0.4.0"
+  },
+  "engines": { "node": ">=20" }
+}
