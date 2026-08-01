@@ -1,1 +1,7 @@
-export { rope, type RoPEArgs } from "./reference.js";
+export {
+  rope,
+  ropeFrequencyParams,
+  type RoPEArgs,
+  type RoPEFrequencyParams,
+  type RoPEScaling,
+} from "./reference.js";

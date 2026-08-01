@@ -134,6 +134,21 @@ Entries record **why** a change was needed. What changed is in the diff.
   `unguardedOps` fails the suite for an entry point that grows a variant no test
   iterates. Per entry point, not per op: looping `scores` says nothing about
   `context`.
+- `ctc_decode` — greedy CTC decoding: argmax per frame, collapse repeats, then
+  drop blanks, **in that order**. The order is the whole op. Stripping blanks
+  first and collapsing afterwards is the implementation everyone reaches for,
+  and it turns `a ␣ a` into a single `a` — losing the doubled letter that the
+  blank symbol exists to make expressible. The two orders agree on every other
+  input, which is what lets the wrong one survive being tested. Blank defaults
+  to `0`, as `torch.nn.CTCLoss` has it, and is a parameter because TensorFlow's
+  `ctc_greedy_decoder` puts it last and models trained that way exist. The
+  result never leaves the GPU: labels come back as `[B, T]` padded with `-1`,
+  and the true lengths in their own `[B]` buffer, both written by the kernel —
+  a greedy decode emits at most one label per frame, so the allocation never
+  depends on the answer. Reading the labels back to find out how long they are
+  would be the per-step readback this op exists to avoid. Beam search is
+  deliberately absent: it is a different algorithm and needs its own decision
+  about where the beam lives.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
@@ -168,5 +183,37 @@ Entries record **why** a change was needed. What changed is in the diff.
   at `0` and `causal_lower_right` at `S - L` without a second flag.
   Speed is **unmeasured**: the roofline harness it should be reported against
   does not exist yet.
+- `rope` gains NTK and YaRN context scaling, as an optional `scaling` argument
+  rather than as new ops. Neither scheme changes the rotation — they change
+  which frequency each pair rotates at — so forking `rope` would have left three
+  copies of the same rotation to keep in step. There is no PyTorch definition to
+  follow, so the convention is `jquesnelle/yarn` and `transformers`, which
+  agree; YaRN's attention temperature (`0.1·ln(s) + 1`) **is** included, folded
+  into `cos`/`sin` as both of those do, and can be overridden for checkpoints
+  fine-tuned with a different one. Omitting `scaling` leaves plain RoPE
+  identical bit for bit, which is a property of the arithmetic rather than a
+  tolerance: the unscaled path multiplies an exact IEEE zero. Speed is
+  **unmeasured** — scaling costs one multiply-add per element over plain RoPE,
+  and the roofline it should be reported against does not exist yet.
+- `flash_attention` — the same function as `attention`, in one dispatch, with the
+  `[B, H, L, S]` score matrix never allocated. That is the entire difference and
+  the entire reason it is a kernel rather than a composition: at any sequence
+  length worth fusing for, the score matrix is the largest thing in the
+  computation. Tiled online softmax — a running max and a running sum, so a tile
+  of 64 keys folds in without a second pass — and the only score storage anywhere
+  is that one tile in workgroup memory, which does not depend on `S`.
+  Both halves of the claim are tested, because the first half alone would pass a
+  kernel that materialised the matrix and read it back. Agreement is checked
+  against **both** references, this op's and the unfused one's. Allocation is
+  checked by counting the bytes behind the dispatches that produced those
+  answers, at shapes where `L` and `S` grow together — the only sweep where
+  `seq x seq` and `seq` can be told apart — and holding the total to a second
+  difference of zero. Bound bytes at `B=H=1, L=S=n, D=Dv=8`: `128n + 32` here
+  against `4n² + 64n + 28` unfused, which is 32_800 against 278_556 at n = 256
+  and doubles its advantage with every doubling of the sequence.
+  Conventions are inherited from `attention` unchanged — same `scale` default,
+  same `queryOffset` mask — and the arg type is imported rather than restated so
+  the two cannot drift. Speed is **unmeasured**: the roofline harness is #3 / #4.
+  Memory is measured, because memory is what this op is a claim about.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
