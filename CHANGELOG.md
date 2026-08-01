@@ -75,5 +75,21 @@ Entries record **why** a change was needed. What changed is in the diff.
   PyTorch raises there and a kernel cannot, and the alternatives — clamping or
   wrapping — hand back a real embedding for a token that was never in the
   vocabulary, which looks plausible all the way downstream.
+- `attention` — unfused scaled dot-product attention, in two dispatches:
+  `softmax(mask(scale * Q @ K^T))` writes the attention matrix, then `@ V` reads
+  it. Slower than a fused kernel by construction, and worth having anyway,
+  because it is what makes the fused one verifiable — `flash_attention` has no
+  other definition of correct to be measured against.
+  Conventions follow `torch.nn.functional.scaled_dot_product_attention`, checked
+  against torch 2.10 rather than read off the docs, because the two that matter
+  both have a plausible wrong answer: `scale` defaults to `1/sqrt(D)` from the
+  **query's** head dim even when V's differs, and `causal` is **upper-left**
+  aligned, so with a KV cache longer than the query it keeps keys `0..i` rather
+  than the most recent `i+1`. That second one is a trap for the case the op
+  exists to serve, so masking is parameterised by `queryOffset` — the absolute
+  position of query row 0 in the key sequence — which reaches `is_causal=True`
+  at `0` and `causal_lower_right` at `S - L` without a second flag.
+  Speed is **unmeasured**: the roofline harness it should be reported against
+  does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD

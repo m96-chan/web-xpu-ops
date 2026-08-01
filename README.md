@@ -42,6 +42,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
+| `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -221,7 +222,7 @@ target-specific tuning pays off most.
 ### `kernel/` — one fused, named operation
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` · `softmax` ✅ · `activation` ✅ ·
-`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
+`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
 `flash_attention` · `ctc_decode` · `mel` · `stft` / `istft`
 
 Fusion is the reason this layer exists rather than being composed from
