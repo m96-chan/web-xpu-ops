@@ -12,6 +12,17 @@ import { create, globals } from "webgpu";
 export type Binding =
   | { kind: "storage"; data: Float32Array | Int32Array | Uint32Array }
   | { kind: "out"; type: "f32" | "i32" | "u32"; length: number }
+  /**
+   * Storage the kernel uses but nobody supplies or inspects: no upload, no
+   * readback, contents undefined (zero in practice).
+   *
+   * It exists for the roofline calibration, which streams hundreds of megabytes
+   * to find out how fast this device moves memory. Through `storage` that would
+   * upload the buffer, and through `out` it would copy it back — either one puts
+   * a transfer of the same size next to the thing being timed, which is exactly
+   * what must not happen when the measurement *is* the transfer rate.
+   */
+  | { kind: "scratch"; length: number }
   | { kind: "uniform"; data: ArrayBuffer };
 
 export interface Dispatch {
@@ -23,6 +34,22 @@ export interface Dispatch {
 
 export interface Runner {
   run(dispatch: Dispatch): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
+  /**
+   * Seconds of GPU time for the dispatch, or null when this device cannot say.
+   *
+   * Read from a timestamp query written around the compute pass, not from a
+   * clock on the host. Wall-clock here measures buffer creation, submission and
+   * the round trip waiting for a mapped readback — about a millisecond on this
+   * machine, which is several times a real dispatch and swamps exactly the
+   * quantity being measured. Measured while building the roofline: a wall-clock
+   * slope reported 5.3 TB/s on a card whose ceiling is 1.8.
+   *
+   * `timestamp-query` is optional, and the devices most in need of an honest
+   * ceiling advertise the fewest features. Null rather than a guess is the point
+   * — rule 9 says an unmeasured figure must say so, and a fabricated one is
+   * worse than none because it looks authoritative.
+   */
+  time(dispatch: Dispatch): Promise<number | null>;
   destroy(): void;
 }
 
@@ -52,7 +79,24 @@ export async function createRunner(): Promise<Runner | null> {
   const gpu = create([]) as GPU;
   const adapter = await gpu.requestAdapter();
   if (!adapter) return null;
-  const device = await adapter.requestDevice();
+  // Asked for explicitly, because the defaults are far below what the hardware
+  // offers: this adapter allows a 2 GB storage binding but a device requested
+  // with no limits caps them at 128 MiB. The roofline calibration streams more
+  // than that on purpose — a buffer that fits in last-level cache measures cache
+  // bandwidth, which is a real number about the wrong thing.
+  //
+  // Capped at what the adapter reports rather than requested blindly, since
+  // asking for more than a device supports fails outright, and the weakest
+  // devices are the ones this library most needs to keep working on.
+  const wanted = 512 * 1024 * 1024;
+  const timestamps = adapter.features.has("timestamp-query");
+  const device = await adapter.requestDevice({
+    requiredFeatures: timestamps ? ["timestamp-query"] : [],
+    requiredLimits: {
+      maxStorageBufferBindingSize: Math.min(wanted, adapter.limits.maxStorageBufferBindingSize),
+      maxBufferSize: Math.min(wanted, adapter.limits.maxBufferSize),
+    },
+  });
 
   /**
    * Compiled modules, keyed by source.
@@ -65,8 +109,32 @@ export async function createRunner(): Promise<Runner | null> {
    */
   const compiled = new Map<string, GPUShaderModule>();
 
-  return {
-    async run({ code, entry = "main", bindings, workgroups }) {
+  /**
+   * Scratch buffers, kept and reused rather than reallocated per dispatch.
+   *
+   * Repeated large allocations abort this binding — measured: a 64 MiB scratch
+   * buffer allocated and freed twice in one file kills the worker on the second
+   * one, and 256 MiB kills it just as reliably (issue #51). The roofline
+   * calibration needs the same large buffer several times over to take a slope,
+   * so allocating per call is not merely wasteful here, it does not survive.
+   *
+   * Reuse is safe precisely because `scratch` is defined as storage nobody
+   * supplies and nobody inspects — there is no content to carry over and no
+   * reader to surprise. Keyed by binding position as well as size so two scratch
+   * bindings in one dispatch never alias onto the same buffer.
+   */
+  const scratch = new Map<string, GPUBuffer>();
+
+  /**
+   * One dispatch. Returns the outputs, and the GPU time when asked for it.
+   *
+   * `run` and `time` share this so a timed dispatch is the same dispatch, not a
+   * second code path that might diverge from the one under test.
+   */
+  async function dispatch(
+    { code, entry = "main", bindings, workgroups }: Dispatch,
+    clock: boolean,
+  ): Promise<{ outputs: (Float32Array | Int32Array | Uint32Array)[]; seconds: number | null }> {
       // Checked before a single buffer exists. A dispatch that fails after
       // `queue.writeBuffer` leaves writes queued against buffers that are then
       // abandoned unsubmitted, and that was measured to destabilise this
@@ -93,7 +161,7 @@ export async function createRunner(): Promise<Runner | null> {
       const created: GPUBuffer[] = [];
       const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];
 
-      const bound = bindings.map((binding) => {
+      const bound = bindings.map((binding, index) => {
         if (binding.kind === "out") {
           const buffer = device.createBuffer({
             size: binding.length * 4,
@@ -101,6 +169,19 @@ export async function createRunner(): Promise<Runner | null> {
           });
           created.push(buffer);
           outputs.push({ spec: binding, buffer });
+          return buffer;
+        }
+        if (binding.kind === "scratch") {
+          const key = `${index}:${binding.length}`;
+          let buffer = scratch.get(key);
+          if (!buffer) {
+            buffer = device.createBuffer({
+              size: Math.max(4, binding.length * 4),
+              usage: GPUBufferUsage.STORAGE,
+            });
+            scratch.set(key, buffer);
+          }
+          // Deliberately not pushed to `created`: it outlives this dispatch.
           return buffer;
         }
         const bytes =
@@ -136,8 +217,28 @@ export async function createRunner(): Promise<Runner | null> {
       const invalid = await device.popErrorScope();
       if (invalid) throw new Error(`dispatch is not valid: ${invalid.message}`);
 
+      // Written around the pass itself, so the number excludes buffer creation,
+      // submission and the readback round trip — all of which dwarf a real
+      // dispatch on this machine.
+      const timing =
+        clock && timestamps
+          ? {
+              set: device.createQuerySet({ type: "timestamp", count: 2 }),
+              resolved: device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+              }),
+              readable: device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+              }),
+            }
+          : null;
+
       const encoder = device.createCommandEncoder();
-      const pass = encoder.beginComputePass();
+      const pass = encoder.beginComputePass(
+        timing ? { timestampWrites: { querySet: timing.set, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+      );
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(...(workgroups as [number, number?, number?]));
@@ -152,6 +253,8 @@ export async function createRunner(): Promise<Runner | null> {
         created.push(read);
         return read;
       });
+      if (timing) encoder.resolveQuerySet(timing.set, 0, 2, timing.resolved, 0);
+      if (timing) encoder.copyBufferToBuffer(timing.resolved, 0, timing.readable, 0, 16);
       device.queue.submit([encoder.finish()]);
 
       const results: (Float32Array | Int32Array | Uint32Array)[] = [];
@@ -169,10 +272,34 @@ export async function createRunner(): Promise<Runner | null> {
               : new Float32Array(bytes),
         );
       }
+      let seconds: number | null = null;
+      if (timing) {
+        await timing.readable.mapAsync(GPUMapMode.READ);
+        const stamps = new BigUint64Array(timing.readable.getMappedRange().slice(0));
+        timing.readable.unmap();
+        // Timestamps are nanoseconds. A query set can return zeros when the
+        // driver declines to serve it, and zero is not a duration.
+        const elapsed = stamps[1]! - stamps[0]!;
+        seconds = elapsed > 0n ? Number(elapsed) / 1e9 : null;
+        timing.set.destroy();
+        timing.resolved.destroy();
+        timing.readable.destroy();
+      }
       for (const buffer of created) buffer.destroy();
-      return results;
+      return { outputs: results, seconds };
+    }
+
+  return {
+    async run(spec) {
+      return (await dispatch(spec, false)).outputs;
+    },
+    async time(spec) {
+      if (!timestamps) return null;
+      return (await dispatch(spec, true)).seconds;
     },
     destroy() {
+      for (const buffer of scratch.values()) buffer.destroy();
+      scratch.clear();
       device.destroy();
     },
   };

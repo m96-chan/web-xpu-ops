@@ -16,6 +16,24 @@ Entries record **why** a change was needed. What changed is in the diff.
   stale. The count line now also states outright that speed is unmeasured for
   every op, since rule 9 treats an omission as a claim of speed.
 
+### Added
+
+- `Runner.time(dispatch)` — GPU time for a dispatch, read from a timestamp query
+  written around the compute pass, and `null` on devices that cannot report it
+  rather than a guess. Host wall-clock cannot stand in: it charges the dispatch
+  for buffer creation, submission and the readback round trip, about 1.2 ms here
+  against a real dispatch of 0.3 ms. Taking a bandwidth ceiling that way reported
+  5.3 TB/s on a 1.79 TB/s card — the authoritative-looking, unrelated figure the
+  roofline design exists to avoid.
+- A `scratch` binding: storage the kernel uses but nobody uploads or reads back,
+  so a measurement of transfer rate does not sit next to a transfer of the same
+  size. Reused across dispatches rather than reallocated, because repeated large
+  allocations abort this binding — a 64 MiB buffer allocated twice kills the
+  worker on the second.
+- The device now asks the adapter for the limits it actually offers. A device
+  requested with none caps storage bindings at 128 MiB where this adapter allows
+  2 GB.
+
 ### Fixed
 
 - The harness refuses a shader that does not compile instead of reading back
