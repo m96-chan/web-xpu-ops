@@ -7,6 +7,14 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Changed
+
+- `npm test` runs one test file per vitest process. A single process cannot cross
+  a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
+  pool or hangs, with no kernel of its own required to trigger it. The runner also
+  refuses to report a false pass: a crashed vitest worker can exit 0 having
+  skipped most of the suite, so every file is now accounted for individually.
+
 ### Added
 
 - `harness` — a WGSL runner over Dawn in Node, an `agree` comparator that passes
@@ -22,6 +30,22 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `matvec` (GEMV) — one vector against a `[M, K]` row-major matrix, following
+  `torch.mv` rather than BLAS `sgemv`: no `alpha`, no `beta`, no transpose flag.
+  It exists as its own op rather than as a path through a future `matmul`
+  because it reads every weight exactly once and reuses none of them, so the
+  kernel is written to stream — lanes walk a row at the workgroup stride, which
+  keeps each pass one contiguous burst — and the tiling that makes GEMM fast has
+  nothing to capture here. Autoregressive decoding is this shape at every step.
+  Speed is **unmeasured**: the bandwidth roofline it should be reported against
+  does not exist yet.
+- `matmul` — GEMM (`C = A @ B`) with a shared-memory tiled WGSL kernel. Separate
+  from GEMV because the reuse a tile buys is the only reason this shape can be
+  compute-bound, and none of it applies to a batch of one. Shapes that do not
+  divide by the tile are where tiled kernels are fast and wrong, so the ragged
+  tails are tested on their own and together — including against buffers longer
+  than the operands, because this device reads past the end of a buffer as zero
+  and would otherwise hide a missing tail guard.
 - `scatter` — indexed writes where **colliding indices accumulate**, via an f32
   compare-exchange atomic. The rule had to be decided rather than discovered:
   "last write wins" is undefined behaviour on a GPU, since nothing orders the
