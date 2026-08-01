@@ -25,10 +25,11 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Seven ops, WGSL only, verified against their references on a real GPU.
+Eight ops, WGSL only, verified against their references on a real GPU.
 
 | op | notes |
 | --- | --- |
+| `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row |
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
@@ -182,7 +183,7 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) · `matvec` (GEMV) · `conv` · `add` · `mul` · `gather` ·
+`matmul` (GEMM) · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ·
 `scatter` · `transpose` · `reduce`
 
 Small, total, boring. Everything else is built from these, and they are where
