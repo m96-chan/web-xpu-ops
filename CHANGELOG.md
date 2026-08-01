@@ -22,5 +22,13 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `reduce` — `sum` / `max` / `min` / `mean` along one axis, over a tensor viewed
+  as `[outer, axis, inner]` so that any axis of any rank fits. rmsnorm and
+  softmax each carry their own copy of the workgroup tree reduction, and a third
+  copy was about to be written; this is that reduction with the combiner and the
+  identity lifted out. The edges follow PyTorch and are stated rather than
+  implied: an empty axis sums to `0`, means to `NaN`, and is an error for `max`
+  and `min`; `mean` always divides by the axis length. Callers who get those
+  wrong get them wrong quietly, which is why they are written down.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
