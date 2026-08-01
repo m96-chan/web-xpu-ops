@@ -42,6 +42,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
+| `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
 
 ### `scatter`: colliding indices accumulate
 
@@ -222,7 +223,7 @@ target-specific tuning pays off most.
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` · `softmax` ✅ · `activation` ✅ ·
 `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
-`flash_attention` · `ctc_decode` · `mel` · `stft` / `istft`
+`flash_attention` · `ctc_decode` ✅ (greedy) · `mel` · `stft` / `istft`
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
