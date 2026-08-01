@@ -35,18 +35,37 @@ function toPath(dir: string | URL): string {
   return typeof dir === "string" ? dir : fileURLToPath(dir);
 }
 
-/** Ops carrying a target- or dtype-specific variant that no test iterates. Sorted. */
+/**
+ * Ops with a target- or dtype-specific variant on an entry point no test loops.
+ * Sorted.
+ *
+ * The check is per entry point, not per op. An op with two of them — `stft`,
+ * `attention` — can loop one and leave the other's variants uncompiled, and an
+ * op-level check would call that covered. So each entry point that has variants
+ * has to be named, which is why `eachVariant` takes the name as a string rather
+ * than defaulting to `kernel`.
+ */
 export function unguardedOps(opsRoot: string | URL): string[] {
   const root = toPath(opsRoot);
   const offenders: string[] = [];
   for (const op of readdirSync(root)) {
     const dir = join(root, op);
     if (!statSync(dir).isDirectory()) continue;
-    const variants = variantsIn(join(dir, "wgsl"));
-    if (!variants.some((v) => v.target !== null || v.dtype !== null)) continue;
-    const tests = readdirSync(dir).filter((file) => file.endsWith(".test.ts"));
-    const looped = tests.some((file) => readFileSync(join(dir, file), "utf8").includes(LOOP));
-    if (!looped) offenders.push(op);
+
+    // Only entry points that actually have a variant can hide one.
+    const needing = new Set(
+      variantsIn(join(dir, "wgsl"))
+        .filter((v) => v.target !== null || v.dtype !== null)
+        .map((v) => v.entry),
+    );
+    if (needing.size === 0) continue;
+
+    const sources = readdirSync(dir)
+      .filter((file) => file.endsWith(".test.ts"))
+      .map((file) => readFileSync(join(dir, file), "utf8"));
+    const covered = (entry: string) =>
+      sources.some((src) => src.includes(LOOP) && src.includes(JSON.stringify(entry)));
+    if (![...needing].every(covered)) offenders.push(op);
   }
   return offenders.sort();
 }

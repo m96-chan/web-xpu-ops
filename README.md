@@ -145,10 +145,10 @@ ops/matmul/
   reference.ts
   wgsl/
     kernel.wgsl           portable, correct, unremarkable
-    apple.wgsl            unified memory, wide subgroups
-    nvidia.wgsl
-    amd.wgsl
-    soc.wgsl              tight power and bandwidth budgets
+    kernel.apple.wgsl     unified memory, wide subgroups
+    kernel.nvidia.wgsl
+    kernel.amd.wgsl
+    kernel.soc.wgsl       tight power and bandwidth budgets
   webnn/graph.ts
   wasm/kernel.ts
 ```
@@ -161,18 +161,41 @@ explicit override  →  target + dtype  →  target  →  dtype  →  portable
 
 **The resolution is implemented** (`harness/resolve.ts`, `harness/target.ts`);
 the per-target kernels are not — no op ships a variant yet, so every op resolves
-to `kernel.wgsl` today. A variant says in its filename what it is specialised
-for, and the name is the whole grammar:
+to its portable kernel today.
+
+An op's `wgsl/` directory holds one or more **entry points**, and each may have
+variants. The filename is the whole grammar — `<entry>[.<target>][.<dtype>].wgsl`:
 
 ```
-kernel.wgsl        portable — required, and what an unknown device gets
-nvidia.wgsl        a target
-f16.wgsl           a dtype
-nvidia.f16.wgsl    both
+kernel.wgsl              the default entry point, portable
+inverse.wgsl             a second entry point, portable         (ops/stft)
+scores.wgsl              one of two entry points, portable      (ops/attention)
+kernel.nvidia.wgsl       a target variant of kernel
+inverse.f16.wgsl         a dtype variant of inverse
+scores.apple.f16.wgsl    both
 ```
 
-A filename that fits none of those is an error rather than a file nothing ever
-resolves to, because a misspelt variant sits in the tree looking tuned.
+Every entry point needs its own portable kernel, and **resolution never leaves
+the entry point it was asked about** — `istft` falling back to the forward
+transform because the chain ran off the end would be a wrong answer that still
+looks like a result.
+
+Entry points are named rather than inferred because an op genuinely may need
+several kernels that are not variants of each other: `stft` computes the inverse
+transform with different arithmetic, and `attention` is two dispatches with a
+buffer between them, deliberately split so `layout: "auto"` cannot drop bindings
+an entry point does not reference.
+
+A suffix that is not a known target or dtype is an error, so `kernel.nvidai.wgsl`
+is rejected rather than left in the tree looking tuned. A **bare** `nvidia.wgsl`
+is rejected too, as ambiguous: it is far likelier to be a mis-written variant
+than an entry point that happens to be called "nvidia".
+
+What that cannot catch is a misspelt entry point — `inverze.wgsl` reads as a new
+one. The asymmetry is deliberate. A misspelt variant fails silently, because
+resolution falls back to portable and everything still runs; a misspelt entry
+point fails loudly the moment its test asks for it by name. Only the silent one
+needs a guard.
 
 **Overrides are a first-class input, not an escape hatch.** Anyone integrating
 this will eventually know something the library cannot — that their sequence
@@ -201,11 +224,12 @@ It is a call the caller makes, not something the runner does on the way past.
 device looks like is a question about the device, and the two do not have to be
 answered at the same moment.
 
-Adding a variant cannot skip the reference test. `eachVariant` builds an op's
-test loop from its `wgsl/` directory rather than from a list someone has to
-remember to extend, and `unguardedOps` fails the suite for an op that grows a
-variant no test iterates. A target-specific kernel that is fast and wrong is the
-failure this axis exists to design against.
+Adding a variant cannot skip the reference test. `eachVariant(url, entry, …)`
+builds an op's test loop from its `wgsl/` directory rather than from a list
+someone has to remember to extend, and `unguardedOps` fails the suite for an
+entry point that grows a variant no test iterates. The check is per entry point,
+not per op: looping `scores` says nothing about `context`. A target-specific
+kernel that is fast and wrong is the failure this axis exists to design against.
 
 ---
 

@@ -52,7 +52,7 @@ export function kernel(url: string | URL, name = "kernel"): string {
 }
 
 /**
- * Runs a block of tests once per variant found beside the calling test.
+ * Runs a block of tests once per variant of one entry point beside the caller.
  *
  * The loop comes from the directory, not from a list in the test, so a variant
  * added to `wgsl/` gets the op's reference comparison whether or not anyone
@@ -61,19 +61,25 @@ export function kernel(url: string | URL, name = "kernel"): string {
  * every variant goes through the same reference.
  *
  * ```ts
- * eachVariant(import.meta.url, ({ code }) => {
+ * eachVariant(import.meta.url, "kernel", ({ code }) => {
  *   gpuTest("agrees with the reference", async (run) => { ... });
  * });
  * ```
  *
- * `harness/coverage.ts` catches the other half: an op that grows a variant and
- * never calls this.
+ * The entry point is named rather than defaulted, even for ops that only have
+ * `kernel`. An op with two of them — `stft` has `kernel` and `inverse`,
+ * `attention` has `scores` and `context` — needs two calls with different
+ * dispatch shapes, and a default would let the second one be forgotten silently.
+ * Naming it also gives `harness/coverage.ts` something to check against: it
+ * catches the other half, an op that grows a variant on an entry point no test
+ * loops.
  */
 export function eachVariant(
   url: string | URL,
+  entry: string,
   define: (found: { variant: Variant; code: string }) => void,
 ): void {
-  for (const found of variantSuites(new URL("./wgsl/", url))) {
+  for (const found of variantSuites(new URL("./wgsl/", url), entry)) {
     describe(found.variant.name, () => define(found));
   }
 }

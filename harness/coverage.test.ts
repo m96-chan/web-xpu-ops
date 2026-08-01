@@ -19,7 +19,10 @@ afterAll(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
-const LOOPED = 'eachVariant(import.meta.url, ({ code }) => {\n  gpuTest("agrees", async () => {});\n});';
+/** A test that loops one named entry point's variants. */
+const looped = (entry: string) =>
+  `eachVariant(import.meta.url, ${JSON.stringify(entry)}, ({ code }) => {\n` +
+  `  gpuTest("agrees", async () => {});\n});`;
 const FIXED = 'const code = kernel(import.meta.url);\ngpuTest("agrees", async () => {});';
 
 describe("unguardedOps", () => {
@@ -34,7 +37,7 @@ describe("unguardedOps", () => {
   it("catches a variant added beside a test that only loads the portable kernel", () => {
     const root = opsTree({
       "beta/wgsl/kernel.wgsl": "",
-      "beta/wgsl/nvidia.wgsl": "",
+      "beta/wgsl/kernel.nvidia.wgsl": "",
       "beta/wgsl.test.ts": FIXED,
     });
     expect(unguardedOps(root)).toEqual(["beta"]);
@@ -43,23 +46,23 @@ describe("unguardedOps", () => {
   it("is satisfied by a test that iterates the variants", () => {
     const root = opsTree({
       "gamma/wgsl/kernel.wgsl": "",
-      "gamma/wgsl/nvidia.wgsl": "",
-      "gamma/wgsl.test.ts": LOOPED,
+      "gamma/wgsl/kernel.nvidia.wgsl": "",
+      "gamma/wgsl.test.ts": looped("kernel"),
     });
     expect(unguardedOps(root)).toEqual([]);
   });
 
   it("catches an op that has variants and no test at all", () => {
-    const root = opsTree({ "delta/wgsl/kernel.wgsl": "", "delta/wgsl/amd.wgsl": "" });
+    const root = opsTree({ "delta/wgsl/kernel.wgsl": "", "delta/wgsl/kernel.amd.wgsl": "" });
     expect(unguardedOps(root)).toEqual(["delta"]);
   });
 
   it("accepts the loop from any test file in the op, not just wgsl.test.ts", () => {
     const root = opsTree({
       "epsilon/wgsl/kernel.wgsl": "",
-      "epsilon/wgsl/amd.wgsl": "",
+      "epsilon/wgsl/kernel.amd.wgsl": "",
       "epsilon/wgsl.test.ts": FIXED,
-      "epsilon/variants.test.ts": LOOPED,
+      "epsilon/variants.test.ts": looped("kernel"),
     });
     expect(unguardedOps(root)).toEqual([]);
   });
@@ -67,13 +70,61 @@ describe("unguardedOps", () => {
   it("reports every offender, sorted", () => {
     const root = opsTree({
       "zeta/wgsl/kernel.wgsl": "",
-      "zeta/wgsl/amd.wgsl": "",
+      "zeta/wgsl/kernel.amd.wgsl": "",
       "eta/wgsl/kernel.wgsl": "",
-      "eta/wgsl/apple.wgsl": "",
+      "eta/wgsl/kernel.apple.wgsl": "",
       "theta/wgsl/kernel.wgsl": "",
       "theta/wgsl.test.ts": FIXED,
     });
     expect(unguardedOps(root)).toEqual(["eta", "zeta"]);
+  });
+
+  /**
+   * Ops with more than one entry point are the case that broke the first version
+   * of this. `stft` has `kernel` and `inverse`; `attention` has `scores` and
+   * `context`. A loop over one of them says nothing about the other.
+   */
+  describe("ops with more than one entry point", () => {
+    it("says nothing when neither entry point has a variant", () => {
+      const root = opsTree({
+        "stftish/wgsl/kernel.wgsl": "",
+        "stftish/wgsl/inverse.wgsl": "",
+        "stftish/wgsl.test.ts": FIXED,
+      });
+      expect(unguardedOps(root)).toEqual([]);
+    });
+
+    it("catches a variant on the entry point the tests do not loop", () => {
+      const root = opsTree({
+        "stftish/wgsl/kernel.wgsl": "",
+        "stftish/wgsl/kernel.amd.wgsl": "",
+        "stftish/wgsl/inverse.wgsl": "",
+        "stftish/wgsl/inverse.amd.wgsl": "",
+        "stftish/wgsl.test.ts": looped("kernel"),
+      });
+      expect(unguardedOps(root)).toEqual(["stftish"]);
+    });
+
+    it("is satisfied once every entry point that has variants is looped", () => {
+      const root = opsTree({
+        "stftish/wgsl/kernel.wgsl": "",
+        "stftish/wgsl/kernel.amd.wgsl": "",
+        "stftish/wgsl/inverse.wgsl": "",
+        "stftish/wgsl/inverse.amd.wgsl": "",
+        "stftish/wgsl.test.ts": `${looped("kernel")}\n${looped("inverse")}`,
+      });
+      expect(unguardedOps(root)).toEqual([]);
+    });
+
+    it("ignores an entry point that has no variants to skip", () => {
+      const root = opsTree({
+        "attentionish/wgsl/scores.wgsl": "",
+        "attentionish/wgsl/scores.amd.wgsl": "",
+        "attentionish/wgsl/context.wgsl": "",
+        "attentionish/wgsl.test.ts": looped("scores"),
+      });
+      expect(unguardedOps(root)).toEqual([]);
+    });
   });
 
   // Runs against the real tree. Vacuous today — no op has a variant yet — and

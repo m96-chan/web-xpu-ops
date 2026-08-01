@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
-import { PORTABLE, TARGETS, describeAdapter, resolve } from "./index.js";
+import { DEFAULT_ENTRY, TARGETS, describeAdapter, resolve } from "./index.js";
 
 /**
  * The one part of resolution that cannot be checked with a fake: that a real
@@ -60,11 +60,11 @@ describe("adapter report / gpu", () => {
     if (!adapter) return;
     const report = describeAdapter(adapter);
     const choice = resolve({
-      have: [PORTABLE],
+      have: [DEFAULT_ENTRY],
       target: report.target,
       dtype: report.features.f16 ? "f16" : "f32",
     });
-    expect(choice.name).toBe(PORTABLE);
+    expect(choice.name).toBe(DEFAULT_ENTRY);
     expect(choice.rung).toBe("portable");
   });
 });

@@ -14,7 +14,7 @@ export {
   type Target,
 } from "./target.js";
 export {
-  PORTABLE,
+  DEFAULT_ENTRY,
   parseVariant,
   resolve,
   variantSuites,
