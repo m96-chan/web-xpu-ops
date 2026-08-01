@@ -7,6 +7,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Documentation
+
+- The README's op count, backend table and roadmap now match what is on disk.
+  They drifted because nineteen op PRs landed in parallel and each was told to
+  leave the shared count line alone — otherwise all nineteen conflict on it. The
+  per-op rows and roadmap ticks were correct throughout; only the totals were
+  stale. The count line now also states outright that speed is unmeasured for
+  every op, since rule 9 treats an omission as a claim of speed.
+
 ### Fixed
 
 - The per-file timeout in `npm test` actually fires. It never had: `npx` starts

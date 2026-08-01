@@ -25,7 +25,12 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Thirteen ops, WGSL only, verified against their references on a real GPU.
+Twenty-four ops, WGSL only, verified against their references on a real GPU.
+
+**Speed is unmeasured for every one of them.** The roofline each would be
+reported against does not exist yet, and a number without one would be a
+statement about this GPU rather than about the kernel — so the column says so
+rather than being left blank.
 
 | op | notes |
 | --- | --- |
@@ -353,7 +358,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
+Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache` ✅
 
 Sharing: `GQA` ✅ · `MQA` ✅ (one op — `gqa`, parameterised by `kvHeads`)
 
@@ -382,7 +387,7 @@ everything else in behind it.
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 7 ops | a kernel per op, per target |
+| WGSL | 24 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 
