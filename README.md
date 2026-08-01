@@ -44,6 +44,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. Speed unmeasured |
+| `mel` | filterbank construction and its application, as two kernels. Defaults are `torchaudio.transforms.MelSpectrogram`: **HTK** mel scale, **unnormalised** triangles, **power** spectrum, and `AmplitudeToDB(stype="power")` for the log — base 10, scaled by `20/power`, flooring its *argument* at `1e-10` rather than adding an epsilon. `{ scale: "slaney", norm: "slaney" }` gives **`librosa.filters.mel`**'s defaults instead; on the same audio the two differ by 200x, so neither is a default worth leaving unstated. No `top_db` — it needs a reduction over the whole spectrogram. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -262,7 +263,7 @@ target-specific tuning pays off most.
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
 `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
-`flash_attention` · `ctc_decode` · `mel` · `stft` / `istft` ✅
+`flash_attention` · `ctc_decode` · `mel` ✅ · `stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
