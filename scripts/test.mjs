@@ -80,9 +80,23 @@ function run(file) {
   });
 }
 
+/**
+ * Strips ANSI SGR sequences before parsing.
+ *
+ * Not cosmetic. CI runs with colour forced on, so the summary arrives as
+ * `\x1b[2m Tests \x1b[22m…` and an anchored `^\s*Tests` never matches — every
+ * file then looks like it produced no summary, gets retried, and fails. It
+ * failed safe (a false FAIL, never a false pass) but it made a genuinely green
+ * suite unreportable, and it was invisible locally because vitest turns colour
+ * off by itself when its output is a pipe.
+ */
+function plain(text) {
+  return text.replace(/\[[0-9;]*m/g, "");
+}
+
 /** `Tests  5 passed (5)` → `{ passed: 5, total: 5 }`; null when vitest printed no summary. */
 function counts(output) {
-  const line = /^\s*Tests\s+(.*)$/m.exec(output);
+  const line = /^\s*Tests\s+(.*)$/m.exec(plain(output));
   if (!line) return null;
   const passed = /(\d+) passed/.exec(line[1]);
   const total = /\((\d+)\)/.exec(line[1]);
@@ -129,7 +143,7 @@ for (const file of files) {
   // the reason is in the log rather than inferred from an exit code.
   console.log(`  FAIL ${file}  exit=${code}${seen ? `  ${seen.passed}/${seen.total}` : "  (no summary — crashed or hung)"}`);
   console.log(
-    output
+    plain(output)
       .split("\n")
       .filter((l) => l.trim())
       .map((l) => `       ${l}`)
