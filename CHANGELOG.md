@@ -224,6 +224,22 @@ Entries record **why** a change was needed. What changed is in the diff.
   tolerance: the unscaled path multiplies an exact IEEE zero. Speed is
   **unmeasured** — scaling costs one multiply-add per element over plain RoPE,
   and the roofline it should be reported against does not exist yet.
+- `rope` gains an optional precomputed angle table, `ropeCache`. The angles
+  depend on position and pair and on nothing else, so decoding recomputes the
+  same `pow`, `sin` and `cos` for every head at every step; a table trades
+  memory for those. What the table does when decoding runs past its end had to
+  be decided rather than discovered, because the tempting answers are silently
+  wrong: growing it needs a host that a dispatch does not have, and wrapping
+  (`pos % positions`) returns a real angle for the wrong position, which comes
+  back as a plausible tensor rather than as an error. So it **falls back** to
+  computing the angle — past the end it is exactly the uncached op — and a
+  table built for a different `thetaBase` or `scaling` is **refused**, since
+  that is the same failure by another route. The transcendental saving is
+  counted rather than asserted: 3 calls per (token, head, pair) become 0, and
+  the table costs 3 per (position, pair) once, so a decode saves a factor of
+  `numHeads`. It does **not** show up in wall time on the GPU measured — RoPE
+  there is bandwidth-bound, so the calls were never what it was waiting for;
+  see the PR for the numbers and the conditions.
 - `flash_attention` — the same function as `attention`, in one dispatch, with the
   `[B, H, L, S]` score matrix never allocated. That is the entire difference and
   the entire reason it is a kernel rather than a composition: at any sequence

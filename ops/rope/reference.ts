@@ -77,6 +77,14 @@ export interface RoPEArgs {
   thetaBase: number;
   /** Omitted means plain RoPE, unchanged in every bit. */
   scaling?: RoPEScaling;
+  /**
+   * Precomputed angles from `ropeCache`. Omitted means every angle is computed
+   * where it is used, which is what this op did before caching existed.
+   *
+   * A cache that was not built from this call's `headDim`, `thetaBase` and
+   * `scaling` is rejected rather than used — see `ropeCache`.
+   */
+  cache?: RoPECache;
 }
 
 /**
@@ -174,6 +182,111 @@ export function ropeFrequencyParams(
   };
 }
 
+/**
+ * The frequency pair `i` rotates at, from the five scalars.
+ *
+ * Shared by `rope` and `ropeCache` deliberately. A table built by a second copy
+ * of this expression would agree with the fallback beside it only for as long
+ * as nobody edited one of the two.
+ */
+function invFreq(
+  { effectiveBase, interpolationFactor, rampLow, rampHigh }: RoPEFrequencyParams,
+  headDim: number,
+  pair: number,
+): number {
+  // The reference implementations write these as `1/pos_freqs` and
+  // `1/(s·pos_freqs)` with `pos_freqs = b^(2i/D)`. Written as a negative
+  // exponent instead, so that the no-scaling path is the same expression this
+  // file has always evaluated, down to the last bit.
+  const extrapolation = Math.pow(effectiveBase, (-2 * pair) / headDim);
+  const interpolation = extrapolation / interpolationFactor;
+
+  // γ(i) in the paper: 0 below `rampLow` (extrapolate — these pairs turn fast
+  // enough to have been seen at every phase during training), 1 above
+  // `rampHigh` (interpolate — these have not completed a rotation even once),
+  // linear between.
+  const ramp = Math.min(Math.max((pair - rampLow) / (rampHigh - rampLow), 0), 1);
+  return extrapolation + (interpolation - extrapolation) * ramp;
+}
+
+export interface RoPECacheArgs {
+  headDim: number;
+  /** 10000 conventionally; some models use 500000. */
+  thetaBase: number;
+  /** How many positions to tabulate. Valid for `0 <= pos < positions`. */
+  positions: number;
+  /** Omitted means plain RoPE. */
+  scaling?: RoPEScaling;
+}
+
+/**
+ * Precomputed `cos`/`sin` for every (position, pair), so that decoding does not
+ * recompute them.
+ *
+ * The angles depend on position and pair only — not on the head, not on the
+ * tensor — so one table serves every head of every step. That is where the
+ * saving comes from: an uncached pass spends `N · numHeads · headDim/2` of each
+ * of `pow`, `sin` and `cos`, and the table costs `positions · headDim/2` of
+ * each, once. Measured in `reference.test.ts` and on the GPU; see the PR.
+ *
+ * ## Past the end of the table
+ *
+ * A table covers `positions` positions and decoding runs past it. Three things
+ * are possible and only one of them is correct:
+ *
+ *   - **grow** it — impossible from inside a dispatch; there is no host there
+ *   - **wrap** it — `pos % positions` is silently the wrong angle, which comes
+ *     back as a plausible-looking tensor rather than as an error
+ *   - **fall back** to computing the angle where it is used
+ *
+ * So this op falls back. Past the end it is exactly the uncached op — the same
+ * expression, at the same cost, giving the same answer — and the only thing a
+ * short table costs is the saving. `rope` and `wgsl/kernel.wgsl` both do this,
+ * and both are tested at the boundary with a deliberately wrong table, which is
+ * the only way to tell "read the table" from "recomputed anyway" apart.
+ *
+ * ## A table built for other parameters
+ *
+ * The same failure by another route: a table built at one `thetaBase` or one
+ * `scaling` and handed to a call using another holds angles that are wrong in
+ * the same quiet way. `rope` refuses it. The five scalars the table was built
+ * from travel with it in `freq` for exactly that comparison — two schemes that
+ * agree in all five are the same rotation, so this is not conservative, it is
+ * exact. The kernel cannot check anything of the sort, since it receives the
+ * scalars already reduced; the host is where this has to be caught.
+ */
+export interface RoPECache {
+  /**
+   * `[positions, headDim/2, 2]` — `cos` then `sin`, YaRN's gain already folded
+   * in. f32 because that is what the GPU reads, and the reference holds the
+   * same rounding so that the two agree about more than the angle.
+   */
+  table: Float32Array;
+  /** Positions `0 <= pos < positions` are in the table. */
+  positions: number;
+  headDim: number;
+  /** What the table was built from. `rope` refuses a cache that disagrees. */
+  freq: RoPEFrequencyParams;
+}
+
+export function ropeCache({ headDim, thetaBase, positions, scaling }: RoPECacheArgs): RoPECache {
+  const freq = ropeFrequencyParams(headDim, thetaBase, scaling);
+  const halfDim = headDim / 2;
+  const table = new Float32Array(positions * halfDim * 2);
+
+  for (let pos = 0; pos < positions; pos += 1) {
+    for (let pair = 0; pair < halfDim; pair += 1) {
+      const theta = pos * invFreq(freq, headDim, pair);
+      // Interleaved, `cos` first, so that the two a thread needs are adjacent —
+      // the kernel walks `pair` fastest, which makes the whole row one burst.
+      const at = (pos * halfDim + pair) * 2;
+      table[at] = Math.cos(theta) * freq.attentionFactor;
+      table[at + 1] = Math.sin(theta) * freq.attentionFactor;
+    }
+  }
+  return { table, positions, headDim, freq };
+}
+
 export function rope({
   input,
   N,
@@ -182,35 +295,50 @@ export function rope({
   posOffset,
   thetaBase,
   scaling,
+  cache,
 }: RoPEArgs): Float32Array {
   const output = new Float32Array(input.length);
   const halfDim = headDim / 2;
-  const { effectiveBase, interpolationFactor, rampLow, rampHigh, attentionFactor } =
-    ropeFrequencyParams(headDim, thetaBase, scaling);
+  const freq = ropeFrequencyParams(headDim, thetaBase, scaling);
+  const { attentionFactor } = freq;
+
+  // A table built for another rotation holds angles that are wrong without
+  // looking wrong. Compared against the five scalars rather than against
+  // `thetaBase` and `scaling` directly, because the scalars are what the
+  // rotation is: two schemes agreeing in all five rotate identically, so this
+  // rejects every mismatch and no matching pair.
+  if (cache) {
+    if (cache.headDim !== headDim) {
+      throw new Error(`rope: cache holds headDim ${cache.headDim}, called with ${headDim}`);
+    }
+    for (const key of Object.keys(freq) as (keyof RoPEFrequencyParams)[]) {
+      if (cache.freq[key] !== freq[key]) {
+        throw new Error(
+          `rope: cache was built with ${key}=${cache.freq[key]}, called with ${key}=${freq[key]}`,
+        );
+      }
+    }
+  }
 
   for (let token = 0; token < N; token += 1) {
     for (let head = 0; head < numHeads; head += 1) {
       for (let pair = 0; pair < halfDim; pair += 1) {
-        // The reference implementations write these as `1/pos_freqs` and
-        // `1/(s·pos_freqs)` with `pos_freqs = b^(2i/D)`. Written as a negative
-        // exponent instead, so that the no-scaling path is the same expression
-        // this file has always evaluated, down to the last bit.
-        const extrapolation = Math.pow(effectiveBase, (-2 * pair) / headDim);
-        const interpolation = extrapolation / interpolationFactor;
+        const pos = token + posOffset;
 
-        // γ(i) in the paper: 0 below `rampLow` (extrapolate — these pairs turn
-        // fast enough to have been seen at every phase during training), 1
-        // above `rampHigh` (interpolate — these have not completed a rotation
-        // even once), linear between.
-        const ramp = Math.min(Math.max((pair - rampLow) / (rampHigh - rampLow), 0), 1);
-        const invFreq = extrapolation + (interpolation - extrapolation) * ramp;
-
-        const theta = (token + posOffset) * invFreq;
-        // The attention temperature is folded into cos/sin, exactly as both
-        // implementations do (`emb.cos() * self.mscale`). Scaling q and k
-        // before the dot product would be the same thing one step later.
-        const cos = Math.cos(theta) * attentionFactor;
-        const sin = Math.sin(theta) * attentionFactor;
+        let cos: number;
+        let sin: number;
+        if (cache && pos < cache.positions) {
+          const at = (pos * halfDim + pair) * 2;
+          cos = cache.table[at]!;
+          sin = cache.table[at + 1]!;
+        } else {
+          const theta = pos * invFreq(freq, headDim, pair);
+          // The attention temperature is folded into cos/sin, exactly as both
+          // implementations do (`emb.cos() * self.mscale`). Scaling q and k
+          // before the dot product would be the same thing one step later.
+          cos = Math.cos(theta) * attentionFactor;
+          sin = Math.sin(theta) * attentionFactor;
+        }
 
         const base = (token * numHeads + head) * headDim + pair * 2;
         const x0 = input[base]!;
