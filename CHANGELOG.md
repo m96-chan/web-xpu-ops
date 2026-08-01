@@ -22,5 +22,14 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `matvec` (GEMV) — one vector against a `[M, K]` row-major matrix, following
+  `torch.mv` rather than BLAS `sgemv`: no `alpha`, no `beta`, no transpose flag.
+  It exists as its own op rather than as a path through a future `matmul`
+  because it reads every weight exactly once and reuses none of them, so the
+  kernel is written to stream — lanes walk a row at the workgroup stride, which
+  keeps each pass one contiguous burst — and the tiling that makes GEMM fast has
+  nothing to capture here. Autoregressive decoding is this shape at every step.
+  Speed is **unmeasured**: the bandwidth roofline it should be reported against
+  does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
