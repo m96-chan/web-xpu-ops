@@ -22,5 +22,12 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `gather` — row selection for embedding lookup, matching
+  `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
+  embedding lookup is why the op exists and the two names are close enough to
+  pick the wrong one by accident. An index outside `[0, rows)` gathers zeros:
+  PyTorch raises there and a kernel cannot, and the alternatives — clamping or
+  wrapping — hand back a real embedding for a token that was never in the
+  vocabulary, which looks plausible all the way downstream.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD

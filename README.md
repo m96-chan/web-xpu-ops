@@ -36,6 +36,7 @@ Seven ops, WGSL only, verified against their references on a real GPU.
 | `rope` | rotary position embedding, with KV-cache offset |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
+| `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 
 Everything below this line is design, not code. It is written down so the shape
 is decided before there is enough built for the shape to be hard to change.
@@ -182,7 +183,7 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) · `matvec` (GEMV) · `conv` · `add` · `mul` · `gather` ·
+`matmul` (GEMM) · `matvec` (GEMV) · `conv` · `add` · `mul` · `gather` ✅ ·
 `scatter` · `transpose` · `reduce`
 
 Small, total, boring. Everything else is built from these, and they are where
