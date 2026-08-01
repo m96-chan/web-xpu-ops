@@ -7,6 +7,14 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Changed
+
+- `npm test` runs one test file per vitest process. A single process cannot cross
+  a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
+  pool or hangs, with no kernel of its own required to trigger it. The runner also
+  refuses to report a false pass: a crashed vitest worker can exit 0 having
+  skipped most of the suite, so every file is now accounted for individually.
+
 ### Added
 
 - `harness` — a WGSL runner over Dawn in Node, an `agree` comparator that passes

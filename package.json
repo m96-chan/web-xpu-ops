@@ -13,7 +13,8 @@
   },
   "scripts": {
     "lint": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "node scripts/test.mjs",
+    "test:file": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
