@@ -25,7 +25,7 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Seven ops, WGSL only, verified against their references on a real GPU.
+Eight ops, WGSL only, verified against their references on a real GPU.
 
 | op | notes |
 | --- | --- |
@@ -36,6 +36,31 @@ Seven ops, WGSL only, verified against their references on a real GPU.
 | `rope` | rotary position embedding, with KV-cache offset |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
+| `scatter` | indexed writes; **colliding indices accumulate** — see below |
+
+### `scatter`: colliding indices accumulate
+
+Two slots naming the same target **add**. That is a decision, and it is the one
+thing about this op a caller has to know before using it.
+
+The alternative usually offered is "last write wins", and on a GPU that is not a
+rule, it is undefined behaviour with a reassuring name: the order threads reach a
+slot is unspecified, so *last* means whatever the driver did that day. Callers
+would build on whichever answer their first device gave. Accumulation is the only
+rule that returns the same answer for every possible ordering, and it is what the
+things scatter is actually used for — gradient accumulation, MoE dispatch,
+bincount — want anyway. The kernel pays an atomic per write for it.
+
+It matches `torch.zeros(N, D).scatter_add_(1, index, src)`, deliberately **not**
+`scatter_`, which PyTorch itself documents as non-deterministic on collision.
+Three departures from PyTorch, spelled out in `ops/scatter/reference.ts`: `self`
+is implicitly zero, out-of-range indices are dropped rather than raising, and
+`index` is i32 because WGSL has no 64-bit integer.
+
+What stays order-dependent is the last bit or two of a collided sum — f32
+addition is not associative. Measured on this GPU at 75 collisions per slot: up
+to 4.1e-7 relative, about three f32 epsilons, which is the tolerance those tests
+are set from.
 
 Everything below this line is design, not code. It is written down so the shape
 is decided before there is enough built for the shape to be hard to change.
@@ -183,7 +208,7 @@ Three layers, by what they are rather than by what they compute.
 ### `primitive/` — the algebra
 
 `matmul` (GEMM) · `matvec` (GEMV) · `conv` · `add` · `mul` · `gather` ·
-`scatter` · `transpose` · `reduce`
+`scatter` ✅ · `transpose` · `reduce`
 
 Small, total, boring. Everything else is built from these, and they are where
 target-specific tuning pays off most.

@@ -22,5 +22,12 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `rope` — rotary position embedding, with a KV-cache offset.
 - `quantize` — per-row absmax to int8, symmetric over `[-127, 127]`.
 - `dequantize` — applies both the weight scale and the activation scale.
+- `scatter` — indexed writes where **colliding indices accumulate**, via an f32
+  compare-exchange atomic. The rule had to be decided rather than discovered:
+  "last write wins" is undefined behaviour on a GPU, since nothing orders the
+  threads reaching a slot, and callers would have built on whichever answer
+  their own device happened to give. Accumulation is the only rule that is the
+  same for every ordering, and it is what gradient accumulation, MoE dispatch
+  and bincount need. Matches `scatter_add_` in PyTorch, not `scatter_`.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
