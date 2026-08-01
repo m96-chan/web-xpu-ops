@@ -261,6 +261,10 @@ npm test
 They need a GPU. Without one they **skip rather than fail**, so a machine with no
 adapter reports a passing suite instead of a wall of red nobody can act on.
 
+`npm test` runs **one test file per vitest process** (`scripts/test.mjs`) rather
+than calling `vitest run` once. `npm run test:file <path>` is the direct escape
+hatch while working on a single op.
+
 ## Tolerances
 
 Comparisons are agreement, not equality: the reference runs in f64, the kernels
@@ -278,9 +282,39 @@ be checked tighter than its hardware allows.
 ## Notes for anyone extending this
 
 The GPU binding is a native module and does not survive vitest recycling its
-workers — it aborts with `std::system_error`. One device is created for the whole
-run and destroyed at the end; `vitest.config.ts` pins the pool accordingly. Three
-configurations were tried before that one.
+workers — it aborts with `std::system_error`. One device is created per test
+file and destroyed when that file's process exits; `vitest.config.ts` pins the
+pool accordingly.
+
+**A single vitest process cannot cross a test-file boundary with a GPU device in
+play.** It dies with a glibc assertion out of Dawn's thread pool
+(`pthread_mutex_lock`, `__pthread_tpp_change_priority`), with `std::system_error`,
+or it hangs. It is not about any kernel: copying an existing op directory to a
+new name reproduces it with no new WGSL, and two files are enough. What was
+measured and did **not** fix it:
+
+- moving teardown from `afterAll` to `process.once("exit")`, so one device
+  genuinely lives for the whole run — this made it *worse*, dying at the first
+  boundary
+- `pool: "forks"` with `isolate: true`, a process per file
+- `pool: "forks"` with `maxForks: 1` and `fileParallelism: false`
+- `pool: "threads"` with `singleThread: true`
+
+The native module is not the cause either — it is evaluated exactly once, which
+was checked by counting evaluations rather than assumed. Sixteen create/destroy
+cycles *inside* one file are fine. A full `/tmp` was ruled out too: the failure
+reproduces unchanged with a disk-backed `TMPDIR`.
+
+So `npm test` gives each file its own process. That also removes a worse hazard:
+a crashed vitest worker prints `Test Files 1 passed (2)` and can still exit 0, so
+the files that never ran look like files that passed. The runner accounts for
+every file and fails the run if any is unaccounted for. It retries a file **only**
+when vitest produced no summary at all — an infrastructure crash, where nothing
+was learned — and announces the retry. A file whose tests ran and failed is never
+retried, because that would launder a broken kernel into a green suite.
+
+Measured after the change: 10 consecutive full runs green, one announced retry
+across all ten. Issue #38 has the bisection.
 
 ## License
 
