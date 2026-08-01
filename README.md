@@ -25,10 +25,11 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Seven ops, WGSL only, verified against their references on a real GPU.
+Eight ops, WGSL only, verified against their references on a real GPU.
 
 | op | notes |
 | --- | --- |
+| `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row |
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
@@ -36,6 +37,31 @@ Seven ops, WGSL only, verified against their references on a real GPU.
 | `rope` | rotary position embedding, with KV-cache offset |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
+| `scatter` | indexed writes; **colliding indices accumulate** — see below |
+
+### `scatter`: colliding indices accumulate
+
+Two slots naming the same target **add**. That is a decision, and it is the one
+thing about this op a caller has to know before using it.
+
+The alternative usually offered is "last write wins", and on a GPU that is not a
+rule, it is undefined behaviour with a reassuring name: the order threads reach a
+slot is unspecified, so *last* means whatever the driver did that day. Callers
+would build on whichever answer their first device gave. Accumulation is the only
+rule that returns the same answer for every possible ordering, and it is what the
+things scatter is actually used for — gradient accumulation, MoE dispatch,
+bincount — want anyway. The kernel pays an atomic per write for it.
+
+It matches `torch.zeros(N, D).scatter_add_(1, index, src)`, deliberately **not**
+`scatter_`, which PyTorch itself documents as non-deterministic on collision.
+Three departures from PyTorch, spelled out in `ops/scatter/reference.ts`: `self`
+is implicitly zero, out-of-range indices are dropped rather than raising, and
+`index` is i32 because WGSL has no 64-bit integer.
+
+What stays order-dependent is the last bit or two of a collided sum — f32
+addition is not associative. Measured on this GPU at 75 collisions per slot: up
+to 4.1e-7 relative, about three f32 epsilons, which is the tolerance those tests
+are set from.
 
 Everything below this line is design, not code. It is written down so the shape
 is decided before there is enough built for the shape to be hard to change.
@@ -182,8 +208,8 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) · `matvec` (GEMV) · `conv` · `add` · `mul` · `gather` ·
-`scatter` · `transpose` · `reduce`
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` · `add` · `mul` · `gather` ·
+`scatter` ✅ · `transpose` · `reduce`
 
 Small, total, boring. Everything else is built from these, and they are where
 target-specific tuning pays off most.
@@ -261,6 +287,10 @@ npm test
 They need a GPU. Without one they **skip rather than fail**, so a machine with no
 adapter reports a passing suite instead of a wall of red nobody can act on.
 
+`npm test` runs **one test file per vitest process** (`scripts/test.mjs`) rather
+than calling `vitest run` once. `npm run test:file <path>` is the direct escape
+hatch while working on a single op.
+
 ## Tolerances
 
 Comparisons are agreement, not equality: the reference runs in f64, the kernels
@@ -278,9 +308,39 @@ be checked tighter than its hardware allows.
 ## Notes for anyone extending this
 
 The GPU binding is a native module and does not survive vitest recycling its
-workers — it aborts with `std::system_error`. One device is created for the whole
-run and destroyed at the end; `vitest.config.ts` pins the pool accordingly. Three
-configurations were tried before that one.
+workers — it aborts with `std::system_error`. One device is created per test
+file and destroyed when that file's process exits; `vitest.config.ts` pins the
+pool accordingly.
+
+**A single vitest process cannot cross a test-file boundary with a GPU device in
+play.** It dies with a glibc assertion out of Dawn's thread pool
+(`pthread_mutex_lock`, `__pthread_tpp_change_priority`), with `std::system_error`,
+or it hangs. It is not about any kernel: copying an existing op directory to a
+new name reproduces it with no new WGSL, and two files are enough. What was
+measured and did **not** fix it:
+
+- moving teardown from `afterAll` to `process.once("exit")`, so one device
+  genuinely lives for the whole run — this made it *worse*, dying at the first
+  boundary
+- `pool: "forks"` with `isolate: true`, a process per file
+- `pool: "forks"` with `maxForks: 1` and `fileParallelism: false`
+- `pool: "threads"` with `singleThread: true`
+
+The native module is not the cause either — it is evaluated exactly once, which
+was checked by counting evaluations rather than assumed. Sixteen create/destroy
+cycles *inside* one file are fine. A full `/tmp` was ruled out too: the failure
+reproduces unchanged with a disk-backed `TMPDIR`.
+
+So `npm test` gives each file its own process. That also removes a worse hazard:
+a crashed vitest worker prints `Test Files 1 passed (2)` and can still exit 0, so
+the files that never ran look like files that passed. The runner accounts for
+every file and fails the run if any is unaccounted for. It retries a file **only**
+when vitest produced no summary at all — an infrastructure crash, where nothing
+was learned — and announces the retry. A file whose tests ran and failed is never
+retried, because that would launder a broken kernel into a green suite.
+
+Measured after the change: 10 consecutive full runs green, one announced retry
+across all ten. Issue #38 has the bisection.
 
 ## License
 
