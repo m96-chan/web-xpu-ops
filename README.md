@@ -36,6 +36,8 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
 | `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included |
+| `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's. Speed unmeasured |
+| `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
@@ -48,6 +50,9 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
 | `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
 | `flash_attention` | the same function as `attention`, one dispatch, tiled online softmax; the `[B, H, L, S]` score matrix is never allocated, which is tested by counting bound bytes and not only by the answer. `128n + 32` bytes at `L = S = n, D = Dv = 8` against unfused `4n² + 64n + 28`. Speed unmeasured |
+| `mel` | filterbank construction and its application, as two kernels. Defaults are `torchaudio.transforms.MelSpectrogram`: **HTK** mel scale, **unnormalised** triangles, **power** spectrum, and `AmplitudeToDB(stype="power")` for the log — base 10, scaled by `20/power`, flooring its *argument* at `1e-10` rather than adding an epsilon. `{ scale: "slaney", norm: "slaney" }` gives **`librosa.filters.mel`**'s defaults instead; on the same audio the two differ by 200x, so neither is a default worth leaving unstated. No `top_db` — it needs a reduction over the whole spectrogram. Speed unmeasured |
+| `moe` | MoE routing: router, dispatch, gather. Softmax before top-k with the k gates renormalised or not, as `MixtralSparseMoeBlock` and `norm_topk_prob` (no default: the Switch Transformer must not renormalise at `k = 1`); **top-k ties go to the lower expert index**, which `torch.topk` leaves undefined; capacity overflow drops **by rank, then by token index**, as GShard / Switch / fairseq `top2gating`, not by arrival; the gate is applied in gather and only there. Speed unmeasured |
+| `gqa` | grouped-query **and** multi-query attention: one op, parameterised by `kvHeads` — `kvHeads = 1` is MQA and `kvHeads = H` is `attention` unchanged. **Contiguous** groups (`kvHead = h / (H / kvHeads)`), as `enable_gqa=True` in torch; `H % kvHeads != 0` throws rather than guessing a grouping. What it buys, in bytes: one Llama-3-8B decoder layer (`B=1, S=8192, D=Dv=128`, f32) caches **268,435,456** at `kvHeads=32`, **67,108,864** at `8`, **8,388,608** at `1` — over 32 layers, 32→8 saves **6,442,450,944** bytes. `kvCacheBytes()` computes it. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -334,7 +339,7 @@ target-specific tuning pays off most.
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
 `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
-`flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` · `stft` / `istft` ✅
+`flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ · `stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
@@ -348,11 +353,11 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
+Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache`
 
-Sharing: `GQA` · `MQA`
+Sharing: `GQA` ✅ · `MQA` ✅ (one op — `gqa`, parameterised by `kvHeads`)
 
-Routing: `MoE router` · `MoE dispatch` · `MoE gather`
+Routing: `MoE router` ✅ · `MoE dispatch` ✅ · `MoE gather` ✅
 
 Serving: `paged KV cache` · `speculative decode`
 

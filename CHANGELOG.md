@@ -7,6 +7,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The per-file timeout in `npm test` actually fires. It never had: `npx` starts
+  vitest as a grandchild that keeps the stdout pipe open, so killing the child
+  left `"close"` unfired and the run waited forever. A hanging file took an outer
+  120s kill instead of the 6s limit it was given. It hid because a *GPU* hang
+  brings the worker down within seconds on its own, which looked like the timeout
+  working — the suite could not tell "wedged" from "slow".
+
 ### Changed
 
 - `npm test` runs one test file per vitest process. A single process cannot cross
@@ -151,6 +160,24 @@ Entries record **why** a change was needed. What changed is in the diff.
   would be the per-step readback this op exists to avoid. Beam search is
   deliberately absent: it is a different algorithm and needs its own decision
   about where the beam lives.
+- `mel` — the filterbank and its application, in two kernels because the matrix
+  depends only on scalars and is built once per configuration while the
+  application runs per frame. The other half of the DSP gap next to `stft`: no
+  ML kernel library ships it because it is not machine learning, so every voice
+  encoder reimplements it in numpy, and that numpy is exactly what has to be
+  rewritten to move a pipeline into a browser. Four conventions have more than
+  one answer in wide use and all four are named rather than picked silently —
+  the HTK mel scale, unnormalised triangles, a power spectrum, and a dB log
+  flooring its argument at `1e-10`, which together are
+  `torchaudio.transforms.MelSpectrogram` + `AmplitudeToDB(stype="power")`.
+  Asking for `{ scale: "slaney", norm: "slaney" }` gives `librosa.filters.mel`'s
+  defaults instead, and on the same audio those two differ by a factor of 200,
+  which is what silently picking one would have cost a caller. Checked against
+  torchaudio 2.10 and librosa 0.11 on a real recorded voice, not on a formula.
+  `top_db` is deliberately absent: it clamps against the maximum over the whole
+  spectrogram, so it cannot be computed before the last frame exists and it
+  makes the answer depend on how the caller chunked their audio — that is
+  `reduce` then `elementwise`. Speed is **unmeasured**.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
@@ -217,5 +244,85 @@ Entries record **why** a change was needed. What changed is in the diff.
   same `queryOffset` mask — and the arg type is imported rather than restated so
   the two cannot drift. Speed is **unmeasured**: the roofline harness is #3 / #4.
   Memory is measured, because memory is what this op is a claim about.
+- `alibi` and `pope` — two more position encodings, so that position encoding is
+  a family in this repository rather than a synonym for `rope`. Models pick
+  differently and none of the three can be substituted for another: `rope`
+  rotates Q and K, `alibi` biases the attention scores, `pope` builds a table
+  that is added to the embeddings. They run on different tensors at different
+  points in the layer.
+
+  `alibi` ships as two kernels because its two halves fail differently. The
+  per-head slopes are where implementations quietly disagree, and the
+  disagreement is invisible at 8 heads: for a power-of-two head count everyone
+  produces the same geometric run, and for anything else the paper appends
+  every other slope of the *next* run rather than interpolating — so the
+  sequence is not monotonic, and an implementation that sorts or truncates is
+  wrong only at head counts nobody tests. The slopes therefore have their own
+  kernel, their own GPU test, and a reference test that pins the published
+  numbers, so a fault in the slopes cannot hide inside a correct bias and the
+  convention is checked against the paper rather than against the kernel. The
+  bias itself follows the paper's relative form, `m * (j - i)`; BLOOM's
+  `m * j` differs by a per-row constant that the following softmax erases, but
+  this op returns the tensor and not the softmax, so the two are not
+  interchangeable here. Masking is left to the caller — writing `-inf` above
+  the diagonal would fold a masking policy into a bias op.
+
+  `pope` records where its paper is silent instead of guessing. The polynomial
+  order is the token position and the argument sweeps the feature index across
+  `[-1, 1)`, which is the paper's Equation (14); whether positions start at 0
+  or 1 is not stated, and it matters, because at order 0 the polynomial is the
+  constant 1 and the first token would carry no position at all. That is a
+  required `posOffset` argument rather than a default, the same way `rope`
+  takes one. It is evaluated by the three-term recurrence, not by Rodrigues'
+  formula, and the reason an f32 kernel can walk the recurrence is that
+  `|P_n(x)| <= 1` holds on the domain — measured, not assumed: the f32
+  recurrence sits 4.1e-6 from f64 at order 70 and 1.6e-5 at order 128, so the
+  tolerance is stated for the order range the tests reach and not beyond it.
+
+  Speed is **unmeasured** for both; the roofline to report against does not
+  exist yet.
+
+- `moe` — MoE routing: `router` (top-k over expert logits and the gate weights),
+  `moeDispatch` (tokens reordered into per-expert contiguous runs) and
+  `moeGather` (results back in token order, weighted). One op rather than three
+  because none of them is usable without the other two, and because the
+  decisions that matter are decisions *between* them. Three of those had to be
+  made rather than inherited, and all three change the model's output:
+  **ties in top-k go to the lower expert index**, which `torch.topk` explicitly
+  leaves open and a GPU cannot — otherwise the same token reaches different
+  experts on different runs; **capacity overflow drops by rank first, then by
+  token index** (GShard, the Switch Transformer, fairseq `top2gating`), so a
+  token's first-choice expert outranks another token's second choice, and not
+  by arrival order, which would make the set of dropped tokens depend on the
+  scheduler; and the **gate is applied in gather and only there**, since
+  weighting on the way in puts it inside the expert FFN and weighting at both
+  ends squares it, which stays plausible while being wrong everywhere.
+  Renormalising the k gates is a caller's flag with no default, because Mixtral
+  renormalises and the Switch Transformer must not — at `k = 1` renormalisation
+  makes every gate exactly 1 and deletes the gate entirely. Nothing divides by
+  an expert's token count: with 64 experts and a short sequence, most experts
+  receive nothing on most steps, and that division is `0/0`. Speed is
+  **unmeasured**.
+- `gqa` — grouped-query and multi-query attention: `kvHeads` query heads share
+  one K and one V. One op rather than two, because MQA is GQA with `kvHeads = 1`
+  and MHA is GQA with `kvHeads = H` — splitting them would mean two copies of the
+  same index arithmetic, one of them less tested.
+  The reason to reach for it is a memory number, so here is the number. One
+  Llama-3-8B decoder layer, batch 1, 8192 cached positions, 32 query heads, head
+  dim 128, f32: the KV cache is **268,435,456 bytes** at `kvHeads = 32` (MHA),
+  **67,108,864 bytes** at `kvHeads = 8` (GQA) and **8,388,608 bytes** at
+  `kvHeads = 1` (MQA). Over the model's 32 layers that is 8 GiB against 2 GiB — a
+  saving of **6,442,450,944 bytes**, which during decoding is usually the
+  difference between the model fitting and not. `kvCacheBytes()` is exported so
+  the figure stays a computation rather than a claim in a document.
+  The head mapping is **contiguous** groups, `kvHead = h / (H / kvHeads)`,
+  matching `enable_gqa=True` on torch 2.10 — measured, because the alternative
+  reading (strided, `h % kvHeads`) agrees with it at both `kvHeads = H` and
+  `kvHeads = 1` and disagrees everywhere in between, which is how an
+  implementation passes the two configurations people test and fails the ones
+  they ship. `H % kvHeads != 0` throws rather than picking a grouping for the
+  caller, as torch does.
+  Speed is **unmeasured**: the roofline harness it should be reported against
+  does not exist yet.
 
 [Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD

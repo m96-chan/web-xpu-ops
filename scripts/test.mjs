@@ -65,25 +65,50 @@ function testFiles() {
  */
 const PER_FILE_TIMEOUT_MS = 60_000;
 
+/**
+ * vitest's own entry, run directly rather than through `npx`.
+ *
+ * `npx` starts vitest as a *grandchild*. Killing the `npx` process leaves that
+ * grandchild alive holding the stdout pipe, so `"close"` — which waits for every
+ * pipe to shut — never fires and the timeout below silently does nothing. That
+ * was measured: a hanging file with a 6s limit ran until an outer 120s kill,
+ * never printing the timeout notice. It went unnoticed because a *GPU* hang
+ * takes the worker down on its own within seconds, which looked like the
+ * timeout working.
+ */
+const VITEST = new URL("../node_modules/vitest/vitest.mjs", import.meta.url).pathname;
+
 function run(file) {
   return new Promise((resolve) => {
-    const child = spawn("npx", ["vitest", "run", file], {
+    // Own process group, so the kill below reaches every descendant.
+    const child = spawn(process.execPath, [VITEST, "run", file], {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      detached: true,
     });
     let output = "";
-    let timedOut = false;
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
     const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // Already gone; the close handler will settle it.
+      }
+      output += `\n[runner] killed after ${PER_FILE_TIMEOUT_MS / 1000}s\n`;
+      // Settle on a short grace rather than waiting for "close". A killed
+      // process can still leave a pipe held open, which is the whole bug.
+      setTimeout(() => settle({ code: "timeout", output }), 500);
     }, PER_FILE_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => (output += chunk));
     child.stderr.on("data", (chunk) => (output += chunk));
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) output += `\n[runner] killed after ${PER_FILE_TIMEOUT_MS / 1000}s\n`;
-      resolve({ code: timedOut ? "timeout" : code, output });
-    });
+    child.on("close", (code) => settle({ code, output }));
+    child.on("error", (error) => settle({ code: "spawn-failed", output: `${output}\n${error}` }));
   });
 }
 
