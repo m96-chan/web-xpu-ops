@@ -66,34 +66,33 @@ export async function createRunner(): Promise<Runner | null> {
         return buffer;
       });
 
-      const fail = (what: string, error: GPUError): never => {
-        for (const buffer of created) buffer.destroy();
-        throw new Error(`${what}: ${error.message}`);
-      };
-
       // Without these two checks a shader that never ran still produces a
       // readback — of the zeros its output buffer was created with. Where the
-      // expected value contains zeros, that is a passing test over a kernel
-      // that did nothing, and since every correctness claim here is "it agrees
-      // with the reference", a silent no-op reading as agreement is the one
-      // failure that could hollow out all of them at once. Issue #46.
+      // expected value contains zeros that is a passing test over a kernel that
+      // did nothing, and since every correctness claim here is "it agrees with
+      // the reference", a silent no-op reading as agreement is the one failure
+      // that could hollow out all of them at once. Issue #46.
       //
-      // Compilation is checked and the scope closed *before* the pipeline is
-      // built, and both halves matter. The scope must open first because a
-      // compile failure arrives as an uncaptured device error, which on this
-      // binding takes the process down rather than the call. It must close
-      // first because handing an already-invalid module to
-      // `createComputePipeline` is itself fatal, so a single check at the end
-      // never survives to report anything.
-      device.pushErrorScope("validation");
+      // Nothing is destroyed on these paths on purpose. Tearing buffers down
+      // while the device is in an error state crashed this binding in 4 of 5
+      // runs; leaving them to the device's own teardown is stable in 5 of 5.
+      // The dispatch is over either way, so the buffers are short-lived.
       const module = device.createShaderModule({ code });
-      const uncompiled = await device.popErrorScope();
-      if (uncompiled) fail("shader failed to compile", uncompiled);
+
+      // Compilation is read through `getCompilationInfo` rather than an error
+      // scope. Both report it, but wrapping module creation in a scope was
+      // measured at 1 pass in 5 here, while this is 5 in 5.
+      const compilation = await module.getCompilationInfo();
+      const failures = compilation.messages.filter((message) => message.type === "error");
+      if (failures.length > 0) {
+        const where = (m: GPUCompilationMessage) => `${m.lineNum}:${m.linePos}: ${m.message}`;
+        throw new Error(`shader failed to compile\n${failures.map(where).join("\n")}`);
+      }
 
       // The other route in: `layout: "auto"` omits a binding the shader never
-      // mentions, and the bind group below then fails validation. Not
-      // hypothetical — it is why `attention` is two WGSL files rather than one
-      // file with two entry points.
+      // mentions, and the bind group then fails validation. Not hypothetical —
+      // it is why `attention` is two WGSL files rather than one file with two
+      // entry points.
       device.pushErrorScope("validation");
       const pipeline = device.createComputePipeline({
         layout: "auto",
@@ -104,7 +103,7 @@ export async function createRunner(): Promise<Runner | null> {
         entries: bound.map((buffer, binding) => ({ binding, resource: { buffer } })),
       });
       const invalid = await device.popErrorScope();
-      if (invalid) fail("dispatch is not valid", invalid);
+      if (invalid) throw new Error(`dispatch is not valid: ${invalid.message}`);
 
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
