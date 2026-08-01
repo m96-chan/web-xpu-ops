@@ -45,6 +45,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. Speed unmeasured |
 | `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
+| `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -300,7 +301,7 @@ target-specific tuning pays off most.
 ### `kernel/` — one fused, named operation
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
-`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ·
+`elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
 `flash_attention` · `ctc_decode` · `mel` · `stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
