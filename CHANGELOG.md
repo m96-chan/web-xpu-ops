@@ -103,6 +103,21 @@ Entries record **why** a change was needed. What changed is in the diff.
   quietly returning a zero tail. Speed is **unmeasured**, and the kernels are a
   naive DFT rather than an FFT: 1920 is not a power of two, this sits beside a
   transformer, and correctness came first.
+- `ctc_decode` — greedy CTC decoding: argmax per frame, collapse repeats, then
+  drop blanks, **in that order**. The order is the whole op. Stripping blanks
+  first and collapsing afterwards is the implementation everyone reaches for,
+  and it turns `a ␣ a` into a single `a` — losing the doubled letter that the
+  blank symbol exists to make expressible. The two orders agree on every other
+  input, which is what lets the wrong one survive being tested. Blank defaults
+  to `0`, as `torch.nn.CTCLoss` has it, and is a parameter because TensorFlow's
+  `ctc_greedy_decoder` puts it last and models trained that way exist. The
+  result never leaves the GPU: labels come back as `[B, T]` padded with `-1`,
+  and the true lengths in their own `[B]` buffer, both written by the kernel —
+  a greedy decode emits at most one label per frame, so the allocation never
+  depends on the answer. Reading the labels back to find out how long they are
+  would be the per-step readback this op exists to avoid. Beam search is
+  deliberately absent: it is a different algorithm and needs its own decision
+  about where the beam lives.
 - `gather` — row selection for embedding lookup, matching
   `torch.index_select(table, 0, indices)` rather than `torch.gather`, because
   embedding lookup is why the op exists and the two names are close enough to
