@@ -43,6 +43,7 @@ Thirteen ops, WGSL only, verified against their references on a real GPU.
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
+| `moe` | MoE routing: router, dispatch, gather. Softmax before top-k with the k gates renormalised or not, as `MixtralSparseMoeBlock` and `norm_topk_prob` (no default: the Switch Transformer must not renormalise at `k = 1`); **top-k ties go to the lower expert index**, which `torch.topk` leaves undefined; capacity overflow drops **by rank, then by token index**, as GShard / Switch / fairseq `top2gating`, not by arrival; the gate is applied in gather and only there. Speed unmeasured |
 
 ### `scatter`: colliding indices accumulate
 
@@ -241,7 +242,7 @@ Position: `RoPE` ✅ · `ALiBi` · `PoPE` · `YaRN` · `NTK scaling` · `rotary 
 
 Sharing: `GQA` · `MQA`
 
-Routing: `MoE router` · `MoE dispatch` · `MoE gather`
+Routing: `MoE router` ✅ · `MoE dispatch` ✅ · `MoE gather` ✅
 
 Serving: `paged KV cache` · `speculative decode`
 
