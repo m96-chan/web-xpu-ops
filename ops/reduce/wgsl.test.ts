@@ -154,19 +154,24 @@ describe("reduce / wgsl", () => {
   });
 
   gpuTest("writes nothing past outer * inner", async (run) => {
-    // Over-dispatched on purpose. Without the bounds check the extra
-    // workgroups reduce slices that are not theirs into slots that are not
-    // theirs; the output buffer is longer than the result, so those writes land
-    // somewhere observable instead of being swallowed by WGSL's bounds
-    // checking — which is the only way this branch can be seen at all.
-    const shape = { outer: 2, axis: 8, inner: 1 };
-    const input = wave(shape.outer * shape.axis * shape.inner);
-    const [out] = await run(dispatch(input, shape, REDUCE.sum, shape.outer * shape.inner + 2));
-    const expected = reduce({ input, ...shape, kind: REDUCE.sum });
+    // Over-dispatched on purpose: four workgroups, but the params claim one
+    // output. The extra three must return without writing.
+    //
+    // The input deliberately holds four full rows. An earlier version of this
+    // test declared two outputs and dispatched four over a two-row input, and
+    // deleting the bounds check did not fail it: the extra workgroups read past
+    // the buffer, WGSL's bounds checking handed them zeros, and they wrote the
+    // same zeros the test was expecting. Here the rows they would run away with
+    // are real and sum to something, so the two outcomes differ.
+    const shape = { outer: 1, axis: 8, inner: 1 };
+    const rows = 4;
+    const input = wave(rows * shape.axis);
+    const [out] = await run(dispatch(input, shape, REDUCE.sum, rows));
+    const expected = reduce({ input: input.slice(0, shape.axis), ...shape, kind: REDUCE.sum });
     // Exactly zero, because nothing wrote there at all.
-    expect(Array.from(out!).slice(shape.outer * shape.inner)).toEqual([0, 0]);
+    expect(Array.from(out!).slice(1)).toEqual([0, 0, 0]);
     // Merely in agreement, because f32 addition got there and the reference
     // used f64. Asserting equality here fails on the last ulp.
-    expect(agree(out!.slice(0, shape.outer * shape.inner), expected)).toBeNull();
+    expect(agree(out!.slice(0, 1), expected)).toBeNull();
   });
 });
