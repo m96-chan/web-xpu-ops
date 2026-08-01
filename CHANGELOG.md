@@ -7,6 +7,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The per-file timeout in `npm test` actually fires. It never had: `npx` starts
+  vitest as a grandchild that keeps the stdout pipe open, so killing the child
+  left `"close"` unfired and the run waited forever. A hanging file took an outer
+  120s kill instead of the 6s limit it was given. It hid because a *GPU* hang
+  brings the worker down within seconds on its own, which looked like the timeout
+  working — the suite could not tell "wedged" from "slow".
+
 ### Changed
 
 - `npm test` runs one test file per vitest process. A single process cannot cross
