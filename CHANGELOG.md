@@ -18,6 +18,13 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `roofline(runner)` — this device's measured bandwidth and compute ceilings,
+  taken here and now rather than derived from a spec sheet, and cached for the
+  session. WebGPU exposes no clock, compute-unit count or bus width, so there is
+  nothing to compute a theoretical peak from; a self-calibrating ceiling also
+  throttles when the device does, which is what keeps a percentage meaningful
+  across machines. Null where the device cannot time a dispatch, rather than an
+  estimate.
 - `Runner.time(dispatch)` — GPU time for a dispatch, read from a timestamp query
   written around the compute pass, and `null` on devices that cannot report it
   rather than a guess. Host wall-clock cannot stand in: it charges the dispatch
