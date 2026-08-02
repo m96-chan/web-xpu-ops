@@ -41,7 +41,7 @@ const busy = (iterations: number): Dispatch => ({
     { kind: "out", type: "f32", length: 256 },
     { kind: "uniform", data: params([["u32", iterations], ["f32", 1.0001]]) },
   ],
-  workgroups: [256],
+  workgroups: [128],
 });
 
 describe("harness / dispatch timing", () => {
@@ -55,7 +55,7 @@ describe("harness / dispatch timing", () => {
 
   it("reports a positive duration, or null where the device cannot say", async () => {
     if (!runner) return;
-    const seconds = await runner.time(busy(20_000));
+    const seconds = await runner.time(busy(8_000));
     if (seconds === null) {
       // A device without `timestamp-query` must say so rather than guess. Rule 9:
       // an unmeasured figure says it is unmeasured, and a fabricated one is worse
@@ -76,8 +76,12 @@ describe("harness / dispatch timing", () => {
     // than reporting some fixed per-dispatch cost. Sixteen times the arithmetic
     // must be visibly longer — asserted loosely (2x) because the point is that
     // it scales, not what the slope is.
+    //
+    // Sized small on purpose. Dispatches long enough to take milliseconds, run
+    // repeatedly, kill this binding (#68), and this file shares a run with the
+    // roofline calibration, which is itself heavy.
     const little = await runner.time(busy(10_000));
-    const lots = await runner.time(busy(160_000));
+    const lots = await runner.time(busy(64_000));
     expect(little).not.toBeNull();
     expect(lots).not.toBeNull();
     expect(lots!).toBeGreaterThan(little! * 2);
@@ -88,7 +92,7 @@ describe("harness / dispatch timing", () => {
     // The whole reason this exists. The same dispatch, timed both ways: the GPU
     // figure must be meaningfully smaller than the wall-clock one, because the
     // difference is buffer creation, submission and the readback round trip.
-    const dispatch = busy(20_000);
+    const dispatch = busy(8_000);
     await runner.time(dispatch);
     const started = performance.now();
     const gpu = await runner.time(dispatch);
