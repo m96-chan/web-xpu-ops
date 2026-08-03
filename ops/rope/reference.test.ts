@@ -231,6 +231,108 @@ describe("rope / reference", () => {
 });
 
 /**
+ * The head range: rotating a subset of the heads and copying the rest.
+ *
+ * The axis is the one thing worth being careful about here — see `reference.ts`.
+ * The range is over **heads**, not over channels within a head, so every test
+ * below asserts on whole head rows.
+ *
+ * Touches no GPU. `wgsl-heads.test.ts` runs the same shapes against the kernel.
+ */
+describe("rope / head range", () => {
+  const headDim = 16;
+  const thetaBase = 10000;
+  /**
+   * Nowhere zero, on purpose — `+ 3` puts every element in [1, 5].
+   *
+   * A passthrough head that was never written back reads as zero, so an input
+   * that is itself zero somewhere cannot tell "copied" from "left alone". The
+   * plain wave used elsewhere in this file is exactly 0 at index 0.
+   */
+  const live = (n: number) => Float32Array.from({ length: n }, (_, i) => Math.sin(i * 0.29) * 2 + 3);
+
+  const [N, numHeads, posOffset] = [4, 8, 5];
+  const base = { N, numHeads, headDim, posOffset, thetaBase };
+  const input = live(N * numHeads * headDim);
+  const row = (a: Float32Array, token: number, head: number) =>
+    Array.from(a.slice((token * numHeads + head) * headDim, (token * numHeads + head + 1) * headDim));
+
+  it("leaves the defaults byte-identical to a call that never heard of a range", () => {
+    // Exact equality, not a tolerance: the default range has to be the same
+    // arithmetic in the same order, not the same answer to within rounding.
+    for (const scaling of [undefined, { kind: "ntk", factor: 8 } as const]) {
+      expect(rope({ ...base, input, scaling, headOffset: 0, headCount: numHeads })).toEqual(
+        rope({ ...base, input, scaling }),
+      );
+    }
+  });
+
+  it("rotates the heads inside the range and copies the ones outside it", () => {
+    // Heads 2, 3, 4 rotate; 0, 1 and 5, 6, 7 pass through. Both ends of the
+    // range are tested by that: an implementation that ignored `headOffset`
+    // would rotate 0..2 and one that ignored `headCount` would rotate 2..7.
+    const [headOffset, headCount] = [2, 3];
+    const out = rope({ ...base, input, headOffset, headCount });
+    const rotated = rope({ ...base, input });
+
+    for (let token = 0; token < N; token += 1) {
+      for (let head = 0; head < numHeads; head += 1) {
+        const inside = head >= headOffset && head < headOffset + headCount;
+        const label = `token ${token} head ${head}`;
+        // Exact both ways. Inside the range it is the same expression on the
+        // same numbers; outside it is a copy, and a copy that rounds is not one.
+        expect(row(out, token, head), label).toEqual(
+          inside ? row(rotated, token, head) : row(input, token, head),
+        );
+        if (inside) {
+          // Otherwise "copied everything" would satisfy the line above at
+          // position 0, where the rotation is the identity.
+          expect(row(out, token, head), label).not.toEqual(row(input, token, head));
+        } else {
+          // The condition the issue names: zeros pass the equality above only
+          // if the input was zero too, so the input must not be.
+          expect(row(out, token, head).every((v) => v !== 0), label).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("copies the whole tensor when the range is empty", () => {
+    // The degenerate end. `headCount: 0` is a caller who wants no rotation at
+    // all in this block, and what comes back has to be the input rather than a
+    // fresh zeroed buffer — `rope` allocates its own output, so nothing else
+    // would fill it.
+    const out = rope({ ...base, input, headOffset: 3, headCount: 0 });
+    expect(Array.from(out)).toEqual(Array.from(input));
+    expect(out.every((v) => v !== 0)).toBe(true);
+  });
+
+  it("still reads the cache for the heads it rotates", () => {
+    // The two features compose: the table is indexed by position and pair and
+    // by nothing else, so a head range does not change which entry a rotated
+    // head reads. Poisoned table, so that "read the table" is observable.
+    const cache = ropeCache({ headDim, thetaBase, positions: N + posOffset });
+    const poisoned = { ...cache, table: cache.table.map((v) => v * 0.5) };
+    const out = rope({ ...base, input, cache: poisoned, headOffset: 0, headCount: 1 });
+    const halved = rope({ ...base, input, cache: poisoned });
+
+    expect(row(out, 1, 0)).toEqual(row(halved, 1, 0));
+    expect(row(out, 1, 1)).toEqual(row(input, 1, 1));
+  });
+
+  it("refuses a range that runs past the last head", () => {
+    // Rotating heads 6..9 of 8 is a caller bug, and the quiet reading of it —
+    // rotate 6 and 7, drop the rest — returns a tensor that is wrong in a way
+    // no assertion downstream would catch.
+    expect(() => rope({ ...base, input, headOffset: 6, headCount: 4 })).toThrow(/head range/);
+    expect(() => rope({ ...base, input, headOffset: -1, headCount: 2 })).toThrow(/head range/);
+    expect(() => rope({ ...base, input, headOffset: 0, headCount: -1 })).toThrow(/head range/);
+    // The exact fit is not an error.
+    expect(() => rope({ ...base, input, headOffset: 4, headCount: 4 })).not.toThrow();
+  });
+});
+
+/**
  * The rotary cache: what the table holds, what happens past its end, and what
  * the whole thing actually saves.
  *

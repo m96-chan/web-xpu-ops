@@ -19,6 +19,26 @@
  * and YaRN additionally scales the magnitude. So they are parameters of this
  * op, not ops of their own.
  *
+ * ## The head range, and which axis it is on
+ *
+ * `headOffset` / `headCount` rotate a contiguous run of heads and copy the rest
+ * through unchanged. **The range is over heads — the `H` of `[N, H, Dh]` — and
+ * not over the channels within a head.** Both are called "half-RoPE" in the
+ * wild and they are different ops:
+ *
+ *   - **this one**, `x.chunk(2, dim=-2)` in Irodori-TTS's `_apply_rotary_half`:
+ *     some heads see position and the others cannot see order at all, which is
+ *     what a block attending jointly over positioned latents and unpositioned
+ *     conditioning wants.
+ *   - **partial rotary** (`rotaryDim`, GPT-NeoX and Phi): *every* head rotates,
+ *     but only its first `rotaryDim` channels. Not implemented here, and
+ *     deliberately not: nothing in front of this library needs it, and a
+ *     parameter added on speculation is one every kernel variant has to honour.
+ *
+ * Heads outside the range are **copied**, not left at zero. `rope` returns a
+ * fresh array, so an uninitialised passthrough head is silent garbage flowing
+ * into attention rather than an error.
+ *
  * There is no PyTorch definition to follow here — `torch` ships no RoPE — so
  * rule 7's fallback is the de-facto reference pair, which agree with each
  * other and with the paper:
@@ -77,6 +97,20 @@ export interface RoPEArgs {
   thetaBase: number;
   /** Omitted means plain RoPE, unchanged in every bit. */
   scaling?: RoPEScaling;
+  /**
+   * First head to rotate. Defaults to 0.
+   *
+   * Over the **head** axis, not over channels — see the note at the top of this
+   * file, which is there because "half-RoPE" means both things in the wild.
+   */
+  headOffset?: number;
+  /**
+   * How many heads to rotate, starting at `headOffset`. Defaults to all of
+   * them, which is the behaviour this op had before the range existed.
+   *
+   * Heads outside `[headOffset, headOffset + headCount)` are copied unchanged.
+   */
+  headCount?: number;
   /**
    * Precomputed angles from `ropeCache`. Omitted means every angle is computed
    * where it is used, which is what this op did before caching existed.
@@ -296,6 +330,8 @@ export function rope({
   thetaBase,
   scaling,
   cache,
+  headOffset = 0,
+  headCount = numHeads,
 }: RoPEArgs): Float32Array {
   const output = new Float32Array(input.length);
   const halfDim = headDim / 2;
@@ -320,8 +356,26 @@ export function rope({
     }
   }
 
+  // A range past the last head is a caller bug, and the quiet reading of it —
+  // rotate the heads that exist and drop the rest — comes back as a tensor
+  // rather than as an error. Same argument as the cache check above.
+  if (headOffset < 0 || headCount < 0 || headOffset + headCount > numHeads) {
+    throw new Error(
+      `rope: head range [${headOffset}, ${headOffset + headCount}) does not fit ${numHeads} heads`,
+    );
+  }
+
   for (let token = 0; token < N; token += 1) {
     for (let head = 0; head < numHeads; head += 1) {
+      // Outside the range the row is copied. Not skipped: the output is a
+      // fresh array, so a head nobody writes stays zero and takes attention
+      // with it.
+      if (head < headOffset || head >= headOffset + headCount) {
+        const from = (token * numHeads + head) * headDim;
+        for (let i = 0; i < headDim; i += 1) output[from + i] = input[from + i]!;
+        continue;
+      }
+
       for (let pair = 0; pair < halfDim; pair += 1) {
         const pos = token + posOffset;
 

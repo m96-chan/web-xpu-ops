@@ -18,6 +18,71 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `snake` — `x + sin²(α·x)/α` with a learned per-channel α, as a **separate op**
+  rather than a kind of `activation`. Every neural audio codec worth decoding on
+  the web is built from it (DACVAE, BigVGAN), and without it the decoder stops
+  at latents. It is separate because `activation` is "one buffer in, one buffer
+  out, branch on an integer" and Snake's α is a tensor: folding it in would add
+  a storage binding and a channel stride that `relu2` and `silu` would then have
+  to supply on every call — the pipeline layout is derived from what the shader
+  declares, so an unused binding is not free, it is mandatory. `elu`'s scalar
+  `alpha` went the other way for the same reason: it costs a uniform field the
+  struct was padding out anyway. The `1e-9` sits inside the reciprocal at
+  upstream's value, because `1/α` guarded afterwards returns NaN at α = 0 where
+  upstream returns x, and a checkpoint that trained an α to nothing would be the
+  one to find that out.
+- `activation` gains `elu`, `tanh`, `gelu` and `gelu_tanh`. The first three
+  complete the set DACVAE's encoder and decoder stages need; GELU is for the
+  other half of the same model, whose text encoder is a GeGLU ModernBERT. GELU
+  is **two** functions in torch, and they part company by 4.73e-4 at x = 2.699 —
+  measured, in the reference — so both ship and the default is the exact `erf`
+  form, matching `torch.nn.functional.gelu`'s own default. A library that picked
+  one silently would be right for half its callers and quietly wrong for the
+  rest.
+- `rmsnorm` takes an optional group count: `weight` may be `[G, D]`, and row `n`
+  uses group `n % G`. QK-norm gives every attention head its own gamma, and
+  until now this op could not say that — a per-head weight flattened into `[N,
+  D]` silently applied head 0's gamma to every head, with no NaN and no change
+  of shape to notice it by. A wrong answer that looks well-formed is worse than
+  a missing op, which is why it is in the library rather than worked around by
+  the caller. `G = 1` and an unpacked group word are both today's behaviour, so
+  nothing existing moves. The grouped axis must be the one immediately left of
+  `D` (`[B, S, H, Dh]`); `[B, H, S, Dh]` needs a different index and is refused
+  rather than served wrongly. Speed unmeasured. `layernorm` has the same gap and
+  #81 tracks it, so the two do not end up disagreeing about what a weight is.
+- An **additive attention mask** on `attention`, `flash_attention` and `gqa`,
+  because without one this library had no answer for an encoder at all. Every
+  batched encoder over variable-length sequences needs to say "key `j` is
+  padding, never attend to it", and `causal` cannot: it masks by position, not by
+  content. Padding positions were contributing to the softmax and every
+  conditioned output was quietly wrong — not NaN, not a crash, just slightly
+  wrong. The form is PyTorch's **float** `attn_mask`, added to the scores before
+  the softmax, and the reason it is the float form rather than the boolean one is
+  `ops/alibi`: ALiBi already produces an additive score bias and says masking is
+  the caller's, so with one representation the two compose by addition instead of
+  needing an op to combine them. `keyPaddingBias(B, S, keep)` converts the
+  boolean mask people actually hold, with `keep` naming the polarity because
+  torch's own two APIs disagree about it. All three ops take the same mask, so it
+  does not decide which kernel a caller may use.
+- **A fully masked row now returns zeros** rather than NaN. It used to be
+  unreachable — `queryOffset >= 0` guaranteed every row saw key 0, and the
+  kernels said so and skipped the guard. A key mask breaks that guarantee, and an
+  empty sequence in a padded batch reaches it by accident, so it is guarded in
+  all three ops: a NaN row is a wrong answer that looks like a result. Zeros is
+  what torch returns, through `aten::_safe_softmax` — measured, and worth
+  measuring, because plain `torch.softmax` on the same row returns NaN.
+- `rope` takes a head range — `headOffset` / `headCount`, defaulting to every
+  head and byte-identical there. The joint-attention blocks of a diffusion TTS
+  DiT rotate half their heads and leave the other half position-free, so that a
+  block attending over positioned latents and unpositioned conditioning has
+  heads that cannot see order at all. The layout is `(token, head, dim)`, so the
+  heads to rotate are not contiguous and the honest workaround was a gather, a
+  dispatch and a scatter — three passes and a temporary, spent to do less work.
+  **The range is over heads, not over the channels within a head**: both are
+  called "half-RoPE" in the wild, and channel-wise partial rotary (`rotaryDim`)
+  is a different op that this deliberately does not add. Heads outside the range
+  are copied rather than left at zero — `rope` returns a fresh array, so an
+  unwritten head is silent garbage flowing into attention.
 - `ops/conv_transpose` — `convTranspose1d` and `convTranspose1dOutputLength`,
   matching `torch.nn.functional.conv_transpose1d`. `conv` covers a codec's
   encoder; nothing covered the decoder, so the library could run the transformer
@@ -76,6 +141,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Changed
 
+- The score kernels of `attention`, `gqa` and `flash_attention` take a **mask
+  buffer at every dispatch**, not only when there is a mask, and their uniform
+  blocks gained three fields for its broadcast shape. A bias of zeros *is* "no
+  mask" — it is what torch's own reference does — and making it unconditional
+  removes a per-element branch and a `has_mask` guard whose only failing input
+  would be a dummy buffer nobody reads. It costs `B * S` floats against the
+  `B * H * L * S` these kernels already move. Callers driving the WGSL directly
+  must add the binding; `attention` and `gqa` bind it at index 2, `flash_attention`
+  at index 3.
 - `npm test` runs one test file per vitest process. A single process cannot cross
   a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
   pool or hangs, with no kernel of its own required to trigger it. The runner also

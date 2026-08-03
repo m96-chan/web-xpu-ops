@@ -63,6 +63,19 @@
 // `cache` is bound either way, since a binding a shader ignores is dropped by
 // `layout: "auto"`. Callers who want no cache bind two floats and pass
 // `cache_positions = 0`; nothing reads them.
+//
+// ## The head range
+//
+// `head_offset` / `head_count` rotate a run of heads and copy the rest. The
+// range is over **heads** — the `H` of `[N, H, Dh]` — and not over the channels
+// within a head; `ops/rope/reference.ts` says why that is worth stating twice.
+// `head_offset = 0, head_count = num_heads` is the whole tensor and the same
+// bytes this kernel produced before the range existed, since the branch below
+// is then never taken.
+//
+// The copy is a write, not a skip. Nothing else fills `output`, so a head this
+// dispatch leaves alone reads back as zeros — a tensor rather than an error,
+// exactly like wrapping the cache would be.
 
 struct Params {
   N: u32,          // sequence length
@@ -79,6 +92,12 @@ struct Params {
   ramp_low: f32,             // pair index where YaRN stops extrapolating
   ramp_high: f32,            // pair index where YaRN is fully interpolated
   attention_factor: f32,     // YaRN's sqrt(1/t), a gain on cos and sin; 1 otherwise
+
+  // Heads [head_offset, head_offset + head_count) rotate; the rest are copied.
+  // Appended rather than grouped with the geometry above so that every offset
+  // this kernel already read stayed where it was when the range arrived.
+  head_offset: u32,
+  head_count: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -106,6 +125,20 @@ fn main(
   let remainder = pair_idx / half_dim;
   let head = remainder % params.num_heads;
   let token = remainder / params.num_heads;
+
+  let base_idx = (token * params.num_heads + head) * params.head_dim + dim_pair * 2u;
+  let x0 = input[base_idx];
+  let x1 = input[base_idx + 1u];
+
+  // Heads outside the range are copied, and the copy happens here rather than
+  // being skipped: `output` arrives zeroed, so a head nobody writes comes back
+  // as zeros — a plausible tensor that takes attention with it, which is the
+  // same failure mode as wrapping the cache above.
+  if (head < params.head_offset || head >= params.head_offset + params.head_count) {
+    output[base_idx]      = x0;
+    output[base_idx + 1u] = x1;
+    return;
+  }
 
   let pos = token + params.pos_offset;
 
@@ -141,10 +174,6 @@ fn main(
     cos_theta = cos(theta) * params.attention_factor;
     sin_theta = sin(theta) * params.attention_factor;
   }
-
-  let base_idx = (token * params.num_heads + head) * params.head_dim + dim_pair * 2u;
-  let x0 = input[base_idx];
-  let x1 = input[base_idx + 1u];
 
   output[base_idx]      = x0 * cos_theta - x1 * sin_theta;
   output[base_idx + 1u] = x0 * sin_theta + x1 * cos_theta;
