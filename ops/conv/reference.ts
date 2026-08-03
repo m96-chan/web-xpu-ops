@@ -88,8 +88,12 @@ export function conv1dOutputLength({
  *   absent buffer, and callers with no bias pass zeros. Adding a `hasBias` flag
  *   would buy a branch whose only observable effect is adding zero.
  *
- * Deliberately absent: transposed convolution (`conv_transpose1d` is a
- * different op with its own `output_padding`), `'same'` / `'valid'` string
+ * Deliberately absent: transposed convolution, which lives in
+ * `ops/conv_transpose` as `convTranspose1d` (ISSUE #75). It is a different op,
+ * not a flag: its weight is `[Cin, Cout/groups, K]` rather than this one's
+ * `[Cout, Cin/groups, K]`, its `padding` crops the output instead of extending
+ * the input, and it has an `output_padding` this signature has nowhere to put.
+ * Also absent: `'same'` / `'valid'` string
  * padding (sugar over the integer form, and `'same'` with an even effective
  * kernel needs asymmetric padding this signature cannot express), and 2D. 2D is
  * out of scope by ISSUE #14: speech front-ends need 1D, and 2D waits until
