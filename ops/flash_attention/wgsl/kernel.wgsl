@@ -5,6 +5,7 @@
 //   q:      [B, H, L, D]  f32, row-major
 //   k:      [B, H, S, D]  f32, row-major
 //   v:      [B, H, S, Dv] f32, row-major
+//   mask:   [MB, MH, MR, S] f32, row-major — the additive attention bias
 //   output: [B, H, L, Dv] f32, row-major
 //
 // The difference from ops/attention is not arithmetic — it computes the same
@@ -40,13 +41,20 @@ struct Params {
   // aligned); S - L reproduces `causal_lower_right`, which is what a KV cache
   // decode step wants. Inherited from ops/attention (#18) unchanged.
   query_offset: i32,
+  // The broadcast shape of `mask`, each either 1 or the full dimension; the
+  // last axis is always S. Inherited from ops/attention (#77) unchanged, which
+  // is the point — one mask serves all three attention ops.
+  mask_batch: u32,
+  mask_heads: u32,
+  mask_rows: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k: array<f32>;
 @group(0) @binding(2) var<storage, read> v: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
 
@@ -83,13 +91,22 @@ fn main(
   @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
   let i = wg.x;                                  // query position
-  let head = wg.z * params.H + wg.y;             // flattened (batch, head)
+  let batch = wg.z;
+  let h = wg.y;                                  // attention head
+  let head = batch * params.H + h;               // flattened (batch, head)
   let tid = local_id.x;
 
   let q_row = (head * params.L + i) * params.D;
   let k_head = head * params.S * params.D;
   let v_head = head * params.S * params.Dv;
   let o_row = (head * params.L + i) * params.Dv;
+
+  // Where this query row's slice of the bias starts; each axis collapses to 0
+  // when the caller broadcast it. Identical to ops/attention's scores kernel.
+  let mb = select(0u, batch, params.mask_batch > 1u);
+  let mh = select(0u, h, params.mask_heads > 1u);
+  let mr = select(0u, i, params.mask_rows > 1u);
+  let m_row = ((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S;
 
   let tiles = (params.S + TILE - 1u) / TILE;
   // One invocation per output channel. When Dv exceeds the workgroup the keys
@@ -129,7 +146,9 @@ fn main(
           for (var d: u32 = 0u; d < params.D; d += 1u) {
             dot += q[q_row + d] * k[k_head + j * params.D + d];
           }
-          value = dot * params.scale;
+          // PyTorch's float `attn_mask`, added rather than selected on, so a
+          // key-padding mask and an ALiBi bias compose. See ops/attention.
+          value = dot * params.scale + mask[m_row + j];
         }
         tile_scores[tid] = value;
       }
@@ -164,11 +183,19 @@ fn main(
       }
     }
 
-    // The single normalisation, after every key has been seen. `l >= 1`: the key
-    // holding the final maximum contributed exp(0), and by the contract above at
-    // least one key is always unmasked.
+    // The single normalisation, after every key has been seen. `l >= 1` whenever
+    // any score was finite: the key holding the final maximum contributed
+    // exp(0). `l == 0` is the row where every key is masked — unreachable before
+    // #77, since `query_offset >= 0` kept column 0 visible, and reachable now
+    // through `mask`. It gets zeros rather than 0/0 = NaN, which is what SDPA
+    // returns (`aten::_safe_softmax`, measured on torch 2.10).
+    //
+    // The test is on `l` and not on `m`, and the two are not interchangeable:
+    // `m` starts at MASKED, so `max(m, -inf)` is MASKED (measured on this
+    // device) and the running maximum never reports -inf however masked the row
+    // is. `l` is exact — the key holding the maximum contributes exp(0) = 1.
     if (owns_channel) {
-      output[o_row + c] = acc / l;
+      output[o_row + c] = select(acc / l, 0.0, l == 0.0);
     }
   }
 }

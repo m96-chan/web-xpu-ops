@@ -1,3 +1,5 @@
+import { resolveMask, type MaskShape } from "../attention/reference.js";
+
 /**
  * Grouped-query and multi-query attention: SDPA where several query heads read
  * the same K and V.
@@ -53,8 +55,24 @@
  *   with GQA equals `is_causal=True` on the expanded K and V. Verified at
  *   `H=4, kvHeads=2, L=3, S=7`.
  *
- * Contract, inherited unchanged: `queryOffset >= 0`, so no row is ever fully
- * masked and neither the reference nor the kernels guard against one.
+ * ## `mask` is `attention`'s, unchanged (#77)
+ *
+ * The additive attention bias, its broadcast shape, its rejection of `causal`
+ * and its zeros for a fully masked row are all `ops/attention`'s and are
+ * documented there. This op imports the check rather than restating it: three
+ * copies of a shape contract are three chances for the three attention ops to
+ * disagree about the shape of the same tensor, and a caller who has to remember
+ * which op wants which layout has been given the choice the mask exists to take
+ * away.
+ *
+ * `maskHeads` is over the **query** heads (`H`), not `kvHeads`. Verified against
+ * torch 2.10: `enable_gqa=True` with a `[B, 1, 1, S]` mask reproduces the same
+ * mask applied to the expanded K and V to 4.4e-16, so the mask is applied after
+ * the KV head is chosen — as causal masking already was.
+ *
+ * The contract that changed: `queryOffset >= 0` no longer implies no row is
+ * fully masked, because `mask` can mask every key. See `ops/attention` for what
+ * that row now returns.
  */
 
 export interface GroupedAttentionArgs {
@@ -81,12 +99,22 @@ export interface GroupedAttentionArgs {
   D: number;
   /** Head dim of V, and of the output. May differ from `D`. */
   Dv: number;
-  /** Apply the causal mask. Default `false`. */
+  /** Apply the causal mask. Default `false`. Throws if combined with `mask`. */
   causal?: boolean;
   /** Absolute position of query row 0 within the key sequence. Default `0`. Must be `>= 0`. */
   queryOffset?: number;
   /** Overrides the `1/sqrt(D)` default, like PyTorch's `scale=`. */
   scale?: number;
+  /**
+   * Additive attention bias, `[maskBatch, maskHeads, maskRows, S]` row-major —
+   * PyTorch's float `attn_mask`. See `ops/attention/reference.ts`.
+   */
+  mask?: Float32Array;
+  /**
+   * `[maskBatch, maskHeads, maskRows]`, each `1` or the full dimension. Default
+   * `[B, 1, 1]`. `maskHeads` counts **query** heads, not `kvHeads`.
+   */
+  maskShape?: MaskShape;
 }
 
 export interface GroupedAttentionResult {
@@ -145,6 +173,7 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
   const causal = args.causal ?? false;
   const queryOffset = args.queryOffset ?? 0;
   const scale = args.scale ?? defaultScale(D);
+  const { at: bias } = resolveMask(args, "groupedAttention");
 
   if (kvHeads < 1 || !Number.isInteger(kvHeads)) {
     throw new Error(`groupedAttention(): kvHeads must be a positive integer, got ${kvHeads}`);
@@ -194,11 +223,14 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
           }
           let dot = 0;
           for (let d = 0; d < D; d += 1) dot += q[qHead + i * D + d]! * k[kHead + j * D + d]!;
-          row[j] = dot * scale;
+          row[j] = dot * scale + bias(b, h, i, j);
         }
 
         let max = -Infinity;
         for (let j = 0; j < S; j += 1) max = Math.max(max, row[j]!);
+        // Every key masked: zeros, as `ops/attention` explains and torch's
+        // `aten::_safe_softmax` does. Reachable only through `mask`.
+        if (max === -Infinity) continue;
         let sum = 0;
         for (let j = 0; j < S; j += 1) sum += Math.exp(row[j]! - max);
         for (let j = 0; j < S; j += 1) probs[pHead + i * S + j] = Math.exp(row[j]! - max) / sum;

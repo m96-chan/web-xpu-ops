@@ -1,4 +1,4 @@
-import { defaultScale, type AttentionArgs } from "../attention/reference.js";
+import { defaultScale, resolveMask, type AttentionArgs } from "../attention/reference.js";
 
 /**
  * Attention computed the way a fused kernel has to compute it: one tile of keys
@@ -44,11 +44,23 @@ import { defaultScale, type AttentionArgs } from "../attention/reference.js";
  *
  * Masked entries are `-Infinity`, as in `ops/attention`; the kernel uses
  * `-FLT_MAX` because WGSL cannot write an infinity, and the two agree for every
- * input this op accepts. The one place they would not is a row with every
- * column masked, where `exp(-Inf - -Inf)` is `NaN` here. That row is outside the
- * contract (`queryOffset >= 0` means column 0 is always visible), so it is
- * stated rather than guarded — a guard no test can trip is code rule 1 says not
- * to write.
+ * input this op accepts.
+ *
+ * `mask` — the additive attention bias, PyTorch's float `attn_mask` — is
+ * `ops/attention`'s in every respect, arrives through `AttentionArgs`, and is
+ * documented there rather than restated here. Two things it changes about this
+ * file specifically:
+ *
+ * - **A fully masked row is now reachable** (#77), and this recurrence reaches
+ *   it as `l = 0` and `acc = 0`, so the final normalisation would be `0 / 0`.
+ *   That row returns zeros instead, matching `aten::_safe_softmax` and hence
+ *   torch's SDPA. The condition is `l == 0` and it is exact: whichever key holds
+ *   the final maximum contributed `exp(0) = 1`, so `l` is 0 if and only if no
+ *   score was ever finite. It is also the reason `m` is not consulted — the
+ *   kernel's running maximum starts at `-FLT_MAX` and cannot report `-Infinity`.
+ * - **`mNew === -Infinity` skips the fold.** With every score so far masked
+ *   there is nothing to rescale and `exp(-Inf - -Inf)` is NaN. The kernel does
+ *   not need the equivalent, because its `m` starts finite.
  */
 export interface FlashAttentionArgs extends AttentionArgs {
   /**
@@ -81,10 +93,13 @@ export function flashAttention(args: FlashAttentionArgs): FlashAttentionResult {
   const queryOffset = args.queryOffset ?? 0;
   const scale = args.scale ?? defaultScale(D);
   const tile = args.tile ?? DEFAULT_TILE;
+  const { at: bias } = resolveMask(args, "flashAttention");
 
   const output = new Float32Array(B * H * L * Dv);
 
   for (let head = 0; head < B * H; head += 1) {
+    const b = Math.floor(head / H);
+    const h = head % H;
     const qHead = head * L * D;
     const kHead = head * S * D;
     const vHead = head * S * Dv;
@@ -109,7 +124,7 @@ export function flashAttention(args: FlashAttentionArgs): FlashAttentionResult {
           }
           let dot = 0;
           for (let d = 0; d < D; d += 1) dot += q[qHead + i * D + d]! * k[kHead + j * D + d]!;
-          scores[s] = dot * scale;
+          scores[s] = dot * scale + bias(b, h, i, j);
         }
 
         let tileMax = -Infinity;
@@ -119,6 +134,11 @@ export function flashAttention(args: FlashAttentionArgs): FlashAttentionResult {
         // and this is an ordinary running sum; when it does, every earlier term
         // is worth `corr` times what it was.
         const mNew = Math.max(m, tileMax);
+        // Nothing finite has been seen yet, in this tile or any before it, so
+        // there is nothing to rescale and nothing to add — and `exp(-Inf - -Inf)`
+        // is NaN, which would poison `l` for the rest of the row. Reachable only
+        // through `mask` (#77).
+        if (mNew === -Infinity) continue;
         const corr = Math.exp(m - mNew);
         l *= corr;
         for (let c = 0; c < Dv; c += 1) acc[c] = acc[c]! * corr;
@@ -131,8 +151,11 @@ export function flashAttention(args: FlashAttentionArgs): FlashAttentionResult {
         m = mNew;
       }
 
-      // The single normalisation, after every key has been seen. `l >= 1`: the
-      // key holding the final maximum contributed exp(0).
+      // The single normalisation, after every key has been seen. `l >= 1`
+      // whenever any score was finite: the key holding the final maximum
+      // contributed exp(0). `l === 0` is the fully masked row, and it gets
+      // zeros rather than 0/0 — see the header.
+      if (l === 0) continue;
       for (let c = 0; c < Dv; c += 1) output[oHead + i * Dv + c] = acc[c]! / l;
     }
   }

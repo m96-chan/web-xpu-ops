@@ -18,6 +18,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- An **additive attention mask** on `attention`, `flash_attention` and `gqa`,
+  because without one this library had no answer for an encoder at all. Every
+  batched encoder over variable-length sequences needs to say "key `j` is
+  padding, never attend to it", and `causal` cannot: it masks by position, not by
+  content. Padding positions were contributing to the softmax and every
+  conditioned output was quietly wrong — not NaN, not a crash, just slightly
+  wrong. The form is PyTorch's **float** `attn_mask`, added to the scores before
+  the softmax, and the reason it is the float form rather than the boolean one is
+  `ops/alibi`: ALiBi already produces an additive score bias and says masking is
+  the caller's, so with one representation the two compose by addition instead of
+  needing an op to combine them. `keyPaddingBias(B, S, keep)` converts the
+  boolean mask people actually hold, with `keep` naming the polarity because
+  torch's own two APIs disagree about it. All three ops take the same mask, so it
+  does not decide which kernel a caller may use.
+- **A fully masked row now returns zeros** rather than NaN. It used to be
+  unreachable — `queryOffset >= 0` guaranteed every row saw key 0, and the
+  kernels said so and skipped the guard. A key mask breaks that guarantee, and an
+  empty sequence in a padded batch reaches it by accident, so it is guarded in
+  all three ops: a NaN row is a wrong answer that looks like a result. Zeros is
+  what torch returns, through `aten::_safe_softmax` — measured, and worth
+  measuring, because plain `torch.softmax` on the same row returns NaN.
 - `roofline(runner)` — this device's measured bandwidth and compute ceilings,
   taken here and now rather than derived from a spec sheet, and cached for the
   session. WebGPU exposes no clock, compute-unit count or bus width, so there is
@@ -60,6 +81,15 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Changed
 
+- The score kernels of `attention`, `gqa` and `flash_attention` take a **mask
+  buffer at every dispatch**, not only when there is a mask, and their uniform
+  blocks gained three fields for its broadcast shape. A bias of zeros *is* "no
+  mask" — it is what torch's own reference does — and making it unconditional
+  removes a per-element branch and a `has_mask` guard whose only failing input
+  would be a dummy buffer nobody reads. It costs `B * S` floats against the
+  `B * H * L * S` these kernels already move. Callers driving the WGSL directly
+  must add the binding; `attention` and `gqa` bind it at index 2, `flash_attention`
+  at index 3.
 - `npm test` runs one test file per vitest process. A single process cannot cross
   a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
   pool or hangs, with no kernel of its own required to trigger it. The runner also

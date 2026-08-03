@@ -70,13 +70,21 @@ type Prepared = {
   want: GroupedAttentionResult;
   scoresParams: ArrayBuffer;
   contextParams: ArrayBuffer;
+  /**
+   * What gets bound at binding 2. Not optional: a bias of zeros *is* "no mask",
+   * which is what torch's own reference does (`attn_bias = torch.zeros(L, S)`,
+   * added unconditionally). See `ops/attention/wgsl.test.ts`.
+   */
+  maskData: Float32Array;
 };
 
 function prepare(name: string, args: GroupedAttentionArgs): Prepared {
+  const [mb, mh, mr] = args.maskShape ?? [args.B, 1, 1];
   return {
     name,
     args,
     want: groupedAttention(args),
+    maskData: args.mask ?? new Float32Array(args.B * args.S),
     scoresParams: params([
       ["u32", args.H],
       ["u32", args.kvHeads],
@@ -86,6 +94,9 @@ function prepare(name: string, args: GroupedAttentionArgs): Prepared {
       ["f32", args.scale ?? defaultScale(args.D)],
       ["u32", args.causal ? 1 : 0],
       ["i32", args.queryOffset ?? 0],
+      ["u32", mb],
+      ["u32", mh],
+      ["u32", mr],
     ]),
     contextParams: params([
       ["u32", args.H],
@@ -263,7 +274,63 @@ const PADDED = (() => {
   };
 })();
 
-const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED];
+/**
+ * The additive key mask (#77), and the one question it raises here that it does
+ * not raise in `attention`: **which** head count indexes it.
+ *
+ * `maskHeads` counts query heads. The wrong reading — indexing the mask by the
+ * KV head, the way K and V are indexed two lines above — is wrong in the way
+ * this op's whole file warns about: it agrees at `kvHeads = H` and at
+ * `kvHeads = 1`, because both make the two indices coincide. Only a middle
+ * grouping with a per-head bias can tell them apart, which is what the second
+ * case below is.
+ */
+const MASK_TESTS: Prepared[] = (() => {
+  const shared = { L: 3, S: 5, D: 8, Dv: 6 };
+  const operands = (B: number, H: number, kvHeads: number) => ({
+    q: wave(B * H * shared.L * shared.D, 0.37),
+    k: wave(B * kvHeads * shared.S * shared.D, 0.11, 0.5),
+    v: wave(B * kvHeads * shared.S * shared.Dv, 0.23, 1.25),
+    B, H, kvHeads, ...shared,
+  });
+  return [
+    prepare("applies a [B, 1, 1, S] key padding mask at kvHeads = 1", {
+      ...operands(2, 4, 1),
+      mask: Float32Array.from([0, -Infinity, 0, 0, -Infinity, 0, 0, -Infinity, -Infinity, 0]),
+    }),
+    // H = 4, kvHeads = 2: query heads 0,1 share KV head 0 and 2,3 share KV head
+    // 1. A mask indexed by the KV head would give heads 0 and 1 the same bias.
+    prepare("indexes the mask by the query head, not the KV head", {
+      ...operands(2, 4, 2),
+      mask: wave(2 * 4 * shared.S, 0.61, 0.4),
+      maskShape: [2, 4, 1],
+    }),
+    prepare("broadcasts a [1, H, L, S] bias across the batch", {
+      ...operands(2, 4, 2),
+      mask: wave(4 * shared.L * shared.S, 0.71, 0.9),
+      maskShape: [1, 4, shared.L],
+    }),
+  ];
+})();
+
+/**
+ * A sample nobody may attend to — zeros rather than NaN, as `ops/attention`
+ * measured against torch. Batch 1 stays alive so the expectation is not zeros
+ * alone, which would be indistinguishable from a dispatch that did nothing.
+ */
+const FULLY_MASKED = (() => {
+  const [B, H, kvHeads, L, S, D, Dv] = [2, 4, 2, 3, 5, 8, 6];
+  const mask = new Float32Array(B * S);
+  mask.fill(-Infinity, 0, S);
+  return prepare("returns zeros for a sample whose every key is masked", {
+    q: wave(B * H * L * D, 0.37),
+    k: wave(B * kvHeads * S * D, 0.11, 0.5),
+    v: wave(B * kvHeads * S * Dv, 0.23, 1.25),
+    B, H, kvHeads, L, S, D, Dv, mask,
+  });
+})();
+
+const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED, ...MASK_TESTS, FULLY_MASKED];
 
 /**
  * Runs the real two-dispatch pipeline and checks both halves.
@@ -279,6 +346,7 @@ async function check(run: Runner["run"], p: Prepared): Promise<void> {
     bindings: [
       { kind: "storage", data: p.args.q },
       { kind: "storage", data: p.args.k },
+      { kind: "storage", data: p.maskData },
       { kind: "out", type: "f32", length: B * H * L * S },
       { kind: "uniform", data: p.scoresParams },
     ],

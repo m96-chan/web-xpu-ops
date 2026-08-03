@@ -69,13 +69,27 @@ type Prepared = {
   want: AttentionResult;
   scoresParams: ArrayBuffer;
   contextParams: ArrayBuffer;
+  /**
+   * What actually gets bound at binding 2.
+   *
+   * The mask binding is not optional, and that is the design rather than an
+   * omission: an additive bias of zeros *is* "no mask", and it is what torch's
+   * own reference does — `attn_bias = torch.zeros(L, S)`, added unconditionally.
+   * A `has_mask` flag would buy one branch per element in exchange for a guard
+   * whose only failing input is a dummy buffer nobody reads (rule 1).
+   */
+  maskData: Float32Array;
 };
 
 function prepare(name: string, args: AttentionArgs): Prepared {
+  const [mb, mh, mr] = args.maskShape ?? [args.B, 1, 1];
   return {
     name,
     args,
     want: attention(args),
+    // A zero bias where the case has no mask. `B * S` of them, the default
+    // [B, 1, 1] shape — the smallest buffer that says "nothing is masked".
+    maskData: args.mask ?? new Float32Array(args.B * args.S),
     scoresParams: params([
       ["u32", args.H],
       ["u32", args.L],
@@ -84,6 +98,9 @@ function prepare(name: string, args: AttentionArgs): Prepared {
       ["f32", args.scale ?? defaultScale(args.D)],
       ["u32", args.causal ? 1 : 0],
       ["i32", args.queryOffset ?? 0],
+      ["u32", mb],
+      ["u32", mh],
+      ["u32", mr],
     ]),
     contextParams: params([["u32", args.H], ["u32", args.L], ["u32", args.S], ["u32", args.Dv]]),
   };
@@ -237,7 +254,173 @@ const STRIDES = (() => {
   });
 })();
 
-const ALL: Prepared[] = [...SHAPE_TESTS, CAUSAL_DIRECTION, OVERFLOW, PADDED, STRIDES];
+/**
+ * The additive key mask (#77).
+ *
+ * Every case here is built so the mask *moves the answer by order 1*. A bias
+ * small enough to be a tolerance question would let a kernel that binds the
+ * buffer and ignores it pass, which is exactly the mutation these have to catch.
+ *
+ * The broadcast cases are the ones with two plausible implementations. A mask
+ * indexed at the wrong axis reads a live, in-bounds neighbour rather than
+ * garbage, so each shape below gives every (batch, head, row) it broadcasts over
+ * a *different* bias — otherwise collapsing the axis is invisible.
+ */
+const MASK_TESTS: Prepared[] = (() => {
+  const [B, H, L, S, D, Dv] = [2, 3, 4, 5, 8, 6];
+  const operands = {
+    q: wave(B * H * L * D, 0.37),
+    k: wave(B * H * S * D, 0.11, 0.5),
+    v: wave(B * H * S * Dv, 0.23, 1.25),
+    B, H, L, S, D, Dv,
+  };
+  const shape = (n: number, k: number, phase: number) => wave(n, k, phase);
+  return [
+    prepare("applies a [B, 1, 1, S] key padding mask", {
+      ...operands,
+      // Each sample keeps a different set of keys, so a mask read at batch 0 for
+      // every sample changes the answer.
+      mask: Float32Array.from([0, 0, -Infinity, -Infinity, 0, 0, -Infinity, 0, 0, -Infinity], (x) => x),
+    }),
+    prepare("applies a [B, H, L, S] bias element by element", {
+      ...operands,
+      mask: shape(B * H * L * S, 0.53, 0.2),
+      maskShape: [B, H, L],
+    }),
+    prepare("broadcasts a [1, H, L, S] bias across the batch, the shape ops/alibi returns", {
+      ...operands,
+      mask: shape(H * L * S, 0.71, 0.9),
+      maskShape: [1, H, L],
+    }),
+    prepare("broadcasts a [B, H, 1, S] bias across the query rows", {
+      ...operands,
+      mask: shape(B * H * S, 0.61, 0.4),
+      maskShape: [B, H, 1],
+    }),
+    prepare("broadcasts a [B, 1, L, S] bias across the heads", {
+      ...operands,
+      mask: shape(B * L * S, 0.43, 1.7),
+      maskShape: [B, 1, L],
+    }),
+    // S past one workgroup: the scores loop strides over j, so the mask index
+    // has to stride with it. A mask read at `tid` instead of `j` agrees for the
+    // first 256 keys and disagrees after.
+    prepare("indexes the mask across a strided S", {
+      q: wave(1 * 2 * 3 * 8, 0.37),
+      k: wave(1 * 2 * (WG + 44) * 8, 0.11, 0.5),
+      v: wave(1 * 2 * (WG + 44) * 6, 0.23, 1.25),
+      B: 1, H: 2, L: 3, S: WG + 44, D: 8, Dv: 6,
+      mask: wave(1 * (WG + 44), 0.09, 2.1),
+    }),
+  ];
+})();
+
+/**
+ * A sample nobody may attend to.
+ *
+ * The row `ops/attention/reference.ts` used to declare unreachable. It is
+ * reachable now, and it is reachable by accident — an empty sequence in a
+ * padded batch is one. Torch returns zeros for it (`aten::_safe_softmax`), and
+ * so must this, because the alternatives are a NaN row and a uniform row and
+ * both look like results.
+ *
+ * Batch 0 is dead and batch 1 is alive, deliberately: an expectation of only
+ * zeros cannot be told apart from a kernel that did nothing at all.
+ */
+const FULLY_MASKED = (() => {
+  const [B, H, L, S, D, Dv] = [2, 2, 3, 4, 8, 5];
+  const mask = new Float32Array(B * S);
+  mask.fill(-Infinity, 0, S);
+  return prepare("returns zeros for a sample whose every key is masked", {
+    q: wave(B * H * L * D, 0.37),
+    k: wave(B * H * S * D, 0.11, 0.5),
+    v: wave(B * H * S * Dv, 0.23, 1.25),
+    B, H, L, S, D, Dv, mask,
+  });
+})();
+
+/**
+ * One dead row inside a live sample, through a `[B, 1, L, S]` mask.
+ *
+ * Different from `FULLY_MASKED` in what it can catch: there the whole workgroup
+ * grid for a batch is dead, so a guard applied per *dispatch* would pass. Here
+ * rows 0 and 2 of every head are dead and row 1 is not, so the guard has to be
+ * per query row — which is the granularity the softmax runs at.
+ */
+const FULLY_MASKED_ROW = (() => {
+  const [B, H, L, S, D, Dv] = [1, 2, 3, 4, 8, 5];
+  const mask = new Float32Array(B * L * S);
+  mask.fill(-Infinity, 0 * S, 1 * S);
+  mask.fill(-Infinity, 2 * S, 3 * S);
+  return prepare("returns zeros for one dead query row beside live ones", {
+    q: wave(B * H * L * D, 0.37),
+    k: wave(B * H * S * D, 0.11, 0.5),
+    v: wave(B * H * S * Dv, 0.23, 1.25),
+    B, H, L, S, D, Dv, mask, maskShape: [B, 1, L],
+  });
+})();
+
+/**
+ * `-FLT_MAX` is not `-Infinity`, and the kernel must not confuse them.
+ *
+ * `-FLT_MAX` is what the causal path writes, so a fully-masked guard spelled
+ * `row_max <= MASKED` would fire on a caller's mask of `-FLT_MAX` and return
+ * zeros. Torch returns the mean of V there — measured on 2.10, a mask row of
+ * -3.402823e38 gives `[-0.662, -0.211, 0.556]`, not zeros. The reference models
+ * that, so this case fails if the comparison is widened by one character.
+ */
+const NEARLY_MASKED = (() => {
+  const [B, H, L, S, D, Dv] = [1, 1, 2, 4, 8, 3];
+  const mask = new Float32Array(B * S).fill(-3.402823e38);
+  return prepare("treats a row of -FLT_MAX as finite, not as fully masked", {
+    q: wave(B * H * L * D, 0.37),
+    k: wave(B * H * S * D, 0.11, 0.5),
+    v: wave(B * H * S * Dv, 0.23, 1.25),
+    B, H, L, S, D, Dv, mask,
+  });
+})();
+
+/**
+ * The mask read that leaves the buffer.
+ *
+ * Same reasoning as `PADDED`: this device returns 0 for a storage read past the
+ * end, and 0 is the *identity* for an additive bias, so an overrun off the tail
+ * of the mask is invisible unless there is something non-zero sitting there.
+ * The padding is 40, which is far past any logit these operands produce, so a
+ * single element of overrun takes that key's probability to 1.
+ */
+const MASK_PADDED = (() => {
+  const [B, H, L, S, D, Dv] = [2, 2, 3, 5, 4, 3];
+  const PAD = 40;
+  const backing = new Float32Array(B * S + 64).fill(PAD);
+  const mask = wave(B * S, 0.31, 0.2);
+  backing.set(mask);
+  return {
+    ...prepare("reads no further than S into the mask", {
+      q: wave(B * H * L * D, 0.41),
+      k: wave(B * H * S * D, 0.23, 0.75),
+      v: wave(B * H * S * Dv, 0.31, 1.1),
+      B, H, L, S, D, Dv,
+      mask: backing.subarray(0, B * S),
+    }),
+    // Bound with the padding still attached; the reference only sees the view.
+    maskData: backing,
+    padding: backing.length - B * S,
+  };
+})();
+
+const ALL: Prepared[] = [
+  ...SHAPE_TESTS,
+  CAUSAL_DIRECTION,
+  OVERFLOW,
+  PADDED,
+  STRIDES,
+  ...MASK_TESTS,
+  FULLY_MASKED,
+  FULLY_MASKED_ROW,
+  NEARLY_MASKED,
+  MASK_PADDED,
+];
 
 /**
  * Runs the real two-dispatch pipeline and checks both halves.
@@ -255,6 +438,7 @@ async function check(run: Runner["run"], p: Prepared): Promise<void> {
     bindings: [
       { kind: "storage", data: p.args.q },
       { kind: "storage", data: p.args.k },
+      { kind: "storage", data: p.maskData },
       { kind: "out", type: "f32", length: B * H * L * S },
       { kind: "uniform", data: p.scoresParams },
     ],
@@ -295,5 +479,7 @@ describe("attention / wgsl", () => {
   // happy with operands sized exactly to their contents.
   gpuTest("the padded case really is padded", async () => {
     expect(PADDED.padding).toEqual({ q: 64, k: 64, v: 64 });
+    expect(MASK_PADDED.padding).toBe(64);
+    expect(MASK_PADDED.maskData.length).toBeGreaterThan(MASK_PADDED.args.mask!.length);
   });
 });
