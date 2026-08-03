@@ -40,7 +40,7 @@ rather than being left blank.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu` |
 | `elementwise` | `add`, `multiply` |
-| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included. An optional precomputed angle table (`ropeCache`); past its end the angle is recomputed rather than wrapped |
+| `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included. An optional precomputed angle table (`ropeCache`); past its end the angle is recomputed rather than wrapped. `headOffset` / `headCount` rotate a subset of the **heads** and copy the rest through — the axis Irodori-TTS's `_apply_rotary_half` uses (`chunk(2, dim=-2)`), not channel-wise partial rotary (`rotaryDim`), which is the other thing "half-RoPE" is used to mean and is not implemented. Speed unmeasured |
 | `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's. Speed unmeasured |
 | `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
@@ -358,7 +358,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache` ✅
+Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache` ✅ · `half-RoPE (head range)` ✅
 
 Sharing: `GQA` ✅ · `MQA` ✅ (one op — `gqa`, parameterised by `kvHeads`)
 
