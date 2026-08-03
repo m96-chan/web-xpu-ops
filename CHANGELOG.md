@@ -83,6 +83,22 @@ Entries record **why** a change was needed. What changed is in the diff.
   is a different op that this deliberately does not add. Heads outside the range
   are copied rather than left at zero — `rope` returns a fresh array, so an
   unwritten head is silent garbage flowing into attention.
+- `ops/conv_transpose` — `convTranspose1d` and `convTranspose1dOutputLength`,
+  matching `torch.nn.functional.conv_transpose1d`. `conv` covers a codec's
+  encoder; nothing covered the decoder, so the library could run the transformer
+  half of a diffusion TTS model and then not turn latents into a waveform. A
+  DAC-style codec decodes with transposed convolutions and nothing else — no
+  iSTFT head to fall back on — which made this a hard blocker rather than a
+  convenience (ISSUE #75, #80). Three conventions are stated rather than chosen
+  quietly, because each fails silently: the weight is `[Cin, Cout/groups, K]`
+  and not `conv`'s transpose of it, which only diverges when `Cin != Cout` —
+  exactly when a codec is upsampling; `padding` *crops* the output instead of
+  extending the input, so getting it backwards yields a waveform that is merely
+  a little too long; and `output_padding` lengthens the trailing end without
+  joining the sum, which matters only at odd `stride`, which is what DACVAE's
+  decoder stages use. `weight_norm` is deliberately not a flag — folding
+  `weight_g`/`weight_v` into a plain weight is a load-time conversion, not
+  per-frame kernel work.
 - `roofline(runner)` — this device's measured bandwidth and compute ceilings,
   taken here and now rather than derived from a spec sheet, and cached for the
   session. WebGPU exposes no clock, compute-unit count or bus width, so there is
