@@ -85,8 +85,22 @@ function uniforms(args: AttentionArgs): ArrayBuffer {
     ["f32", args.scale ?? defaultScale(args.D)],
     ["u32", args.causal ? 1 : 0],
     ["i32", args.queryOffset ?? 0],
+    ["u32", (args.maskShape ?? [args.B, 1, 1])[0]],
+    ["u32", (args.maskShape ?? [args.B, 1, 1])[1]],
+    ["u32", (args.maskShape ?? [args.B, 1, 1])[2]],
   ]);
 }
+
+/**
+ * What gets bound at binding 3.
+ *
+ * Not optional, and that is the design: an additive bias of zeros *is* "no
+ * mask", which is exactly what torch's own reference does (`attn_bias =
+ * torch.zeros(L, S)`, added unconditionally). It costs `B * S` floats — `4n` at
+ * the growth shapes below, against the `4n^2` this op exists to avoid — and it
+ * buys back a per-element branch and a guard nothing could trip.
+ */
+const maskFor = (args: AttentionArgs): Float32Array => args.mask ?? new Float32Array(args.B * args.S);
 
 /**
  * The one place a dispatch of this kernel is described.
@@ -104,6 +118,7 @@ function dispatchFor(args: AttentionArgs): Dispatch {
       { kind: "storage", data: args.q },
       { kind: "storage", data: args.k },
       { kind: "storage", data: args.v },
+      { kind: "storage", data: maskFor(args) },
       { kind: "out", type: "f32", length: B * H * L * Dv },
       { kind: "uniform", data: uniforms(args) },
     ],
@@ -309,7 +324,86 @@ const GROWTH = GROWTH_N.map((n) =>
   }),
 );
 
-const ALL: Prepared[] = [...SHAPE_TESTS, ...GROWTH, RESCALE, CAUSAL_DIRECTION, OVERFLOW, PADDED, STRIDES];
+/**
+ * The additive key mask (#77), and the thing it interacts with that it does not
+ * in `attention`: the tile boundary.
+ *
+ * The online recurrence carries a running maximum across tiles, so *where* the
+ * masked keys fall changes which path runs. The third case below masks the whole
+ * of the first tile and nothing after it, which is the only input that reaches a
+ * fold with no finite score in it yet — and the only one that can tell a missing
+ * `-Infinity` guard apart from a working one, since every other row has
+ * something finite in tile 0 to anchor the maximum.
+ */
+const MASK_TESTS: Prepared[] = (() => {
+  const small = { B: 2, H: 3, L: 4, S: 5, D: 8, Dv: 6 };
+  const operands = (a: { B: number; H: number; L: number; S: number; D: number; Dv: number }) => ({
+    q: wave(a.B * a.H * a.L * a.D, 0.37),
+    k: wave(a.B * a.H * a.S * a.D, 0.11, 0.5),
+    v: wave(a.B * a.H * a.S * a.Dv, 0.23, 1.25),
+    ...a,
+  });
+  const wide = { B: 1, H: 2, L: 3, S: 3 * TILE + 17, D: 8, Dv: 6 };
+  // Every key of tile 0 masked, the rest alive.
+  const firstTileDead = new Float32Array(wide.B * wide.S);
+  firstTileDead.fill(-Infinity, 0, TILE);
+  return [
+    prepare("applies a [B, 1, 1, S] key padding mask", {
+      ...operands(small),
+      mask: Float32Array.from([0, 0, -Infinity, -Infinity, 0, 0, -Infinity, 0, 0, -Infinity]),
+    }),
+    prepare("applies a [B, H, L, S] bias element by element", {
+      ...operands(small),
+      mask: wave(small.B * small.H * small.L * small.S, 0.53, 0.2),
+      maskShape: [small.B, small.H, small.L],
+    }),
+    prepare("carries the running maximum across a fully masked first tile", {
+      ...operands(wide),
+      mask: firstTileDead,
+    }),
+    prepare("broadcasts a [1, H, L, S] bias across the batch", {
+      ...operands(small),
+      mask: wave(small.H * small.L * small.S, 0.71, 0.9),
+      maskShape: [1, small.H, small.L],
+    }),
+    prepare("indexes the mask past a tile boundary", {
+      ...operands(wide),
+      mask: wave(wide.B * wide.S, 0.09, 2.1),
+    }),
+  ];
+})();
+
+/**
+ * A sample nobody may attend to — zeros, not `0 / 0`.
+ *
+ * This op reaches the row differently from `attention`: there the softmax
+ * denominator is 0, here the running sum `l` never leaves 0 and the final divide
+ * is 0/0. Batch 1 stays alive so the expectation is not zeros alone.
+ */
+const FULLY_MASKED = (() => {
+  const shape = { B: 2, H: 2, L: 3, S: TILE + 9, D: 8, Dv: 5 };
+  const mask = new Float32Array(shape.B * shape.S);
+  mask.fill(-Infinity, 0, shape.S);
+  return prepare("returns zeros for a sample whose every key is masked", {
+    q: wave(shape.B * shape.H * shape.L * shape.D, 0.37),
+    k: wave(shape.B * shape.H * shape.S * shape.D, 0.11, 0.5),
+    v: wave(shape.B * shape.H * shape.S * shape.Dv, 0.23, 1.25),
+    ...shape,
+    mask,
+  });
+})();
+
+const ALL: Prepared[] = [
+  ...SHAPE_TESTS,
+  ...GROWTH,
+  RESCALE,
+  CAUSAL_DIRECTION,
+  OVERFLOW,
+  PADDED,
+  STRIDES,
+  ...MASK_TESTS,
+  FULLY_MASKED,
+];
 
 /**
  * What the harness will really allocate for a binding, mirroring
@@ -346,8 +440,9 @@ const secondDifference = (xs: number[]): number[] =>
  */
 function unfusedPeakBytes(a: AttentionArgs): number {
   const probs = a.B * a.H * a.L * a.S * 4;
-  // 28 and 16 are the two uniform blocks: seven fields and four, floored at 16.
-  const scores = a.B * a.H * a.L * a.D * 4 + a.B * a.H * a.S * a.D * 4 + probs + 28;
+  const mask = a.B * a.S * 4;
+  // 40 and 16 are the two uniform blocks: ten fields and four, floored at 16.
+  const scores = a.B * a.H * a.L * a.D * 4 + a.B * a.H * a.S * a.D * 4 + mask + probs + 40;
   const context = probs + a.B * a.H * a.S * a.Dv * 4 + a.B * a.H * a.L * a.Dv * 4 + 16;
   return Math.max(scores, context);
 }
@@ -357,15 +452,20 @@ function unfusedPeakBytes(a: AttentionArgs): number {
  * the growth shapes (B=H=1, L=S=n, D=Dv=8), flash against unfused.
  *
  *   n     flash    unfused peak   the score matrix alone
- *    64    8_224        20_508                   16_384
- *   128   16_416        73_756                   65_536
- *   192   24_608       159_772                  147_456
- *   256   32_800       278_556                  262_144
+ *    64    8_492        20_776                   16_384
+ *   128   16_940        74_280                   65_536
+ *   192   25_388       160_552                  147_456
+ *   256   33_836       279_592                  262_144
  *
- * Flash is `128n + 32` exactly; unfused is `4n^2 + 64n + 28`, and the whole of
+ * Flash is `132n + 44` exactly; unfused is `4n^2 + 68n + 40`, and the whole of
  * the difference is the score matrix. At n = 256 that is already 8x, and it
  * doubles with every doubling of the sequence. The assertions below hold both
  * shapes rather than these particular numbers.
+ *
+ * `4n` of the linear term on each side is the mask buffer added in #77 — a
+ * `[B, 1, 1, S]` bias of zeros where the case has no mask. It is linear, so it
+ * changes the constants and not the claim; the previous figures, before the
+ * mask existed, were `128n + 32` and `4n^2 + 64n + 28`.
  *
  * Time is **unmeasured**: the roofline harness is #3 / #4.
  */
