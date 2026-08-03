@@ -18,6 +18,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `snake` — `x + sin²(α·x)/α` with a learned per-channel α, as a **separate op**
+  rather than a kind of `activation`. Every neural audio codec worth decoding on
+  the web is built from it (DACVAE, BigVGAN), and without it the decoder stops
+  at latents. It is separate because `activation` is "one buffer in, one buffer
+  out, branch on an integer" and Snake's α is a tensor: folding it in would add
+  a storage binding and a channel stride that `relu2` and `silu` would then have
+  to supply on every call — the pipeline layout is derived from what the shader
+  declares, so an unused binding is not free, it is mandatory. `elu`'s scalar
+  `alpha` went the other way for the same reason: it costs a uniform field the
+  struct was padding out anyway. The `1e-9` sits inside the reciprocal at
+  upstream's value, because `1/α` guarded afterwards returns NaN at α = 0 where
+  upstream returns x, and a checkpoint that trained an α to nothing would be the
+  one to find that out.
+- `activation` gains `elu`, `tanh`, `gelu` and `gelu_tanh`. The first three
+  complete the set DACVAE's encoder and decoder stages need; GELU is for the
+  other half of the same model, whose text encoder is a GeGLU ModernBERT. GELU
+  is **two** functions in torch, and they part company by 4.73e-4 at x = 2.699 —
+  measured, in the reference — so both ship and the default is the exact `erf`
+  form, matching `torch.nn.functional.gelu`'s own default. A library that picked
+  one silently would be right for half its callers and quietly wrong for the
+  rest.
+- `rmsnorm` takes an optional group count: `weight` may be `[G, D]`, and row `n`
+  uses group `n % G`. QK-norm gives every attention head its own gamma, and
+  until now this op could not say that — a per-head weight flattened into `[N,
+  D]` silently applied head 0's gamma to every head, with no NaN and no change
+  of shape to notice it by. A wrong answer that looks well-formed is worse than
+  a missing op, which is why it is in the library rather than worked around by
+  the caller. `G = 1` and an unpacked group word are both today's behaviour, so
+  nothing existing moves. The grouped axis must be the one immediately left of
+  `D` (`[B, S, H, Dh]`); `[B, H, S, Dh]` needs a different index and is refused
+  rather than served wrongly. Speed unmeasured. `layernorm` has the same gap and
+  #81 tracks it, so the two do not end up disagreeing about what a weight is.
 - An **additive attention mask** on `attention`, `flash_attention` and `gqa`,
   because without one this library had no answer for an encoder at all. Every
   batched encoder over variable-length sequences needs to say "key `j` is
