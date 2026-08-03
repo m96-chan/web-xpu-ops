@@ -6,13 +6,31 @@
 //
 // Layout:
 //   input:  [N, D] f32
-//   weight: [D]    f32 (learnable scale)
+//   weight: [G, D] f32 (learnable scale; row n uses group n % G)
 //   output: [N, D] f32
+//
+// G is the extent of the axis immediately left of D — the fastest varying of
+// the axes flattened into N. For QK-norm's [B, S, H, Dh] that is H, which is
+// why `row % G` is the head index. reference.ts states the layout and why the
+// [B, H, S, Dh] one is refused rather than served wrongly.
 
 struct Params {
   N: u32,
   D: u32,
   eps: f32,
+  // Group count. Zero means one group: a caller packing the three-word params
+  // this op took before #78 leaves this word zero, and must keep its old
+  // behaviour rather than take an indeterminate `% 0`.
+  //
+  // The `max(params.G, 1u)` below is stated as a contract because **no test can
+  // kill it here**, and that is worth writing down rather than discovering. Rule
+  // 1 asks for a mutation that goes red; this one does not. Measured: dropping
+  // the `max` left every pre-#78 case green, so Tint lowers `x % 0` to `0` on
+  // this device — the same answer the guard gives. WGSL only promises an
+  // *indeterminate* value, so the guard is what makes the compatibility path a
+  // property of this op rather than of one driver. Deleting it would be green
+  // here and wrong somewhere else.
+  G: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -57,7 +75,8 @@ fn main(
   let rms = inverseSqrt(shared_sum[0] / f32(params.D) + params.eps);
 
   // Pass 2: Normalize
+  let weight_offset = (row % max(params.G, 1u)) * params.D;
   for (var col = tid; col < params.D; col += WORKGROUP_SIZE) {
-    output[row_offset + col] = input[row_offset + col] * rms * weight[col];
+    output[row_offset + col] = input[row_offset + col] * rms * weight[weight_offset + col];
   }
 }

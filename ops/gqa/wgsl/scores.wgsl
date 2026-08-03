@@ -3,6 +3,7 @@
 // Layout:
 //   q:      [B, H,       L, D]  f32, row-major
 //   k:      [B, kv_heads, S, D] f32, row-major   <- fewer heads than q
+//   mask:   [MB, MH, MR, S]     f32, row-major — the additive attention bias
 //   probs:  [B, H,       L, S]  f32, row-major
 //
 // Structurally this is ops/attention's scores kernel. The only difference is
@@ -27,12 +28,20 @@ struct Params {
   scale: f32,
   causal: u32,
   query_offset: i32,
+  // The broadcast shape of `mask`, each either 1 or the full dimension; the
+  // last axis is always S. `mask_heads` counts *query* heads, since the mask is
+  // applied after the KV head is chosen (measured against torch — see
+  // reference.ts).
+  mask_batch: u32,
+  mask_heads: u32,
+  mask_rows: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k: array<f32>;
-@group(0) @binding(2) var<storage, read_write> probs: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read> mask: array<f32>;
+@group(0) @binding(3) var<storage, read_write> probs: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
 
 const WORKGROUP_SIZE: u32 = 256u;
 
@@ -65,6 +74,14 @@ fn main(
   let k_head = kv_head * params.S * params.D;
   let p_row = (q_head * params.L + i) * params.S;
 
+  // Where this query row's slice of the bias starts; each axis collapses to 0
+  // when the caller broadcast it. Identical to ops/attention — deliberately, so
+  // one mask serves both ops.
+  let mb = select(0u, batch, params.mask_batch > 1u);
+  let mh = select(0u, head, params.mask_heads > 1u);
+  let mr = select(0u, i, params.mask_rows > 1u);
+  let m_row = ((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S;
+
   // Pass 1: scaled dot products, straight into `probs`.
   var local_max: f32 = MASKED;
   for (var j = tid; j < params.S; j += WORKGROUP_SIZE) {
@@ -74,7 +91,9 @@ fn main(
       for (var d: u32 = 0u; d < params.D; d += 1u) {
         dot += q[q_row + d] * k[k_head + j * params.D + d];
       }
-      value = dot * params.scale;
+      // PyTorch's float `attn_mask`, added rather than selected on. See
+      // ops/attention/wgsl/scores.wgsl.
+      value = dot * params.scale + mask[m_row + j];
     }
     probs[p_row + j] = value;
     local_max = max(local_max, value);
@@ -108,7 +127,12 @@ fn main(
     }
     workgroupBarrier();
   }
-  let inv_sum = 1.0 / shared_val[0];
+  // Every key masked — reachable only through `mask`, and returned as zeros
+  // because 1/0 here is +inf and 0 * inf is NaN. The condition is the *sum* and
+  // not the row maximum: `local_max` starts at MASKED so the maximum cannot
+  // report -inf, while the sum is 0 exactly when no score was finite. See
+  // ops/attention/wgsl/scores.wgsl for the torch measurements.
+  let inv_sum = select(1.0 / shared_val[0], 0.0, shared_val[0] == 0.0);
   workgroupBarrier();
 
   // Pass 3: normalise. Masked columns are already 0 and stay 0.
