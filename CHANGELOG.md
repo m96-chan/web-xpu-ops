@@ -39,6 +39,17 @@ Entries record **why** a change was needed. What changed is in the diff.
   form, matching `torch.nn.functional.gelu`'s own default. A library that picked
   one silently would be right for half its callers and quietly wrong for the
   rest.
+- `rmsnorm` takes an optional group count: `weight` may be `[G, D]`, and row `n`
+  uses group `n % G`. QK-norm gives every attention head its own gamma, and
+  until now this op could not say that — a per-head weight flattened into `[N,
+  D]` silently applied head 0's gamma to every head, with no NaN and no change
+  of shape to notice it by. A wrong answer that looks well-formed is worse than
+  a missing op, which is why it is in the library rather than worked around by
+  the caller. `G = 1` and an unpacked group word are both today's behaviour, so
+  nothing existing moves. The grouped axis must be the one immediately left of
+  `D` (`[B, S, H, Dh]`); `[B, H, S, Dh]` needs a different index and is refused
+  rather than served wrongly. Speed unmeasured. `layernorm` has the same gap and
+  #81 tracks it, so the two do not end up disagreeing about what a weight is.
 - `roofline(runner)` — this device's measured bandwidth and compute ceilings,
   taken here and now rather than derived from a spec sheet, and cached for the
   session. WebGPU exposes no clock, compute-unit count or bus width, so there is

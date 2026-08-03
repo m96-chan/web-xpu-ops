@@ -35,7 +35,7 @@ rather than being left blank.
 | op | notes |
 | --- | --- |
 | `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
-| `rmsnorm` | workgroup reduction; `eps` guards an all-zero row |
+| `rmsnorm` | workgroup reduction; `eps` guards an all-zero row. An optional per-group `weight` of `[G, D]` for QK-norm — row `n` takes group `n % G`, so the grouped axis has to be the one just left of `D` (`[B, S, H, Dh]`, not `[B, H, S, Dh]`); `G = 1` is the single shared gamma. Reduction stays over `D` alone, matching `F.rms_norm(x, (D,)) * w` rather than `torch.nn.RMSNorm((H, Dh))`, which reduces over both. Speed unmeasured |
 | `layernorm` | two workgroup reductions; **biased** variance (`1/D`) and `eps` inside the `sqrt`, as `torch.nn.functional.layer_norm`. Speed unmeasured |
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu`, `elu`, `tanh`, `gelu`, `gelu_tanh`. `elu`'s `alpha` is a scalar hyperparameter defaulting to 1.0, as `torch.nn.ELU`. GELU is two functions, not one: the default `gelu` is the exact `erf` form (`torch.nn.functional.gelu`'s own default, `approximate="none"`) and `gelu_tanh` is `approximate="tanh"` — they differ by up to **4.73e-4, at x = 2.699**, so neither is a silent stand-in for the other. Speed unmeasured |
