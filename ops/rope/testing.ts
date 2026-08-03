@@ -52,8 +52,19 @@ export interface Cached {
  */
 export function scenario(
   code: string,
-  { N, numHeads, headDim, posOffset, thetaBase, scaling }: Omit<RoPEArgs, "input" | "cache">,
+  {
+    N, numHeads, headDim, posOffset, thetaBase, scaling,
+    headOffset = 0, headCount = numHeads,
+  }: Omit<RoPEArgs, "input" | "cache">,
   cached: Cached = { positions: 0 },
+  /**
+   * Defaults to the wave every other case uses.
+   *
+   * Head-range cases pass one that is nowhere zero: a passthrough head the
+   * kernel never wrote reads back as zero, and an input that is itself zero
+   * somewhere cannot tell that apart from a copy. See `wgsl-heads.test.ts`.
+   */
+  input: Float32Array = wave(N * numHeads * headDim, 0.29),
 ): { dispatch: Dispatch; expected: Float32Array } {
   const length = N * numHeads * headDim;
   const totalPairs = length / 2;
@@ -64,7 +75,6 @@ export function scenario(
   // `pair_idx >= total_pairs` guard observable at all.
   const slots = workgroups * 256 * 2;
 
-  const input = wave(length, 0.29);
   const padded = new Float32Array(slots).fill(SENTINEL);
   padded.set(input);
 
@@ -91,7 +101,7 @@ export function scenario(
   const expected = new Float32Array(slots);
   expected.set(
     rope({
-      input, N, numHeads, headDim, posOffset, thetaBase, scaling,
+      input, N, numHeads, headDim, posOffset, thetaBase, scaling, headOffset, headCount,
       ...(cached.poison ? { cache } : {}),
     }),
   );
@@ -115,6 +125,10 @@ export function scenario(
             ["u32", cached.positions],
             ["f32", freq.effectiveBase], ["f32", freq.interpolationFactor],
             ["f32", freq.rampLow], ["f32", freq.rampHigh], ["f32", freq.attentionFactor],
+            // Appended rather than grouped with the geometry above so that the
+            // offsets the kernel already reads did not move when the range
+            // arrived — the default case stays the same bytes it was.
+            ["u32", headOffset], ["u32", headCount],
           ]),
         },
       ],

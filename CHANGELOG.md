@@ -71,6 +71,18 @@ Entries record **why** a change was needed. What changed is in the diff.
   all three ops: a NaN row is a wrong answer that looks like a result. Zeros is
   what torch returns, through `aten::_safe_softmax` — measured, and worth
   measuring, because plain `torch.softmax` on the same row returns NaN.
+- `rope` takes a head range — `headOffset` / `headCount`, defaulting to every
+  head and byte-identical there. The joint-attention blocks of a diffusion TTS
+  DiT rotate half their heads and leave the other half position-free, so that a
+  block attending over positioned latents and unpositioned conditioning has
+  heads that cannot see order at all. The layout is `(token, head, dim)`, so the
+  heads to rotate are not contiguous and the honest workaround was a gather, a
+  dispatch and a scatter — three passes and a temporary, spent to do less work.
+  **The range is over heads, not over the channels within a head**: both are
+  called "half-RoPE" in the wild, and channel-wise partial rotary (`rotaryDim`)
+  is a different op that this deliberately does not add. Heads outside the range
+  are copied rather than left at zero — `rope` returns a fresh array, so an
+  unwritten head is silent garbage flowing into attention.
 - `roofline(runner)` — this device's measured bandwidth and compute ceilings,
   taken here and now rather than derived from a spec sheet, and cached for the
   session. WebGPU exposes no clock, compute-unit count or bus width, so there is
