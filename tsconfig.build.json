@@ -1,0 +1,33 @@
+{
+  // What gets published, which is a strict subset of what gets type-checked.
+  //
+  // `tsconfig.json` covers `ops` and `harness` so the tests and the runner are
+  // held to the same strictness as everything else. None of that ships: the
+  // harness imports vitest and the Dawn binding, so publishing it would put two
+  // devDependencies on a consumer's runtime import graph to deliver code that
+  // only ever runs against this repo's own suite.
+  //
+  // The entry points are named rather than globbed by directory so the program
+  // is exactly the reachable graph — an op's `index.ts` pulls in its
+  // `reference.ts` and stops there. Test-only helpers beside them
+  // (`ops/*/cases.ts`) are reached by no entry point and so are never emitted,
+  // which is why there is no exclude list to keep in sync.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": "dist",
+    "declaration": true,
+    // The comments in this repo carry the reasoning, and that reasoning is worth
+    // reading — but it is worth reading in the source, not in a bundle a browser
+    // downloads. `declaration` keeps the JSDoc, so hovering a symbol in an
+    // editor still shows why the op behaves the way it does.
+    "removeComments": true,
+    // Op code depends on no ambient types at all. Stating that here rather than
+    // inheriting `["@webgpu/types", "node"]` makes the build fail if a reference
+    // ever reaches for a `GPUBuffer` or a `node:` global, which would quietly
+    // narrow where the published package can run.
+    "types": []
+  },
+  "include": ["ops/*/index.ts"]
+}

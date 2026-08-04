@@ -16,6 +16,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      # The tests import from the source tree and never touch `dist/`, so a
+      # broken package — a missing kernel, an op left out of the build — is
+      # invisible to them. Building here is what makes it visible before a
+      # publish rather than after one.
+      - run: npm run build
       # Runners have no GPU. The suite skips rather than fails there, so this
       # checks that everything compiles and the harness degrades cleanly —
       # the kernels themselves are verified on a machine with an adapter.
