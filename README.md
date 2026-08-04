@@ -520,6 +520,28 @@ retried, because that would launder a broken kernel into a green suite.
 Measured after the change: 10 consecutive full runs green, one announced retry
 across all ten. Issue #38 has the bisection.
 
+## Releasing
+
+Publishing is driven by a tag, not by a merge, so that preparing a release and
+shipping it stay two decisions:
+
+```bash
+# on main, with package.json already at the new version
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` then lints, builds, runs the suite, checks that
+the tag agrees with `package.json` — a mistyped tag would otherwise publish a
+version nobody asked for, and npm versions cannot be replaced — and publishes
+with `--provenance`, which links the tarball to the workflow run and commit that
+produced it.
+
+It authenticates with an `NPM_TOKEN` repository secret (an npm **automation**
+token, since a publish token subject to 2FA cannot be used unattended). npm's
+trusted publishing (OIDC) would remove that secret, but it cannot be configured
+for a package that does not yet exist on the registry, so it is a change to make
+after the first release rather than before it.
+
 ## License
 
 MIT

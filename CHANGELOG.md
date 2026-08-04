@@ -558,6 +558,24 @@ Entries record **why** a change was needed. What changed is in the diff.
   without that check a package missing its entire WGSL backend would type-check,
   pack and publish without a word.
 
+- Publishing is a **tag-triggered workflow** rather than a command someone runs
+  on a laptop. `.github/workflows/release.yml` fires on `v*`, repeats the lint,
+  build and test that CI runs — a tag can point at a commit that never went
+  through CI — and publishes with `--provenance`, so the tarball is linked to the
+  workflow run and commit that produced it rather than being bytes of unknown
+  origin. It refuses to publish when the tag disagrees with `package.json`: the
+  tag is typed by hand while `npm publish` reads the version from the file, and
+  an npm version, once taken, cannot be replaced.
+
+  The token is an npm automation token in a repository secret. Trusted publishing
+  (OIDC) would remove that secret, and is the better end state, but npm cannot
+  configure a trusted publisher for a package that does not exist on the registry
+  yet — so it is a follow-up to the first release, not part of it.
+
+- `package.json` carries `keywords`, `homepage` and `bugs`. None of it changes
+  what is installed; all of it is what npm's own page and search have to work
+  from, and a package that cannot be found is not meaningfully published.
+
 - The first released version is `0.1.0`, not `1.0.0`. One backend of the three
   described here exists, every op's speed is unmeasured against the roofline it
   should be reported against, and the resolution grammar has target and dtype
