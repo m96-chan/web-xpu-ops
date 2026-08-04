@@ -1,1 +1,7 @@
-export { snake, SNAKE_EPS, type SnakeArgs } from "./reference.js";
+export {
+  snake,
+  snakeBeta,
+  SNAKE_EPS,
+  type SnakeArgs,
+  type SnakeBetaArgs,
+} from "./reference.js";

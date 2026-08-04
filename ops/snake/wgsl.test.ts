@@ -1,8 +1,9 @@
 import { describe } from "vitest";
 import { expectAgrees, gpuTest, kernel, params, useGpu } from "../../harness/index.js";
-import { snake } from "./reference.js";
+import { snake, snakeBeta } from "./reference.js";
 
 const code = kernel(import.meta.url);
+const betaCode = kernel(import.meta.url, "beta");
 
 /**
  * Every case is built here, at module scope, before a device exists.
@@ -140,6 +141,154 @@ describe("snake / wgsl", () => {
       await expectAgrees(
         run,
         { code, bindings: [...bindings(c)], workgroups: [c.workgroups] },
+        [c.expected],
+      );
+    });
+  }
+});
+
+/* ------------------------------------------------------------------------ *
+ * snake_beta — the second entry point (#88)
+ * ------------------------------------------------------------------------ */
+
+interface BetaCase extends Case {
+  beta: Float32Array;
+}
+
+/**
+ * Deliberately **different from `ALPHAS`, element for element**.
+ *
+ * The whole point of SnakeBeta is that the sine's frequency and the amplitude
+ * it is added at are separate numbers. A test where they happen to match is a
+ * test of `snake` wearing a second buffer: swapping the two bindings, or
+ * reading α where β belongs, would sail through it.
+ */
+const BETAS = [3, 0.05, 0.5, 12, 1, 0.2, 7];
+
+function buildBeta(label: string, N: number, C: number, L: number): BetaCase {
+  const total = N * C * L;
+  const workgroups = Math.ceil(total / WG);
+  const alpha = Float32Array.from({ length: C }, (_, c) => ALPHAS[c % ALPHAS.length]!);
+  const beta = Float32Array.from({ length: C }, (_, c) => BETAS[c % BETAS.length]!);
+  const input = Float32Array.from({ length: total }, (_, i) => Math.sin(i * 0.37) * 10);
+  const padded = new Float32Array(workgroups * WG).fill(SENTINEL);
+  padded.set(input);
+  const expected = new Float32Array(workgroups * WG);
+  expected.set(snakeBeta({ input, alpha, beta, N, C, L }));
+  return { label, N, C, L, alpha, beta, padded, expected, workgroups };
+}
+
+const betaCases = [
+  // C > 1 with L > 1, so both α and β are indexed by a real division.
+  buildBeta("N=1 C=4 L=7", 1, 4, 7),
+  // The batch axis has to be skipped over by *both* parameter lookups.
+  buildBeta("N=2 C=3 L=5", 2, 3, 5),
+  // Not a multiple of 256: the bounds check is load-bearing, and the sentinel
+  // tail is `snake_beta(4.5)` with α and β read out of range rather than 0.
+  buildBeta("N=2 C=5 L=30", 2, 5, 30),
+];
+
+const betaBindings = (c: BetaCase) =>
+  [
+    { kind: "storage", data: c.padded },
+    { kind: "storage", data: c.alpha },
+    { kind: "storage", data: c.beta },
+    { kind: "out", type: "f32", length: c.expected.length },
+    {
+      kind: "uniform",
+      data: params([
+        ["u32", c.N],
+        ["u32", c.C],
+        ["u32", c.L],
+      ]),
+    },
+  ] as const;
+
+/**
+ * β = α, which must reproduce `snake` exactly — that is the claim that this
+ * generalises rather than replaces.
+ *
+ * Checked against `snake`'s **own** reference rather than against
+ * `snakeBeta`'s, so it is an equivalence between the two functions and not a
+ * restatement of one of them.
+ */
+const betaEqualsAlpha = (() => {
+  const [N, C, L] = [1, 3, 9];
+  const alpha = Float32Array.from([0.37, 2.5, 10]);
+  const input = Float32Array.from({ length: N * C * L }, (_, i) => Math.sin(i * 0.61) * 8);
+  const padded = new Float32Array(WG).fill(SENTINEL);
+  padded.set(input);
+  const expected = new Float32Array(WG);
+  expected.set(snake({ input, alpha, N, C, L }));
+  return {
+    label: "β = α reproduces snake",
+    N,
+    C,
+    L,
+    alpha,
+    beta: alpha,
+    padded,
+    expected,
+    workgroups: 1,
+  };
+})();
+
+/**
+ * α = 0 with an ordinary β, and β = 0 with an ordinary α. They are **not**
+ * symmetric, and that asymmetry is the reason the epsilon moved.
+ *
+ * At α = 0 the sine is 0, so the answer is x whatever β does — benign, exactly
+ * as in `snake`. At β = 0 the scale is 1e9 and it multiplies a sine that is
+ * *not* zero, so the output is enormous and finite. Written as `1/β` it would
+ * be `inf · sin²` — still enormous, but infinite, and no tolerance survives
+ * that. Channel 2 carries ordinary values in the same dispatch so neither case
+ * can pass by the kernel ignoring a buffer.
+ *
+ * Reachable through this API, not through a checkpoint: MioCodec stores log β
+ * and the loader exponentiates, and `exp` is never 0. The guard is defensive.
+ */
+const zeroParams = (() => {
+  const [N, C, L] = [1, 3, 6];
+  const alpha = Float32Array.from([0, 1.5, 2]);
+  const beta = Float32Array.from([2, 0, 0.75]);
+  const input = Float32Array.from({ length: N * C * L }, (_, i) => (i % 6) * 0.4 - 1);
+  const padded = new Float32Array(WG).fill(SENTINEL);
+  padded.set(input);
+  const expected = new Float32Array(WG);
+  expected.set(snakeBeta({ input, alpha, beta, N, C, L }));
+  return { label: "α = 0 and β = 0", N, C, L, alpha, beta, padded, expected, workgroups: 1 };
+})();
+
+describe("snake_beta / wgsl", () => {
+  useGpu();
+
+  for (const c of [...betaCases, betaEqualsAlpha, zeroParams]) {
+    gpuTest(`agrees with the reference at ${c.label}`, async (run) => {
+      // Default tolerance, and `snake`'s argument for why does **not** carry
+      // over. There, `sin(αx)`'s error of ≈1.2e-7·α|x| was divided straight
+      // back out by the `1/α` in front, leaving ≈2.4e-7·|x| whatever α was.
+      // Here the divisor is β, so nothing cancels and the absolute error
+      // scales as ≈2.4e-7·(α/β)·|x| — these cases run α/β up to 200 (α = 10
+      // against β = 0.05).
+      //
+      // What holds it together is that the same 1/β amplifies the output, so
+      // the *relative* error stays where `snake`'s was. Measured on this
+      // device with a zero tolerance, worst element per case:
+      //
+      //   N=1 C=4 L=7      abs 6.68e-6   rel 1.44e-6
+      //   N=2 C=3 L=5      abs 2.09e-7   rel 1.04e-6
+      //   N=2 C=5 L=30     abs 6.20e-6   rel 4.60e-6
+      //   β = α            abs 1.19e-7   rel 1.29e-7
+      //   α = 0 and β = 0  abs 1.34e-7   rel 1.31e-6
+      //
+      // So the absolute figures sit above the default 1e-6 and the relative
+      // ones under the default 1e-5, which is what carries these — the same
+      // shape as `snake`, reached for a different reason. Measured over the
+      // ratios above rather than proven, so a case with a far smaller β would
+      // need measuring again rather than assuming.
+      await expectAgrees(
+        run,
+        { code: betaCode, bindings: [...betaBindings(c)], workgroups: [c.workgroups] },
         [c.expected],
       );
     });

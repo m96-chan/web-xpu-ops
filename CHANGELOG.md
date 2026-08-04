@@ -34,6 +34,25 @@ Entries record **why** a change was needed. What changed is in the diff.
   ulps and not noise. `C % G != 0` throws, as torch does; distributing a
   remainder would be a different op that happens to run. The layout is `[N, C,
   L]` contiguous, which makes a group one unbroken run rather than a stride.
+- `snake_beta`, as a second entry point of `ops/snake` — `x + sin²(α·x)/β`, with
+  α and β both learned per channel. Added because "Snake" turns out to name two
+  different functions and the library shipped only one of them: DACVAE's has a
+  single α, while BigVGAN's `SnakeBeta` — which MioCodec's decoder is built from
+  — separates the sine's frequency from the amplitude it is added at. β = α
+  recovers the one-parameter form, so this generalises rather than replaces.
+  Two entry points rather than one kernel with an optional binding, because an
+  unreferenced binding throws since #46 and the α-only path would otherwise have
+  to supply a β buffer it never reads.
+
+  The reason this needed saying at all is that the two fail into each other
+  silently. A checkpoint holds a tensor called `alpha` and nothing in it says
+  which function it belongs to — and the BigVGAN family stores **logarithms**
+  where DACVAE stores values, so reading one as the other turns a log-scale
+  α of `0.0` into α = 0, which makes `sin(0·x)` vanish and collapses the whole
+  activation to the identity. No NaN, no shape mismatch: just a vocoder that
+  sounds duller than it should. Neither kernel exponentiates — that belongs to
+  whoever reads the checkpoint — and both references now say so where a reader
+  will look.
 - `snake` — `x + sin²(α·x)/α` with a learned per-channel α, as a **separate op**
   rather than a kind of `activation`. Every neural audio codec worth decoding on
   the web is built from it (DACVAE, BigVGAN), and without it the decoder stops
