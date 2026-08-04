@@ -186,7 +186,67 @@ function inverseDispatch(
 
 const padding = (nFft: number, center: boolean) => (center ? Math.floor(nFft / 2) : 0);
 
+/**
+ * `"same"` on the GPU, with no kernel change at all.
+ *
+ * The kernel already takes the leading crop as a uniform and says so: "the
+ * caller resolves the convention". That claim is only worth anything if a
+ * convention it has never seen works without touching it, which is what this
+ * asserts — the mode is arithmetic on the host, not a branch in the shader.
+ */
+const SAME_N_FFT = 16;
+const SAME_HOP = 4;
+const SAME_FRAMES = 6;
+const SAME_BINS = SAME_N_FFT / 2 + 1;
+const SAME_WINDOW = hannWindow(SAME_N_FFT);
+const SAME_REAL = Float32Array.from(
+  { length: SAME_FRAMES * SAME_BINS },
+  (_, i) => Math.cos(0.41 * i) * 1.7,
+);
+const SAME_IMAG = Float32Array.from(
+  { length: SAME_FRAMES * SAME_BINS },
+  (_, i) => Math.sin(0.29 * i) - 0.3,
+);
+const SAME_EXPECTED = istft({
+  real: SAME_REAL,
+  imag: SAME_IMAG,
+  frames: SAME_FRAMES,
+  nFft: SAME_N_FFT,
+  hop: SAME_HOP,
+  window: SAME_WINDOW,
+  padding: "same",
+});
+const SAME_PAD = (SAME_N_FFT - SAME_HOP) / 2;
+
 /** Every dispatch and every expected array, built before any device exists. */
+gpuTest("synthesises same padding, with the crop resolved on the host", async (run) => {
+  // Length is hop * frames = 24, not the 20 centred gives or the 36 uncentred
+  // does — a wrong crop here is a waveform that is merely the wrong length.
+  expect(SAME_EXPECTED).toHaveLength(SAME_HOP * SAME_FRAMES);
+  await expectAgrees(
+    run,
+    {
+      code: inverse,
+      bindings: [
+        { kind: "storage", data: SAME_REAL },
+        { kind: "storage", data: SAME_IMAG },
+        { kind: "storage", data: SAME_WINDOW },
+        { kind: "out", type: "f32", length: SAME_EXPECTED.length },
+        {
+          kind: "uniform",
+          data: params([
+            ["u32", SAME_N_FFT], ["u32", SAME_HOP], ["u32", SAME_BINS],
+            ["u32", SAME_FRAMES], ["u32", SAME_EXPECTED.length], ["u32", SAME_PAD],
+          ]),
+        },
+      ],
+      workgroups: [Math.ceil(SAME_EXPECTED.length / 256)],
+    },
+    [SAME_EXPECTED],
+    SMALL_INVERSE,
+  );
+});
+
 const FORWARD_CASES = SHAPES.map(({ name, nFft, hop, length, center, forwardTolerance: tolerance }) => {
   const window = center ? hannWindow(nFft) : liftedHann(nFft);
   const signal = nFft > 64 ? voice(length) : wave(length);

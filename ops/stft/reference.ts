@@ -67,6 +67,20 @@ export interface StftArgs {
   center?: boolean;
 }
 
+/**
+ * How the synthesised signal is trimmed at its edges.
+ *
+ * - `"center"` — drop `floor(nFft / 2)` from each end, undoing `stft`'s centring
+ *   pad. `torch.istft(center=True)`.
+ * - `"none"` — return everything the frames cover. `torch.istft(center=False)`.
+ * - `"same"` — drop `(nFft - hop) / 2` from each end, so `T` frames give exactly
+ *   `T * hop` samples. **Not a torch mode**, and it cannot be built from one:
+ *   see `istft` for why `"none"` plus a slice fails before it can be sliced.
+ *   It is the Vocos / X-Codec-2 / MioCodec vocoder convention, chosen because a
+ *   vocoder wants as many samples out as frames times hop.
+ */
+export type IstftPadding = "center" | "none" | "same";
+
 export interface IstftArgs {
   real: ArrayLike<number>;
   imag: ArrayLike<number>;
@@ -74,7 +88,10 @@ export interface IstftArgs {
   nFft: number;
   hop: number;
   window: ArrayLike<number>;
+  /** Kept for callers written before `padding` existed; `true` is `"center"`. */
   center?: boolean;
+  /** Edge trimming. Defaults to `"center"`. Giving both this and `center` raises. */
+  padding?: IstftPadding;
   /** Output samples. Defaults to `istftLength(...)`; may not exceed `istftMaxLength(...)`. */
   length?: number;
 }
@@ -95,8 +112,13 @@ export function stftFrames(nFft: number, hop: number, length: number, center = t
  * Centred, this is `hop * (frames - 1)`: the trailing half-window is dropped
  * because it came from padding. See `istftMaxLength` for what is recoverable.
  */
-export function istftLength(nFft: number, hop: number, frames: number, center = true): number {
-  return nFft + hop * (frames - 1) - 2 * padding(nFft, center);
+export function istftLength(
+  nFft: number,
+  hop: number,
+  frames: number,
+  mode: IstftPadding | boolean = true,
+): number {
+  return nFft + hop * (frames - 1) - 2 * padding(nFft, hop, mode);
 }
 
 /**
@@ -105,12 +127,41 @@ export function istftLength(nFft: number, hop: number, frames: number, center = 
  * Larger than `istftLength` by the leading pad when centred, and asking for it
  * is how a signal whose length is not a multiple of `hop` gets its tail back.
  */
-export function istftMaxLength(nFft: number, hop: number, frames: number, center = true): number {
-  return nFft + hop * (frames - 1) - padding(nFft, center);
+export function istftMaxLength(
+  nFft: number,
+  hop: number,
+  frames: number,
+  mode: IstftPadding | boolean = true,
+): number {
+  const trim = padding(nFft, hop, mode);
+  // `"same"` crops both ends, so nothing is left over to ask back for: every
+  // frame's contribution is either kept or cropped. The other two crop only the
+  // head, and the extra reach is how a signal whose length is not a multiple of
+  // hop gets its tail back.
+  return resolve(mode) === "same"
+    ? nFft + hop * (frames - 1) - 2 * trim
+    : nFft + hop * (frames - 1) - trim;
 }
 
-function padding(nFft: number, center: boolean): number {
-  return center ? Math.floor(nFft / 2) : 0;
+function resolve(mode: IstftPadding | boolean): IstftPadding {
+  if (mode === true) return "center";
+  if (mode === false) return "none";
+  return mode;
+}
+
+/**
+ * Samples dropped from the head.
+ *
+ * `"same"` uses `(nFft - hop) / 2`, which is upstream's `(win_length -
+ * hop_length) // 2` — the window here is always `nFft` long. At MioCodec's
+ * `nFft = 1920, hop = 480` that is 720, where `"center"` would take 960 and
+ * `"none"` none.
+ */
+function padding(nFft: number, hop: number, mode: IstftPadding | boolean): number {
+  const resolved = resolve(mode);
+  if (resolved === "none") return 0;
+  if (resolved === "same") return Math.floor((nFft - hop) / 2);
+  return Math.floor(nFft / 2);
 }
 
 /**
@@ -132,7 +183,9 @@ export function stft({ input, nFft, hop, window, center = true }: StftArgs): Spe
   if (hop < 1) throw new Error(`hop must be positive, got ${hop}`);
   if (window.length !== nFft) throw new Error(`window must be ${nFft} long, got ${window.length}`);
   const signalLength = input.length;
-  const pad = padding(nFft, center);
+  // The forward has only torch's two modes; `"same"` is a synthesis-side
+  // convention and has no analysis counterpart to invert.
+  const pad = padding(nFft, hop, center);
   // torch raises the same way: reflection may not reach past the far edge.
   if (center && pad >= signalLength) {
     throw new Error(`reflect padding of ${pad} needs more than ${signalLength} samples`);
@@ -182,9 +235,16 @@ export function istft({
   nFft,
   hop,
   window,
-  center = true,
+  center,
+  padding: mode,
   length,
 }: IstftArgs): Float32Array {
+  if (center !== undefined && mode !== undefined) {
+    // Ranking them would make one of two explicit requests silently lose. torch
+    // takes the same line with `is_causal` and `attn_mask`.
+    throw new Error("give either center or padding, not both");
+  }
+  const resolved = resolve(mode ?? center ?? true);
   if (nFft < 1) throw new Error(`nFft must be positive, got ${nFft}`);
   if (hop < 1) throw new Error(`hop must be positive, got ${hop}`);
   if (window.length !== nFft) throw new Error(`window must be ${nFft} long, got ${window.length}`);
@@ -194,14 +254,14 @@ export function istft({
       throw new Error(`${name} must be ${frames} x ${bins} = ${frames * bins}, got ${side.length}`);
     }
   }
-  const samples = length ?? istftLength(nFft, hop, frames, center);
-  const reach = istftMaxLength(nFft, hop, frames, center);
+  const samples = length ?? istftLength(nFft, hop, frames, resolved);
+  const reach = istftMaxLength(nFft, hop, frames, resolved);
   if (samples > reach) {
     // torch zero-pads here and warns. See the header for why this refuses.
     throw new Error(`${frames} frames reach ${reach} samples, cannot produce ${samples}`);
   }
 
-  const pad = padding(nFft, center);
+  const pad = padding(nFft, hop, resolved);
   const even = nFft % 2 === 0;
   const output = new Float32Array(samples);
 
@@ -227,6 +287,14 @@ export function istft({
       numerator += w * (acc / nFft);
       envelope += w * w;
     }
+    // The floor is checked over the samples actually returned, which is the
+    // only place it can be. This loop never visits a cropped sample, so nothing
+    // is relaxed for `"same"` — the check simply lives where the answer is.
+    // That distinction matters: upstream folds the whole signal and asserts only
+    // over the retained region for exactly this reason, and a floor applied to
+    // cropped samples would make `"same"` throw for the very reason it exists.
+    // The edge samples `"none"` returns really are unreconstructable; the ones
+    // `"same"` crops are simply not asked for.
     if (envelope < NOLA_FLOOR) {
       throw new Error(
         `window fails NOLA at sample ${t}: the w² envelope is ${envelope}, below ${NOLA_FLOOR}`,
