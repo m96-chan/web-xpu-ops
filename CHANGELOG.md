@@ -18,6 +18,22 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `group_norm` — `torch.nn.functional.group_norm`, pooling statistics over a
+  group of channels while applying the affine transform per channel. Added
+  because a codec decoder's residual blocks are `GroupNorm → SiLU → Conv1d` and
+  nothing here could express the reduction: `layernorm` over `[N·C, L]` gives one
+  mean per channel, where GroupNorm pools `C/G` of them into each. Same input,
+  same output shape, no error either way, different numbers — the shape of bug
+  this library exists to keep out of a caller's code.
+
+  Both numerical conventions were measured against torch 2.10 rather than
+  inherited from `layernorm`, since `group_norm` is a separate kernel upstream
+  and its agreement is worth one measurement: the biased variance matched to
+  4.4e-16 while the unbiased form was out by 1.6e-1, and moving `eps` outside
+  the square root moved the answer by 4.3e-6 — small, but four thousand f32
+  ulps and not noise. `C % G != 0` throws, as torch does; distributing a
+  remainder would be a different op that happens to run. The layout is `[N, C,
+  L]` contiguous, which makes a group one unbroken run rather than a stride.
 - `snake_beta`, as a second entry point of `ops/snake` — `x + sin²(α·x)/β`, with
   α and β both learned per channel. Added because "Snake" turns out to name two
   different functions and the library shipped only one of them: DACVAE's has a
