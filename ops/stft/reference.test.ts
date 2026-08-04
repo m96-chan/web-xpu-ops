@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { agree } from "../../harness/index.js";
-import { hannWindow, istft, istftLength, istftMaxLength, stft, stftFrames } from "./reference.js";
+import {
+  hannWindow,
+  istft,
+  istftLength,
+  istftMaxLength,
+  stft,
+  stftFrames,
+} from "./reference.js";
 
 /**
  * The conventions, pinned to the library they claim to match.
@@ -68,6 +75,16 @@ const ISTFT_OUT = [
   -0.07069075770621946, -0.11324549647897113, 0.11918595028055268, -0.1881816052340515,
 ];
 
+/** The arbitrary spectrogram the istft tests share. */
+const arbitrary = () => ({
+  real: ARBITRARY_REAL,
+  imag: ARBITRARY_IMAG,
+  frames: FRAMES,
+  nFft: N_FFT,
+  hop: HOP,
+  window: hannWindow(N_FFT),
+});
+
 describe("stft / reference", () => {
   it("gives the periodic Hann window, as torch does", () => {
     expect(agree(hannWindow(8), HANN8, TOLERANCE)).toBeNull();
@@ -122,6 +139,83 @@ describe("stft / reference", () => {
     // 1e-5 because the spectrogram was stored as f32 in between; torch does the
     // same round trip in f64 and lands at 4e-16.
     expect(agree(out, input, { rel: 1e-5, abs: 1e-5 })).toBeNull();
+  });
+
+  // "same" padding: the vocoder convention, and the reason this op exists.
+  // MioCodec's ISTFTHead crops (nFft - hop) / 2 from each end so T frames give
+  // exactly T * hop samples. torch cannot express it: center=false leaves the
+  // uncropped edges in, and those edges fail NOLA before any slice can happen.
+  it("gives three different lengths for the three paddings", () => {
+    // The failure this guards against is a waveform a little too long or short
+    // that still sounds like audio, so the lengths are asserted against each
+    // other rather than each in isolation.
+    const nFft = 8;
+    const hop = 4;
+    const frames = 5;
+    expect(istftLength(nFft, hop, frames, "center")).toBe(hop * (frames - 1));
+    expect(istftLength(nFft, hop, frames, "none")).toBe(nFft + hop * (frames - 1));
+    expect(istftLength(nFft, hop, frames, "same")).toBe(hop * frames);
+    // Three modes, three answers: 16, 24 and 20.
+    const lengths = new Set([
+      istftLength(nFft, hop, frames, "center"),
+      istftLength(nFft, hop, frames, "none"),
+      istftLength(nFft, hop, frames, "same"),
+    ]);
+    expect(lengths.size).toBe(3);
+  });
+
+  it("reaches no further than it returns under same padding", () => {
+    // Every frame's contribution is either kept or cropped, so unlike centred
+    // padding there is no tail to ask back for.
+    expect(istftMaxLength(8, 4, 5, "same")).toBe(istftLength(8, 4, 5, "same"));
+    expect(() => istft({ ...arbitrary(), padding: "same", length: 21 })).toThrow(/cannot produce/);
+  });
+
+  it("answers hop * frames at MioCodec's shape", () => {
+    // nFft 1920, hop 480: the crop is 720, where centred would take 960 and
+    // uncentred none. Measured decode lengths upstream were 24000, 19680 and
+    // 76800 for 50, 41 and 160 frames.
+    for (const [frames, samples] of [[50, 24000], [41, 19680], [160, 76800]] as const) {
+      expect(istftLength(1920, 480, frames, "same")).toBe(samples);
+    }
+  });
+
+  it("synthesises the samples center: false cannot, because they fail NOLA", () => {
+    // The workaround this replaces: ask for the uncropped signal and slice.
+    // It cannot even be requested — output sample 0 is covered only by frame 0
+    // at n = 0, where a periodic Hann is exactly 0.
+    expect(() => istft({ ...arbitrary(), center: false })).toThrow(/NOLA/);
+    const same = istft({ ...arbitrary(), padding: "same" });
+    expect(same).toHaveLength(20);
+    expect(same.every(Number.isFinite)).toBe(true);
+  });
+
+  it("leaves the old boolean exactly where it was", () => {
+    // Nothing existing may move. Asserted as identity against the new spelling
+    // rather than against the torch constants: those are f64 and the op returns
+    // f32, so `toEqual` on them would compare rounding, not behaviour. The
+    // agreement with torch is already pinned by the test above.
+    expect(Array.from(istft({ ...arbitrary(), center: true }))).toEqual(
+      Array.from(istft({ ...arbitrary(), padding: "center" })),
+    );
+    // `false` and `"none"` both refuse this window, and must refuse alike —
+    // that they throw at all is the fact `"same"` exists to work around.
+    const asBoolean = () => istft({ ...arbitrary(), center: false });
+    const asMode = () => istft({ ...arbitrary(), padding: "none" });
+    expect(asBoolean).toThrow(/NOLA at sample 0/);
+    expect(asMode).toThrow(/NOLA at sample 0/);
+    // And the default is still centred: omitting both must equal center: true.
+    expect(Array.from(istft(arbitrary()))).toEqual(
+      Array.from(istft({ ...arbitrary(), center: true })),
+    );
+    expect(istftLength(8, 4, 5, true)).toBe(istftLength(8, 4, 5, "center"));
+    expect(istftLength(8, 4, 5, false)).toBe(istftLength(8, 4, 5, "none"));
+    expect(istftMaxLength(8, 4, 5, true)).toBe(istftMaxLength(8, 4, 5, "center"));
+  });
+
+  it("refuses center and padding together, rather than ranking them", () => {
+    // torch raises when is_causal and attn_mask are both given; same reasoning.
+    expect(() => istft({ ...arbitrary(), center: true, padding: "same" })).toThrow(/both/i);
   });
 
   it("refuses a length the frames do not reach", () => {

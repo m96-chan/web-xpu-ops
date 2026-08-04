@@ -18,6 +18,14 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `istft` synthesises `"same"` padding, the vocoder convention: `(nFft - hop) / 2`
+  cropped from each end, so `T` frames give exactly `T * hop` samples. torch has
+  no such mode and it cannot be composed from one — `center: false` returns edge
+  samples whose `w²` envelope is zero, so the signal a caller would slice cannot
+  be produced in the first place. This is the last stage of a MioCodec-style
+  decoder, and the point where latents become audio. `center` keeps working and
+  is unchanged; `padding` is the new spelling and giving both raises.
+
 - `group_norm` — `torch.nn.functional.group_norm`, pooling statistics over a
   group of channels while applying the affine transform per channel. Added
   because a codec decoder's residual blocks are `GroupNorm → SiLU → Conv1d` and
