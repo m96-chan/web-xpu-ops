@@ -1,20 +1,27 @@
 {
   "name": "web-xpu-ops",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Web primitive layer implementations for xPU: one reference per op, one implementation per backend, and tests that hold them together.",
   "type": "module",
   "license": "MIT",
   "author": "Yusuke Harada",
   "repository": { "type": "git", "url": "git+https://github.com/m96-chan/web-xpu-ops.git" },
-  "files": ["ops", "harness", "README.md", "CHANGELOG.md"],
+  "files": ["dist", "CHANGELOG.md"],
+  "sideEffects": false,
   "exports": {
-    "./harness": "./harness/index.ts",
-    "./ops/*": "./ops/*/index.ts"
+    "./ops/*": {
+      "types": "./dist/ops/*/index.d.ts",
+      "default": "./dist/ops/*/index.js"
+    },
+    "./ops/*.wgsl": "./dist/ops/*.wgsl",
+    "./package.json": "./package.json"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/assets.mjs",
     "lint": "tsc --noEmit",
     "test": "node scripts/test.mjs",
-    "test:file": "vitest run"
+    "test:file": "vitest run",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

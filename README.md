@@ -25,7 +25,7 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Twenty-four ops, WGSL only, verified against their references on a real GPU.
+Twenty-seven ops, WGSL only, verified against their references on a real GPU.
 
 **Speed is unmeasured for every one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
@@ -123,6 +123,54 @@ is indistinguishable from silence in a vocoder output.
 The kernels are a naive DFT per frame, not an FFT. 1920 is `2^7 * 15`, so radix-2
 does not apply, and this runs beside a transformer over a few hundred frames.
 Speed is **unmeasured**.
+
+---
+
+## Install
+
+```bash
+npm install web-xpu-ops
+```
+
+Compiled JavaScript and `.d.ts` ship beside the `.wgsl` kernels, so nothing at
+the other end needs a TypeScript toolchain to consume this. ESM only, Node ≥ 20.
+
+## Using it
+
+An op is two things, and they are imported separately because they run in
+different places.
+
+The **reference** is plain TypeScript with no dependencies — no GPU, no `node:`
+imports — so the same import works in a browser, in Node and in a test runner:
+
+```ts
+import { matmul } from "web-xpu-ops/ops/matmul";
+
+const c = matmul({ a, b, M: 64, N: 64, K: 64 }); // Float32Array, [M, N]
+```
+
+It is the definition of what the op means, not a fast path. It accumulates in
+f64 and is written to be read rather than to be quick, which is the whole reason
+it can be trusted as the thing a kernel is checked against. Reach for it to
+verify a result, not to produce one at speed.
+
+The **kernel** is the WGSL, published at a path that mirrors the resolution
+grammar (`<entry>[.<target>][.<dtype>].wgsl`):
+
+```ts
+import code from "web-xpu-ops/ops/matmul/wgsl/kernel.wgsl?raw";
+```
+
+Turning a `.wgsl` file into a string is your bundler's job rather than this
+package's — `?raw` is Vite's spelling, webpack wants `asset/source`, and fetching
+the file at runtime works too. What is promised here is only that the path is
+stable and the file is present.
+
+You supply the `GPUDevice`. This library has no opinion about how an application
+gets one, and the Node-and-Dawn runner under `harness/` is test infrastructure
+rather than a runtime: it imports vitest, so it is deliberately not published.
+
+---
 
 Everything below this line is design, not code. It is written down so the shape
 is decided before there is enough built for the shape to be hard to change.
@@ -345,9 +393,10 @@ target-specific tuning pays off most.
 
 ### `kernel/` — one fused, named operation
 
-`rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `softmax` ✅ · `activation` ✅ ·
-`snake` ✅ · `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ · `attention` ✅ ·
-`flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ · `stft` / `istft` ✅
+`rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `group_norm` ✅ · `softmax` ✅ ·
+`activation` ✅ · `snake` ✅ · `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ ·
+`attention` ✅ · `flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ ·
+`stft` / `istft` ✅
 
 Fusion is the reason this layer exists rather than being composed from
 `primitive/` at call time. `flash_attention` is not `matmul` + `softmax` +
@@ -390,7 +439,7 @@ everything else in behind it.
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 24 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
+| WGSL | 27 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 

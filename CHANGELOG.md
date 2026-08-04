@@ -7,14 +7,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-04
+
 ### Documentation
 
-- The README's op count, backend table and roadmap now match what is on disk.
-  They drifted because nineteen op PRs landed in parallel and each was told to
-  leave the shared count line alone — otherwise all nineteen conflict on it. The
-  per-op rows and roadmap ticks were correct throughout; only the totals were
-  stale. The count line now also states outright that speed is unmeasured for
-  every op, since rule 9 treats an omission as a claim of speed.
+- The README's op count, backend table and roadmap match what is on disk:
+  **twenty-seven** ops, where both count lines still said twenty-four. This is
+  the second time these same lines have gone stale, and the reason is structural
+  rather than careless — op PRs land in parallel and each is told to leave the
+  shared count line alone, since otherwise every one of them conflicts on it. The
+  count is therefore correct when it is written and wrong again once the next
+  batch merges. `group_norm` had also reached the per-op table without reaching
+  the roadmap's `kernel/` layer, which is the same drift wearing a different
+  shape. The per-op rows were right throughout; only the totals and that one
+  roadmap tick were not. The count line still states outright that speed is
+  unmeasured for every op, since rule 9 treats an omission as a claim of speed.
+
+  Nothing here stops it happening a third time. What would is a test asserting
+  the count against `ops/` on disk, the way `harness/coverage.ts` already asserts
+  that a kernel variant cannot exist without a test looping it — worth doing, and
+  deliberately not smuggled into a release-preparation change.
+
+- The README says how to install this and what to import. It had neither: written
+  as a design document, it could tell a reader why `scatter` accumulates but not
+  how to call it. An op's two halves are now given as two imports, because they
+  run in different places — the reference is dependency-free TypeScript that runs
+  anywhere, while the kernel is a `.wgsl` file whose loading belongs to the
+  caller's bundler and is documented as such rather than guessed at here.
 
 ### Added
 
@@ -164,42 +183,6 @@ Entries record **why** a change was needed. What changed is in the diff.
 - The device now asks the adapter for the limits it actually offers. A device
   requested with none caps storage bindings at 128 MiB where this adapter allows
   2 GB.
-
-### Fixed
-
-- The harness refuses a shader that does not compile instead of reading back
-  zeros. Output buffers start zeroed, so a dispatch that never ran produced a
-  result — and where an expected value contains zeros, that is a passing test
-  over a kernel that executed nothing. Every correctness claim here is "it agrees
-  with the reference", so a silent no-op reading as agreement could have hollowed
-  out all of them at once. Compiled modules are now cached by source as well, so
-  the check costs one await per distinct shader rather than one per dispatch.
-
-- The per-file timeout in `npm test` actually fires. It never had: `npx` starts
-  vitest as a grandchild that keeps the stdout pipe open, so killing the child
-  left `"close"` unfired and the run waited forever. A hanging file took an outer
-  120s kill instead of the 6s limit it was given. It hid because a *GPU* hang
-  brings the worker down within seconds on its own, which looked like the timeout
-  working — the suite could not tell "wedged" from "slow".
-
-### Changed
-
-- The score kernels of `attention`, `gqa` and `flash_attention` take a **mask
-  buffer at every dispatch**, not only when there is a mask, and their uniform
-  blocks gained three fields for its broadcast shape. A bias of zeros *is* "no
-  mask" — it is what torch's own reference does — and making it unconditional
-  removes a per-element branch and a `has_mask` guard whose only failing input
-  would be a dummy buffer nobody reads. It costs `B * S` floats against the
-  `B * H * L * S` these kernels already move. Callers driving the WGSL directly
-  must add the binding; `attention` and `gqa` bind it at index 2, `flash_attention`
-  at index 3.
-- `npm test` runs one test file per vitest process. A single process cannot cross
-  a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
-  pool or hangs, with no kernel of its own required to trigger it. The runner also
-  refuses to report a false pass: a crashed vitest worker can exit 0 having
-  skipped most of the suite, so every file is now accounted for individually.
-
-### Added
 
 - `harness` — a WGSL runner over Dawn in Node, an `agree` comparator that passes
   an element on either relative or absolute difference, and a suite helper that
@@ -516,4 +499,69 @@ Entries record **why** a change was needed. What changed is in the diff.
   Speed is **unmeasured**: the roofline harness it should be reported against
   does not exist yet.
 
-[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/main...HEAD
+### Fixed
+
+- The harness refuses a shader that does not compile instead of reading back
+  zeros. Output buffers start zeroed, so a dispatch that never ran produced a
+  result — and where an expected value contains zeros, that is a passing test
+  over a kernel that executed nothing. Every correctness claim here is "it agrees
+  with the reference", so a silent no-op reading as agreement could have hollowed
+  out all of them at once. Compiled modules are now cached by source as well, so
+  the check costs one await per distinct shader rather than one per dispatch.
+
+- The per-file timeout in `npm test` actually fires. It never had: `npx` starts
+  vitest as a grandchild that keeps the stdout pipe open, so killing the child
+  left `"close"` unfired and the run waited forever. A hanging file took an outer
+  120s kill instead of the 6s limit it was given. It hid because a *GPU* hang
+  brings the worker down within seconds on its own, which looked like the timeout
+  working — the suite could not tell "wedged" from "slow".
+
+### Changed
+
+- The score kernels of `attention`, `gqa` and `flash_attention` take a **mask
+  buffer at every dispatch**, not only when there is a mask, and their uniform
+  blocks gained three fields for its broadcast shape. A bias of zeros *is* "no
+  mask" — it is what torch's own reference does — and making it unconditional
+  removes a per-element branch and a `has_mask` guard whose only failing input
+  would be a dummy buffer nobody reads. It costs `B * S` floats against the
+  `B * H * L * S` these kernels already move. Callers driving the WGSL directly
+  must add the binding; `attention` and `gqa` bind it at index 2, `flash_attention`
+  at index 3.
+- `npm test` runs one test file per vitest process. A single process cannot cross
+  a test-file boundary with a GPU device in play — it aborts inside Dawn's thread
+  pool or hangs, with no kernel of its own required to trigger it. The runner also
+  refuses to report a false pass: a crashed vitest worker can exit 0 having
+  skipped most of the suite, so every file is now accounted for individually.
+
+- The package ships **compiled JavaScript and type declarations** instead of
+  TypeScript source. `exports` pointed straight at `.ts` files with no build
+  behind them, which requires every consumer to own a TypeScript toolchain
+  configured the way this repo's is, and bills a browser bundle for comments that
+  belong in the source. `npm run build` emits `dist/`, `prepublishOnly` runs it,
+  and CI runs it too — the tests import from the source tree and never touch
+  `dist/`, so a broken package is invisible to them by construction.
+  `removeComments` applies to the JavaScript only: the declarations keep their
+  JSDoc, so the reasoning still reaches an editor's hover.
+
+- `harness` is **no longer exported**. It imports vitest and the Dawn binding,
+  both devDependencies, so that subpath resolved to code no consumer's runtime
+  could load. Nothing imported it that way regardless — the tests reach it by
+  relative path — so this removes a promise that was never kept rather than a
+  feature anyone had. It stays in the repo as the test infrastructure it always
+  was.
+
+- The `.wgsl` kernels are published beside the JavaScript at
+  `web-xpu-ops/ops/<op>/wgsl/<entry>.wgsl`, mirroring the source tree so a
+  kernel's path is one string across the repo, the resolution grammar and the
+  package. `scripts/assets.mjs` copies them, then fails the build if an op
+  compiled to a reference with no kernel beside it: `tsc` emits no assets, so
+  without that check a package missing its entire WGSL backend would type-check,
+  pack and publish without a word.
+
+- The first released version is `0.1.0`, not `1.0.0`. One backend of the three
+  described here exists, every op's speed is unmeasured against the roofline it
+  should be reported against, and the resolution grammar has target and dtype
+  rungs that no kernel yet uses. A major version would claim those are settled.
+
+[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/m96-chan/web-xpu-ops/releases/tag/v0.1.0
