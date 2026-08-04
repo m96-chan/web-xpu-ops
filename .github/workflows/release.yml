@@ -1,0 +1,58 @@
+name: Release
+
+# A publish is triggered by a tag rather than by a merge, so that landing a
+# release-preparation commit and actually shipping it stay two decisions. The
+# tag is the only signal — nothing here reads the version from the branch.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  # Required for the provenance attestation on the `npm publish` step below.
+  # Without it the publish still succeeds, but silently without provenance.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          # Writes the .npmrc that points `NODE_AUTH_TOKEN` at the public
+          # registry. Publishing without it authenticates against nothing.
+          registry-url: "https://registry.npmjs.org"
+
+      - run: npm ci
+
+      # The tag is typed by hand and `npm publish` reads the version from
+      # package.json, so a mistyped tag would publish a version nobody asked
+      # for under a tag that disagrees with it — and npm versions cannot be
+      # replaced. Failing here is the cheap moment to catch it.
+      - name: Tag agrees with package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag ${GITHUB_REF_NAME} implies version $tag, package.json says $pkg" >&2
+            exit 1
+          fi
+
+      # The same three steps CI runs on every push, repeated rather than
+      # assumed: a tag can point at a commit that never went through CI, and
+      # this is the last point at which a broken publish is still preventable.
+      - run: npm run lint
+      - run: npm run build
+      # No GPU on the runner, so the suite skips rather than verifies the
+      # kernels. It still catches a harness that fails to load at all.
+      - run: npm test
+
+      # `--provenance` links the tarball to this workflow run and this commit,
+      # so a consumer can verify the published bytes were built here rather
+      # than uploaded from someone's laptop.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

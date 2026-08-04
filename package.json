@@ -6,8 +6,24 @@
   "license": "MIT",
   "author": "Yusuke Harada",
   "repository": { "type": "git", "url": "git+https://github.com/m96-chan/web-xpu-ops.git" },
+  "homepage": "https://github.com/m96-chan/web-xpu-ops#readme",
+  "bugs": { "url": "https://github.com/m96-chan/web-xpu-ops/issues" },
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "webnn",
+    "gpu",
+    "npu",
+    "kernel",
+    "shader",
+    "tensor",
+    "inference",
+    "machine-learning",
+    "browser"
+  ],
   "files": ["dist", "CHANGELOG.md"],
   "sideEffects": false,
+  "publishConfig": { "access": "public" },
   "exports": {
     "./ops/*": {
       "types": "./dist/ops/*/index.d.ts",
