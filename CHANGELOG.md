@@ -7,6 +7,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Added
+
+- `llm/sampler.ts`: token sampling with `greedy` and `temperature` + `top-p`
+  modes, plus a token-level `Constraint` interface (`nextAllowed(prefixTokens)
+  -> allowed token ids, or null`) applied to the logits before either mode
+  runs. Repetition penalty is **deliberately not implemented** — the
+  consuming project measured it degrading Japanese output rather than
+  de-looping it (technologies-moe/alibi-ai#3); see `sampler.ts`'s module
+  comment for the reasoning. A caller that wants repetition control should
+  express it as a `Constraint` instead.
+
+- `llm/constraints/line-format.ts`: a `Constraint` implementation for a fixed
+  line shape — literal text, an enum choice, more literal text, free text
+  (forbidden characters, max length), then EOS. Built for a small,
+  hand-written schema like `policy: <enum>\ntopic: <short text>`, where a
+  full GBNF/grammar engine would be overkill. Tokenizer-agnostic: it takes an
+  injected `TokenCodec` (`encode` / `idToToken` / `vocabSize`) rather than
+  depending on any one tokenizer, since issue #101's tokenizer is a separate,
+  not-yet-merged branch. Enum choices are matched by tokenizing each
+  candidate once and walking a token-id trie, so they must be
+  **token-prefix-free** (no choice's tokenization may be a strict prefix of
+  another's) — an ambiguous spec is rejected at construction rather than
+  silently misclassified at generation time.
+
+  Neither module is wired into `llm/engine.ts` yet — that integration is
+  left to a follow-up issue, matching #102's stated scope.
+
 ## [0.1.0] - 2026-08-04
 
 ### Documentation

@@ -435,6 +435,67 @@ everything else in behind it.
 
 ---
 
+## `llm/`: sampler and token-level constraints
+
+`llm/sampler.ts` turns a next-token logits vector into a token id — `greedy`
+(argmax) or `temperature` + `top-p` (nucleus) — and takes an optional
+`Constraint`:
+
+```ts
+interface Constraint {
+  nextAllowed(prefixTokens: readonly number[]): ReadonlySet<number> | null;
+}
+```
+
+`null` means unconstrained; an empty set means no legal continuation, which
+`sampleNext` treats as an error rather than guessing. The mask is applied to
+the raw logits before either sampling mode runs, so a constrained draw can
+never land outside the allowed set regardless of temperature or top-p.
+
+There is **no repetition penalty**, on purpose. The usual per-seen-token
+logit penalty was tried against Alibi's Japanese model and measured to
+degrade output rather than de-loop it — see
+[technologies-moe/alibi-ai#3](https://github.com/technologies-moe/alibi-ai/issues/3).
+A caller that wants to discourage repetition should express it as a
+`Constraint`, this module's own tool for narrowing the next token, rather
+than as a penalty baked into the sampler.
+
+`llm/constraints/line-format.ts` is one `Constraint`: a state machine for a
+fixed line shape — literal text, an enum choice, more literal text, free
+text (a forbidden-character set and a max length), then EOS. It exists for
+schemas as small as `policy: <enum>\ntopic: <short text>`, where a full
+GBNF/grammar engine is more machinery than the shape needs. It is
+**tokenizer-agnostic**: it takes an injected `TokenCodec`
+(`encode` / `idToToken` / `vocabSize`) instead of depending on any one
+tokenizer —
+
+```ts
+const constraint = new LineFormatConstraint(codec, {
+  segments: [
+    { kind: "literal", text: "policy: " },
+    { kind: "enum", choices: ["allow", "deny", "review"] },
+    { kind: "literal", text: "\ntopic: " },
+    { kind: "freeText", forbiddenChars: ["\n"], maxLength: 80 },
+  ],
+  eosTokenId,
+});
+
+const next = sampleNext(logits, generatedSoFar, { mode: "greedy" }, constraint);
+```
+
+Enum choices are matched by tokenizing each candidate once and walking a
+token-id trie — the "candidate string, tokenized, forward-matched" approach —
+so choices must be **token-prefix-free**: no choice's tokenization may be a
+strict prefix of another's, or completion would be ambiguous. Such a spec is
+rejected at construction rather than silently misclassified during
+generation.
+
+Neither file is wired into an inference engine yet. `llm/` does not exist on
+`main` as anything more than this — the engine that would call `sampleNext`
+per step is a separate, later issue.
+
+---
+
 ## Backends
 
 | backend | status | shape |
