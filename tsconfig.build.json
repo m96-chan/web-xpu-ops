@@ -27,7 +27,16 @@
     // inheriting `["@webgpu/types", "node"]` makes the build fail if a reference
     // ever reaches for a `GPUBuffer` or a `node:` global, which would quietly
     // narrow where the published package can run.
-    "types": []
+    "types": [],
+    // `llm/tokenizer.ts` needs `TextEncoder`/`TextDecoder` for its UTF-8
+    // byte-fallback handling — standard Web APIs available in every runtime
+    // this package targets (browsers, Node, Deno, Workers), unlike
+    // `@webgpu/types` or `node:` globals. TypeScript's bundled `"DOM"` lib is
+    // the only place their *types* live short of pulling in `@types/node`,
+    // which is exactly the ambient dependency the `types: []` above exists to
+    // keep out; it adds no WebGPU types (those come only from the excluded
+    // `@webgpu/types` package), so it does not weaken that guard.
+    "lib": ["ES2022", "DOM"]
   },
-  "include": ["ops/*/index.ts"]
+  "include": ["ops/*/index.ts", "llm/tokenizer.ts"]
 }

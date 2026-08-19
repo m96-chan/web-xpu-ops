@@ -36,6 +36,7 @@ import { join } from "node:path";
 
 const OPS = "ops";
 const HARNESS = "harness";
+const LLM = "llm";
 
 /** Test files, discovered the same way `vitest.config.ts` globs them. */
 function testFiles() {
@@ -52,6 +53,12 @@ function testFiles() {
   // they get a process each anyway: the alternative is a second code path.
   for (const file of readdirSync(HARNESS)) {
     if (file.endsWith(".test.ts")) found.push(join(HARNESS, file));
+  }
+  // llm/ is CPU-only (no GPU device involved at all — see llm/tokenizer.ts),
+  // but it gets a process per file too for the same reason as the harness:
+  // one discovery code path beats two that have to be kept in sync.
+  for (const file of readdirSync(LLM)) {
+    if (file.endsWith(".test.ts")) found.push(join(LLM, file));
   }
   return found.sort();
 }
