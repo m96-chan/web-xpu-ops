@@ -7,6 +7,17 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Added
+
+- `matvecQ8`, a W8A32 GEMV in `ops/matvec`: the weight held as int8 instead of
+  f32, packed four codes per `u32` word. Decode-time GEMV is bandwidth-bound,
+  and an int8 weight is a quarter the traffic of f32 for the same values — the
+  packed layout halves that again versus one code per lane, since the whole
+  point of quantizing a weight nobody re-quantizes at inference is to spend
+  the packing cost once rather than never taking it (#97). `packQ8` packs
+  `quantize`'s existing per-row absmax codes into the layout `matvecQ8` reads,
+  so the two compose instead of `matvecQ8` inventing its own quantization.
+
 ## [0.1.0] - 2026-08-04
 
 ### Documentation
