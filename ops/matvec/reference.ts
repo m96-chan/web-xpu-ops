@@ -145,6 +145,100 @@ export function matvecQ8({ weight, scale, vector, N, K }: MatVecQ8Args): Float32
  * a defined value beats an uninitialised one for anyone who inspects the
  * buffer directly.
  */
+/**
+ * `matvecQ8Ffn`: `silu(matvecQ8(weightGate, x)) * matvecQ8(weightUp, x)` — one
+ * row, two int8 weights, in a single logical op instead of four (issue #111).
+ *
+ * ## Why this exists
+ *
+ * `llm/engine-q8-resident.ts`'s decode step computes exactly this shape every
+ * layer, as four separate GPU dispatches: `matvecQ8(gate)`, `matvecQ8(up)`,
+ * `activation(silu)`, `elementwise(multiply)`. Each dispatch there costs a
+ * fixed per-submit overhead independent of how much data it moves (issue
+ * #111's own measurement: prefill at 76 and 365 tokens takes about the same
+ * wall time, which only makes sense if dispatch count, not bandwidth,
+ * dominates). Fusing the four into one halves the weight-reading dispatches
+ * and removes the two elementwise ones entirely, without changing the
+ * arithmetic: `silu` and `*` are still applied in f32, in the same order, to
+ * the same two dot products this reference computes separately below.
+ *
+ * ## Reference shape, not reference *independence*
+ *
+ * This composes `matvecQ8` (already the correctness definition for a single
+ * quantized GEMV row, `ops/matvec/q8.wgsl.test.ts`) with `silu`'s formula
+ * copied verbatim from `ops/activation/reference.ts` (rule 7 — not
+ * re-derived) rather than re-deriving the packed-int8 unpacking a third
+ * time. Rule 8 asks this reference to be "obviously right", and composing
+ * two already-obviously-right pieces is more obviously right than a fresh
+ * from-scratch loop would be — the risk this op actually carries is in the
+ * *fusion* (does the WGSL kernel's shared single-pass-over-`vector` unpacking
+ * of two weights agree with computing them apart?), which this reference,
+ * built from the already-verified parts, is positioned to catch.
+ */
+export interface MatVecQ8FfnArgs {
+  /** `[N, ceil(K/4)] u32` — `matvecQ8`'s packed format, gate projection. */
+  weightGate: Uint32Array;
+  /** `[N]` — gate's per-row scale. */
+  scaleGate: Float32Array;
+  /** `[N, ceil(K/4)] u32` — up projection, same wire format as `weightGate`. */
+  weightUp: Uint32Array;
+  /** `[N]` — up's per-row scale. */
+  scaleUp: Float32Array;
+  /** `[K]`, shared by both projections. */
+  vector: Float32Array;
+  N: number;
+  K: number;
+}
+
+export function matvecQ8Ffn({ weightGate, scaleGate, weightUp, scaleUp, vector, N, K }: MatVecQ8FfnArgs): Float32Array {
+  const gate = matvecQ8({ weight: weightGate, scale: scaleGate, vector, N, K });
+  const up = matvecQ8({ weight: weightUp, scale: scaleUp, vector, N, K });
+  const output = new Float32Array(N);
+  for (let row = 0; row < N; row += 1) {
+    const g = gate[row]!;
+    // `silu(x) = x / (1 + e^-x)` — copied from `ops/activation/reference.ts`'s
+    // `apply(x, ACTIVATION.silu, ...)` branch, not re-derived (rule 7).
+    const silu = g / (1 + Math.exp(-g));
+    output[row] = silu * up[row]!;
+  }
+  return output;
+}
+
+/**
+ * `matvecQ8Residual`: `residual + matvecQ8(weight, x)` — one row instead of
+ * `matvecQ8` followed by an `elementwise(add)` dispatch (issue #111).
+ *
+ * `llm/engine-q8-resident.ts`'s decode step uses this for both
+ * post-attention (`o_proj`) and post-FFN (`down_proj`) residual adds: each
+ * currently pays a `matvecQ8` dispatch and then a separate `elementwise`
+ * dispatch to add the pre-projection residual stream back in. The residual
+ * add does not depend on any column of `weight`, so it can be applied once
+ * per row, after that row's reduction — the same "scale is per-row, applied
+ * once after the dot product, not per term" shape `matvecQ8`'s own doc
+ * already establishes for `scale`; `residual` rides along the same way.
+ */
+export interface MatVecQ8ResidualArgs {
+  /** `[N, ceil(K/4)] u32` — `matvecQ8`'s packed format. */
+  weight: Uint32Array;
+  /** `[N]` — one absmax-derived scale per row. */
+  scale: Float32Array;
+  /** `[K]`. */
+  vector: Float32Array;
+  /** `[N]`, added to this row's `matvecQ8` output after the scale. */
+  residual: Float32Array;
+  N: number;
+  K: number;
+}
+
+export function matvecQ8Residual({ weight, scale, vector, residual, N, K }: MatVecQ8ResidualArgs): Float32Array {
+  const projected = matvecQ8({ weight, scale, vector, N, K });
+  const output = new Float32Array(N);
+  for (let row = 0; row < N; row += 1) {
+    output[row] = residual[row]! + projected[row]!;
+  }
+  return output;
+}
+
 export function packQ8({ codes, N, K }: { codes: Int32Array; N: number; K: number }): Uint32Array {
   const wordsPerRow = Math.ceil(K / 4);
   const packed = new Uint32Array(N * wordsPerRow);

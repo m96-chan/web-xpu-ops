@@ -29,6 +29,7 @@
  */
 import { LineFormatConstraint, type LineFormatSpec } from "../../../llm/constraints/line-format.js";
 import type { TokenCodec } from "../../../llm/constraints/token-codec.js";
+import { argmax } from "../../../llm/engine.js";
 import { LlamaEngineQ8 } from "../../../llm/engine-q8.js";
 import { LlamaEngineQ8Resident } from "../../../llm/engine-q8-resident.js";
 import { sampleNext, type Constraint } from "../../../llm/sampler.js";
@@ -624,3 +625,84 @@ async function __resetBenchmark(
   return { order, reset, rebuild };
 }
 (window as unknown as { __resetBenchmark: typeof __resetBenchmark }).__resetBenchmark = __resetBenchmark;
+
+// ---------------------------------------------------------------------------
+// Issue #111: measuring the fused decode kernels' effect on forward()'s fixed cost
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue #111's own completion bar: "前後のforward固定費とtok/sを実測" — this
+ * issue's own motivating measurement was that `LlamaEngineQ8Resident.forward()`'s
+ * wall time barely changes between a 76-token prompt and a 365-token one,
+ * which only makes sense if dispatch *count* (fixed per `forward()` call),
+ * not bytes moved, dominates — exactly what fusing four decode dispatches
+ * into one (`ops/matvec/wgsl/q8_ffn.wgsl`) or two into one
+ * (`q8_residual.wgsl`) is meant to shrink. This benchmark reproduces that
+ * comparison directly against real weights and a real device, one prompt
+ * length at a time, plus per-step decode timing after it.
+ *
+ * Prompt *content* does not matter for a timing measurement — only its
+ * length does (`forward()` reads exactly `hiddenSize` embedding-table
+ * bytes per token, regardless of which row) — so this builds synthetic
+ * token id sequences (`i % vocabSize`, always in range) instead of relying
+ * on `tokenizer.encode` to land on an exact requested length, which a real
+ * tokenizer over real text cannot promise.
+ *
+ * One `LlamaEngineQ8Resident`/`ResidentDevice` for every prompt length in
+ * `promptLengths`, `reset()` (issue #120) between them rather than a fresh
+ * `create()` — the same "don't let `create()`'s own ~1.4 GiB weight
+ * re-upload leak into a measurement that is not about `create()`" reasoning
+ * `runResetStrategy` above already established, load-bearing here for the
+ * same reason: `createMs` is reported once, separately, so a slow first
+ * `create()` call cannot be mistaken for a slow `forward()`.
+ *
+ * Not reachable from the UI — a CDP-driven script calls this directly, the
+ * same pattern `__resetBenchmark` above already establishes.
+ */
+interface DecodeFixedCostResult {
+  promptLength: number;
+  prefillMs: number;
+  decodeStepMs: number[];
+}
+
+async function __decodeFixedCostBenchmark(
+  promptLengths: number[],
+  decodeSteps: number,
+): Promise<{ createMs: number; results: DecodeFixedCostResult[] }> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights } = loaded;
+  const device = await createBrowserResidentDevice();
+  try {
+    const createT0 = performance.now();
+    const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+    const createMs = performance.now() - createT0;
+
+    const results: DecodeFixedCostResult[] = [];
+    for (let i = 0; i < promptLengths.length; i += 1) {
+      const promptLength = promptLengths[i]!;
+      if (i > 0) engine.reset();
+      const tokens = Array.from({ length: promptLength }, (_, j) => j % engineConfig.vocabSize);
+
+      const prefillT0 = performance.now();
+      const prefillLogits = await engine.forward(tokens);
+      const prefillMs = performance.now() - prefillT0;
+
+      let logits = prefillLogits[prefillLogits.length - 1]!;
+      const decodeStepMs: number[] = [];
+      for (let s = 0; s < decodeSteps; s += 1) {
+        const next = argmax(logits);
+        const stepT0 = performance.now();
+        // eslint-disable-next-line no-await-in-loop
+        const [nextLogits] = await engine.forward([next]);
+        decodeStepMs.push(performance.now() - stepT0);
+        logits = nextLogits!;
+      }
+      results.push({ promptLength, prefillMs, decodeStepMs });
+    }
+    return { createMs, results };
+  } finally {
+    device.destroy();
+  }
+}
+(window as unknown as { __decodeFixedCostBenchmark: typeof __decodeFixedCostBenchmark }).__decodeFixedCostBenchmark =
+  __decodeFixedCostBenchmark;

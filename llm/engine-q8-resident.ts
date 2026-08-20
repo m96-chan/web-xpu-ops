@@ -194,6 +194,13 @@ import {
 const CODE = {
   rmsnorm: kernel(new URL("../ops/rmsnorm/index.ts", import.meta.url)),
   matvecQ8: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8"),
+  // Issue #111: decode-only fused entry points on the same `ops/matvec` op —
+  // see `ops/matvec/wgsl/q8_ffn.wgsl`/`q8_residual.wgsl`'s own docs. Prefill
+  // (`runPrefillResident`) keeps the unfused `matmul`+`activation`+
+  // `elementwise` path deliberately — issue #111's own "スコープ外: プリフィル
+  // 専用最適化" — so these two are read only by `runDecodeStep`'s bind groups.
+  matvecQ8Ffn: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8_ffn"),
+  matvecQ8Residual: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8_residual"),
   matmul: kernel(new URL("../ops/matmul/index.ts", import.meta.url)),
   rope: kernel(new URL("../ops/rope/index.ts", import.meta.url)),
   gqaScores: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "scores"),
@@ -251,6 +258,70 @@ async function buildProjection(
   const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
   device.upload(scaleBuf, 0, linear.scale);
   return device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, outBuf, uniform]);
+}
+
+/**
+ * Packs, uploads and binds one `matvecQ8Ffn` projection (issue #111): two
+ * weights (gate, up), sharing one `vector` input and writing one fused
+ * `silu(gate) * up` output — `buildProjection`'s own doc explains why gate
+ * and up get their own weight/scale buffers rather than one fused buffer
+ * (the same `minStorageBufferOffsetAlignment` reasoning applies here
+ * unchanged, one layer up: the *pair* is fused into one dispatch, but each
+ * half is still its own buffer). Binding order matches
+ * `ops/matvec/wgsl/q8_ffn.wgsl`'s own bindings 0-6, and `uniform` is the
+ * *existing* `{N: ffnHidden, K: hiddenSize}` uniform `create()` already
+ * builds for the old `gateGroup` (`gateUniform`) — this op's `Params` shape
+ * is identical to `q8`'s, so no new uniform buffer is needed.
+ */
+async function buildFfnProjection(
+  device: ResidentDevice,
+  pipeline: GPUComputePipeline,
+  gate: QuantizedLinear,
+  up: QuantizedLinear,
+  N: number,
+  K: number,
+  uniform: GPUBuffer,
+  vectorBuf: GPUBuffer,
+  outBuf: GPUBuffer,
+): Promise<GPUBindGroup> {
+  const packedGate = packInt8Rows(gate.codes, N, K);
+  const weightGateBuf = device.createStorageBuffer(packedGate.byteLength);
+  device.upload(weightGateBuf, 0, packedGate);
+  const scaleGateBuf = device.createStorageBuffer(gate.scale.byteLength);
+  device.upload(scaleGateBuf, 0, gate.scale);
+  const packedUp = packInt8Rows(up.codes, N, K);
+  const weightUpBuf = device.createStorageBuffer(packedUp.byteLength);
+  device.upload(weightUpBuf, 0, packedUp);
+  const scaleUpBuf = device.createStorageBuffer(up.scale.byteLength);
+  device.upload(scaleUpBuf, 0, up.scale);
+  return device.bindGroup(pipeline, [weightGateBuf, scaleGateBuf, weightUpBuf, scaleUpBuf, vectorBuf, outBuf, uniform]);
+}
+
+/**
+ * Packs, uploads and binds one `matvecQ8Residual` projection (issue #111):
+ * same shape as `buildProjection`, plus a `residualBuf` input bound between
+ * `vector` and `output` — `ops/matvec/wgsl/q8_residual.wgsl`'s own binding
+ * order. `uniform` is, again, an existing `{N, K}` uniform (`oUniform` for
+ * `wo`, `downUniform` for `wDown`) — `q8_residual`'s `Params` struct is
+ * identical to `q8`'s.
+ */
+async function buildResidualProjection(
+  device: ResidentDevice,
+  pipeline: GPUComputePipeline,
+  linear: QuantizedLinear,
+  N: number,
+  K: number,
+  uniform: GPUBuffer,
+  vectorBuf: GPUBuffer,
+  residualBuf: GPUBuffer,
+  outBuf: GPUBuffer,
+): Promise<GPUBindGroup> {
+  const packed = packInt8Rows(linear.codes, N, K);
+  const weightBuf = device.createStorageBuffer(packed.byteLength);
+  device.upload(weightBuf, 0, packed);
+  const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
+  device.upload(scaleBuf, 0, linear.scale);
+  return device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, residualBuf, outBuf, uniform]);
 }
 
 /** Must match `TILE` in `ops/matmul/wgsl/kernel.wgsl` — copied per rule 2, same as `llm/kernels.ts#MATMUL_TILE`. */
@@ -368,6 +439,10 @@ async function dequantIntoShape(
 interface SharedResident {
   rmsnormPipeline: GPUComputePipeline;
   matvecPipeline: GPUComputePipeline;
+  /** Issue #111, decode only — see `CODE.matvecQ8Ffn`'s own doc. */
+  matvecFfnPipeline: GPUComputePipeline;
+  /** Issue #111, decode only — see `CODE.matvecQ8Residual`'s own doc. */
+  matvecResidualPipeline: GPUComputePipeline;
   ropePipeline: GPUComputePipeline;
   gqaScoresPipeline: GPUComputePipeline;
   gqaContextPipeline: GPUComputePipeline;
@@ -390,12 +465,15 @@ interface SharedResident {
   qRopedBuf: GPUBuffer;
   kRopedBuf: GPUBuffer;
   attnOutBuf: GPUBuffer;
-  projOutBuf: GPUBuffer;
-  gateOutBuf: GPUBuffer;
-  upOutBuf: GPUBuffer;
-  gateActBuf: GPUBuffer;
+  /**
+   * Issue #111: `matvecQ8Ffn`'s fused `silu(gate) * up` output, read
+   * straight back in as `down_proj`'s `vector` input — the un-fused path's
+   * `gateOutBuf`/`upOutBuf`/`gateActBuf` intermediates (matvecQ8(gate),
+   * matvecQ8(up), then activation(silu) into a *separate* buffer before the
+   * multiply) no longer exist for decode; this is the only buffer between
+   * the FFN's two projections now.
+   */
   gatedBuf: GPUBuffer;
-  downOutBuf: GPUBuffer;
   finalNormedBuf: GPUBuffer;
 
   ropeQUniform: GPUBuffer;
@@ -405,10 +483,6 @@ interface SharedResident {
 
   ropeQGroup: GPUBindGroup;
   ropeKGroup: GPUBindGroup;
-  add1Group: GPUBindGroup;
-  siluGroup: GPUBindGroup;
-  mulGroup: GPUBindGroup;
-  add2Group: GPUBindGroup;
   finalNormGroup: GPUBindGroup;
 }
 
@@ -422,9 +496,11 @@ interface LayerResident {
   wvGroup: GPUBindGroup;
   scoresGroup: GPUBindGroup;
   contextGroup: GPUBindGroup;
+  /** Issue #111: `matvecQ8Residual` — `hiddenB = hiddenA + wo · attnOutBuf`, fusing the old `woGroup` matvec and the old `add1Group` elementwise add into one dispatch. */
   woGroup: GPUBindGroup;
-  gateGroup: GPUBindGroup;
-  upGroup: GPUBindGroup;
+  /** Issue #111: `matvecQ8Ffn` — `gatedBuf = silu(wGate · normed2Buf) * (wUp · normed2Buf)`, fusing the old `gateGroup`/`upGroup` matvecs and the old `siluGroup`/`mulGroup` dispatches into one. */
+  ffnGroup: GPUBindGroup;
+  /** Issue #111: `matvecQ8Residual` — `hiddenA = hiddenB + wDown · gatedBuf`, fusing the old `downGroup` matvec and the old `add2Group` elementwise add into one dispatch. */
   downGroup: GPUBindGroup;
 }
 
@@ -609,11 +685,15 @@ export class LlamaEngineQ8Resident {
     const kvDim = numKvHeads * headDim;
 
     const [
-      rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
+      rmsnormPipeline, matvecPipeline, matvecFfnPipeline, matvecResidualPipeline,
+      ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
       matmulPipeline, permutePipeline, dequantTransposePipeline,
     ] = await Promise.all([
         device.pipelineFor(CODE.rmsnorm),
         device.pipelineFor(CODE.matvecQ8),
+        // Issue #111, decode only — see `CODE.matvecQ8Ffn`/`CODE.matvecQ8Residual`'s own doc.
+        device.pipelineFor(CODE.matvecQ8Ffn),
+        device.pipelineFor(CODE.matvecQ8Residual),
         device.pipelineFor(CODE.rope),
         device.pipelineFor(CODE.gqaScores),
         device.pipelineFor(CODE.gqaContext),
@@ -641,12 +721,14 @@ export class LlamaEngineQ8Resident {
     const qRopedBuf = device.createStorageBuffer(qDim * 4);
     const kRopedBuf = device.createStorageBuffer(kvDim * 4);
     const attnOutBuf = device.createStorageBuffer(qDim * 4);
-    const projOutBuf = device.createStorageBuffer(hiddenSize * 4);
-    const gateOutBuf = device.createStorageBuffer(ffnHidden * 4);
-    const upOutBuf = device.createStorageBuffer(ffnHidden * 4);
-    const gateActBuf = device.createStorageBuffer(ffnHidden * 4);
+    // Issue #111: decode's only FFN intermediate now — `matvecQ8Ffn` writes
+    // `silu(gate) * up` straight here, and `matvecQ8Residual` reads it
+    // straight back out as `down_proj`'s vector input. The old
+    // `gateOutBuf`/`upOutBuf`/`gateActBuf`/`projOutBuf`/`downOutBuf`
+    // intermediates (separate matvecQ8 outputs, a separate silu output, a
+    // separate pre-residual-add projection output) no longer exist for
+    // decode — see `SharedResident.gatedBuf`'s own doc.
     const gatedBuf = device.createStorageBuffer(ffnHidden * 4);
-    const downOutBuf = device.createStorageBuffer(hiddenSize * 4);
     const finalNormedBuf = device.createStorageBuffer(hiddenSize * 4);
     // `rope`'s uncached-table binding — always bound, never read
     // (`cache_positions = 0`), see `ops/rope/wgsl/kernel.wgsl`'s doc.
@@ -667,9 +749,15 @@ export class LlamaEngineQ8Resident {
     const gateUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
     const upUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
     const downUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ffnHidden]]);
-    const siluUniform = uniformOf(device, [["u32", ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1]]);
-    const addUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ELEMENTWISE.add]]);
-    const mulUniform = uniformOf(device, [["u32", ffnHidden], ["u32", ELEMENTWISE.multiply]]);
+    // Issue #111: `gateUniform`/`oUniform`/`downUniform` above are reused
+    // as-is by the fused decode kernels below — `q8_ffn`'s and
+    // `q8_residual`'s `Params` structs are both `{N, K}`, identical to
+    // plain `q8`'s, so no new uniform buffers are needed for them. The old
+    // `siluUniform`/`addUniform`/`mulUniform` triple (decode's un-fused
+    // activation/elementwise dispatches) is gone with the dispatches that
+    // read it — `runPrefillResident` below declares its own copies of all
+    // three locally, unaffected, since prefill's FFN stays un-fused (issue
+    // #111's own "スコープ外: プリフィル専用最適化").
 
     // `pos_offset` (index 3) is rewritten every decode step
     // (`ROPE_POS_OFFSET_BYTE`); every other field is architecture-wide and
@@ -703,10 +791,6 @@ export class LlamaEngineQ8Resident {
 
     const ropeQGroup = await device.bindGroup(ropePipeline, [qOutBuf, dummyCacheBuf, qRopedBuf, ropeQUniform]);
     const ropeKGroup = await device.bindGroup(ropePipeline, [kOutBuf, dummyCacheBuf, kRopedBuf, ropeKUniform]);
-    const add1Group = await device.bindGroup(elementwisePipeline, [hiddenA, projOutBuf, hiddenB, addUniform]);
-    const siluGroup = await device.bindGroup(activationPipeline, [gateOutBuf, gateActBuf, siluUniform]);
-    const mulGroup = await device.bindGroup(elementwisePipeline, [gateActBuf, upOutBuf, gatedBuf, mulUniform]);
-    const add2Group = await device.bindGroup(elementwisePipeline, [hiddenB, downOutBuf, hiddenA, addUniform]);
 
     const layers: LayerResident[] = [];
     for (const layer of weights.layers) {
@@ -720,10 +804,19 @@ export class LlamaEngineQ8Resident {
       const wqGroup = await buildProjection(device, matvecPipeline, layer.wq, qDim, hiddenSize, qUniform, normedBuf, qOutBuf);
       const wkGroup = await buildProjection(device, matvecPipeline, layer.wk, kvDim, hiddenSize, kUniform, normedBuf, kOutBuf);
       const wvGroup = await buildProjection(device, matvecPipeline, layer.wv, kvDim, hiddenSize, vUniform, normedBuf, vOutBuf);
-      const woGroup = await buildProjection(device, matvecPipeline, layer.wo, hiddenSize, qDim, oUniform, attnOutBuf, projOutBuf);
-      const gateGroup = await buildProjection(device, matvecPipeline, layer.wGate, ffnHidden, hiddenSize, gateUniform, normed2Buf, gateOutBuf);
-      const upGroup = await buildProjection(device, matvecPipeline, layer.wUp, ffnHidden, hiddenSize, upUniform, normed2Buf, upOutBuf);
-      const downGroup = await buildProjection(device, matvecPipeline, layer.wDown, hiddenSize, ffnHidden, downUniform, gatedBuf, downOutBuf);
+      // Issue #111: `hiddenB = hiddenA + wo · attnOutBuf` — fused
+      // matvecQ8+residual, replacing the old `woGroup` (plain matvecQ8 into
+      // `projOutBuf`) plus a separate `add1Group` elementwise dispatch.
+      const woGroup = await buildResidualProjection(device, matvecResidualPipeline, layer.wo, hiddenSize, qDim, oUniform, attnOutBuf, hiddenA, hiddenB);
+      // Issue #111: `gatedBuf = silu(wGate · normed2Buf) * (wUp · normed2Buf)`
+      // — fused gate+up+silu+multiply, replacing the old `gateGroup`/
+      // `upGroup` (two plain matvecQ8 dispatches) plus the old
+      // `siluGroup`/`mulGroup` (activation, then elementwise multiply).
+      const ffnGroup = await buildFfnProjection(device, matvecFfnPipeline, layer.wGate, layer.wUp, ffnHidden, hiddenSize, gateUniform, normed2Buf, gatedBuf);
+      // Issue #111: `hiddenA = hiddenB + wDown · gatedBuf` — fused
+      // matvecQ8+residual, same shape as `woGroup` above, replacing the old
+      // `downGroup` (plain matvecQ8 into `downOutBuf`) plus `add2Group`.
+      const downGroup = await buildResidualProjection(device, matvecResidualPipeline, layer.wDown, hiddenSize, ffnHidden, downUniform, gatedBuf, hiddenB, hiddenA);
 
       const kCacheBuf = device.createStorageBuffer(numKvHeads * maxSeqLen * headDim * 4);
       const vCacheBuf = device.createStorageBuffer(numKvHeads * maxSeqLen * headDim * 4);
@@ -731,7 +824,7 @@ export class LlamaEngineQ8Resident {
       const contextGroup = await device.bindGroup(gqaContextPipeline, [probsBuf, vCacheBuf, attnOutBuf, gqaContextUniform]);
 
       layers.push({
-        kCacheBuf, vCacheBuf, attnNormGroup, ffnNormGroup, wqGroup, wkGroup, wvGroup, scoresGroup, contextGroup, woGroup, gateGroup, upGroup, downGroup,
+        kCacheBuf, vCacheBuf, attnNormGroup, ffnNormGroup, wqGroup, wkGroup, wvGroup, scoresGroup, contextGroup, woGroup, ffnGroup, downGroup,
       });
     }
 
@@ -758,12 +851,13 @@ export class LlamaEngineQ8Resident {
     }
 
     const shared: SharedResident = {
-      rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
+      rmsnormPipeline, matvecPipeline, matvecFfnPipeline, matvecResidualPipeline,
+      ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
       matmulPipeline, permutePipeline, dequantTransposePipeline,
-      hiddenA, hiddenB, normedBuf, normed2Buf, qOutBuf, kOutBuf, vOutBuf, qRopedBuf, kRopedBuf, attnOutBuf, projOutBuf,
-      gateOutBuf, upOutBuf, gateActBuf, gatedBuf, downOutBuf, finalNormedBuf,
+      hiddenA, hiddenB, normedBuf, normed2Buf, qOutBuf, kOutBuf, vOutBuf, qRopedBuf, kRopedBuf, attnOutBuf,
+      gatedBuf, finalNormedBuf,
       ropeQUniform, ropeKUniform, gqaScoresUniform, gqaContextUniform,
-      ropeQGroup, ropeKGroup, add1Group, siluGroup, mulGroup, add2Group, finalNormGroup,
+      ropeQGroup, ropeKGroup, finalNormGroup,
     };
 
     return new LlamaEngineQ8Resident(
@@ -1219,15 +1313,19 @@ export class LlamaEngineQ8Resident {
       }
       dispatch(s.gqaScoresPipeline, layer.scoresGroup, [1, numHeads, 1]);
       dispatch(s.gqaContextPipeline, layer.contextGroup, [1, numHeads, 1]);
-      dispatch(s.matvecPipeline, layer.woGroup, [hiddenSize]);
-      dispatch(s.elementwisePipeline, s.add1Group, [Math.ceil(hiddenSize / 256)]);
+      // Issue #111: `hiddenB = hiddenA + wo · attnOutBuf` — one dispatch
+      // (`matvecQ8Residual`) in place of the old `matvecQ8(wo)` +
+      // `elementwise(add)` pair. See `LayerResident.woGroup`'s own doc.
+      dispatch(s.matvecResidualPipeline, layer.woGroup, [hiddenSize]);
       dispatch(s.rmsnormPipeline, layer.ffnNormGroup, [1]);
-      dispatch(s.matvecPipeline, layer.gateGroup, [ffnHidden]);
-      dispatch(s.matvecPipeline, layer.upGroup, [ffnHidden]);
-      dispatch(s.activationPipeline, s.siluGroup, [Math.ceil(ffnHidden / 256)]);
-      dispatch(s.elementwisePipeline, s.mulGroup, [Math.ceil(ffnHidden / 256)]);
-      dispatch(s.matvecPipeline, layer.downGroup, [hiddenSize]);
-      dispatch(s.elementwisePipeline, s.add2Group, [Math.ceil(hiddenSize / 256)]);
+      // Issue #111: `gatedBuf = silu(wGate · normed2Buf) * (wUp · normed2Buf)`
+      // — one dispatch (`matvecQ8Ffn`) in place of the old two `matvecQ8`
+      // dispatches plus `activation(silu)` plus `elementwise(multiply)`. See
+      // `LayerResident.ffnGroup`'s own doc.
+      dispatch(s.matvecFfnPipeline, layer.ffnGroup, [ffnHidden]);
+      // Issue #111: `hiddenA = hiddenB + wDown · gatedBuf` — same fusion as
+      // `woGroup` above. See `LayerResident.downGroup`'s own doc.
+      dispatch(s.matvecResidualPipeline, layer.downGroup, [hiddenSize]);
     }
     dispatch(s.rmsnormPipeline, s.finalNormGroup, [1]);
     for (const chunk of this.lmHeadChunks) dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount]);
