@@ -16,42 +16,25 @@
  * through `harnessBrowserShim`; `main.ts` calls it directly and hands the
  * result to `LlamaEngineQ8Resident.create()`, which only cares that the
  * object it receives satisfies the structural `ResidentDevice` shape.
+ *
+ * `ResidentOp`/`ResidentReadback`/`ResidentDevice` themselves are imported
+ * type-only from the real `harness/resident.ts` (below), the same
+ * type-only-import pattern `browser-runtime.ts` already established for
+ * `Binding`/`Dispatch` from `harness/wgsl.ts` — not hand-redeclared, as an
+ * earlier version of this file did. That earlier version had already drifted
+ * once from the real thing (`ResidentOp` split into two interfaces,
+ * `ResidentOp`/`ResidentCopyOp`, where `harness/resident.ts` has always kept
+ * `ResidentOp` as one discriminated union — PR #116 review, item 6):
+ * `examples/llm-demo/tsconfig.json` only checks `src/`, so a mismatch here
+ * is invisible to `tsc` and would only ever surface as an esbuild bundling
+ * failure or, worse, a silent structural near-match. Importing the types
+ * instead of restating them makes that class of drift impossible rather
+ * than merely checked.
  */
+import type { Binding, Dispatch } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
 
-export interface ResidentOp {
-  kind: "dispatch";
-  pipeline: GPUComputePipeline;
-  bindGroup: GPUBindGroup;
-  workgroups: [number] | [number, number] | [number, number, number];
-}
-
-export interface ResidentCopyOp {
-  kind: "copy";
-  src: GPUBuffer;
-  srcOffset: number;
-  dst: GPUBuffer;
-  dstOffset: number;
-  size: number;
-}
-
-export interface ResidentReadback {
-  staging: GPUBuffer;
-  source: GPUBuffer;
-  sourceOffset: number;
-  length: number;
-  type: "f32" | "i32" | "u32";
-}
-
-export interface ResidentDevice {
-  readonly stats: { buffersCreated: number; pipelinesCreated: number; submits: number };
-  createStorageBuffer(bytes: number, usage?: number): GPUBuffer;
-  createUniformBuffer(bytes: number): GPUBuffer;
-  upload(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void;
-  pipelineFor(code: string, entry?: string): Promise<GPUComputePipeline>;
-  bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup>;
-  batch(ops: (ResidentOp | ResidentCopyOp)[], readback: ResidentReadback[]): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
-  destroy(): void;
-}
+export type { ResidentDevice, ResidentOp, ResidentReadback };
 
 /** `harness/resident.ts#createResidentDevice`'s `navigator.gpu` counterpart — see that file's doc for what every piece below is for; this is a direct port, not a redesign. */
 export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
@@ -103,7 +86,16 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       }
       modules.set(code, module);
     }
+    // Same reason `bindGroup` below pushes an error scope, and the same fix
+    // `harness/resident.ts#pipelineFor` (this file's Node counterpart) needed
+    // (PR #116 review, item 4): `layout: "auto"` silently drops a binding an
+    // entry point never references rather than failing pipeline creation, so
+    // without this, a wrong `entry` string had no validation path here at
+    // all.
+    device.pushErrorScope("validation");
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
+    const invalid = await device.popErrorScope();
+    if (invalid) throw new Error(`resident pipeline is not valid: ${invalid.message}`);
     pipelines.set(key, pipeline);
     stats.pipelinesCreated += 1;
     return pipeline;
@@ -121,7 +113,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   }
 
   async function batch(
-    ops: (ResidentOp | ResidentCopyOp)[],
+    ops: ResidentOp[],
     readback: ResidentReadback[],
   ): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
     const encoder = device.createCommandEncoder();
@@ -183,23 +175,13 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
  */
 export function runnerFromBrowserResident(
   device: ResidentDevice,
-): (dispatch: {
-  code: string;
-  entry?: string;
-  bindings: (
-    | { kind: "storage"; data: Float32Array | Int32Array | Uint32Array }
-    | { kind: "out"; type: "f32" | "i32" | "u32"; length: number }
-    | { kind: "scratch"; length: number }
-    | { kind: "uniform"; data: ArrayBuffer }
-  )[];
-  workgroups: [number] | [number, number] | [number, number, number];
-}) => Promise<(Float32Array | Int32Array | Uint32Array)[]> {
+): (dispatch: Dispatch) => Promise<(Float32Array | Int32Array | Uint32Array)[]> {
   return async function run(dispatch) {
     const { code, entry = "main", bindings, workgroups } = dispatch;
     const pipeline = await device.pipelineFor(code, entry);
 
     const buffers: GPUBuffer[] = [];
-    const outputs: { spec: Extract<(typeof bindings)[number], { kind: "out" }>; buffer: GPUBuffer }[] = [];
+    const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];
 
     for (const binding of bindings) {
       if (binding.kind === "out") {

@@ -144,7 +144,19 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
       if (failure) throw new Error(failure);
       modules.set(code, module);
     }
+    // Same reason `wgsl.ts#dispatch` (lines ~223-232) pushes an error scope
+    // around its own `createComputePipeline`/`createBindGroup`: `layout:
+    // "auto"` silently drops a binding the entry point never references
+    // rather than failing pipeline creation, and the mismatch only surfaces
+    // later as a bind-group validation error — or, without an error scope at
+    // all, as a same-class-of-error output that just reads "zeros" (issue
+    // #46's own failure mode). `bindGroup` below already has this scope;
+    // `pipelineFor` did not (PR #116 review, item 4), so a wrong `entry`
+    // string had no validation path here at all.
+    device.pushErrorScope("validation");
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
+    const invalid = await device.popErrorScope();
+    if (invalid) throw new Error(`resident pipeline is not valid: ${invalid.message}`);
     pipelines.set(key, pipeline);
     stats.pipelinesCreated += 1;
     return pipeline;
