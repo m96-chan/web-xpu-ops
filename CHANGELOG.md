@@ -35,11 +35,13 @@ Entries record **why** a change was needed. What changed is in the diff.
   baked into `LlamaEngineQ8`'s output — worst observed diff abs 1.49e-7, rel
   7.22e-4). The real Sarashina2.2-1B-alibi-v1 checkpoint converts, loads, and
   constructs a `LlamaEngineQ8` successfully; **live GPU generation from it
-  could not be completed on the machine this was built on** — a Node+Dawn
-  binding fragility triggered by real-model-scale CPU-bound work before a
-  dispatch, not a correctness problem (see #107 for the isolated repro).
-  Live generation, `llama.cpp` comparison, and tok/s move to #106 (browser
-  demo), where WebGPU's separate GPU process does not have this condition.
+  does not run yet** — a Node+Dawn binding fragility triggered by
+  real-model-scale CPU-bound work before a dispatch (see #107 for the
+  isolated repro), and, found in review, the real vocab's lmHead projection
+  breaking WebGPU's default dispatch and buffer limits (#112). Neither is a
+  numerics problem. Live generation, `llama.cpp` comparison, and tok/s move
+  to #106 (browser demo), where #107's condition does not exist — #112
+  applies there too and blocks it.
 - `matvecQ8` gets a second call site: `llm/kernels.ts#runMatVecQ8`, the GPU
   dispatch wrapper `LlamaEngineQ8`'s decode path uses — issue #97's kernel
   finally consumed by the engine it was built for.
@@ -60,13 +62,77 @@ Entries record **why** a change was needed. What changed is in the diff.
 - `llm/tools/quant_common.py`: the per-row absmax int8 quantizer
   `convert_weights.py` and `gen_fixture_q8.py` both call, sharing one
   implementation rather than risking two silently-different ones (rule 7).
-  Uses `np.floor(x + 0.5)`, not `np.round` — `Math.round` (what
-  `ops/quantize/reference.ts#quantize` uses) rounds ties toward `+Infinity`;
-  `np.round` rounds ties to even. The two disagree at every exact `.5`
-  boundary (`Math.round(62.5) === 63`, `np.round(62.5) === 62`), verified
+  Uses `floor(x) + (frac >= 0.5)`, not `np.round` and not `np.floor(x + 0.5)`
+  — `Math.round` (what `ops/quantize/reference.ts#quantize` uses) rounds ties
+  toward `+Infinity`; `np.round` rounds ties to even and disagrees at every
+  exact `.5` boundary (`Math.round(62.5) === 63`, `np.round(62.5) === 62`);
+  `np.floor(x + 0.5)` disagrees in the narrow band just below half-integers,
+  where the addition itself rounds up before `floor` runs
+  (`Math.round(0.49999999999999994) === 0`, `floor(… + 0.5) === 1`). Verified
   rather than assumed by `llm/quantize-parity.test.ts`, which spawns
   `quant_common.py --selftest` and diffs its output against `quantize()`
-  directly, including that boundary.
+  directly, including rows at both boundaries.
+- `llm/tokenizer.ts`: a SentencePiece **unigram** tokenizer (Viterbi encode,
+  matching decode) for the Sarashina2.2-1B-Instruct model the LLM engine
+  (#98) targets, plus `llm/tools/export_tokenizer.py` (parses
+  `tokenizer.model`'s protobuf into a JSON vocab) and
+  `llm/tools/gen_fixtures.py` (bakes real-tokenizer encode/decode fixtures
+  from Python `sentencepiece`, never `transformers` — see below). No wasm,
+  no vendored binary: this is a from-scratch TS reimplementation of the
+  algorithm, CPU-only, and it never touches a GPU device.
+
+  Nothing about this model's tokenizer config was assumed. Read directly out
+  of the real `tokenizer.model`/`tokenizer_config.json`:
+
+  - The normalizer is literally `"identity"` — **not** NFKC. Composed and
+    decomposed forms of the same glyph (が vs か + combining voiced sound
+    mark) tokenize to different ids; a normalizing tokenizer would not do
+    that. Only the literal ASCII space gets escaped to `▁`; tabs, newlines,
+    NBSP and the full-width space do not.
+  - `add_dummy_prefix` is `false`: no implicit leading `▁`.
+  - Control/special tokens (`<s>`, `</s>`, `<|system|>`, ...) are **not**
+    matched by SentencePiece's own Viterbi search against raw text — verified
+    directly (`sp.encode("<|system|>")` decomposes it byte-by-byte). They are
+    recognized through a separate literal-substring pre-tokenization pass
+    over `tokenizer_config.json`'s `added_tokens_decoder`, which is what
+    lets the engine's chat-template fragments (`<|system|>`, `<|user|>`,
+    `</s>`, ...) round-trip as single ids.
+  - `transformers` 5.3.0, on this environment, silently converts this
+    UNIGRAM model into an *approximate BPE* tokenizer when loaded with
+    `AutoTokenizer.from_pretrained(..., use_fast=False)` and no
+    `tokenizer.json` is present (e.g. it segments `"hello"` as
+    `['he','ll','o']`, not the single correct unigram piece `'hello'`).
+    Fixtures are therefore generated from Python `sentencepiece`'s
+    `SentencePieceProcessor` directly, never from `transformers`.
+  - Byte fallback is one Viterbi edge per uncovered *codepoint*, scored
+    `min_score() - 10.0` (SentencePiece's own `kUnkPenalty`/`min_score()`
+    formula from `unigram_model.cc`) — not per byte, and not an arbitrarily
+    large sentinel. An earlier version used `-1e6` per byte, which is locally
+    harmless (a byte edge never competes with a real piece at the same
+    position) but not globally harmless: accumulated over a few dozen
+    uncovered codepoints in one string it pushed the running score to a
+    magnitude where float32 could no longer distinguish the much smaller
+    (~1-2 point) gaps between competing *real* segmentations later in the
+    same string, silently picking the wrong one. Caught by a fixture built
+    from a Hiragana-block sweep containing unassigned codepoints; kept as a
+    permanent regression case (`byte_fallback_dense_sweep`).
+  - The Viterbi DP accumulates scores in float32, matching SentencePiece's
+    own C++ `Lattice`, and rounds every candidate to float32 *before*
+    comparing it against an already-stored (also float32) score — comparing
+    an un-rounded float64 sum against an already-rounded value can flip an
+    exact tie either way depending on which side happened to round which
+    way. This is not cosmetic: for a run of one repeated character, more
+    than one tiling by the same multiset of piece lengths can be an exact
+    tie at the level of real numbers, and only float32 rounding — applied
+    consistently on both sides of the comparison — reproduces which one the
+    real tokenizer picks.
+
+  80+ fixture cases (Japanese/English/mixed, code fragments, emoji including
+  ZWJ/flag/skin-tone sequences, whitespace and newline patterns, NFC/NFD
+  probes, chat-template-shaped special-token boundaries, and the
+  byte-fallback stress case above) all match the real tokenizer exactly on
+  both encode and decode. Vocab JSON: 102400 entries, 3.48 MiB raw / 1.33 MiB
+  gzipped — not compressed further; see the PR for why.
 - `llm/sampler.ts`: token sampling with `greedy` and `temperature` + `top-p`
   modes, plus a token-level `Constraint` interface (`nextAllowed(prefixTokens)
   -> allowed token ids, or null`) applied to the logits before either mode

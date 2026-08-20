@@ -30,6 +30,10 @@
       "default": "./dist/ops/*/index.js"
     },
     "./ops/*.wgsl": "./dist/ops/*.wgsl",
+    "./llm/tokenizer": {
+      "types": "./dist/llm/tokenizer.d.ts",
+      "default": "./dist/llm/tokenizer.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

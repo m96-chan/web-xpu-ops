@@ -127,6 +127,45 @@ Speed is **unmeasured**.
 
 ---
 
+## LLM tokenizer
+
+`llm/tokenizer.ts` is not a WGSL op — it never touches a GPU device — but it
+lives beside the ops because the LLM engine (#98) that consumes those ops
+needs text turned into token ids and back before any of them run. It is a
+from-scratch TypeScript reimplementation of **SentencePiece unigram**
+encode (Viterbi) / decode: no wasm, no vendored binary, no runtime dependency
+on the `sentencepiece` package.
+
+```ts
+import { SentencePieceTokenizer } from "web-xpu-ops/llm/tokenizer";
+
+// vocab is whatever llm/tools/export_tokenizer.py produced for your model —
+// fetch it, import it as JSON, however your bundler prefers.
+const tokenizer = new SentencePieceTokenizer(vocab);
+const ids = tokenizer.encode("<|system|>You are Alibi.</s>");
+tokenizer.decode(ids); // "<|system|>You are Alibi.</s>"
+```
+
+Every normalizer/byte-fallback/special-token behavior is read out of a real
+model rather than assumed — this matters because SentencePiece's own common
+defaults (NFKC normalization, an implicit leading `▁`) do **not** apply to
+every model, including the one this was built against
+(Sarashina2.2-1B-Instruct). `llm/tools/export_tokenizer.py` parses
+`tokenizer.model`'s protobuf directly and refuses to silently drop a
+`normalizer_spec` it does not implement; `llm/tokenizer.ts`'s module doc
+records exactly what was verified and how. Ground truth for correctness is
+Python `sentencepiece`'s `SentencePieceProcessor`, never `transformers` —
+`transformers` 5.3.0 silently converts a UNIGRAM model with no
+`tokenizer.json` beside it into an approximate BPE tokenizer that does not
+reproduce true unigram segmentation.
+
+`llm/tools/gen_fixtures.py` bakes real-tokenizer encode/decode pairs (80+
+cases: Japanese/English/mixed, code, emoji, whitespace patterns, and the
+`<|system|>`/`<|user|>`/`</s>`-style chat-template boundaries the engine
+emits) that `llm/tokenizer.test.ts` holds this implementation to exactly.
+
+---
+
 ## Install
 
 ```bash
@@ -470,7 +509,8 @@ hidden size, query/KV heads, head dim, FFN width, vocab, RoPE base, RMSNorm
 fixture below actually runs) and `SARASHINA_2_2_1B_CONFIG` (24 layers, hidden
 1792, 16 query / 8 KV heads, FFN 6272, vocab 102400, RoPE base 500000 — issue
 #96's real target, documentation only: running the actual checkpoint needs a
-weight-conversion tool and a tokenizer, both later issues).
+weight-conversion tool, a later issue — the tokenizer side is covered by
+`llm/tokenizer.ts` above).
 
 **KV cache and dispatch fusion.** The cache is pre-allocated f32,
 `[kvHeads, maxSeqLen, headDim]` per layer (`llm/kv-cache.ts`) — no growth
@@ -509,7 +549,8 @@ approximate — the derivation and a numeric proof are in
 `tiny.weights.bin`.
 
 **Scope.** f32 weights (this section) and int8 weights (next section) both
-exist now; no tokenizer or browser wiring yet (later issues under #96).
+exist now; the tokenizer and sampler elsewhere in this README are not wired
+into the engine yet, and there is no browser wiring (later issues under #96).
 Correctness first, per the rule below — nothing here has been tuned for speed.
 
 ---
@@ -521,6 +562,13 @@ loop from "an engine that runs a tiny fixture" to "an engine that loads and
 generates from a real checkpoint": `llm/tools/convert_weights.py` converts a
 HF safetensors checkpoint (bf16) into per-row int8, and `LlamaEngineQ8`
 (`llm/engine-q8.ts`) runs it.
+
+Every number in this section was measured on one machine (rule 9): NVIDIA
+GeForce RTX 5090, driver 610.57.04, Linux (Arch, kernel 7.1.5-arch1-2),
+backend Dawn via `webgpu@0.4.x` under Node v25.6.1, Python 3.14 / NumPy 2.4
+for the converter; checkpoint Sarashina2.2-1B-alibi-v1 (bf16, 2.68 GiB).
+Timing figures are single observations from that machine, not averages —
+comparable only against a rerun under the same conditions.
 
 ```ts
 // llm/tools/convert_weights.py --model-dir <hf checkpoint> --out-dir <out>
@@ -596,31 +644,45 @@ error to expect, not that either one is loose). `llm/quantize-parity.test.ts`
 separately checks that `llm/tools/quant_common.py` (the quantizer
 `convert_weights.py` and `gen_fixture_q8.py` both call) rounds ties exactly
 the way `ops/quantize/reference.ts#quantize`'s `Math.round` does
-(`np.floor(x + 0.5)`, not `np.round`'s banker's rounding — the two disagree at
-every `.5` boundary) by spawning the Python script and diffing its output
-directly, including that boundary case.
+(`floor(x) + (frac >= 0.5)`, not `np.round`'s banker's rounding — which
+disagrees at every `.5` boundary — and not the tempting `np.floor(x + 0.5)`,
+whose addition double-rounds just below half-integers; see
+`quant_common.py`'s module doc) by spawning the Python script and diffing its
+output directly, including both boundary cases.
 
 **Real-checkpoint status.** Converting, loading (`real-model-weights.ts`,
 checked in `real-model-weights.test.ts`), and constructing `LlamaEngineQ8`
 from the real Sarashina2.2-1B-alibi-v1 checkpoint all succeed and are
-verified. **Live GPU generation from the real checkpoint could not be
-completed on the machine this was built on** — not a correctness problem
-(the int8 path is verified above, to a tight tolerance, on real GPU
-dispatches) but a Node+Dawn binding fragility triggered by real-model-scale
-CPU-bound work (loading and packing a ~1.4 GiB checkpoint, on the order of a
-second) immediately preceding a GPU dispatch; see
-[#107](https://github.com/m96-chan/web-xpu-ops/issues/107) for the isolated
-repro (an unrelated large allocation, and separately a pure CPU busy-loop
-with no allocation at all, both reproduce it — GPU contention and buffer
-count/size were ruled out). `llm/engine-q8.real-model.test.ts` runs this
-end to end (prefill + greedy decode, tok/s per step) when a converted
-checkpoint and an encoded prompt are supplied via environment variables, and
-skips otherwise; #107's resolution, or running it somewhere the binding does
-not hit this, is what turns that test's real assertions on rather than an
-early return. Live generation, `llama.cpp` comparison, and tok/s are planned
-for [#106](https://github.com/m96-chan/web-xpu-ops/issues/106) (browser demo),
+verified. **Live GPU generation from the real checkpoint does not run yet**,
+for two separate reasons, neither a numerics problem (the int8 path is
+verified above, to a tight tolerance, on real GPU dispatches):
+
+- On the machine this was built on, a Node+Dawn binding fragility is
+  triggered by real-model-scale CPU-bound work (loading and packing a
+  ~1.4 GiB checkpoint, on the order of a second) immediately preceding a GPU
+  dispatch; see [#107](https://github.com/m96-chan/web-xpu-ops/issues/107)
+  for the isolated repro (an unrelated large allocation, and separately a
+  pure CPU busy-loop with no allocation at all, both reproduce it — GPU
+  contention and buffer count/size were ruled out).
+- Independently of #107 and of the machine, the real vocabulary size breaks
+  the lmHead projection against WebGPU's own limits: decode dispatches one
+  workgroup per output row (102,400 > the default 65,535
+  `maxComputeWorkgroupsPerDimension`), and prefill dequantizes lmHead to a
+  ~700 MiB f32 matrix that exceeds the 512 MiB buffer/binding cap the
+  harness requests (and the 128 MiB browser default). Found in review, not
+  yet hit at runtime only because #107 aborts earlier; tracked as
+  [#112](https://github.com/m96-chan/web-xpu-ops/issues/112), which blocks
+  #106's real-model demo as well.
+
+`llm/engine-q8.real-model.test.ts` runs this end to end (prefill + greedy
+decode, tok/s per step) when a converted checkpoint and an encoded prompt are
+supplied via environment variables, and skips (visibly, not as a silent pass)
+otherwise; resolving #107 and #112 is what turns its assertions on. Live
+generation, `llama.cpp` comparison, and tok/s are planned for
+[#106](https://github.com/m96-chan/web-xpu-ops/issues/106) (browser demo),
 where WebGPU runs in a separate GPU process rather than sharing Node's — the
-condition this fragility depends on does not exist there.
+condition #107 depends on does not exist there (but #112 applies to the
+browser all the same).
 
 ---
 
