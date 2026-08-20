@@ -9,6 +9,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/matvec`: two decode-only fused entry points, `q8_ffn`
+  (`silu(wGate·x) * (wUp·x)`, one dispatch reading both gate and up weights)
+  and `q8_residual` (`residual + w·x`, folding a post-projection residual
+  add into the projection itself) — issue #111. `LlamaEngineQ8Resident`'s
+  decode step (`llm/engine-q8-resident.ts`) wires both in, cutting one
+  token's real GPU dispatch count from 411 to 291 at Sarashina2.2-1B's shape
+  (17→12 per layer × 24 layers): the FFN triad (`matvecQ8(gate)` +
+  `matvecQ8(up)` + `activation(silu)` + `elementwise(multiply)`) collapses
+  4→1, and each of `o_proj`/`down_proj`'s trailing residual add collapses
+  2→1. Prefill (`runPrefillResident`) is unchanged — its projections go
+  through `matmul`, not `matvecQ8`, so these two entry points do not apply
+  there (out of this issue's own scope: "プリフィル専用最適化はスコープ外").
+  Measured (RTX 5090, real Sarashina2.2-1B-alibi-v1 checkpoint): decode
+  **7.2% lower latency / 7.7% higher tok/s** (4.471ms → 4.150ms/token,
+  combined across 76- and 365-token prompts); prefill within measurement
+  noise of itself, as expected since it was not touched. See README's
+  "Fused decode kernels (issue #111)" for the full table and for why the
+  issue's own opening "~1.2s regardless of prompt length" motivation turned
+  out to describe prefill's fixed cost, not decode's — prefill fusion is
+  tracked as separate future work.
+
 - `LlamaEngineQ8Resident.reset()` (issue #120): starts a second, independent
   generation on an already-`create()`d engine — position counter back to 0,
   next `forward()` accepted as a new prefill — without rebuilding anything

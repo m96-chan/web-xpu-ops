@@ -29,17 +29,32 @@ import type { Binding, Dispatch } from "../../../harness/wgsl.js";
 // `runnerFromBrowserResident` itself (`browser-resident-runtime.ts`) was
 // deleted alongside this re-export rather than left dead.
 
-// The ten kernel entry points `llm/kernels.ts#CODE` builds via
-// `harness/suite.ts#kernel(url, name)` — one static import per `.wgsl` file
-// so esbuild's `text` loader (see `build.mjs`) can inline each one as a JS
-// string at bundle time. Keep this list in lockstep with `llm/kernels.ts`'s
-// own `CODE` object; `llm/kernels.browser-parity.test.ts` (run under `npm
-// test`, no browser needed — it reads both files as text rather than
-// importing this one) asserts the two never drift apart.
+// The kernel entry points `llm/kernels.ts#CODE` and `llm/engine-q8-resident.ts#CODE`
+// build via `harness/suite.ts#kernel(url, name)` — one static import per
+// `.wgsl` file so esbuild's `text` loader (see `build.mjs`) can inline each
+// one as a JS string at bundle time. Both files import `kernel`/`params`
+// from `harness/index.js`, which `build.mjs`'s `harnessBrowserShim`
+// redirects to this module for *every* importer in the bundle graph, not
+// just `kernels.ts` — so this table has to cover both files' entries, not
+// only the ten `kernels.ts#CODE` builds (issue #106) plus `permute`/
+// `dequant_transpose` (issue #117). `llm/kernels.browser-parity.test.ts`
+// (run under `npm test`, no browser needed — it reads all three files as
+// text rather than importing them) asserts this table is the exact union of
+// both `CODE` objects' entries, per op.
 import gatherKernel from "../../../ops/gather/wgsl/kernel.wgsl";
 import rmsnormKernel from "../../../ops/rmsnorm/wgsl/kernel.wgsl";
 import matvecKernel from "../../../ops/matvec/wgsl/kernel.wgsl";
 import matvecQ8Kernel from "../../../ops/matvec/wgsl/q8.wgsl";
+// Issue #111: `llm/engine-q8-resident.ts`'s two decode-only fused entry
+// points — not referenced by `llm/kernels.ts#CODE` (that file's `opKernel`
+// calls are what `kernels.browser-parity.test.ts` checks against this
+// table), but still resolved through this same `harness/index.js` ->
+// `browser-runtime.ts` redirect (`build.mjs`'s `harnessBrowserShim` has no
+// way to tell which importer is asking), so they need an entry here too —
+// see that test file's own doc for how it now covers both `kernels.ts` and
+// `engine-q8-resident.ts`.
+import matvecQ8FfnKernel from "../../../ops/matvec/wgsl/q8_ffn.wgsl";
+import matvecQ8ResidualKernel from "../../../ops/matvec/wgsl/q8_residual.wgsl";
 import matmulKernel from "../../../ops/matmul/wgsl/kernel.wgsl";
 import ropeKernel from "../../../ops/rope/wgsl/kernel.wgsl";
 import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
@@ -67,7 +82,7 @@ import dequantTransposeKernel from "../../../ops/dequant_transpose/wgsl/kernel.w
 export const WGSL_TABLE: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   gather: { kernel: gatherKernel },
   rmsnorm: { kernel: rmsnormKernel },
-  matvec: { kernel: matvecKernel, q8: matvecQ8Kernel },
+  matvec: { kernel: matvecKernel, q8: matvecQ8Kernel, q8_ffn: matvecQ8FfnKernel, q8_residual: matvecQ8ResidualKernel },
   matmul: { kernel: matmulKernel },
   rope: { kernel: ropeKernel },
   permute: { kernel: permuteKernel },
