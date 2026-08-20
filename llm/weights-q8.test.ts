@@ -98,6 +98,19 @@ describe("gatherDequantRows", () => {
     // row 2: [-1,-2]*2 = [-2,-4]; row 0: [1,2]*1 = [1,2]; row 2 again
     expect(Array.from(out)).toEqual([-2, -4, 1, 2, -2, -4]);
   });
+
+  it("gathers zeros for out-of-range indices, matching ops/gather", () => {
+    // Token ids reach this from external JSON (a prompt encoded elsewhere,
+    // possibly with a different tokenizer). ops/gather documents and tests
+    // "indices outside [0, rows) gather zeros" for exactly this case; the CPU
+    // gather must not diverge into NaN rows that propagate through every
+    // layer and still argmax to a plausible-looking token.
+    const codes = Int8Array.from([1, 2, 10, 20]); // [2 rows, D=2]
+    const scale = Float32Array.from([1, 0.5]);
+    const table: QuantizedLinear = { codes, scale };
+    const out = gatherDequantRows(table, [-1, 1, 2], 2);
+    expect(Array.from(out)).toEqual([0, 0, 5, 10, 0, 0]);
+  });
 });
 
 describe("cloneQuantizedLinear", () => {

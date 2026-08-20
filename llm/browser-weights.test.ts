@@ -104,4 +104,23 @@ describe("loadWeightsQ8FromUrl", () => {
       loadWeightsQ8FromUrl("http://demo.invalid/does-not-exist", 128, undefined, fakeFetch),
     ).rejects.toThrow(/404/);
   });
+
+  it("reports totalBytes as null, never NaN, when Content-Length is unparsable", async () => {
+    // WeightFetchProgress documents totalBytes as "number | null, null when
+    // unknown". Number("garbage") is NaN, which is neither — it flows into
+    // `p.totalBytes ? ...` consumers as falsy-but-non-null and into any
+    // fraction as NaN.
+    const garbageLengthFetch = async (input: string | URL | Request): Promise<Response> => {
+      const res = await fakeFetch(input);
+      const headers = new Headers(res.headers);
+      headers.set("content-length", "garbage");
+      return new Response(res.body, { status: res.status, headers });
+    };
+    const ticks: WeightFetchProgress[] = [];
+    await loadWeightsQ8FromUrl("http://demo.invalid/weights", 128, (p) => ticks.push({ ...p }), garbageLengthFetch);
+    expect(ticks.length).toBeGreaterThan(0);
+    for (const tick of ticks) {
+      expect(tick.totalBytes === null || Number.isFinite(tick.totalBytes)).toBe(true);
+    }
+  });
 });
