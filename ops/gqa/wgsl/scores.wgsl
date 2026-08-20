@@ -35,6 +35,13 @@ struct Params {
   mask_batch: u32,
   mask_heads: u32,
   mask_rows: u32,
+  // Issue #117. `S` stays the address stride for `k` (`k_head` below is still
+  // `kv_head * S * D`) — this only bounds the softmax scan. Defaults to `S`
+  // (append rather than insert, so this field's byte offset does not move
+  // `query_offset`'s — `llm/engine-q8-resident.ts#GQA_QUERY_OFFSET_BYTE`
+  // copies that offset, rule 2). See reference.ts's `sEff` doc for the
+  // caller's safety contract.
+  s_eff: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -82,9 +89,11 @@ fn main(
   let mr = select(0u, i, params.mask_rows > 1u);
   let m_row = ((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S;
 
-  // Pass 1: scaled dot products, straight into `probs`.
+  // Pass 1: scaled dot products, straight into `probs`. Bounded by `s_eff`,
+  // not `S` — positions `[s_eff, S)` are never read, not masked-then-summed
+  // (issue #117; see reference.ts's `sEff` doc).
   var local_max: f32 = MASKED;
-  for (var j = tid; j < params.S; j += WORKGROUP_SIZE) {
+  for (var j = tid; j < params.s_eff; j += WORKGROUP_SIZE) {
     var value: f32 = MASKED;
     if (params.causal == 0u || i32(j) <= i32(i) + params.query_offset) {
       var dot: f32 = 0.0;
@@ -113,7 +122,7 @@ fn main(
   // Pass 2: exponentiate in place, and sum. The row max comes off first because
   // exp() overflows f32 at 89 and attention logits reach the hundreds.
   var local_sum: f32 = 0.0;
-  for (var j = tid; j < params.S; j += WORKGROUP_SIZE) {
+  for (var j = tid; j < params.s_eff; j += WORKGROUP_SIZE) {
     let e = exp(probs[p_row + j] - row_max);
     probs[p_row + j] = e;
     local_sum += e;
@@ -135,8 +144,12 @@ fn main(
   let inv_sum = select(1.0 / shared_val[0], 0.0, shared_val[0] == 0.0);
   workgroupBarrier();
 
-  // Pass 3: normalise. Masked columns are already 0 and stay 0.
-  for (var j = tid; j < params.S; j += WORKGROUP_SIZE) {
+  // Pass 3: normalise. Masked columns are already 0 and stay 0. Columns
+  // `[s_eff, S)` are never written by any pass — whatever `probs` held there
+  // before this dispatch stays there, and `context.wgsl` must never read it
+  // (it also stops at `s_eff`, given the same params buffer — see that
+  // file's doc).
+  for (var j = tid; j < params.s_eff; j += WORKGROUP_SIZE) {
     probs[p_row + j] = probs[p_row + j] * inv_sum;
   }
 }

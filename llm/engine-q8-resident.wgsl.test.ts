@@ -16,23 +16,29 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * file proving `LlamaEngineQ8Resident`'s tokens equal `fixture.decodeTokens`
  * establishes the same "matches the pre-optimization engine" fact the issue
  * asks for, without constructing two independent engines' worth of
- * `matvecQ8`-packed weights and dispatches on one device at once.
+ * `matvecQ8`-packed weights and dispatches on one device at once. An
+ * earlier version of this file did build a second `LlamaEngineQ8` here
+ * (via `runnerFromResident`, `harness/resident.ts`), and running both
+ * engines' dispatches back to back reliably crashed this repository's
+ * Node/Dawn binding (`terminate called after throwing an instance of
+ * 'std::system_error'`) partway through the second engine's prefill — the
+ * same failure family issue #38/#49/#107 document, this time triggered by
+ * total GPU-object count (`LlamaEngineQ8Resident.create()`'s own ~45
+ * pipelines/bind groups for the tiny fixture, plus a second engine's worth
+ * on top) rather than by a second native device.
  *
- * That "at once" mattered in practice: an earlier version of this file did
- * build a second `LlamaEngineQ8` here (via `runnerFromResident`, issue
- * #110's own single-device fix for the *previous* instability this file
- * hit — see that function's doc), and running both engines' dispatches
- * back to back reliably crashed this repository's Node/Dawn binding
- * (`terminate called after throwing an instance of 'std::system_error'`)
- * partway through the second engine's prefill — the same failure family
- * issue #38/#49/#107 document, this time triggered by total GPU-object
- * count (`LlamaEngineQ8Resident.create()`'s own ~45 pipelines/bind groups
- * for the tiny fixture, plus a second engine's worth on top) rather than by
- * a second native device. `LlamaEngineQ8Resident`'s prefill delegation
- * already exercises `runnerFromResident` end to end on every run below (see
- * `engine-q8-resident.ts#runPrefill`), so dropping the second engine here
- * lost no coverage of that function, only the redundant second dispatch
- * load.
+ * Issue #117 removed the delegation to `LlamaEngineQ8` entirely — prefill
+ * is resident now (`engine-q8-resident.ts#runPrefillResident`) — so the
+ * instability this file's history describes no longer applies to prefill
+ * specifically, but the fixture-comparison shape (rather than a live
+ * second engine) is kept regardless: it is still the more direct
+ * "matches the pre-optimization engine" proof, one engine, one device.
+ *
+ * `forward()`'s prefill return shape changed with #117 too: **one**
+ * element (the final prompt position's logits), not one per prompt token —
+ * see `engine-q8-resident.ts#forward`'s own doc. This file's prefill check
+ * compares that one element against `fixture.prefillLogits`'s own last
+ * element, the same position.
  */
 
 const TOLERANCE = { rel: 1e-2, abs: 5e-3 };
@@ -56,19 +62,16 @@ describe("llm/engine-q8-resident / greedy tokens match the pre-optimization engi
     const fixture = loadTinyFixtureQ8();
     const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
 
+    // Issue #117: prefill returns exactly one element — the final prompt
+    // position's logits (see this file's own doc, and
+    // `engine-q8-resident.ts#forward`'s). Compared against the fixture's own
+    // last prefill position, the same one.
     const prefillLogits = await engine.forward(fixture.promptTokens);
-    prefillLogits.forEach((got, t) => {
-      const worst = agree(got, fixture.prefillLogits[t]!, TOLERANCE);
-      expect(worst, worst ? `prefill token ${t}: ${JSON.stringify(worst)}` : undefined).toBeNull();
-    });
-    const worstPrefill = prefillLogits.reduce(
-      (worst, got, t) => {
-        const d = worstDiff(got, fixture.prefillLogits[t]!);
-        return { abs: Math.max(worst.abs, d.abs), rel: Math.max(worst.rel, d.rel) };
-      },
-      { abs: 0, rel: 0 },
-    );
-    console.log("resident int8 prefill worst abs/rel diff:", worstPrefill);
+    expect(prefillLogits).toHaveLength(1);
+    const fixtureLastPrefill = fixture.prefillLogits[fixture.prefillLogits.length - 1]!;
+    const worst = agree(prefillLogits[0]!, fixtureLastPrefill, TOLERANCE);
+    expect(worst, worst ? `prefill (final position): ${JSON.stringify(worst)}` : undefined).toBeNull();
+    console.log("resident int8 prefill worst abs/rel diff:", worstDiff(prefillLogits[0]!, fixtureLastPrefill));
 
     const decodeTokens: number[] = [];
     const decodeLogits: Float32Array[] = [];

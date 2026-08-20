@@ -1,11 +1,11 @@
-import { kernel, params, runnerFromResident, type ResidentDevice, type ResidentOp, type Runner } from "../harness/index.js";
+import { kernel, params, type ResidentDevice, type ResidentOp } from "../harness/index.js";
 import type { LlamaConfig } from "./config.js";
-import { LlamaEngineQ8 } from "./engine-q8.js";
 import { MAX_WORKGROUPS_PER_DISPATCH } from "./kernels.js";
-import type { KVCache } from "./kv-cache.js";
+import { transposeRowMajor } from "./reshape.js";
 import {
   assertWeightShapesQ8,
   cloneQuantizedLinear,
+  dequantizePackedQ8,
   gatherDequantRows,
   packInt8Rows,
   type LlamaWeightsQ8,
@@ -27,15 +27,70 @@ import {
  * `LlamaEngineQ8`'s own class doc gives for not being a mode flag on
  * `LlamaEngine`.
  *
- * ## Scope: decode only, per issue #110
+ * ## Prefill is resident too, as of issue #117
  *
- * Prefill is unchanged — "プリフィルは現行方式のまま(別ISSUE)". This class
- * does not reimplement it: the first `forward()` call (however many tokens
- * long) is delegated whole to a private `LlamaEngineQ8` instance, and this
- * class only takes over from the *second* `forward()` call onward, where
- * every call must be exactly one token (`LlamaEngineQ8`'s own decode
- * contract, `tokens.length === 1`). See `LlamaEngineQ8#cacheState` for the
- * handoff this reuses rather than re-deriving prefill's control flow.
+ * Issue #110 scoped prefill out — "プリフィルは現行方式のまま(別ISSUE)" — and an
+ * earlier version of this class delegated the first `forward()` call whole to
+ * a private `LlamaEngineQ8` instance, then uploaded its CPU-side `KVCache`
+ * into this class's own GPU buffers. That paid `LlamaEngineQ8`'s per-op
+ * `await run(...)` round trips for every dispatch in the prompt's pass
+ * through every layer — ~360 of them for a 76-token prompt at
+ * Sarashina2.2-1B's 24 layers, measured at 12.6s (issue #117's own numbers) —
+ * for exactly the reason issue #110 already fixed for decode.
+ *
+ * `runPrefillResident` (below) is that fix applied to prefill: every prompt
+ * token's pass through every layer is encoded into the *same* flat op list
+ * `runDecodeStep` builds, and the whole prompt costs one `queue.submit`, one
+ * readback — the **final** token's logits alone (`greedyGenerate`,
+ * `examples/llm-demo`, and this class's own decode step only ever read
+ * `prefillLogits[prefillLogits.length - 1]`, never an earlier prefill
+ * position — see `forward`'s return-shape note). `LlamaEngineQ8` is no
+ * longer used by this class at all.
+ *
+ * Prefill keeps `LlamaEngineQ8`'s **matmul** path rather than switching to
+ * `matvecQ8` per token: `matvecQ8` re-reads a projection's whole weight once
+ * per query vector, so running it once per prompt token would multiply the
+ * weight traffic prefill moves by `N` — turning a 360-token prompt into 360x
+ * the decode bandwidth, the opposite of the goal. `matmul` reads each
+ * projection's weight once and computes against all `N` rows at once, same
+ * as `LlamaEngineQ8`'s own prefill branch; only *how many round trips it
+ * costs* changes here, not which kernel. Weight for `matmul`'s `b` operand is
+ * dequantized-then-transposed from the packed int8 form once per layer per
+ * `forward()` call that runs prefill — never per token, matching
+ * `LlamaEngineQ8#project`'s own accepted cost (that class's doc: "この
+ * transient dequantが1回のgenerationにつき1回で済む").
+ *
+ * ## Reshape: a GPU permute kernel, not a CPU round trip
+ *
+ * `matmul`'s projections produce `[N, heads, dim]` token-major (a token's
+ * `heads * dim` output channels are one contiguous output row), and `rope`
+ * reads and writes that same layout unchanged — but `ops/gqa` wants
+ * `[heads, N, dim]` head-major (`llm/reshape.ts#splitHeadsMajor`'s doc has
+ * the full explanation, shared with `LlamaEngineQ8`). That class reshapes on
+ * the CPU (`llm/reshape.ts`'s own doc: "None of these are compute... so they
+ * run on the CPU"), which is fine when every dispatch already pays a round
+ * trip, and wrong here — reading Q/K/V back to reshape and re-uploading
+ * would put a CPU round trip exactly where this class removes one.
+ * `llm/wgsl/permute.wgsl` (issue #117) is that reshape as one GPU dispatch;
+ * see its own doc for why it is not an `ops/` kernel.
+ *
+ * ## Prefill's own KV is scanned at S = N, not S = maxSeqLen
+ *
+ * Prefill's attention only ever needs the tokens in *this* prompt — nothing
+ * before them exists yet (this class's own decode contract: `forward()`
+ * accepts more than one token exactly once, as the first call). So
+ * `runPrefillResident` binds `gqaScores`/`gqaContext` against **transient**
+ * `[kvHeads, N, headDim]` buffers (this call's own freshly projected,
+ * RoPE'd K and V), not the persistent `maxSeqLen`-strided cache — `S = N`
+ * there, already the tight bound, and `sEff` (issue #117, see below) stays
+ * at its default (`sEff = S`) for prefill's own attention. The persistent
+ * cache is written *separately*, once attention has read from the tight
+ * buffers: `kvHeads` `copyBufferToBuffer` calls per layer (one per head, each
+ * moving that head's whole `N`-position block in one contiguous copy — the
+ * same shape of copy `runDecodeStep` already does for one position, scaled
+ * to `N`), so decode's own persistent, `maxSeqLen`-strided `kCacheBuf`/
+ * `vCacheBuf` are ready for `runDecodeStep`'s first call the moment prefill's
+ * `batch()` resolves.
  *
  * ## Buffer design: one buffer per tensor, not one fused buffer sliced by offset
  *
@@ -57,19 +112,19 @@ import {
  * all bandwidth-bound against the same total weight bytes, and correct
  * regardless of how the model's dimensions happen to divide.
  *
- * ## One device, not two
+ * ## One device, always
  *
- * `create()` takes a single `ResidentDevice` — no separate `Runner` for the
- * prefill delegate. `LlamaEngineQ8` is written against `Runner["run"]`, so
- * an earlier version of this class took one of those alongside the
- * `ResidentDevice`, and constructing both (two native `webgpu` `GPUDevice`s
- * in one process) reproducibly crashed this repository's Node/Dawn binding
- * partway through prefill — not on every run, and not always at the same
- * call, which is the signature of binding instability under load (the same
- * failure family issue #38/#49/#107 document) rather than a logic bug.
- * `harness/resident.ts#runnerFromResident` adapts the one `ResidentDevice`
- * into a `Runner["run"]` instead, so prefill and decode share a single
- * device — see that function's own doc for the measurement.
+ * `create()` takes a single `ResidentDevice`, still. A pre-#117 version of
+ * this class needed a *second* device dressed up as a `Runner["run"]`
+ * (`harness/resident.ts#runnerFromResident`) purely so `LlamaEngineQ8` had
+ * something to call for its delegated prefill — two native `webgpu`
+ * `GPUDevice`s in one process reproducibly crashed this repository's
+ * Node/Dawn binding partway through prefill (issue #38/#49/#107's failure
+ * family). Prefill going resident removed the delegate, and with it the
+ * only reason this class ever touched a second device or `runnerFromResident`
+ * — `harness/resident.ts` keeps that function for callers that still need
+ * it (issue #110's own decode-vs-prefill history is why it exists at all),
+ * but this class no longer imports it.
  *
  * ## KV-cache writes: a GPU-to-GPU copy, not `queue.writeBuffer`
  *
@@ -85,31 +140,33 @@ import {
  * The KV cache itself keeps `KVCache`'s own layout (`kv-cache.ts`'s doc):
  * `[kvHeads, maxSeqLen, headDim]` per layer, head-major, so a head's positions
  * are contiguous but heads are not — a new position's write is `kvHeads`
- * small copies (one per head), not one. `maxSeqLen` positions are always the
- * causal-mask's job to hide, never the buffer's: `ops/gqa`'s kernels take
- * `S` as both the loop bound *and* the per-head stride
+ * small copies (one per head), not one. `ops/gqa`'s kernels take `S` as both
+ * the loop bound *and* the per-head stride
  * (`ops/gqa/wgsl/scores.wgsl`: `let k_head = kv_head * params.S * params.D`),
  * so a cache addressed by `maxSeqLen` has to be *read* with `S = maxSeqLen`
- * too, not the position actually filled — this class always passes
- * `S = maxSeqLen` to `gqaScores`/`gqaContext` and relies on the causal mask
- * (`j <= i + query_offset`, unconditionally true for every step this class
- * runs) to skip the dot product for every unwritten position, which
- * `ops/gqa/wgsl/scores.wgsl`'s own `if` already does before ever reading `k`
- * there. The cost this accepts: every decode step's attention dispatches
- * scan `maxSeqLen` positions, not `position + 1` — bounded, and (per the
- * PR's roofline table) small next to the weight traffic `matvecQ8` moves,
- * but real, and not something #110's "no new kernels" scope leaves room to
- * avoid without a stride parameter `ops/gqa` does not have.
+ * as the stride — but not scanned that far: `ops/gqa`'s `sEff` parameter
+ * (issue #117) separates the two, and this class passes `S = maxSeqLen`,
+ * `sEff = position + 1` to `gqaScores`/`gqaContext` every step
+ * (`GQA_SCORES_S_EFF_BYTE`/`GQA_CONTEXT_S_EFF_BYTE` below). Before `sEff`
+ * existed, every decode step's attention dispatches scanned all `maxSeqLen`
+ * positions regardless of how many were real, relying only on the causal
+ * mask to skip the dot product past the real ones — issue #116's own
+ * roofline table measured that at 672 MiB/token on Sarashina2.2-1B's shape,
+ * the single largest unaccounted term in decode's bandwidth budget. `sEff`
+ * removes the scan itself rather than skipping work inside it.
  */
 
 const CODE = {
   rmsnorm: kernel(new URL("../ops/rmsnorm/index.ts", import.meta.url)),
   matvecQ8: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8"),
+  matmul: kernel(new URL("../ops/matmul/index.ts", import.meta.url)),
   rope: kernel(new URL("../ops/rope/index.ts", import.meta.url)),
   gqaScores: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "scores"),
   gqaContext: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "context"),
   activation: kernel(new URL("../ops/activation/index.ts", import.meta.url)),
   elementwise: kernel(new URL("../ops/elementwise/index.ts", import.meta.url)),
+  // Issue #117's prefill reshape — see `llm/wgsl/permute.wgsl`'s own doc.
+  permute: kernel(new URL(".", import.meta.url), "permute"),
 };
 
 /** `ops/activation/reference.ts#ACTIVATION.silu`, copied rather than imported to avoid pulling in `ops/activation`'s whole module graph for one constant — same value, checked against `llm/kernels.ts`'s own `ACTIVATION` re-export. */
@@ -122,6 +179,14 @@ const ELEMENTWISE_MULTIPLY = 1;
 const ROPE_POS_OFFSET_BYTE = 3 * 4;
 /** `runGqa`'s scores uniform layout: field index 7 is `query_offset` (i32). */
 const GQA_QUERY_OFFSET_BYTE = 7 * 4;
+/**
+ * `runGqa`'s scores uniform layout: field index 11 is `s_eff` (u32) — issue
+ * #117, appended after `mask_rows` so `GQA_QUERY_OFFSET_BYTE` above did not
+ * have to move.
+ */
+const GQA_SCORES_S_EFF_BYTE = 11 * 4;
+/** `runGqa`'s context uniform layout: field index 5 is `s_eff` (u32), same reasoning. */
+const GQA_CONTEXT_S_EFF_BYTE = 5 * 4;
 
 function uniformOf(device: ResidentDevice, fields: ["u32" | "i32" | "f32", number][]): GPUBuffer {
   const data = params(fields);
@@ -157,6 +222,42 @@ async function buildProjection(
   return device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, outBuf, uniform]);
 }
 
+/** Must match `TILE` in `ops/matmul/wgsl/kernel.wgsl` — copied per rule 2, same as `llm/kernels.ts#MATMUL_TILE`. */
+const MATMUL_TILE = 16;
+
+/**
+ * A `QuantizedLinear`'s `[outFeatures, inFeatures]` int8 weight, dequantized
+ * to f32 and transposed to `[inFeatures, outFeatures]` — `matmul`'s `b`
+ * operand shape (`ops/matmul/wgsl/kernel.wgsl`: `b: [K, N]`). Packs first
+ * because `dequantizePackedQ8` reads the packed wire format, the same
+ * detour `LlamaEngineQ8#project`'s own prefill branch takes (that class's
+ * doc: "プリフィルは...「行スケールdequantしてf32 matmul」でもよい") — this
+ * function is that same operation, called once per layer per projection per
+ * `runPrefillResident` call, never per token.
+ */
+function dequantTransposed(linear: QuantizedLinear, outFeatures: number, inFeatures: number): Float32Array {
+  const packed = packInt8Rows(linear.codes, outFeatures, inFeatures);
+  const dequant = dequantizePackedQ8(packed, linear.scale, outFeatures, inFeatures);
+  return transposeRowMajor(dequant, outFeatures, inFeatures);
+}
+
+/** Uploads a dequantized-and-transposed `[K, N]` weight and binds one `matmul` dispatch: `a` (this call's shared input buffer) @ weight -> `out`. */
+async function buildMatmulProjection(
+  device: ResidentDevice,
+  pipeline: GPUComputePipeline,
+  linear: QuantizedLinear,
+  outFeatures: number,
+  inFeatures: number,
+  uniform: GPUBuffer,
+  aBuf: GPUBuffer,
+  outBuf: GPUBuffer,
+): Promise<GPUBindGroup> {
+  const weightT = dequantTransposed(linear, outFeatures, inFeatures);
+  const weightBuf = device.createStorageBuffer(weightT.byteLength);
+  device.upload(weightBuf, 0, weightT);
+  return device.bindGroup(pipeline, [aBuf, weightBuf, outBuf, uniform]);
+}
+
 interface SharedResident {
   rmsnormPipeline: GPUComputePipeline;
   matvecPipeline: GPUComputePipeline;
@@ -165,6 +266,10 @@ interface SharedResident {
   gqaContextPipeline: GPUComputePipeline;
   activationPipeline: GPUComputePipeline;
   elementwisePipeline: GPUComputePipeline;
+  /** Prefill only — see `runPrefillResident`. */
+  matmulPipeline: GPUComputePipeline;
+  /** Prefill only — see `runPrefillResident`. */
+  permutePipeline: GPUComputePipeline;
 
   hiddenA: GPUBuffer;
   hiddenB: GPUBuffer;
@@ -187,6 +292,7 @@ interface SharedResident {
   ropeQUniform: GPUBuffer;
   ropeKUniform: GPUBuffer;
   gqaScoresUniform: GPUBuffer;
+  gqaContextUniform: GPUBuffer;
 
   ropeQGroup: GPUBindGroup;
   ropeKGroup: GPUBindGroup;
@@ -227,7 +333,6 @@ export class LlamaEngineQ8Resident {
   private constructor(
     private readonly config: LlamaConfig,
     private readonly device: ResidentDevice,
-    private readonly legacyRun: Runner["run"],
     weights: LlamaWeightsQ8,
     private readonly embedTokens: QuantizedLinear,
     private readonly shared: SharedResident,
@@ -235,11 +340,12 @@ export class LlamaEngineQ8Resident {
     private readonly lmHeadChunks: LmHeadChunk[],
   ) {
     // Retained only until the first `forward()` call runs prefill (see the
-    // class doc): `LlamaEngineQ8`'s own constructor needs the full,
-    // unpacked `LlamaWeightsQ8` to build *its* resident packed weights, and
-    // this class cannot know the prompt's tokens (so cannot run prefill)
-    // before that first call — dropped afterward (`runPrefill` below) so it
-    // does not outlive the one delegation that needs it.
+    // class doc): this class cannot know the prompt's tokens (so cannot
+    // dequantize-and-transpose each layer's projection weight for `matmul`,
+    // `runPrefillResident`'s own first step) before that first call —
+    // dropped afterward so it does not outlive the one call that needs it
+    // (the same reasoning `LlamaEngineQ8`'s own class doc gives for not
+    // holding onto the unpacked `LlamaWeightsQ8` past construction).
     this.prefillWeights = weights;
   }
 
@@ -254,8 +360,10 @@ export class LlamaEngineQ8Resident {
     const qDim = numHeads * headDim;
     const kvDim = numKvHeads * headDim;
 
-    const [rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline] =
-      await Promise.all([
+    const [
+      rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
+      matmulPipeline, permutePipeline,
+    ] = await Promise.all([
         device.pipelineFor(CODE.rmsnorm),
         device.pipelineFor(CODE.matvecQ8),
         device.pipelineFor(CODE.rope),
@@ -263,6 +371,12 @@ export class LlamaEngineQ8Resident {
         device.pipelineFor(CODE.gqaContext),
         device.pipelineFor(CODE.activation),
         device.pipelineFor(CODE.elementwise),
+        // Prefill only (issue #117's resident prefill, `runPrefillResident`
+        // below) — pipeline creation does not depend on `N`, only the
+        // dispatch workgroup counts and buffer sizes do, so these are built
+        // once here alongside decode's, not per `forward()` call.
+        device.pipelineFor(CODE.matmul),
+        device.pipelineFor(CODE.permute),
       ]);
 
     // f32 activation buffers, sized for the N = 1 decode this class runs —
@@ -323,13 +437,19 @@ export class LlamaEngineQ8Resident {
       ["u32", 0], ["u32", numKvHeads],
     ]);
     // `S = maxSeqLen` always — see the class doc's KV-cache section for why.
-    // `query_offset` (index 7) is rewritten every decode step.
+    // `query_offset` (index 7) and `s_eff` (index 11 — issue #117) are both
+    // rewritten every decode step, to `at` and `at + 1` respectively: the
+    // cache holds exactly `at + 1` valid positions (0..at) once this step's
+    // own K/V have been written, so `s_eff = at + 1` is the tight bound —
+    // not `maxSeqLen`, which is what made every decode step scan the whole
+    // cache regardless of how much of it was real (issue #116's roofline
+    // table: 672 MiB/token of that scan on Sarashina2.2-1B's shape).
     const gqaScoresUniform = uniformOf(device, [
       ["u32", numHeads], ["u32", numKvHeads], ["u32", 1], ["u32", maxSeqLen], ["u32", headDim],
-      ["f32", 1 / Math.sqrt(headDim)], ["u32", 1], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
+      ["f32", 1 / Math.sqrt(headDim)], ["u32", 1], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1], ["u32", maxSeqLen],
     ]);
     const gqaContextUniform = uniformOf(device, [
-      ["u32", numHeads], ["u32", numKvHeads], ["u32", 1], ["u32", maxSeqLen], ["u32", headDim],
+      ["u32", numHeads], ["u32", numKvHeads], ["u32", 1], ["u32", maxSeqLen], ["u32", headDim], ["u32", maxSeqLen],
     ]);
 
     const ropeQGroup = await device.bindGroup(ropePipeline, [qOutBuf, dummyCacheBuf, qRopedBuf, ropeQUniform]);
@@ -390,54 +510,249 @@ export class LlamaEngineQ8Resident {
 
     const shared: SharedResident = {
       rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
+      matmulPipeline, permutePipeline,
       hiddenA, hiddenB, normedBuf, normed2Buf, qOutBuf, kOutBuf, vOutBuf, qRopedBuf, kRopedBuf, attnOutBuf, projOutBuf,
       gateOutBuf, upOutBuf, gateActBuf, gatedBuf, downOutBuf, finalNormedBuf,
-      ropeQUniform, ropeKUniform, gqaScoresUniform,
+      ropeQUniform, ropeKUniform, gqaScoresUniform, gqaContextUniform,
       ropeQGroup, ropeKGroup, add1Group, siluGroup, mulGroup, add2Group, finalNormGroup,
     };
 
     return new LlamaEngineQ8Resident(
-      config, device, runnerFromResident(device), weights, cloneQuantizedLinear(weights.embedTokens), shared, layers, lmHeadChunks,
+      config, device, weights, cloneQuantizedLinear(weights.embedTokens), shared, layers, lmHeadChunks,
     );
   }
 
+  /**
+   * Prefill's return shape is `[finalPositionLogits]` — **one** element,
+   * regardless of how many tokens the prompt had, unlike `LlamaEngineQ8.forward`'s
+   * one-per-token array. Issue #117's own "readbackは最終位置logitsのみ": every
+   * real caller (`llm/engine.ts#greedyGenerate`, `examples/llm-demo/src/main.ts`)
+   * only ever reads `prefillLogits[prefillLogits.length - 1]`, so this
+   * remains a drop-in replacement for both — `[x][0]` and `[x][x.length - 1]`
+   * name the same element when `x.length === 1`. A caller that wanted every
+   * prefill position's logits (nothing in this repository does) would need a
+   * different method; that is a real capability this class does not have
+   * after issue #117, not an oversight — see the class doc's "Prefill is
+   * resident too" section for why recovering it would cost back the
+   * round-trip issue #117 removes.
+   */
   async forward(tokens: number[]): Promise<Float32Array[]> {
     if (tokens.length === 0) throw new Error("LlamaEngineQ8Resident.forward: tokens must be non-empty");
-    if (this.prefillWeights) return this.runPrefill(tokens);
+    if (this.prefillWeights) return this.runPrefillResident(tokens);
     if (tokens.length !== 1) {
       throw new Error("LlamaEngineQ8Resident.forward: after prefill, every call must be exactly one token (decode)");
     }
     return this.runDecodeStep(tokens[0]!);
   }
 
-  /** Delegates whole to `LlamaEngineQ8` — see the class doc's "Scope" section. */
-  private async runPrefill(tokens: number[]): Promise<Float32Array[]> {
+  /**
+   * All `N` prompt tokens, every layer, one `queue.submit`, one readback —
+   * the final position's logits alone. See the class doc's "Prefill is
+   * resident too" / "Reshape" / "Prefill's own KV" sections for the design;
+   * this method is their assembly.
+   *
+   * Every buffer here is transient — allocated once at the top of this call
+   * (sized by `N`, which `create()` cannot know) and left for GC once this
+   * `await` resolves. That is unlike `runDecodeStep`'s buffers (built once in
+   * `create()`, reused every step): prefill runs exactly once per generation
+   * (this class's own decode contract, enforced in `forward`), so there is
+   * no repeated call to amortize allocation across — the "resident" property
+   * that matters here is *within* this one call (one submit for the whole
+   * prompt), not across calls.
+   */
+  private async runPrefillResident(tokens: number[]): Promise<Float32Array[]> {
     const weights = this.prefillWeights!;
-    const legacy = new LlamaEngineQ8(this.config, weights, this.legacyRun);
-    const logits = await legacy.forward(tokens);
-    const { cache, position } = legacy.cacheState;
-    await this.uploadKvCache(cache, position);
-    this.tokensSoFar = position;
-    // Dropped now that both this class's own resident buffers (built in
-    // `create()`) and `legacy` (built just above) have read what they
-    // needed from it — see the constructor's doc.
-    this.prefillWeights = null;
-    return logits;
-  }
+    const { numLayers, hiddenSize, numHeads, numKvHeads, headDim, ffnHidden, maxSeqLen, vocabSize, ropeTheta, rmsNormEps } = this.config;
+    const N = tokens.length;
+    if (N > maxSeqLen) throw new Error(`LlamaEngineQ8Resident.forward: prompt length ${N} exceeds maxSeqLen=${maxSeqLen}`);
+    const qDim = numHeads * headDim;
+    const kvDim = numKvHeads * headDim;
+    const device = this.device;
+    const s = this.shared;
 
-  private async uploadKvCache(cache: KVCache, position: number): Promise<void> {
-    if (position === 0) return;
-    const { numLayers, numKvHeads, headDim, maxSeqLen } = this.config;
+    // ---- N-sized scratch, reused across every layer of this call (not across calls — see this method's doc). ----
+    const hiddenA = device.createStorageBuffer(N * hiddenSize * 4);
+    const hiddenB = device.createStorageBuffer(N * hiddenSize * 4);
+    const normedBuf = device.createStorageBuffer(N * hiddenSize * 4);
+    const normed2Buf = device.createStorageBuffer(N * hiddenSize * 4);
+    const qOutBuf = device.createStorageBuffer(N * qDim * 4);
+    const kOutBuf = device.createStorageBuffer(N * kvDim * 4);
+    const vOutBuf = device.createStorageBuffer(N * kvDim * 4);
+    const qRopedBuf = device.createStorageBuffer(N * qDim * 4);
+    const kRopedBuf = device.createStorageBuffer(N * kvDim * 4);
+    const qHeadMajorBuf = device.createStorageBuffer(N * qDim * 4);
+    const kHeadMajorBuf = device.createStorageBuffer(N * kvDim * 4);
+    const vHeadMajorBuf = device.createStorageBuffer(N * kvDim * 4);
+    // Attention matrix at prefill's own tight stride S = N (not maxSeqLen —
+    // see the class doc's "Prefill's own KV" section).
+    const probsBuf = device.createStorageBuffer(numHeads * N * N * 4);
+    const attnHeadMajorBuf = device.createStorageBuffer(N * qDim * 4);
+    const attnTokenMajorBuf = device.createStorageBuffer(N * qDim * 4);
+    const projOutBuf = device.createStorageBuffer(N * hiddenSize * 4);
+    const gateOutBuf = device.createStorageBuffer(N * ffnHidden * 4);
+    const upOutBuf = device.createStorageBuffer(N * ffnHidden * 4);
+    const gateActBuf = device.createStorageBuffer(N * ffnHidden * 4);
+    const gatedBuf = device.createStorageBuffer(N * ffnHidden * 4);
+    const downOutBuf = device.createStorageBuffer(N * hiddenSize * 4);
+    const finalNormedAllBuf = device.createStorageBuffer(N * hiddenSize * 4);
+    // Same reasoning as `create()`'s `dummyCacheBuf`/`maskBuf`: unread or
+    // all-zero, so a fresh (zero-initialized) buffer needs no upload.
+    const dummyCacheBuf = device.createStorageBuffer(8);
+    const maskBuf = device.createStorageBuffer(N * 4);
+
+    const embed = gatherDequantRows(this.embedTokens, tokens, hiddenSize);
+    device.upload(hiddenA, 0, embed);
+
+    // ---- Uniforms constant across every layer of this call. ----
+    const rmsUniform = uniformOf(device, [["u32", N], ["u32", hiddenSize], ["f32", rmsNormEps], ["u32", 1]]);
+    const qMmUniform = uniformOf(device, [["u32", N], ["u32", qDim], ["u32", hiddenSize]]);
+    const kMmUniform = uniformOf(device, [["u32", N], ["u32", kvDim], ["u32", hiddenSize]]);
+    const vMmUniform = uniformOf(device, [["u32", N], ["u32", kvDim], ["u32", hiddenSize]]);
+    const oMmUniform = uniformOf(device, [["u32", N], ["u32", hiddenSize], ["u32", qDim]]);
+    const gateMmUniform = uniformOf(device, [["u32", N], ["u32", ffnHidden], ["u32", hiddenSize]]);
+    const upMmUniform = uniformOf(device, [["u32", N], ["u32", ffnHidden], ["u32", hiddenSize]]);
+    const downMmUniform = uniformOf(device, [["u32", N], ["u32", hiddenSize], ["u32", ffnHidden]]);
+    const siluUniform = uniformOf(device, [["u32", N * ffnHidden], ["u32", SILU], ["f32", 1]]);
+    const addUniform = uniformOf(device, [["u32", N * hiddenSize], ["u32", ELEMENTWISE_ADD]]);
+    const mulUniform = uniformOf(device, [["u32", N * ffnHidden], ["u32", ELEMENTWISE_MULTIPLY]]);
+    // `pos_offset = 0` always: prefill is only ever the first `forward()`
+    // call (this class's own contract), so every prompt token's absolute
+    // position is its index in `tokens`.
+    const ropeQUniform = uniformOf(device, [
+      ["u32", N], ["u32", numHeads], ["u32", headDim], ["u32", 0], ["u32", 0],
+      ["f32", ropeTheta], ["f32", 1], ["f32", 0], ["f32", 1], ["f32", 1],
+      ["u32", 0], ["u32", numHeads],
+    ]);
+    const ropeKUniform = uniformOf(device, [
+      ["u32", N], ["u32", numKvHeads], ["u32", headDim], ["u32", 0], ["u32", 0],
+      ["f32", ropeTheta], ["f32", 1], ["f32", 0], ["f32", 1], ["f32", 1],
+      ["u32", 0], ["u32", numKvHeads],
+    ]);
+    // S = N here (prefill's own tight buffers, not the maxSeqLen-strided
+    // cache), so sEff's default (sEff = S) is already the tight bound — no
+    // truncation to ask for. See the class doc's "Prefill's own KV" section.
+    const gqaScoresUniform = uniformOf(device, [
+      ["u32", numHeads], ["u32", numKvHeads], ["u32", N], ["u32", N], ["u32", headDim],
+      ["f32", 1 / Math.sqrt(headDim)], ["u32", 1], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1], ["u32", N],
+    ]);
+    const gqaContextUniform = uniformOf(device, [
+      ["u32", numHeads], ["u32", numKvHeads], ["u32", N], ["u32", N], ["u32", headDim], ["u32", N],
+    ]);
+    // Split (token-major -> head-major): [N, heads, D] -> [heads, N, D].
+    const splitQUniform = uniformOf(device, [["u32", N], ["u32", numHeads], ["u32", headDim]]);
+    const splitKvUniform = uniformOf(device, [["u32", N], ["u32", numKvHeads], ["u32", headDim]]);
+    // Merge (head-major -> token-major): [heads, N, D] -> [N, heads, D].
+    const mergeUniform = uniformOf(device, [["u32", numHeads], ["u32", N], ["u32", headDim]]);
+
+    // ---- Bind groups constant across every layer of this call. ----
+    const ropeQGroup = await device.bindGroup(s.ropePipeline, [qOutBuf, dummyCacheBuf, qRopedBuf, ropeQUniform]);
+    const ropeKGroup = await device.bindGroup(s.ropePipeline, [kOutBuf, dummyCacheBuf, kRopedBuf, ropeKUniform]);
+    const splitQGroup = await device.bindGroup(s.permutePipeline, [qRopedBuf, qHeadMajorBuf, splitQUniform]);
+    const splitKGroup = await device.bindGroup(s.permutePipeline, [kRopedBuf, kHeadMajorBuf, splitKvUniform]);
+    const splitVGroup = await device.bindGroup(s.permutePipeline, [vOutBuf, vHeadMajorBuf, splitKvUniform]);
+    const gqaScoresGroup = await device.bindGroup(s.gqaScoresPipeline, [qHeadMajorBuf, kHeadMajorBuf, maskBuf, probsBuf, gqaScoresUniform]);
+    const gqaContextGroup = await device.bindGroup(s.gqaContextPipeline, [probsBuf, vHeadMajorBuf, attnHeadMajorBuf, gqaContextUniform]);
+    const mergeGroup = await device.bindGroup(s.permutePipeline, [attnHeadMajorBuf, attnTokenMajorBuf, mergeUniform]);
+    const add1Group = await device.bindGroup(s.elementwisePipeline, [hiddenA, projOutBuf, hiddenB, addUniform]);
+    const siluGroup = await device.bindGroup(s.activationPipeline, [gateOutBuf, gateActBuf, siluUniform]);
+    const mulGroup = await device.bindGroup(s.elementwisePipeline, [gateActBuf, upOutBuf, gatedBuf, mulUniform]);
+    const add2Group = await device.bindGroup(s.elementwisePipeline, [hiddenB, downOutBuf, hiddenA, addUniform]);
+
+    const ops: ResidentOp[] = [];
+    const dispatch = (pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number] | [number, number] | [number, number, number]) =>
+      ops.push({ kind: "dispatch", pipeline, bindGroup, workgroups });
+    const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) =>
+      ops.push({ kind: "copy", src, srcOffset, dst, dstOffset, size });
+    const wg256 = (elements: number) => Math.ceil(elements / 256);
+    const matmulWg = (outFeatures: number): [number, number] => [Math.ceil(outFeatures / MATMUL_TILE), Math.ceil(N / MATMUL_TILE)];
+
     for (let l = 0; l < numLayers; l += 1) {
-      const { k, v } = cache.read(l, position);
+      const lw = weights.layers[l]!;
       const layer = this.layers[l]!;
+
+      // Norm-gain buffers are per-layer and small (hiddenSize floats) —
+      // re-created here rather than reusing `layer.attnNormGroup`'s own
+      // (decode-only) buffer, which is bound at N = 1 shapes this call
+      // cannot reuse.
+      const attnNormBuf = device.createStorageBuffer(hiddenSize * 4);
+      device.upload(attnNormBuf, 0, lw.attnNorm);
+      const ffnNormBuf = device.createStorageBuffer(hiddenSize * 4);
+      device.upload(ffnNormBuf, 0, lw.ffnNorm);
+      const attnNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]);
+      const ffnNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]);
+
+      const wqGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wq, qDim, hiddenSize, qMmUniform, normedBuf, qOutBuf);
+      const wkGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wk, kvDim, hiddenSize, kMmUniform, normedBuf, kOutBuf);
+      const wvGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wv, kvDim, hiddenSize, vMmUniform, normedBuf, vOutBuf);
+      const woGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wo, hiddenSize, qDim, oMmUniform, attnTokenMajorBuf, projOutBuf);
+      const gateGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wGate, ffnHidden, hiddenSize, gateMmUniform, normed2Buf, gateOutBuf);
+      const upGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wUp, ffnHidden, hiddenSize, upMmUniform, normed2Buf, upOutBuf);
+      const downGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wDown, hiddenSize, ffnHidden, downMmUniform, gatedBuf, downOutBuf);
+
+      dispatch(s.rmsnormPipeline, attnNormGroup, [N]);
+      dispatch(s.matmulPipeline, wqGroup, matmulWg(qDim));
+      dispatch(s.matmulPipeline, wkGroup, matmulWg(kvDim));
+      dispatch(s.matmulPipeline, wvGroup, matmulWg(kvDim));
+      dispatch(s.ropePipeline, ropeQGroup, [wg256((N * qDim) / 2)]);
+      dispatch(s.ropePipeline, ropeKGroup, [wg256((N * kvDim) / 2)]);
+      dispatch(s.permutePipeline, splitQGroup, [wg256(N * qDim)]);
+      dispatch(s.permutePipeline, splitKGroup, [wg256(N * kvDim)]);
+      dispatch(s.permutePipeline, splitVGroup, [wg256(N * kvDim)]);
+      dispatch(s.gqaScoresPipeline, gqaScoresGroup, [N, numHeads, 1]);
+      dispatch(s.gqaContextPipeline, gqaContextGroup, [N, numHeads, 1]);
+      dispatch(s.permutePipeline, mergeGroup, [wg256(N * qDim)]);
+      dispatch(s.matmulPipeline, woGroup, matmulWg(hiddenSize));
+      dispatch(s.elementwisePipeline, add1Group, [wg256(N * hiddenSize)]);
+      dispatch(s.rmsnormPipeline, ffnNormGroup, [N]);
+      dispatch(s.matmulPipeline, gateGroup, matmulWg(ffnHidden));
+      dispatch(s.matmulPipeline, upGroup, matmulWg(ffnHidden));
+      dispatch(s.activationPipeline, siluGroup, [wg256(N * ffnHidden)]);
+      dispatch(s.elementwisePipeline, mulGroup, [wg256(N * ffnHidden)]);
+      dispatch(s.matmulPipeline, downGroup, matmulWg(hiddenSize));
+      dispatch(s.elementwisePipeline, add2Group, [wg256(N * hiddenSize)]);
+
+      // Into the persistent, maxSeqLen-strided cache `runDecodeStep` reads —
+      // one contiguous copy per head (this layer's whole N-position block),
+      // not one per position: `kHeadMajorBuf`/`vHeadMajorBuf` are already
+      // head-major, so head h's N positions are one contiguous run on both
+      // ends of the copy. See the class doc's "Prefill's own KV" section.
       for (let h = 0; h < numKvHeads; h += 1) {
-        const src = h * position * headDim;
-        const dstBytes = h * maxSeqLen * headDim * 4;
-        this.device.upload(layer.kCacheBuf, dstBytes, k.subarray(src, src + position * headDim));
-        this.device.upload(layer.vCacheBuf, dstBytes, v.subarray(src, src + position * headDim));
+        copy(kHeadMajorBuf, h * N * headDim * 4, layer.kCacheBuf, h * maxSeqLen * headDim * 4, N * headDim * 4);
+        copy(vHeadMajorBuf, h * N * headDim * 4, layer.vCacheBuf, h * maxSeqLen * headDim * 4, N * headDim * 4);
       }
     }
+
+    const finalNormBuf = device.createStorageBuffer(hiddenSize * 4);
+    device.upload(finalNormBuf, 0, weights.finalNorm);
+    const finalNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenA, finalNormBuf, finalNormedAllBuf, rmsUniform]);
+    dispatch(s.rmsnormPipeline, finalNormGroup, [N]);
+    // Only the last row goes through lm_head — issue #117's "readbackは最終
+    //位置logitsのみ", and `forward`'s own doc for why every real caller only
+    // ever wants that row. `s.finalNormedBuf`/`this.lmHeadChunks` are the
+    // exact buffer and bind groups `runDecodeStep` uses, reused here rather
+    // than duplicated: lm_head is by far the largest projection
+    // (`vocabSize` rows), so computing it for every prompt position instead
+    // of one would undo most of what going resident buys prefill.
+    copy(finalNormedAllBuf, (N - 1) * hiddenSize * 4, s.finalNormedBuf, 0, hiddenSize * 4);
+    for (const chunk of this.lmHeadChunks) dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount]);
+
+    const readback = this.lmHeadChunks.map((chunk) => ({
+      staging: chunk.staging, source: chunk.outBuf, sourceOffset: 0, length: chunk.rowCount, type: "f32" as const,
+    }));
+    const results = await device.batch(ops, readback);
+
+    const logits = new Float32Array(vocabSize);
+    let offset = 0;
+    for (const r of results) {
+      logits.set(r as Float32Array, offset);
+      offset += r.length;
+    }
+
+    this.tokensSoFar = N;
+    // Dropped now that this call has read every layer's weight it needed —
+    // see the constructor's doc.
+    this.prefillWeights = null;
+    return [logits];
   }
 
   /**
@@ -459,6 +774,16 @@ export class LlamaEngineQ8Resident {
     this.device.upload(s.ropeQUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
     this.device.upload(s.ropeKUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
     this.device.upload(s.gqaScoresUniform, GQA_QUERY_OFFSET_BYTE, new Int32Array([at]));
+    // Issue #117: `s_eff = at + 1` — this step's cache write (below) fills
+    // position `at`, so positions `0..at` are the whole valid cache, and
+    // `ops/gqa`'s scan need not reach past it to `maxSeqLen`. Both uniforms
+    // carry it because `scores.wgsl` and `context.wgsl` are separate
+    // dispatches reading separate params buffers (see their own docs — they
+    // must agree, or `context.wgsl` reads `probs` columns `scores.wgsl` never
+    // wrote this step).
+    const sEff = new Uint32Array([at + 1]);
+    this.device.upload(s.gqaScoresUniform, GQA_SCORES_S_EFF_BYTE, sEff);
+    this.device.upload(s.gqaContextUniform, GQA_CONTEXT_S_EFF_BYTE, sEff);
 
     const ops: ResidentOp[] = [];
     const dispatch = (pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number] | [number, number] | [number, number, number]) =>
