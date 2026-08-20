@@ -128,6 +128,32 @@ export function concatRows(matrices: Float32Array[], rows: number[], cols: numbe
 }
 
 /**
+ * `concatRows`, for `Int8Array` rather than `Float32Array`.
+ *
+ * Issue #105's int8 engine path fuses Q/K/V (and gate/up) the same way the f32
+ * engine does (`concatRows` above) — one `matvecQ8`/dequant-then-`matmul`
+ * dispatch instead of three — but the source rows are per-row-quantized
+ * **codes**, not weights, so concatenating them needs no separate function
+ * body, only a separate element type: a code is just an int8 the row's scale
+ * has not yet been applied to, and stacking rows does not touch column values,
+ * so it commutes with quantization exactly (quantizing three matrices and
+ * concatenating the codes gives the same per-row codes as concatenating first
+ * and quantizing — the scale stays per-row regardless of order, which is why
+ * `LlamaLayerWeightsQ8`'s per-projection `scale` arrays are concatenated
+ * separately, not recomputed here).
+ */
+export function concatRowsInt8(matrices: Int8Array[], rows: number[], cols: number): Int8Array {
+  const total = rows.reduce((a, b) => a + b, 0);
+  const output = new Int8Array(total * cols);
+  let offset = 0;
+  matrices.forEach((matrix, i) => {
+    output.set(matrix, offset);
+    offset += rows[i]! * cols;
+  });
+  return output;
+}
+
+/**
  * The inverse of concatenating projections along the output axis, applied
  * after the fused dispatch instead of before it: `flat` is `[tokens, sum(sizes)]`
  * token-major — one row per token, that row being every fused output

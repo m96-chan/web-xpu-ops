@@ -1,0 +1,253 @@
+{
+  "generatedBy": "llm/tools/gen_fixture_q8.py",
+  "transformersVersion": "5.3.0",
+  "torchVersion": "2.10.0+cu128",
+  "weightSeed": 0,
+  "promptSeed": 123,
+  "config": {
+    "numLayers": 2,
+    "hiddenSize": 64,
+    "numHeads": 4,
+    "numKvHeads": 2,
+    "headDim": 16,
+    "ffnHidden": 128,
+    "vocabSize": 256,
+    "ropeTheta": 10000.0,
+    "rmsNormEps": 1e-05,
+    "tieEmbeddings": false
+  },
+  "promptTokens": [
+    254,
+    109,
+    126,
+    66,
+    220,
+    98,
+    230,
+    17
+  ],
+  "decodeTokens": [
+    175,
+    135,
+    233,
+    132
+  ],
+  "weights": [
+    {
+      "name": "embedTokens",
+      "kind": "quant",
+      "shape": [
+        256,
+        64
+      ],
+      "codesOffset": 0,
+      "scaleOffset": 0
+    },
+    {
+      "name": "layers.0.wq",
+      "kind": "quant",
+      "shape": [
+        64,
+        64
+      ],
+      "codesOffset": 16384,
+      "scaleOffset": 256
+    },
+    {
+      "name": "layers.0.wk",
+      "kind": "quant",
+      "shape": [
+        32,
+        64
+      ],
+      "codesOffset": 20480,
+      "scaleOffset": 320
+    },
+    {
+      "name": "layers.0.wv",
+      "kind": "quant",
+      "shape": [
+        32,
+        64
+      ],
+      "codesOffset": 22528,
+      "scaleOffset": 352
+    },
+    {
+      "name": "layers.0.wo",
+      "kind": "quant",
+      "shape": [
+        64,
+        64
+      ],
+      "codesOffset": 24576,
+      "scaleOffset": 384
+    },
+    {
+      "name": "layers.0.wGate",
+      "kind": "quant",
+      "shape": [
+        128,
+        64
+      ],
+      "codesOffset": 28672,
+      "scaleOffset": 448
+    },
+    {
+      "name": "layers.0.wUp",
+      "kind": "quant",
+      "shape": [
+        128,
+        64
+      ],
+      "codesOffset": 36864,
+      "scaleOffset": 576
+    },
+    {
+      "name": "layers.0.wDown",
+      "kind": "quant",
+      "shape": [
+        64,
+        128
+      ],
+      "codesOffset": 45056,
+      "scaleOffset": 704
+    },
+    {
+      "name": "layers.1.wq",
+      "kind": "quant",
+      "shape": [
+        64,
+        64
+      ],
+      "codesOffset": 53248,
+      "scaleOffset": 768
+    },
+    {
+      "name": "layers.1.wk",
+      "kind": "quant",
+      "shape": [
+        32,
+        64
+      ],
+      "codesOffset": 57344,
+      "scaleOffset": 832
+    },
+    {
+      "name": "layers.1.wv",
+      "kind": "quant",
+      "shape": [
+        32,
+        64
+      ],
+      "codesOffset": 59392,
+      "scaleOffset": 864
+    },
+    {
+      "name": "layers.1.wo",
+      "kind": "quant",
+      "shape": [
+        64,
+        64
+      ],
+      "codesOffset": 61440,
+      "scaleOffset": 896
+    },
+    {
+      "name": "layers.1.wGate",
+      "kind": "quant",
+      "shape": [
+        128,
+        64
+      ],
+      "codesOffset": 65536,
+      "scaleOffset": 960
+    },
+    {
+      "name": "layers.1.wUp",
+      "kind": "quant",
+      "shape": [
+        128,
+        64
+      ],
+      "codesOffset": 73728,
+      "scaleOffset": 1088
+    },
+    {
+      "name": "layers.1.wDown",
+      "kind": "quant",
+      "shape": [
+        64,
+        128
+      ],
+      "codesOffset": 81920,
+      "scaleOffset": 1216
+    },
+    {
+      "name": "lmHead",
+      "kind": "quant",
+      "shape": [
+        256,
+        64
+      ],
+      "codesOffset": 90112,
+      "scaleOffset": 1280
+    },
+    {
+      "name": "layers.0.attnNorm",
+      "kind": "norm",
+      "shape": [
+        64
+      ],
+      "offset": 0
+    },
+    {
+      "name": "layers.0.ffnNorm",
+      "kind": "norm",
+      "shape": [
+        64
+      ],
+      "offset": 64
+    },
+    {
+      "name": "layers.1.attnNorm",
+      "kind": "norm",
+      "shape": [
+        64
+      ],
+      "offset": 128
+    },
+    {
+      "name": "layers.1.ffnNorm",
+      "kind": "norm",
+      "shape": [
+        64
+      ],
+      "offset": 192
+    },
+    {
+      "name": "finalNorm",
+      "kind": "norm",
+      "shape": [
+        64
+      ],
+      "offset": 256
+    }
+  ],
+  "logits": {
+    "prefill": {
+      "shape": [
+        8,
+        256
+      ],
+      "offset": 0
+    },
+    "decode": {
+      "shape": [
+        4,
+        256
+      ],
+      "offset": 2048
+    }
+  }
+}
