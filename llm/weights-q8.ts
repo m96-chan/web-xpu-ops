@@ -205,8 +205,15 @@ export function cloneQuantizedLinear(source: QuantizedLinear): QuantizedLinear {
  * table.
  */
 export function gatherDequantRows(table: QuantizedLinear, indices: number[], D: number): Float32Array {
+  const rows = table.scale.length;
   const output = new Float32Array(indices.length * D);
   indices.forEach((rowIndex, i) => {
+    // Same convention as ops/gather: indices outside [0, rows) gather zeros
+    // (the output starts zeroed). Without this, an out-of-vocab token id from
+    // an externally encoded prompt reads undefined and fills the row with
+    // NaN, which propagates through every layer and still argmaxes to a
+    // plausible-looking token.
+    if (rowIndex < 0 || rowIndex >= rows) return;
     const s = table.scale[rowIndex]!;
     const base = rowIndex * D;
     for (let c = 0; c < D; c += 1) output[i * D + c] = table.codes[base + c]! * s;
