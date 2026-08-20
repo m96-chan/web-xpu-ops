@@ -118,7 +118,7 @@ export async function runRmsNorm(
  * wrong token, because argmax over an all-zero logits vector always picks
  * index 0. Below the limit this is a single dispatch, identical to before.
  */
-const MAX_WORKGROUPS_PER_DISPATCH = 65535;
+export const MAX_WORKGROUPS_PER_DISPATCH = 65535;
 
 /**
  * Runs a one-workgroup-per-row dispatch over `M` rows, splitting into

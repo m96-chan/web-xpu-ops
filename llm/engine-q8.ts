@@ -151,6 +151,26 @@ export class LlamaEngineQ8 {
   }
 
   /**
+   * Read-only handle onto this engine's own `KVCache` and position counter —
+   * issue #110's prefill handoff: `LlamaEngineQ8Resident` runs prefill by
+   * delegating to a private `LlamaEngineQ8` instance unchanged ("プリフィルは
+   * 現行方式のまま", #110's own stated scope), then uploads *this* cache's
+   * content into its GPU-resident KV buffers once, before switching to its
+   * own one-submit-per-token decode path. Exposed rather than duplicating
+   * `forward`'s prefill branch: the alternative was re-deriving an
+   * already-tested control flow (rule 2), for a class whose entire reason to
+   * exist is the decode path, not prefill.
+   *
+   * The caller must not mutate `cache` — this is the engine's own live
+   * state, not a copy, so `LlamaEngineQ8Resident`'s handoff reads every
+   * layer's `[kvHeads, maxSeqLen, headDim]` arrays once and uploads them,
+   * never holding a reference past that.
+   */
+  get cacheState(): { cache: KVCache; position: number } {
+    return { cache: this.cache, position: this.tokensSoFar };
+  }
+
+  /**
    * `hidden` is `[tokens, inFeatures]` token-major; `group` is `matvecQ8`'s
    * packed `[outFeatures, ceil(inFeatures/4)]` weight plus its `[outFeatures]`
    * scale. Returns `[tokens, outFeatures]` token-major — see the class doc for

@@ -79,6 +79,13 @@
         <label><input type="checkbox" id="listenConstraint" checked /> line-format 制約を有効にする</label>
       </div>
 
+      <div>
+        <label
+          ><input type="checkbox" id="residentEngine" /> GPU常駐デコード (issue #110, LlamaEngineQ8Resident) —
+          未チェックは従来のLlamaEngineQ8</label
+        >
+      </div>
+
       <p><textarea id="input" rows="3">新しいGPUを買ったので、ベンチマークを回してみた。思ったより速くて驚いた。</textarea></p>
       <button id="genBtn" type="button">生成</button>
 
