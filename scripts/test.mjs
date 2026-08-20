@@ -38,6 +38,20 @@ const OPS = "ops";
 const HARNESS = "harness";
 const LLM = "llm";
 
+/** Every `*.test.ts` under `dir`, recursing into subdirectories. */
+function testFilesRecursive(dir) {
+  const found = [];
+  for (const entry of readdirSync(dir)) {
+    const path = join(dir, entry);
+    if (statSync(path).isDirectory()) {
+      found.push(...testFilesRecursive(path));
+    } else if (entry.endsWith(".test.ts")) {
+      found.push(path);
+    }
+  }
+  return found;
+}
+
 /** Test files, discovered the same way `vitest.config.ts` globs them. */
 function testFiles() {
   const found = [];
@@ -54,12 +68,12 @@ function testFiles() {
   for (const file of readdirSync(HARNESS)) {
     if (file.endsWith(".test.ts")) found.push(join(HARNESS, file));
   }
-  // llm/ is CPU-only (no GPU device involved at all — see llm/tokenizer.ts),
-  // but it gets a process per file too for the same reason as the harness:
-  // one discovery code path beats two that have to be kept in sync.
-  for (const file of readdirSync(LLM)) {
-    if (file.endsWith(".test.ts")) found.push(join(LLM, file));
-  }
+  // `llm/` mixes flat files (`sampler.test.ts`) with a subdirectory
+  // (`constraints/`), unlike `ops` (always one directory per op) or
+  // `harness` (always flat) — so it gets its own recursive walk rather than
+  // being forced into either shape. None of these need a GPU, but per-file
+  // processes are what makes a crash attributable to one file (see #38).
+  found.push(...testFilesRecursive(LLM));
   return found.sort();
 }
 

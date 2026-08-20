@@ -70,6 +70,56 @@ Entries record **why** a change was needed. What changed is in the diff.
   byte-fallback stress case above) all match the real tokenizer exactly on
   both encode and decode. Vocab JSON: 102400 entries, 3.48 MiB raw / 1.33 MiB
   gzipped — not compressed further; see the PR for why.
+- `llm/sampler.ts`: token sampling with `greedy` and `temperature` + `top-p`
+  modes, plus a token-level `Constraint` interface (`nextAllowed(prefixTokens)
+  -> allowed token ids, or null`) applied to the logits before either mode
+  runs. Repetition penalty is **deliberately not implemented** — the
+  consuming project measured it degrading Japanese output rather than
+  de-looping it (technologies-moe/alibi-ai#3); see `sampler.ts`'s module
+  comment for the reasoning. A caller that wants repetition control should
+  express it as a `Constraint` instead.
+
+- `llm/constraints/line-format.ts`: a `Constraint` implementation for a fixed
+  line shape — literal text, an enum choice, more literal text, free text
+  (forbidden characters, max length), then EOS. Built for a small,
+  hand-written schema like `policy: <enum>\ntopic: <short text>`, where a
+  full GBNF/grammar engine would be overkill. Tokenizer-agnostic: it takes an
+  injected `TokenCodec` (`encode` / `idToToken` / `vocabSize`) rather than
+  depending on any one tokenizer, since issue #101's tokenizer is a separate,
+  not-yet-merged branch. Enum choices are matched by tokenizing each
+  candidate once and walking a token-id trie, so they must be
+  **token-prefix-free** (no choice's tokenization may be a strict prefix of
+  another's) — an ambiguous spec is rejected at construction rather than
+  silently misclassified at generation time.
+
+  Neither module is wired into `llm/engine.ts` yet — that integration is
+  left to a follow-up issue, matching #102's stated scope.
+- `llm/`: a config-driven llama-architecture inference engine built by
+  composing existing ops (`gather` → N × [`rmsnorm` → fused QKV projection →
+  `rope` → `gqa` + a pre-allocated f32 KV cache → O projection → residual →
+  `rmsnorm` → fused gate/up projection → SiLU-gated MLP → residual] →
+  `rmsnorm` → `lm_head`), rather than a new op — issue #98. Prefill uses
+  `matmul`, decode uses `matvec`; Q/K/V and gate/up are fused into single
+  projections purely to keep this repository's `webgpu` (Dawn) binding within
+  the dispatch count it can sustain in one device's lifetime on some
+  machines, not for FLOPs. Correctness is defined by a `transformers`-generated
+  fixture (`llm/tools/gen_fixture.py`, committed at `llm/fixtures/tiny.*`,
+  436 KiB): an 8-token prefill and a 4-step greedy decode on a tiny random
+  model, checked on a real GPU to a measured tolerance (worst observed
+  absolute diff 1.49e-7, relative 3.4e-4) and exact greedy-token equality.
+  `SARASHINA_2_2_1B_CONFIG` documents the real target model's dimensions;
+  running it needs a weight converter and tokenizer, both later issues under
+  #96. Needed because wllama's WASM CPU path is too slow for in-browser
+  inference (technologies-moe/alibi-ai#3: 22.6s few-shot prefill) and WebLLM's
+  4-bit-only quantization collapses on the target Japanese model.
+- `matvecQ8`, a W8A32 GEMV in `ops/matvec`: the weight held as int8 instead of
+  f32, packed four codes per `u32` word. Decode-time GEMV is bandwidth-bound,
+  and an int8 weight is a quarter the traffic of f32 for the same values — the
+  packed layout halves that again versus one code per lane, since the whole
+  point of quantizing a weight nobody re-quantizes at inference is to spend
+  the packing cost once rather than never taking it (#97). `packQ8` packs
+  `quantize`'s existing per-row absmax codes into the layout `matvecQ8` reads,
+  so the two compose instead of `matvecQ8` inventing its own quantization.
 
 ## [0.1.0] - 2026-08-04
 

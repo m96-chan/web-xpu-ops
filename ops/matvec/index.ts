@@ -1,1 +1,1 @@
-export { matvec, type MatVecArgs } from "./reference.js";
+export { matvec, matvecQ8, packQ8, type MatVecArgs, type MatVecQ8Args } from "./reference.js";
