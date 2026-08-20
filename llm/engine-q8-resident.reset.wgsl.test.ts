@@ -1,4 +1,4 @@
-import { describe, expect } from "vitest";
+import { beforeAll, describe, expect } from "vitest";
 import { agree, residentTest, useResidentGpu } from "../harness/index.js";
 import { argmax } from "./engine.js";
 import { LlamaEngineQ8Resident } from "./engine-q8-resident.js";
@@ -16,9 +16,27 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * `engine-q8-resident.wgsl.test.ts` or `.limits.wgsl.test.ts`: the same
  * "total GPU object count, not per-file case count" reason those two files'
  * own docs already give (issue #38/#49/#107's failure family, PR #116
- * review item 9, the `ops/gqa` split in PR #119's second review round) —
- * this file's own single `create()` call already shares a `describe` with
- * nothing else that would add more.
+ * review item 9, the `ops/gqa` split in PR #119's second review round).
+ *
+ * **One shared engine, built once in `beforeAll`, not one `create()` call
+ * per `residentTest`** — PR #126's own second review round: an earlier
+ * version of this file built a fresh engine inside every `residentTest`
+ * (five of them by the time the epoch-race and no-new-pipeline tests were
+ * added), each one ~45 pipelines/bind groups accumulating on the same
+ * shared `ResidentDevice` with no `destroy()` between them — exactly the
+ * "total GPU object count" cliff `engine-q8-resident.wgsl.test.ts`'s own
+ * module doc already names (PR #116 review, item 9), just reached by five
+ * `create()` calls in one file instead of two. Four sat inside the cliff;
+ * the fifth reliably pushed this file's process off it (`0/5`, reproduced
+ * under a quiet machine). Every test below now `reset()`s the one shared
+ * engine at its own start rather than building a new one — which is also
+ * the more thematically direct proof this issue asks for: "`reset()` puts
+ * the engine back in exactly `create()`'s own initial state" is not just
+ * asserted once, it is the mechanism every test in this file relies on to
+ * start from a clean slate, including the one *before* it, and the poison
+ * test still carries the isolation burden (nothing from an earlier test's
+ * generation should be observable after a `reset()`, `+Infinity`-poisoned
+ * or not).
  */
 
 const TOLERANCE = { rel: 1e-2, abs: 5e-3 };
@@ -54,12 +72,17 @@ async function runFixtureGenerationAndAssert(engine: LlamaEngineQ8Resident, fixt
 }
 
 describe("llm/engine-q8-resident / reset() (issue #120)", () => {
-  // PR #126 review (cap): every test below receives its own `resident` as
-  // `residentTest`'s own callback argument, so the accessor
-  // `useResidentGpu()` returns is never called here — only its `beforeAll`/
-  // `afterAll` registration (this call's real side effect) is needed.
-  useResidentGpu();
+  const getResident = useResidentGpu();
   const fixture = loadTinyFixtureQ8();
+  // Built once, shared by every `residentTest` below — see this file's own
+  // module doc for why (PR #126 review, second round).
+  let engine: LlamaEngineQ8Resident | undefined;
+
+  beforeAll(async () => {
+    const resident = getResident();
+    if (!resident) return; // no adapter — every residentTest below reports a skip, same as ever
+    engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
+  });
 
   /**
    * The correctness proof issue #120 itself asks for: "旧KVに毒値を書いた状態で
@@ -96,14 +119,17 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
    * which cannot agree with the fixture's finite numbers under any
    * tolerance.
    */
-  residentTest("reset() + the same prompt reproduces the fixture exactly, even with the old KV cache poisoned with +Infinity", async (resident) => {
-    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
+  residentTest("reset() + the same prompt reproduces the fixture exactly, even with the old KV cache poisoned with +Infinity", async () => {
+    // Starts every test from `create()`'s own initial state, regardless of
+    // whatever an earlier test in this file left the shared engine in — see
+    // this file's own module doc.
+    engine!.reset();
 
-    await runFixtureGenerationAndAssert(engine, fixture);
-    const firstGenPosition = engine.position;
+    await runFixtureGenerationAndAssert(engine!, fixture);
+    const firstGenPosition = engine!.position;
     expect(firstGenPosition).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
 
-    engine.debugPoisonKVCache(Number.POSITIVE_INFINITY);
+    engine!.debugPoisonKVCache(Number.POSITIVE_INFINITY);
 
     // Positive control (PR #126 review, item 2): prove the poison is
     // actually *observable* before trusting `reset()` to route the next
@@ -119,14 +145,14 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
     // within that bound must produce a non-finite logit somewhere; a
     // finite result here would mean the poison never reached the buffer
     // the real scan reads, making the parity check below meaningless.
-    const [poisonedLogits] = await engine.forward([fixture.promptTokens[0]!]);
+    const [poisonedLogits] = await engine!.forward([fixture.promptTokens[0]!]);
     expect(Array.from(poisonedLogits!).some((x) => !Number.isFinite(x))).toBe(true);
 
-    engine.reset();
-    expect(engine.position).toBe(0);
+    engine!.reset();
+    expect(engine!.position).toBe(0);
 
-    await runFixtureGenerationAndAssert(engine, fixture);
-    expect(engine.position).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
+    await runFixtureGenerationAndAssert(engine!, fixture);
+    expect(engine!.position).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
   });
 
   /**
@@ -156,25 +182,25 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
    * fixture run already validates the *first* decode step against), closes
    * that gap.
    */
-  residentTest("reset() + a shorter second generation does not read the first generation's leftover positions", async (resident) => {
-    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
+  residentTest("reset() + a shorter second generation does not read the first generation's leftover positions", async () => {
+    engine!.reset();
 
-    await runFixtureGenerationAndAssert(engine, fixture);
-    expect(engine.position).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
+    await runFixtureGenerationAndAssert(engine!, fixture);
+    expect(engine!.position).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
 
-    engine.reset();
-    const prefillLogits = await engine.forward(fixture.promptTokens);
+    engine!.reset();
+    const prefillLogits = await engine!.forward(fixture.promptTokens);
     expect(prefillLogits).toHaveLength(1);
     const fixtureLastPrefill = fixture.prefillLogits[fixture.prefillLogits.length - 1]!;
     const prefillWorst = agree(prefillLogits[0]!, fixtureLastPrefill, TOLERANCE);
     expect(prefillWorst, prefillWorst ? `prefill (final position) after reset: ${JSON.stringify(prefillWorst)}` : undefined).toBeNull();
-    expect(engine.position).toBe(fixture.promptTokens.length);
+    expect(engine!.position).toBe(fixture.promptTokens.length);
 
     const next = argmax(prefillLogits[0]!);
-    const [decodeLogits] = await engine.forward([next]);
+    const [decodeLogits] = await engine!.forward([next]);
     const decodeWorst = agree(decodeLogits!, fixture.decodeLogits[0]!, TOLERANCE);
     expect(decodeWorst, decodeWorst ? `decode step 0 after reset: ${JSON.stringify(decodeWorst)}` : undefined).toBeNull();
-    expect(engine.position).toBe(fixture.promptTokens.length + 1);
+    expect(engine!.position).toBe(fixture.promptTokens.length + 1);
   });
 
   /**
@@ -191,15 +217,15 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
    * throw *this* message, or might not throw at all, silently decoding only
    * the prompt's first token and discarding the rest.
    */
-  residentTest("reset() re-arms prefill routing: a multi-token forward() after reset() is accepted, not rejected as decode", async (resident) => {
-    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
-    await engine.forward(fixture.promptTokens);
-    await expect(engine.forward([1, 2])).rejects.toThrow(/exactly one token/);
+  residentTest("reset() re-arms prefill routing: a multi-token forward() after reset() is accepted, not rejected as decode", async () => {
+    engine!.reset();
+    await engine!.forward(fixture.promptTokens);
+    await expect(engine!.forward([1, 2])).rejects.toThrow(/exactly one token/);
 
-    engine.reset();
+    engine!.reset();
     // No throw: routed back into prefill, which accepts any non-empty
     // token list, unlike decode's "exactly one token" contract just above.
-    await expect(engine.forward(fixture.promptTokens)).resolves.toHaveLength(1);
+    await expect(engine!.forward(fixture.promptTokens)).resolves.toHaveLength(1);
   });
 
   /**
@@ -216,19 +242,19 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
    * synchronous work up to their own first `await`, so this reliably lands
    * the `reset()` call inside that window, not after it.
    */
-  residentTest("reset() during an in-flight forward() invalidates that call instead of silently rewinding its own effect", async (resident) => {
-    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
-    await engine.forward(fixture.promptTokens); // now decoding, tokensSoFar = promptTokens.length
+  residentTest("reset() during an in-flight forward() invalidates that call instead of silently rewinding its own effect", async () => {
+    engine!.reset();
+    await engine!.forward(fixture.promptTokens); // now decoding, tokensSoFar = promptTokens.length
 
-    const inFlight = engine.forward([fixture.decodeTokens[0]!]); // not yet awaited
-    engine.reset(); // races the pending call above
+    const inFlight = engine!.forward([fixture.decodeTokens[0]!]); // not yet awaited
+    engine!.reset(); // races the pending call above
     await expect(inFlight).rejects.toThrow(/reset\(\) was called while this call was still in flight/);
 
     // reset() itself, not the stale in-flight call's own write, is what the
     // engine's state reflects — and the engine is still usable afterward,
     // not left corrupted by the aborted call.
-    expect(engine.position).toBe(0);
-    await expect(engine.forward(fixture.promptTokens)).resolves.toHaveLength(1);
+    expect(engine!.position).toBe(0);
+    await expect(engine!.forward(fixture.promptTokens)).resolves.toHaveLength(1);
   });
 
   /**
@@ -249,16 +275,17 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
    * expected, correct behaviour, not evidence of anything `reset()` failed
    * to do. What must not grow is the *pipeline* count, and what must not
    * happen at all — not measurable via `stats`, but true by construction,
-   * since `reset()`'s own implementation touches only `tokensSoFar` and one
-   * boolean — is a second `ResidentDevice` or a second `create()` call.
+   * since `reset()`'s own implementation touches only `tokensSoFar` and a
+   * `generationEpoch` counter — is a second `ResidentDevice` or a second
+   * `create()` call.
    */
   residentTest("reset() creates no new pipeline — every dispatch after it still runs through create()'s own pipelines", async (resident) => {
-    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
-    await runFixtureGenerationAndAssert(engine, fixture);
+    engine!.reset();
+    await runFixtureGenerationAndAssert(engine!, fixture);
 
     const pipelinesBefore = resident.stats.pipelinesCreated;
-    engine.reset();
-    await runFixtureGenerationAndAssert(engine, fixture);
+    engine!.reset();
+    await runFixtureGenerationAndAssert(engine!, fixture);
     expect(resident.stats.pipelinesCreated).toBe(pipelinesBefore);
   });
 });
