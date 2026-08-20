@@ -157,6 +157,38 @@ import {
  * roofline table measured that at 672 MiB/token on Sarashina2.2-1B's shape,
  * the single largest unaccounted term in decode's bandwidth budget. `sEff`
  * removes the scan itself rather than skipping work inside it.
+ *
+ * ## `reset()`: a second (third, ...) independent generation, same instance
+ *
+ * Issue #120: before this, every new independent prompt needed a whole new
+ * `ResidentDevice` and `LlamaEngineQ8Resident.create()` call — `forward()`'s
+ * own contract was "prefill exactly once, then decode only", so there was no
+ * other way back to "accepts a new prefill". alibi-ai's chat integration
+ * measured what that costs in practice: 17-33s per independent turn,
+ * dominated by `create()`'s own `device.upload()` calls rebuilding every
+ * persistent `matvecQ8` weight buffer from the ~1.4 GiB checkpoint (issue
+ * #120's own background) — for a workload (a chat: many short, independent
+ * generations) where the model itself never changes between turns.
+ *
+ * `reset()` sets `tokensSoFar` back to 0 and re-arms `forward()`'s prefill
+ * routing, and touches nothing else: every pipeline, bind group and
+ * persistent buffer `create()` built (`this.shared`, `this.layers`,
+ * `this.lmHeadChunks` — the weight buffers `buildProjection` populated via
+ * `device.upload()`, specifically, since those are the expensive ones) is
+ * still exactly what the next generation's `runDecodeStep`/`runPrefillResident`
+ * calls read and write. Old KV cache contents are left in place, not
+ * cleared — see `reset()`'s own doc for why that is still correct rather
+ * than an oversight, and `llm/engine-q8-resident.reset.wgsl.test.ts` for the
+ * `+Infinity`-poisoned proof.
+ *
+ * Not free, still: `runPrefillResident`'s own transient, `N`-sized buffer
+ * allocation and its per-layer dequant-transpose weight prep both re-run on
+ * every generation, `reset()`-triggered or not — that was already true
+ * before issue #120 (every generation pays it exactly once, on its own
+ * first `forward()` call), and `reset()` does not change it. What `reset()`
+ * removes is strictly the `create()` call itself and the weight re-upload
+ * inside it, which is the term alibi-ai's own measurement named as
+ * dominant.
  */
 
 const CODE = {
@@ -405,30 +437,105 @@ interface LmHeadChunk {
 
 export class LlamaEngineQ8Resident {
   private tokensSoFar = 0;
-  private prefillWeights: LlamaWeightsQ8 | null;
+  /**
+   * `forward()`'s own routing flag — `false` means "the next `forward()`
+   * call must be prefill", `true` means "decode". Issue #120's `reset()`
+   * flips this back to `false` without touching `this.weights` at all; see
+   * that field's own doc for why the two used to be the same field (and why
+   * they no longer are).
+   */
+  private hasPrefilled = false;
 
   private constructor(
     private readonly config: LlamaConfig,
     private readonly device: ResidentDevice,
-    weights: LlamaWeightsQ8,
+    /**
+     * Held for this instance's whole lifetime, not dropped after the first
+     * `forward()` call the way a pre-#120 version of this field
+     * (`prefillWeights: LlamaWeightsQ8 | null`) did. `runPrefillResident`
+     * needs these CPU-side packed weights (`codes`/`scale` per layer) every
+     * time it runs — to dequantize-and-transpose each layer's projection
+     * for `matmul`, since prefill's weight layout is not the persistent
+     * `matvecQ8` one `create()` already built into `this.layers` — and
+     * issue #120 asks for exactly that: `reset()` followed by a *second*
+     * prefill, not a one-shot.
+     *
+     * Costs nothing extra to keep: `weights` is a reference to the exact
+     * object the caller passed into `create()`, not a clone, and every real
+     * caller in this repository (`examples/llm-demo/src/main.ts`'s `loaded`)
+     * already keeps its own reference to it for the whole page session
+     * regardless — this field holding a second reference to the same
+     * ~1.4 GiB object adds a pointer, not another ~1.4 GiB. The pre-#120
+     * reasoning for dropping it ("does not outlive the one call that needs
+     * it") only ever saved memory for a hypothetical caller that itself
+     * gave up its own reference right after `create()`; no caller here does.
+     */
+    private readonly weights: LlamaWeightsQ8,
     private readonly embedTokens: QuantizedLinear,
     private readonly shared: SharedResident,
     private readonly layers: LayerResident[],
     private readonly lmHeadChunks: LmHeadChunk[],
-  ) {
-    // Retained only until the first `forward()` call runs prefill (see the
-    // class doc): this class cannot know the prompt's tokens (so cannot
-    // dequantize-and-transpose each layer's projection weight for `matmul`,
-    // `runPrefillResident`'s own first step) before that first call —
-    // dropped afterward so it does not outlive the one call that needs it
-    // (the same reasoning `LlamaEngineQ8`'s own class doc gives for not
-    // holding onto the unpacked `LlamaWeightsQ8` past construction).
-    this.prefillWeights = weights;
-  }
+  ) {}
 
-  /** Positions already resident in the KV cache — 0 before the first `forward`. */
+  /** Positions already resident in the KV cache — 0 before the first `forward`, and again immediately after `reset()`. */
   get position(): number {
     return this.tokensSoFar;
+  }
+
+  /**
+   * Issue #120: back to `create()`'s own initial state — position 0, next
+   * `forward()` accepted as a new prefill — **without** rebuilding anything
+   * `create()` built. Every pipeline, bind group and persistent buffer
+   * (`this.shared`, `this.layers`, `this.lmHeadChunks`) stays exactly as it
+   * was; `runPrefillResident`'s transient, `N`-sized buffers for the new
+   * prompt are still allocated fresh (they always were, once per prefill —
+   * see that method's own doc), and its per-layer dequant-transpose weight
+   * prep still re-runs (needs `this.weights`, kept resident for exactly
+   * this — see that field's own doc) — neither of those is the ~1.4 GiB
+   * weight re-upload issue #120 exists to remove, which was **`create()`
+   * itself**: a whole new `ResidentDevice`, a whole new set of persistent
+   * `matvecQ8` weight buffers built via `device.upload()`. `reset()` means
+   * that call never happens again for a second, independent generation.
+   *
+   * Old KV cache contents are **not** cleared here, deliberately — nothing
+   * clears them. The next generation's own prefill only ever *writes* into
+   * `layer.kCacheBuf`/`vCacheBuf` (`runPrefillResident`'s per-head
+   * `copyBufferToBuffer`, never a read), and decode's attention is bounded
+   * by `sEff = position + 1` (issue #117), which after `reset()` starts
+   * from the same 0 `tokensSoFar` a freshly `create()`d engine would — so
+   * the old generation's leftover bytes, wherever they still physically
+   * sit in the buffer, are simply never in scanning range again. Proved by
+   * `llm/engine-q8-resident.reset.wgsl.test.ts`, which poisons those bytes
+   * with `+Infinity` before `reset()` rather than trusting this argument on
+   * its own (`context.wgsl` reads `v` unconditionally within its bound — a
+   * scan that reached the poison would return `NaN`, not a plausible wrong
+   * number).
+   */
+  reset(): void {
+    this.tokensSoFar = 0;
+    this.hasPrefilled = false;
+  }
+
+  /**
+   * Test/debug-only: overwrites every layer's entire KV cache
+   * (`kCacheBuf`/`vCacheBuf`, every position, not just the ones a given
+   * generation has actually written) with `value`. Exists for
+   * `reset.wgsl.test.ts`'s own correctness proof — see `reset()`'s own doc
+   * — so that a `sEff` bound leaking past where it should stops being "a
+   * number that happens to look plausible" and becomes `NaN` on contact
+   * (`+Infinity` through `context.wgsl`'s unconditional `v` read). Never
+   * called by `forward()`, `reset()`, or anything else this class's own
+   * production path reaches — writing directly into the persistent cache
+   * outside `runPrefillResident`'s/`runDecodeStep`'s own copy operations is
+   * not something real generation should ever do.
+   */
+  debugPoisonKVCache(value: number): void {
+    const { numKvHeads, maxSeqLen, headDim } = this.config;
+    const poison = new Float32Array(numKvHeads * maxSeqLen * headDim).fill(value);
+    for (const layer of this.layers) {
+      this.device.upload(layer.kCacheBuf, 0, poison);
+      this.device.upload(layer.vCacheBuf, 0, poison);
+    }
   }
 
   static async create(config: LlamaConfig, weights: LlamaWeightsQ8, device: ResidentDevice): Promise<LlamaEngineQ8Resident> {
@@ -613,10 +720,15 @@ export class LlamaEngineQ8Resident {
    * after issue #117, not an oversight — see the class doc's "Prefill is
    * resident too" section for why recovering it would cost back the
    * round-trip issue #117 removes.
+   *
+   * Routes on `this.hasPrefilled`, not on whether `this.weights` is
+   * present — issue #120's `reset()` flips that flag back to `false`
+   * without touching `this.weights`, which stays available for exactly
+   * this (a second prefill); see both fields' own doc.
    */
   async forward(tokens: number[]): Promise<Float32Array[]> {
     if (tokens.length === 0) throw new Error("LlamaEngineQ8Resident.forward: tokens must be non-empty");
-    if (this.prefillWeights) return this.runPrefillResident(tokens);
+    if (!this.hasPrefilled) return this.runPrefillResident(tokens);
     if (tokens.length !== 1) {
       throw new Error("LlamaEngineQ8Resident.forward: after prefill, every call must be exactly one token (decode)");
     }
@@ -636,10 +748,15 @@ export class LlamaEngineQ8Resident {
    * (this class's own decode contract, enforced in `forward`), so there is
    * no repeated call to amortize allocation across — the "resident" property
    * that matters here is *within* this one call (one submit for the whole
-   * prompt), not across calls.
+   * prompt), not across calls. Issue #120's `reset()` means "once per
+   * generation" no longer means "once per this class instance's lifetime" —
+   * this method's own transient allocation and dequant-transpose weight
+   * prep both re-run, unchanged, on every generation after a `reset()`; see
+   * that method's own doc for which cost `reset()` actually removes (it is
+   * not this one).
    */
   private async runPrefillResident(tokens: number[], debugAllPositions = false): Promise<Float32Array[]> {
-    const weights = this.prefillWeights!;
+    const weights = this.weights;
     const { numLayers, hiddenSize, numHeads, numKvHeads, headDim, ffnHidden, maxSeqLen, vocabSize, ropeTheta, rmsNormEps } = this.config;
     const N = tokens.length;
     if (N > maxSeqLen) throw new Error(`LlamaEngineQ8Resident.forward: prompt length ${N} exceeds maxSeqLen=${maxSeqLen}`);
@@ -927,9 +1044,11 @@ export class LlamaEngineQ8Resident {
     for (const shape of [wqShape, wkShape, wvShape, woShape, gateShape, upShape, downShape]) shape.weightTBuf.destroy();
 
     this.tokensSoFar = N;
-    // Dropped now that this call has read every layer's weight it needed —
-    // see the constructor's doc.
-    this.prefillWeights = null;
+    // `this.weights` is *not* dropped here (issue #120) — see that field's
+    // own doc for why keeping the reference costs nothing and why
+    // `reset()` needs it available for a second prefill. Only the routing
+    // flag flips.
+    this.hasPrefilled = true;
     return logits;
   }
 
@@ -950,12 +1069,14 @@ export class LlamaEngineQ8Resident {
    * prefill" cost that branch's sibling comment describes; harmless at the
    * tiny fixture's `vocabSize`, not something real generation should do.
    *
-   * Same one-call contract as `forward()`'s own prefill branch otherwise:
-   * only valid as this instance's first call, and consumes
-   * `this.prefillWeights` the same way.
+   * Same one-call-per-generation contract as `forward()`'s own prefill
+   * branch otherwise: valid as this instance's first call, or again after
+   * `reset()` (issue #120) — checked against `this.hasPrefilled`, the same
+   * flag `forward()` itself routes on, not against `this.weights` (always
+   * present now — see that field's own doc).
    */
   async debugAllPositionLogits(tokens: number[]): Promise<Float32Array[]> {
-    if (!this.prefillWeights) {
+    if (this.hasPrefilled) {
       throw new Error("LlamaEngineQ8Resident.debugAllPositionLogits: only valid before prefill has run");
     }
     return this.runPrefillResident(tokens, true);

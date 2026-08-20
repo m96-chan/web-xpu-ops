@@ -9,6 +9,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `LlamaEngineQ8Resident.reset()` (issue #120): starts a second, independent
+  generation on an already-`create()`d engine — position counter back to 0,
+  next `forward()` accepted as a new prefill — without rebuilding anything
+  `create()` built (pipelines, bind groups, persistent KV/activation
+  buffers, the resident `matvecQ8` weight buffers). `technologies-moe/alibi-ai`'s
+  chat integration measured what rebuilding cost before this: 17-33s per
+  independent turn, dominated by `create()`'s own weight re-upload — a cost
+  a chat's "many short, independent generations against an unchanging model"
+  workload never needed to pay more than once. Old KV cache contents are
+  left in place (not cleared) rather than needing a separate wipe step;
+  correctness relies on `sEff = position + 1` (issue #117) never scanning
+  past what the current generation itself has written, proved by
+  `llm/engine-q8-resident.reset.wgsl.test.ts` poisoning the entire old KV
+  cache with `+Infinity` before `reset()` and confirming the next
+  generation's output is unaffected. Measured on real hardware (RTX 5090,
+  Chrome, real checkpoint): three independent generations via "build once +
+  `reset()`" totalled ~9.2s against ~14.2s for "build fresh each time" — a
+  ~35% reduction, reproducible across three independent trials (README's
+  "reset(): multi-generation reuse without rebuilding" section has the full
+  numbers and this measurement's own limits).
+
 - `ops/gqa`'s `scores`/`context` kernels gain an `sEff` parameter (issue
   #117): the number of key/value positions actually resident, bounding the
   softmax scan without changing `S`, the KV cache's own address stride.

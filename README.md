@@ -1317,6 +1317,95 @@ issue) is a separate design point from decode's `sEff`, not the same
 mechanism reused — see `llm/engine-q8-resident.ts`'s class doc, "Prefill's
 own KV is scanned at S = N, not S = maxSeqLen".
 
+### `reset()`: multi-generation reuse without rebuilding (issue #120)
+
+`forward()`'s own contract, up through issue #117, was "prefill exactly
+once, then decode only" — every new *independent* prompt needed a whole new
+`ResidentDevice` and `LlamaEngineQ8Resident.create()` call, since there was
+no other way back to "accepts a new prefill". `technologies-moe/alibi-ai`'s
+chat integration (this repository's real consumer) measured what that costs
+in practice: 17-33s per independent turn, dominated by `create()`'s own
+`device.upload()` calls rebuilding every persistent `matvecQ8` weight buffer
+from the ~1.4 GiB checkpoint — for a workload (a chat: many short,
+independent generations against a model that never changes between turns)
+where none of that needed to happen again.
+
+`engine.reset()` sets the position counter back to 0 and re-arms `forward()`'s
+prefill routing, and touches nothing else — every pipeline, bind group and
+persistent buffer `create()` built stays exactly what it was, weights are not
+re-uploaded, and the next `forward()` call is accepted as a fresh prompt the
+same way the very first one was.
+
+**Correctness: old KV cache contents are left in place, not cleared.**
+Nothing clears them — the next generation's own prefill only ever *writes*
+into the KV cache (never reads it), and decode's attention is bounded by
+`sEff = position + 1` (issue #117), which starts from the same `0` a freshly
+`create()`d engine would after `reset()`. So the old generation's leftover
+bytes, wherever they still physically sit in the buffer, are simply never in
+scanning range again — proved rather than assumed:
+`llm/engine-q8-resident.reset.wgsl.test.ts` overwrites the **entire** KV
+cache with `+Infinity` (`debugPoisonKVCache`, test/debug-only) before
+`reset()`, then runs the exact same fixture prompt through the same engine a
+second time and checks the result against the fixture's own ground-truth
+logits — unchanged, and no `NaN` (`context.wgsl` reads `v` unconditionally
+within its `sEff` bound, so a scan that leaked into the poison would have
+produced `NaN`, not a plausible wrong number). A second test uses a
+*shorter* second generation specifically, so genuine (non-poisoned, but
+still `reset()`-irrelevant) fixture-derived values from the first
+generation's own later positions sit beyond the second generation's own
+final position and must equally not be read — the first test alone cannot
+tell "correctly bounded" apart from "coincidentally the same length as
+before". Both mutation-verified: reverting either line of `reset()`'s own
+two-line body reddens the intended test(s) and nothing else (confirmed via
+`md5sum` before/after the edit, per this repository's rule 1).
+
+**Measured effect (RTX 5090, Chrome, real Sarashina2.2-1B-alibi-v1
+checkpoint, real hardware over CDP — not estimated, rule 9).** Three
+independent, short casual-Japanese prompts, greedy decode to `</s>`, driven
+through the exact same `generate()` the demo's own button calls: "build
+once, `reset()` before generations 2 and 3" against "build fresh for every
+generation" (`examples/llm-demo/src/main.ts#__resetBenchmark`, exposed on
+`window` for a CDP script rather than reachable from the UI). Three
+independent trials, same page session, same three prompts:
+
+| trial | reset() total (3 gens) | rebuild total (3 gens) | reduction |
+| --- | --- | --- | --- |
+| 1 | 9,164.9 ms | 14,483.1 ms | 36.7% |
+| 2 | 9,111.9 ms | 14,084.5 ms | 35.3% |
+| 3 | 9,369.8 ms | 14,128.8 ms | 33.7% |
+| **avg** | **9,215.5 ms** | **14,232.1 ms** | **35.2%, ~5.0s saved / 3 gens** |
+
+Reproducible across all three trials, well outside this box's ordinary
+run-to-run noise (the per-step `stepMs` figures underneath, ~5.2-5.7 ms,
+match this repository's own earlier decode measurements almost exactly, so
+decode itself is not what moved).
+
+**What this run could *not* cleanly isolate, reported rather than smoothed
+over (rule 9's "測っていない項目は「未測定」と書く"):** the per-generation
+detail (`resetPerGenDetail`) shows generation 1 of the `reset()` strategy
+(which *does* pay one `create()` call) at `prefillMs` 2,105-2,295 ms across
+the three trials — barely higher than generations 2 and 3 (which pay only
+`reset()`, ~0 cost), even though each `create()` call inside the *rebuild*
+strategy costs roughly 2,500 ms more than a `reset()`-only generation by the
+aggregate numbers above. That asymmetry (a session's *first* `create()`
+costing little, but *later* ones costing much more) was consistent across
+all three trials and is not something this measurement's own design
+(wall-clock around `create()`+`generate()`, one page session, `ResidentDevice`
+create/destroy cycles accumulating) can attribute to a specific cause —
+GPU/driver-level allocator pressure from repeated `ResidentDevice`
+create/destroy cycles within one page session is the most likely
+explanation, not investigated further here. The **aggregate** totals above
+are unaffected by this — they are the actual wall-clock time issue #120
+asks about — but a claim like "the
+2nd and 3rd generation's construction cost is exactly zero" would be
+overstating what this specific run can support; "the whole `reset()`
+strategy reliably beats the whole rebuild strategy by about a third, for
+this workload, on this hardware" is the claim these numbers back.
+
+**Scope not touched:** multi-session/concurrent generation and prompt-prefix
+caching (shared-prefix KV reuse across *different* prompts) are explicitly
+out of scope for this issue — tracked as future work, not attempted here.
+
 ### Scope
 
 Reaching into `technologies-moe/alibi-ai` (a separate repository) itself —

@@ -439,3 +439,88 @@ async function runGeneration(): Promise<void> {
     (residentDevice as Awaited<ReturnType<typeof createBrowserResidentDevice>> | null)?.destroy();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #120: measuring reset()'s own effect
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue #120's own completion bar: "reset経由の2生成目以降が構築コストゼロで動くこと
+ * の実測", a real-hardware wall-clock comparison, not an estimate (rule 9) —
+ * "構築1回+reset反復で連続 N 生成" against "都度構築 N 生成", both running
+ * the exact same `promptTexts` through the exact same `generate()` this
+ * file's own button uses, so the only thing that differs between the two
+ * loops below is whether each generation after the first pays
+ * `LlamaEngineQ8Resident.create()`'s own cost (a fresh `ResidentDevice`, a
+ * fresh `device.upload()` for every persistent `matvecQ8` weight buffer) or
+ * `reset()`'s (two field writes).
+ *
+ * Not reachable from the UI — a CDP-driven script calls this directly, the
+ * same way issue #117's own prefill numbers were measured (this README's
+ * "GPU-resident prefill" section) — so it lives outside `runGeneration`'s
+ * own click handler entirely and never runs unless something calls it by
+ * name. `policySelect.value`'s current UI selection is still used to build
+ * each prompt (`buildStylePrompt`), the same style/policy the button itself
+ * would use, so a driving script only has to set the text input, not
+ * reimplement prompt construction.
+ */
+async function __resetBenchmark(promptTexts: string[]): Promise<{
+  resetTotalMs: number;
+  resetPerGenMs: number[];
+  resetPerGenDetail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number }[];
+  rebuildTotalMs: number;
+  rebuildPerGenMs: number[];
+  rebuildPerGenDetail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number }[];
+}> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights, tokenizer } = loaded;
+  const tokensFor = (text: string): number[] => tokenizer.encode(buildStylePrompt(policySelect.value, text));
+
+  // Strategy A: one `ResidentDevice`, one `LlamaEngineQ8Resident`, `reset()`
+  // before every generation after the first.
+  const resetPerGenMs: number[] = [];
+  const resetPerGenDetail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number }[] = [];
+  const resetStart = performance.now();
+  {
+    const device = await createBrowserResidentDevice();
+    try {
+      const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+      for (let i = 0; i < promptTexts.length; i += 1) {
+        const t0 = performance.now();
+        if (i > 0) engine.reset();
+        // eslint-disable-next-line no-await-in-loop
+        const { prefillMs, decodeMsTotal, decodeSteps } = await generate(engine, tokensFor(promptTexts[i]!), undefined);
+        resetPerGenMs.push(performance.now() - t0);
+        resetPerGenDetail.push({ prefillMs, decodeMsTotal, decodeSteps });
+      }
+    } finally {
+      device.destroy();
+    }
+  }
+  const resetTotalMs = performance.now() - resetStart;
+
+  // Strategy B: `runGeneration`'s own resident branch, unchanged — a fresh
+  // `ResidentDevice` and a fresh `LlamaEngineQ8Resident.create()` call for
+  // every generation.
+  const rebuildPerGenMs: number[] = [];
+  const rebuildPerGenDetail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number }[] = [];
+  const rebuildStart = performance.now();
+  for (const text of promptTexts) {
+    const t0 = performance.now();
+    const device = await createBrowserResidentDevice();
+    let detail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number };
+    try {
+      const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+      // eslint-disable-next-line no-await-in-loop
+      detail = await generate(engine, tokensFor(text), undefined);
+    } finally {
+      device.destroy();
+    }
+    rebuildPerGenMs.push(performance.now() - t0);
+    rebuildPerGenDetail.push(detail);
+  }
+  const rebuildTotalMs = performance.now() - rebuildStart;
+
+  return { resetTotalMs, resetPerGenMs, resetPerGenDetail, rebuildTotalMs, rebuildPerGenMs, rebuildPerGenDetail };
+}
+(window as unknown as { __resetBenchmark: typeof __resetBenchmark }).__resetBenchmark = __resetBenchmark;
