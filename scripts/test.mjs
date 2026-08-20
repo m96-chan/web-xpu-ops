@@ -147,14 +147,31 @@ function plain(text) {
   return text.replace(/\[[0-9;]*m/g, "");
 }
 
-/** `Tests  5 passed (5)` → `{ passed: 5, total: 5 }`; null when vitest printed no summary. */
+/**
+ * `Tests  5 passed (5)` → `{ passed: 5, skipped: 0, total: 5 }`;
+ * `Tests  2 skipped (2)` → `{ passed: 0, skipped: 2, total: 2 }`;
+ * null when vitest printed no summary.
+ *
+ * Skips are parsed, not ignored: a file may legitimately skip everything
+ * (`it.skipIf` on a gitignored checkpoint that CI never has — see
+ * llm/real-model-weights.test.ts). Before this, such a file printed a
+ * summary with no `passed` count, parsed as null, and was reported as
+ * "crashed or hung" — a false FAIL on every CI run. The skip count stays
+ * in the log line so an all-skipped file still cannot be mistaken for a
+ * file that verified something.
+ */
 function counts(output) {
   const line = /^\s*Tests\s+(.*)$/m.exec(plain(output));
   if (!line) return null;
   const passed = /(\d+) passed/.exec(line[1]);
+  const skipped = /(\d+) skipped/.exec(line[1]);
   const total = /\((\d+)\)/.exec(line[1]);
-  if (!passed || !total) return null;
-  return { passed: Number(passed[1]), total: Number(total[1]) };
+  if ((!passed && !skipped) || !total) return null;
+  return {
+    passed: passed ? Number(passed[1]) : 0,
+    skipped: skipped ? Number(skipped[1]) : 0,
+    total: Number(total[1]),
+  };
 }
 
 const files = testFiles();
@@ -185,10 +202,11 @@ for (const file of files) {
     seen = counts(output);
   }
 
-  const ok = code === 0 && seen !== null && seen.passed === seen.total;
+  const ok = code === 0 && seen !== null && seen.passed + seen.skipped === seen.total;
   if (ok) {
     tests += seen.passed;
-    console.log(`  ok   ${file}  ${seen.passed}/${seen.total}`);
+    const skips = seen.skipped > 0 ? `  (${seen.skipped} skipped)` : "";
+    console.log(`  ${seen.passed > 0 ? "ok  " : "skip"} ${file}  ${seen.passed}/${seen.total}${skips}`);
     continue;
   }
   failed += 1;

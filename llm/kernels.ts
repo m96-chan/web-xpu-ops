@@ -31,6 +31,7 @@ const CODE = {
   gather: opKernel("gather"),
   rmsnorm: opKernel("rmsnorm"),
   matvec: opKernel("matvec"),
+  matvecQ8: opKernel("matvec", "q8"),
   matmul: opKernel("matmul"),
   rope: opKernel("rope"),
   gqaScores: opKernel("gqa", "scores"),
@@ -104,6 +105,39 @@ export async function runMatVec(run: Runner["run"], { matrix, vector, M, K }: Ma
     code: CODE.matvec,
     bindings: [
       { kind: "storage", data: matrix },
+      { kind: "storage", data: vector },
+      { kind: "out", type: "f32", length: M },
+      { kind: "uniform", data: params([["u32", M], ["u32", K]]) },
+    ],
+    workgroups: [M],
+  });
+  return asF32(out!);
+}
+
+export interface MatVecQ8Args {
+  /** `[M, ceil(K/4)]` u32, row-major, `matvecQ8`'s own packed wire format (`ops/matvec/reference.ts#packQ8`). */
+  weight: Uint32Array;
+  /** `[M]`, one absmax-derived scale per row. */
+  scale: Float32Array;
+  vector: Float32Array;
+  M: number;
+  K: number;
+}
+
+/**
+ * `matvecQ8` (issue #97), used by `LlamaEngineQ8`'s decode path (issue #105):
+ * the same GEMV as `runMatVec`, with the weight held as int8 codes packed
+ * four to a `u32` word instead of f32 — a quarter the bytes moved per decode
+ * step, which is what makes decode bandwidth-bound rather than
+ * compute-bound at this weight size. Binding order and uniform layout are
+ * copied from `ops/matvec/q8.wgsl.test.ts`, not re-derived (rule 2).
+ */
+export async function runMatVecQ8(run: Runner["run"], { weight, scale, vector, M, K }: MatVecQ8Args): Promise<Float32Array> {
+  const [out] = await run({
+    code: CODE.matvecQ8,
+    bindings: [
+      { kind: "storage", data: weight },
+      { kind: "storage", data: scale },
       { kind: "storage", data: vector },
       { kind: "out", type: "f32", length: M },
       { kind: "uniform", data: params([["u32", M], ["u32", K]]) },

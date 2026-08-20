@@ -548,11 +548,141 @@ approximate — the derivation and a numeric proof are in
 `llm/tools/gen_fixture.py` applies the same permutation before writing
 `tiny.weights.bin`.
 
-**Scope.** f32 weights only (int8 lands after #97's quantized `matvec`
-connects); the tokenizer and sampler elsewhere in this README are not wired
+**Scope.** f32 weights (this section) and int8 weights (next section) both
+exist now; the tokenizer and sampler elsewhere in this README are not wired
 into the engine yet, and there is no browser wiring (later issues under #96).
-Correctness first, per the rule below — nothing here has been tuned for
-speed.
+Correctness first, per the rule below — nothing here has been tuned for speed.
+
+---
+
+## `llm/`: weight converter and the int8 (W8A32) engine path
+
+Issue [#105](https://github.com/m96-chan/web-xpu-ops/issues/105) closes the
+loop from "an engine that runs a tiny fixture" to "an engine that loads and
+generates from a real checkpoint": `llm/tools/convert_weights.py` converts a
+HF safetensors checkpoint (bf16) into per-row int8, and `LlamaEngineQ8`
+(`llm/engine-q8.ts`) runs it.
+
+Every number in this section was measured on one machine (rule 9): NVIDIA
+GeForce RTX 5090, driver 610.57.04, Linux (Arch, kernel 7.1.5-arch1-2),
+backend Dawn via `webgpu@0.4.x` under Node v25.6.1, Python 3.14 / NumPy 2.4
+for the converter; checkpoint Sarashina2.2-1B-alibi-v1 (bf16, 2.68 GiB).
+Timing figures are single observations from that machine, not averages —
+comparable only against a rerun under the same conditions.
+
+```ts
+// llm/tools/convert_weights.py --model-dir <hf checkpoint> --out-dir <out>
+// writes <out>/manifest.json + weights.codes.bin + weights.scales.bin + weights.norms.bin
+
+import { loadConvertedWeightsQ8 } from "./llm/real-model-weights.js";
+import { LlamaEngineQ8 } from "./llm/engine-q8.js";
+
+const { config, weights } = loadConvertedWeightsQ8("<out-dir>", /* maxSeqLen */ 4096);
+const engine = new LlamaEngineQ8(config, weights, runner.run);
+const prefillLogits = await engine.forward(promptTokens);
+```
+
+**Converted format.** Every Linear weight (`wq`/`wk`/`wv`/`wo`/`gate`/`up`/`down`/
+`lm_head`) and the embedding table become per-row absmax int8 codes (`[N, K]`,
+one signed byte per element — `ops/quantize/reference.ts#quantize`'s own
+convention) plus an f32 scale per row; `wq`/`wk` get `permuteRopeChannels`
+applied before quantizing (permuting rows and quantizing per row commute, so
+this is equivalent to permuting the codes afterward — the tiny fixture's
+generator does it the other way around, on purpose, for a reason its own
+module doc explains). Norm weights stay f32. Manifest entries are
+`{ name, kind: "quant" | "norm", shape, codesOffset, scaleOffset }` or
+`{ name, kind: "norm", shape, offset }` — the exact shape `llm/weights-q8-io.ts#buildLlamaWeightsQ8`
+parses, shared by the tiny fixture's loader (`fixture-q8.ts`) and the real
+checkpoint's (`real-model-weights.ts`) so the two formats cannot silently
+drift apart. Converting Sarashina2.2-1B-alibi-v1 (2.68 GiB bf16) produced a
+1.41 GiB int8 checkpoint (1,407,451,136 bytes codes + 2,711,552 bytes scales +
+351,232 bytes norms) in about 8 seconds.
+
+**`LlamaEngineQ8`'s resident memory.** Only the packed `matvecQ8` wire format
+(`ops/matvec/reference.ts#packQ8`) is kept per projection after construction —
+not also the unpacked codes the loader handed in, since packing does not
+change a weight's size (repacking would roughly double memory for nothing).
+The embedding table is the one exception kept in its original (unpacked)
+form, decoupled from the loader's shared buffer via a copy
+(`weights-q8.ts#cloneQuantizedLinear`) — without that copy, the loader's
+manifest-parsing convenience (every weight a *view* into one buffer covering
+the whole checkpoint) would keep the entire raw codes buffer resident (~1.4
+GiB) for the engine's whole lifetime just to reach the ~183 MiB embedding
+table. Measured on the real checkpoint: loading is ~220ms, `LlamaEngineQ8`
+construction (packing every projection) is ~1.1s, and process RSS falls from
+~2.96 GiB (while the loader's own buffers are still referenced) to ~1.56 GiB
+once the caller drops that reference and a GC runs.
+
+**Decode vs. prefill.** Decode (`tokens === 1`) dispatches `matvecQ8` directly
+against the resident packed weight. Prefill (`tokens > 1`) dequantizes the
+needed projection into a transient f32 matrix and runs `matmul` — issue
+#105's own stated scope ("プリフィルは当面「行スケールdequantしてf32 matmul」
+でもよい"), which happens once per generation (the prompt), not once per
+token, since `greedyGenerate` calls `forward` with more than one token exactly
+once. A prefill kernel that reads packed int8 directly is explicit follow-up
+work, not done here.
+
+**The embedding table's gather is CPU-side, not a GPU dispatch.** `embedTokens`
+is quantized like every other weight, but `LlamaEngineQ8` dequantizes only the
+rows a `forward` call's tokens actually name, on the CPU
+(`weights-q8.ts#gatherDequantRows`), instead of dispatching `runGather`
+against a fully-dequantized 733 MiB table for a call that reads at most
+`maxSeqLen` of its rows.
+
+**Correctness: an int8-quantization-aware fixture.** `llm/tools/gen_fixture_q8.py`
+quantizes the tiny fixture's own weights per row, **substitutes the
+dequantized weights back into the `transformers` model**, and re-runs the
+same prefill/decode loop `gen_fixture.py` runs — so the reference
+(`llm/fixtures/tiny_q8.*`) has the *same* quantization error baked in that
+`LlamaEngineQ8` produces, rather than being compared against an f32-exact
+answer a genuinely quantized engine could never match. `llm/engine-q8.wgsl.test.ts`
+checks `LlamaEngineQ8` against it on a real GPU: worst observed absolute diff
+**1.49e-7**, relative **7.22e-4** (well inside the `rel 1e-2, abs 5e-3`
+tolerance, and close to `LlamaEngineQ8`'s own f32 counterpart's numbers —
+evidence the int8 path and the Python reference agree on what quantization
+error to expect, not that either one is loose). `llm/quantize-parity.test.ts`
+separately checks that `llm/tools/quant_common.py` (the quantizer
+`convert_weights.py` and `gen_fixture_q8.py` both call) rounds ties exactly
+the way `ops/quantize/reference.ts#quantize`'s `Math.round` does
+(`floor(x) + (frac >= 0.5)`, not `np.round`'s banker's rounding — which
+disagrees at every `.5` boundary — and not the tempting `np.floor(x + 0.5)`,
+whose addition double-rounds just below half-integers; see
+`quant_common.py`'s module doc) by spawning the Python script and diffing its
+output directly, including both boundary cases.
+
+**Real-checkpoint status.** Converting, loading (`real-model-weights.ts`,
+checked in `real-model-weights.test.ts`), and constructing `LlamaEngineQ8`
+from the real Sarashina2.2-1B-alibi-v1 checkpoint all succeed and are
+verified. **Live GPU generation from the real checkpoint does not run yet**,
+for two separate reasons, neither a numerics problem (the int8 path is
+verified above, to a tight tolerance, on real GPU dispatches):
+
+- On the machine this was built on, a Node+Dawn binding fragility is
+  triggered by real-model-scale CPU-bound work (loading and packing a
+  ~1.4 GiB checkpoint, on the order of a second) immediately preceding a GPU
+  dispatch; see [#107](https://github.com/m96-chan/web-xpu-ops/issues/107)
+  for the isolated repro (an unrelated large allocation, and separately a
+  pure CPU busy-loop with no allocation at all, both reproduce it — GPU
+  contention and buffer count/size were ruled out).
+- Independently of #107 and of the machine, the real vocabulary size breaks
+  the lmHead projection against WebGPU's own limits: decode dispatches one
+  workgroup per output row (102,400 > the default 65,535
+  `maxComputeWorkgroupsPerDimension`), and prefill dequantizes lmHead to a
+  ~700 MiB f32 matrix that exceeds the 512 MiB buffer/binding cap the
+  harness requests (and the 128 MiB browser default). Found in review, not
+  yet hit at runtime only because #107 aborts earlier; tracked as
+  [#112](https://github.com/m96-chan/web-xpu-ops/issues/112), which blocks
+  #106's real-model demo as well.
+
+`llm/engine-q8.real-model.test.ts` runs this end to end (prefill + greedy
+decode, tok/s per step) when a converted checkpoint and an encoded prompt are
+supplied via environment variables, and skips (visibly, not as a silent pass)
+otherwise; resolving #107 and #112 is what turns its assertions on. Live
+generation, `llama.cpp` comparison, and tok/s are planned for
+[#106](https://github.com/m96-chan/web-xpu-ops/issues/106) (browser demo),
+where WebGPU runs in a separate GPU process rather than sharing Node's — the
+condition #107 depends on does not exist there (but #112 applies to the
+browser all the same).
 
 ---
 
