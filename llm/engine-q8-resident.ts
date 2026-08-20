@@ -74,7 +74,7 @@ import {
  *
  * ## Reshape: a GPU permute kernel, not a CPU round trip
  *
- * `matmul`'s projections produce `[N, heads, dim]` token-major (a token's
+ * `matmulQ8`'s projections produce `[N, heads, dim]` token-major (a token's
  * `heads * dim` output channels are one contiguous output row), and `rope`
  * reads and writes that same layout unchanged — but `ops/gqa` wants
  * `[heads, N, dim]` head-major (`llm/reshape.ts#splitHeadsMajor`'s doc has
