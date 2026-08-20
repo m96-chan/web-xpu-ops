@@ -54,7 +54,11 @@ async function runFixtureGenerationAndAssert(engine: LlamaEngineQ8Resident, fixt
 }
 
 describe("llm/engine-q8-resident / reset() (issue #120)", () => {
-  const getResident = useResidentGpu();
+  // PR #126 review (cap): every test below receives its own `resident` as
+  // `residentTest`'s own callback argument, so the accessor
+  // `useResidentGpu()` returns is never called here — only its `beforeAll`/
+  // `afterAll` registration (this call's real side effect) is needed.
+  useResidentGpu();
   const fixture = loadTinyFixtureQ8();
 
   /**
@@ -100,6 +104,24 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
     expect(firstGenPosition).toBe(fixture.promptTokens.length + fixture.decodeTokens.length);
 
     engine.debugPoisonKVCache(Number.POSITIVE_INFINITY);
+
+    // Positive control (PR #126 review, item 2): prove the poison is
+    // actually *observable* before trusting `reset()` to route the next
+    // generation away from it — measured (this review) to matter: an empty
+    // `debugPoisonKVCache` body (writes nothing) still passed every
+    // assertion below it without this check, because "never wrote the
+    // poison" and "correctly avoided reading it" look identical from the
+    // parity check alone. Without calling `reset()` first, `tokensSoFar`
+    // is still `firstGenPosition`, so this call routes into *decode*
+    // (`forward()`'s own routing), whose `sEff` bound covers
+    // `[0, firstGenPosition + 1)` — every position `debugPoisonKVCache`
+    // just overwrote. `context.wgsl` reading `+Infinity` unconditionally
+    // within that bound must produce a non-finite logit somewhere; a
+    // finite result here would mean the poison never reached the buffer
+    // the real scan reads, making the parity check below meaningless.
+    const [poisonedLogits] = await engine.forward([fixture.promptTokens[0]!]);
+    expect(Array.from(poisonedLogits!).some((x) => !Number.isFinite(x))).toBe(true);
+
     engine.reset();
     expect(engine.position).toBe(0);
 
@@ -109,15 +131,30 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
 
   /**
    * The same proof, but with the second generation *shorter* than the
-   * first (prefill only, no decode steps) — so real, un-poisoned positions
-   * from generation 1 (`fixture.promptTokens.length` .. `firstGenPosition -
-   * 1`, genuine fixture-derived numbers, not `+Infinity`) sit *beyond*
-   * generation 2's own final position and must equally not be read. The
-   * first test alone cannot catch a `reset()` that forgot to shrink `sEff`
-   * back down and instead kept scanning out to the *previous* generation's
-   * length: same-length-after-reset would still, by coincidence, read only
+   * first (prefill, plus exactly one decode step — not the full fixture
+   * decode run) — so real, un-poisoned positions from generation 1
+   * (`fixture.promptTokens.length` .. `firstGenPosition - 1`, genuine
+   * fixture-derived numbers, not `+Infinity`) sit *beyond* generation 2's
+   * own final position and must equally not be read. The first test alone
+   * cannot catch a `reset()` that forgot to shrink `sEff` back down and
+   * instead kept scanning out to the *previous* generation's length:
+   * same-length-after-reset would still, by coincidence, read only
    * positions this generation itself just wrote. A shorter second
    * generation does not have that coincidence protecting it.
+   *
+   * PR #126 review, item 1: an earlier version of this test stopped at
+   * prefill alone, never calling `runDecodeStep` at all — so a `sEff`
+   * regression confined to *decode*'s own bound (`GQA_SCORES_S_EFF_BYTE`/
+   * `GQA_CONTEXT_S_EFF_BYTE` in `engine-q8-resident.ts`, computed fresh
+   * from `this.tokensSoFar` every step) could revert to always scanning
+   * `firstGenPosition + 1` positions regardless of what `reset()` had done,
+   * and this test would not have noticed — prefill's own attention never
+   * touches the persistent, `maxSeqLen`-strided cache at all (the class
+   * doc's "Prefill's own KV is scanned at S = N, not S = maxSeqLen"), so it
+   * cannot exercise that specific bound. One decode step, checked against
+   * `fixture.decodeLogits[0]` (the same reference value the full-length
+   * fixture run already validates the *first* decode step against), closes
+   * that gap.
    */
   residentTest("reset() + a shorter second generation does not read the first generation's leftover positions", async (resident) => {
     const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
@@ -129,9 +166,15 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
     const prefillLogits = await engine.forward(fixture.promptTokens);
     expect(prefillLogits).toHaveLength(1);
     const fixtureLastPrefill = fixture.prefillLogits[fixture.prefillLogits.length - 1]!;
-    const worst = agree(prefillLogits[0]!, fixtureLastPrefill, TOLERANCE);
-    expect(worst, worst ? `prefill (final position) after reset: ${JSON.stringify(worst)}` : undefined).toBeNull();
+    const prefillWorst = agree(prefillLogits[0]!, fixtureLastPrefill, TOLERANCE);
+    expect(prefillWorst, prefillWorst ? `prefill (final position) after reset: ${JSON.stringify(prefillWorst)}` : undefined).toBeNull();
     expect(engine.position).toBe(fixture.promptTokens.length);
+
+    const next = argmax(prefillLogits[0]!);
+    const [decodeLogits] = await engine.forward([next]);
+    const decodeWorst = agree(decodeLogits!, fixture.decodeLogits[0]!, TOLERANCE);
+    expect(decodeWorst, decodeWorst ? `decode step 0 after reset: ${JSON.stringify(decodeWorst)}` : undefined).toBeNull();
+    expect(engine.position).toBe(fixture.promptTokens.length + 1);
   });
 
   /**
@@ -156,6 +199,35 @@ describe("llm/engine-q8-resident / reset() (issue #120)", () => {
     engine.reset();
     // No throw: routed back into prefill, which accepts any non-empty
     // token list, unlike decode's "exactly one token" contract just above.
+    await expect(engine.forward(fixture.promptTokens)).resolves.toHaveLength(1);
+  });
+
+  /**
+   * PR #126 review, item 3: `reset()`'s own writes are synchronous, but
+   * `runDecodeStep`/`runPrefillResident` only write `this.tokensSoFar`
+   * *after* their own `await device.batch(...)` resolves — so calling
+   * `reset()` while a `forward()` call is still in flight (a chat UI's "new
+   * conversation" button firing mid-decode, the natural place this API
+   * would actually be misused) used to let the in-flight call's own
+   * state-write silently overwrite `reset()`'s, with no error and nothing
+   * in the return value to say so. `engine.reset()` runs synchronously,
+   * right after `engine.forward(...)` is called but deliberately *before*
+   * that call is `await`ed — `forward()`/`runDecodeStep` do only
+   * synchronous work up to their own first `await`, so this reliably lands
+   * the `reset()` call inside that window, not after it.
+   */
+  residentTest("reset() during an in-flight forward() invalidates that call instead of silently rewinding its own effect", async (resident) => {
+    const engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
+    await engine.forward(fixture.promptTokens); // now decoding, tokensSoFar = promptTokens.length
+
+    const inFlight = engine.forward([fixture.decodeTokens[0]!]); // not yet awaited
+    engine.reset(); // races the pending call above
+    await expect(inFlight).rejects.toThrow(/reset\(\) was called while this call was still in flight/);
+
+    // reset() itself, not the stale in-flight call's own write, is what the
+    // engine's state reflects — and the engine is still usable afterward,
+    // not left corrupted by the aborted call.
+    expect(engine.position).toBe(0);
     await expect(engine.forward(fixture.promptTokens)).resolves.toHaveLength(1);
   });
 

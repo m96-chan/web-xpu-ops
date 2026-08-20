@@ -436,15 +436,35 @@ interface LmHeadChunk {
 }
 
 export class LlamaEngineQ8Resident {
+  /**
+   * `forward()`'s own routing state, not merely a position counter: `0`
+   * means "the next `forward()` call must be prefill", non-zero means
+   * "decode". PR #126 review, item 4: an earlier version of this class kept
+   * a *separate* `hasPrefilled` boolean for that routing decision, redundant
+   * with `tokensSoFar` at every real call site — the one place they could
+   * diverge was `debugAllPositionLogits([])` (an empty prompt, which
+   * `forward()` itself rejects but that debug method did not), which left
+   * `tokensSoFar === 0` but `hasPrefilled === true`, an inconsistent state
+   * nothing else in this class expected. Routing on `tokensSoFar === 0`
+   * directly makes that state unreachable rather than merely unlikely: `N =
+   * 0` prefill leaves `tokensSoFar` at `0`, so the *next* call is still
+   * routed as prefill, exactly the self-consistent behaviour a real empty
+   * prompt would need anyway.
+   */
   private tokensSoFar = 0;
   /**
-   * `forward()`'s own routing flag — `false` means "the next `forward()`
-   * call must be prefill", `true` means "decode". Issue #120's `reset()`
-   * flips this back to `false` without touching `this.weights` at all; see
-   * that field's own doc for why the two used to be the same field (and why
-   * they no longer are).
+   * PR #126 review, item 3: `reset()`'s own writes are synchronous, but
+   * `runPrefillResident`/`runDecodeStep` only write `this.tokensSoFar` (and,
+   * before this field existed, `this.hasPrefilled`) *after* their own
+   * `await device.batch(...)` resolves — so a `reset()` call landing while a
+   * `forward()` call is still in flight would otherwise be silently undone
+   * the moment that in-flight call's own state-write ran, with no error and
+   * no trace. Bumped by every `reset()` call; each `forward()`-family method
+   * captures the value at its own start and refuses to write state (or
+   * return logits as if they were still valid) if it has changed by the
+   * time that method's own GPU work resolves — see `assertSameEpoch`.
    */
-  private hasPrefilled = false;
+  private generationEpoch = 0;
 
   private constructor(
     private readonly config: LlamaConfig,
@@ -510,10 +530,54 @@ export class LlamaEngineQ8Resident {
    * its own (`context.wgsl` reads `v` unconditionally within its bound — a
    * scan that reached the poison would return `NaN`, not a plausible wrong
    * number).
+   *
+   * **Not safe to call while a `forward()` call on this same instance is
+   * still in flight** (PR #126 review, item 3) — `reset()` this instance
+   * mid-generation, e.g. a chat UI's "new conversation" button firing while
+   * the previous turn's decode step is still awaiting the GPU. Call it only
+   * once every `forward()` promise you have started has settled (`await`ed
+   * or rejected). This method does not detect that misuse itself (it has no
+   * way to know whether a `forward()` call is outstanding), but the
+   * in-flight `forward()` call detects being reset out from under it —
+   * `assertSameEpoch` throws rather than writing stale position/routing
+   * state or returning logits computed against a generation that no longer
+   * exists from this instance's point of view.
    */
   reset(): void {
+    this.generationEpoch += 1;
     this.tokensSoFar = 0;
-    this.hasPrefilled = false;
+  }
+
+  /**
+   * PR #126 review, item 3: throws if `reset()` ran on this instance after
+   * `epoch` (captured by the caller at the *start* of its own `forward()`
+   * work) was captured — meaning this call's result is stale and must not
+   * write `this.tokensSoFar`, or be returned as though it reflects the
+   * engine's current generation. Called once, immediately after the one
+   * `await device.batch(...)`/`await` chain each of `runPrefillResident`'s
+   * two branches and `runDecodeStep` ends with — after that point nothing
+   * further in this class blocks, so one check there covers the entire
+   * window `reset()` could have raced against.
+   *
+   * This *cannot* undo the GPU-side KV cache writes a stale call's own
+   * `device.batch(...)` already made by the time this runs — those
+   * `copyBufferToBuffer`s were already recorded and submitted before
+   * `reset()` was even called (this method only runs after that submit's
+   * own `await` resolves). That is not a gap: those writes become exactly
+   * the kind of "old generation's leftover bytes" `reset()`'s own doc
+   * already explains are harmless — whatever *real* generation runs next
+   * overwrites that same cache region with its own prefill before decode
+   * ever reads it, the same guarantee `reset.wgsl.test.ts`'s poison tests
+   * exercise deliberately. What this check protects is purely the JS-side
+   * bookkeeping (`tokensSoFar`) and this call's own return value, not the
+   * GPU buffers.
+   */
+  private assertSameEpoch(epoch: number, caller: string): void {
+    if (this.generationEpoch !== epoch) {
+      throw new Error(
+        `LlamaEngineQ8Resident.${caller}: reset() was called while this call was still in flight — its result is stale; its own position update has been discarded (its GPU-side KV writes already landed, but the next real generation's own prefill will overwrite that same region before anything reads it — see reset()'s own doc)`,
+      );
+    }
   }
 
   /**
@@ -721,14 +785,14 @@ export class LlamaEngineQ8Resident {
    * resident too" section for why recovering it would cost back the
    * round-trip issue #117 removes.
    *
-   * Routes on `this.hasPrefilled`, not on whether `this.weights` is
-   * present — issue #120's `reset()` flips that flag back to `false`
-   * without touching `this.weights`, which stays available for exactly
-   * this (a second prefill); see both fields' own doc.
+   * Routes on `this.tokensSoFar === 0`, not on whether `this.weights` is
+   * present — issue #120's `reset()` sets `tokensSoFar` back to `0` without
+   * touching `this.weights`, which stays available for exactly this (a
+   * second prefill); see both fields' own doc.
    */
   async forward(tokens: number[]): Promise<Float32Array[]> {
     if (tokens.length === 0) throw new Error("LlamaEngineQ8Resident.forward: tokens must be non-empty");
-    if (!this.hasPrefilled) return this.runPrefillResident(tokens);
+    if (this.tokensSoFar === 0) return this.runPrefillResident(tokens);
     if (tokens.length !== 1) {
       throw new Error("LlamaEngineQ8Resident.forward: after prefill, every call must be exactly one token (decode)");
     }
@@ -756,6 +820,10 @@ export class LlamaEngineQ8Resident {
    * not this one).
    */
   private async runPrefillResident(tokens: number[], debugAllPositions = false): Promise<Float32Array[]> {
+    // PR #126 review, item 3: captured before this call's first `await`, so
+    // a `reset()` racing against this call is unambiguously "before" or
+    // "after" this snapshot — see `assertSameEpoch`'s own doc.
+    const epoch = this.generationEpoch;
     const weights = this.weights;
     const { numLayers, hiddenSize, numHeads, numKvHeads, headDim, ffnHidden, maxSeqLen, vocabSize, ropeTheta, rmsNormEps } = this.config;
     const N = tokens.length;
@@ -1043,12 +1111,13 @@ export class LlamaEngineQ8Resident {
     for (const buf of transientBuffers) buf.destroy();
     for (const shape of [wqShape, wkShape, wvShape, woShape, gateShape, upShape, downShape]) shape.weightTBuf.destroy();
 
+    this.assertSameEpoch(epoch, debugAllPositions ? "debugAllPositionLogits" : "forward");
     this.tokensSoFar = N;
     // `this.weights` is *not* dropped here (issue #120) — see that field's
     // own doc for why keeping the reference costs nothing and why
-    // `reset()` needs it available for a second prefill. Only the routing
-    // flag flips.
-    this.hasPrefilled = true;
+    // `reset()` needs it available for a second prefill. Routing now reads
+    // `this.tokensSoFar` directly (PR #126 review, item 4), so there is no
+    // separate flag to flip.
     return logits;
   }
 
@@ -1071,12 +1140,12 @@ export class LlamaEngineQ8Resident {
    *
    * Same one-call-per-generation contract as `forward()`'s own prefill
    * branch otherwise: valid as this instance's first call, or again after
-   * `reset()` (issue #120) — checked against `this.hasPrefilled`, the same
-   * flag `forward()` itself routes on, not against `this.weights` (always
-   * present now — see that field's own doc).
+   * `reset()` (issue #120) — checked against `this.tokensSoFar === 0`, the
+   * same state `forward()` itself routes on (PR #126 review, item 4), not
+   * against `this.weights` (always present now — see that field's own doc).
    */
   async debugAllPositionLogits(tokens: number[]): Promise<Float32Array[]> {
-    if (this.hasPrefilled) {
+    if (this.tokensSoFar !== 0) {
       throw new Error("LlamaEngineQ8Resident.debugAllPositionLogits: only valid before prefill has run");
     }
     return this.runPrefillResident(tokens, true);
@@ -1094,6 +1163,9 @@ export class LlamaEngineQ8Resident {
   private async runDecodeStep(tokenId: number): Promise<Float32Array[]> {
     const { numLayers, numKvHeads, headDim, hiddenSize, ffnHidden, numHeads, maxSeqLen, vocabSize } = this.config;
     const at = this.tokensSoFar;
+    // PR #126 review, item 3: same reasoning as `runPrefillResident`'s own
+    // `epoch` capture — see `assertSameEpoch`'s doc.
+    const epoch = this.generationEpoch;
     // `LlamaEngine`/`LlamaEngineQ8`'s own `forward()` reject a call once
     // `posOffset + N > maxSeqLen` (see those files) before touching the KV
     // cache; this decode path bypasses `KVCache.write` entirely (a GPU-to-GPU
@@ -1172,6 +1244,12 @@ export class LlamaEngineQ8Resident {
       offset += r.length;
     }
 
+    // PR #126 review, item 3: `+= 1`, not an absolute set — a stale call
+    // that slipped past this guard would not merely revert `tokensSoFar` to
+    // an old value, it would push a *new* generation's counter one past
+    // where it should be, so this check matters even more here than in
+    // `runPrefillResident`'s own absolute `this.tokensSoFar = N`.
+    this.assertSameEpoch(epoch, "forward");
     this.tokensSoFar += 1;
     return [logits];
   }

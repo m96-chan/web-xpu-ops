@@ -17,18 +17,45 @@ Entries record **why** a change was needed. What changed is in the diff.
   chat integration measured what rebuilding cost before this: 17-33s per
   independent turn, dominated by `create()`'s own weight re-upload — a cost
   a chat's "many short, independent generations against an unchanging model"
-  workload never needed to pay more than once. Old KV cache contents are
-  left in place (not cleared) rather than needing a separate wipe step;
-  correctness relies on `sEff = position + 1` (issue #117) never scanning
-  past what the current generation itself has written, proved by
-  `llm/engine-q8-resident.reset.wgsl.test.ts` poisoning the entire old KV
-  cache with `+Infinity` before `reset()` and confirming the next
-  generation's output is unaffected. Measured on real hardware (RTX 5090,
-  Chrome, real checkpoint): three independent generations via "build once +
-  `reset()`" totalled ~9.2s against ~14.2s for "build fresh each time" — a
-  ~35% reduction, reproducible across three independent trials (README's
-  "reset(): multi-generation reuse without rebuilding" section has the full
-  numbers and this measurement's own limits).
+  workload never needed to pay more than once. A within-repo (source-only)
+  API, same status as the rest of `llm/` (issue #98's own precedent) — not a
+  blocker for `alibi-ai`, which already imports `llm/` from source rather
+  than through this package's published `exports`.
+
+  **Contract change:** the CPU-side quantized weights (`LlamaWeightsQ8`,
+  ~1.4 GiB) are now kept for the engine instance's whole lifetime instead of
+  being dropped after the first prefill — `reset()` needs them again for
+  every later generation's dequant-transpose weight prep. Costs nothing
+  *additional* for every real caller in this repository, which already keeps
+  its own reference to the same weights object for the whole page session
+  regardless (one extra pointer, not another 1.4 GiB) — but a caller that
+  used to rely on this class releasing that memory after its first `forward()`
+  call will now see it stay live for as long as the instance does; no
+  `releaseWeights()` escape hatch exists yet (see README for the full
+  reasoning and the fallback: a single-generation engine, discarded and
+  rebuilt, is unaffected).
+
+  Old KV cache contents are left in place (not cleared) rather than needing
+  a separate wipe step; correctness relies on `sEff = position + 1` (issue
+  #117) never scanning past what the current generation itself has written,
+  proved by `llm/engine-q8-resident.reset.wgsl.test.ts` poisoning the entire
+  old KV cache with `+Infinity` before `reset()` and confirming the next
+  generation's output is unaffected — including a positive control proving
+  the poison is actually observable before trusting the parity check, and a
+  shorter-second-generation variant that exercises `runDecodeStep`'s own
+  `sEff` bound, not only prefill's. `reset()` is also guarded against racing
+  a still-in-flight `forward()` call on the same instance (a `generationEpoch`
+  counter; calling `reset()` before every outstanding `forward()` promise has
+  settled is not supported and now throws instead of silently rewinding).
+
+  Measured on real hardware (RTX 5090, Chrome, real checkpoint, three
+  independent generations, order counterbalanced across trials per PR #126
+  review): "build once + `reset()`" beat "build fresh each time" by 34-49%
+  across four trials (avg 42.5%, ~4.7s saved per three generations) —
+  reproducible and not an ordering artifact (README's "reset(): multi-generation
+  reuse without rebuilding" section has the full numbers, the counterbalancing
+  design, and this measurement's own limits, including real concurrent
+  system load during the run).
 
 - `ops/gqa`'s `scores`/`context` kernels gain an `sEff` parameter (issue
   #117): the number of key/value positions actually resident, bounding the

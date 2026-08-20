@@ -1328,13 +1328,45 @@ in practice: 17-33s per independent turn, dominated by `create()`'s own
 `device.upload()` calls rebuilding every persistent `matvecQ8` weight buffer
 from the ~1.4 GiB checkpoint — for a workload (a chat: many short,
 independent generations against a model that never changes between turns)
-where none of that needed to happen again.
+where none of that needed to happen again. This is a **within-repo (source-only)
+API** — same status as the rest of `llm/` ("`llm/`: an inference engine
+built from these ops" above, following issue #98's own precedent): nothing
+here is reachable through this package's published npm `exports`, so a
+consumer needs a source/`llm/` import, not a package one. Not a blocker for
+this repository's own real consumer: `alibi-ai` already imports `llm/`
+straight from source and bundles it with esbuild, not through `npm install`,
+so this status quo is unchanged by issue #120 and no `exports` work is
+required to use `reset()` there. Widening the published surface is tracked
+as a separate, later concern if anyone needs it.
 
 `engine.reset()` sets the position counter back to 0 and re-arms `forward()`'s
 prefill routing, and touches nothing else — every pipeline, bind group and
 persistent buffer `create()` built stays exactly what it was, weights are not
 re-uploaded, and the next `forward()` call is accepted as a fresh prompt the
 same way the very first one was.
+
+**Contract change: the CPU-side quantized weights are now kept for the
+engine's whole lifetime, not dropped after the first prefill.** Before this
+issue, `LlamaEngineQ8Resident` held its `LlamaWeightsQ8` argument only until
+its first `forward()` call finished, then set the field to `null` so it
+could be garbage-collected. `reset()` needs those same CPU-side packed
+weights again for every later prefill's dequant-transpose step, so this
+class now keeps that reference for as long as the instance itself lives —
+in a long-lived tab (exactly `reset()`'s own target workload), that is an
+extra ~1.4 GiB kept reachable from this instance for however long it stays
+alive. In practice this costs nothing *additional* for this repository's own
+demo and for `alibi-ai`: both already keep their own reference to the same
+weights object for the whole page session regardless (`examples/llm-demo/src/main.ts`'s
+`loaded.weights`), so this instance holding a second reference to the exact
+same object is one pointer, not another 1.4 GiB — but a caller that used to
+rely on `LlamaEngineQ8Resident` being the *sole* owner of that memory, and
+dropped its own reference right after `create()` expecting the engine to
+release it after the first prefill, will now see that memory stay live for
+as long as the engine instance does. No `releaseWeights()` escape hatch
+exists for that caller today — a caller in that situation should not call
+`reset()` (a single-generation engine, discarded and rebuilt like before
+issue #120, still works exactly as it always did) rather than expect this
+memory to free itself mid-lifetime.
 
 **Correctness: old KV cache contents are left in place, not cleared.**
 Nothing clears them — the next generation's own prefill only ever *writes*
@@ -1349,58 +1381,106 @@ cache with `+Infinity` (`debugPoisonKVCache`, test/debug-only) before
 second time and checks the result against the fixture's own ground-truth
 logits — unchanged, and no `NaN` (`context.wgsl` reads `v` unconditionally
 within its `sEff` bound, so a scan that leaked into the poison would have
-produced `NaN`, not a plausible wrong number). A second test uses a
-*shorter* second generation specifically, so genuine (non-poisoned, but
-still `reset()`-irrelevant) fixture-derived values from the first
-generation's own later positions sit beyond the second generation's own
-final position and must equally not be read — the first test alone cannot
-tell "correctly bounded" apart from "coincidentally the same length as
-before". Both mutation-verified: reverting either line of `reset()`'s own
-two-line body reddens the intended test(s) and nothing else (confirmed via
-`md5sum` before/after the edit, per this repository's rule 1).
+produced `NaN`, not a plausible wrong number). That poison test carries its
+own **positive control** (PR #126 review, item 2 — measured to matter: an
+earlier version of `debugPoisonKVCache` that silently wrote nothing still
+passed every other assertion in the file): *before* calling `reset()`, one
+more `forward()` call is made on the still-poisoned, still-unreset engine —
+routed into decode, whose `sEff` bound at that point covers exactly the
+region just poisoned — and its own logits are asserted non-finite, proving
+the poison actually reached the buffer the real scan reads before the parity
+check below is trusted at all. A second test uses a *shorter* second
+generation (prefill plus exactly one decode step, checked against
+`fixture.decodeLogits[0]`, so `runDecodeStep`'s own `sEff` bound is
+exercised too, not only prefill's) — genuine (non-poisoned, but still
+`reset()`-irrelevant) fixture-derived values from the first generation's own
+later positions sit beyond the second generation's final position and must
+equally not be read; the first test alone cannot tell "correctly bounded"
+apart from "coincidentally the same length as before". A third test starts
+a `forward()` call, calls `reset()` while it is still in flight (before
+`await`ing it), and checks that the in-flight call *rejects* rather than
+silently writing a stale position after `reset()`'s own write (PR #126
+review, item 3 — `reset()`'s writes are synchronous but
+`runPrefillResident`/`runDecodeStep` only write `this.tokensSoFar` after
+their own GPU work resolves, so a `reset()` racing a still-pending
+`forward()` used to be silently undone the moment that pending call finished;
+a `generationEpoch` counter, bumped by `reset()` and checked once each
+`forward()`-family method's GPU work resolves, makes that a thrown error
+instead — see `reset()`'s own doc for why this cannot, and does not need to,
+undo that stale call's GPU-side KV writes, only its effect on
+`tokensSoFar`). All of `reset()`'s own two-line body and both `assertSameEpoch`
+call sites are individually mutation-verified: reverting any one of them
+reddens exactly the test(s) built to catch that specific line and nothing
+else (confirmed via `md5sum` before/after each edit, per this repository's
+rule 1).
 
 **Measured effect (RTX 5090, Chrome, real Sarashina2.2-1B-alibi-v1
 checkpoint, real hardware over CDP — not estimated, rule 9).** Three
-independent, short casual-Japanese prompts, greedy decode to `</s>`, driven
-through the exact same `generate()` the demo's own button calls: "build
-once, `reset()` before generations 2 and 3" against "build fresh for every
-generation" (`examples/llm-demo/src/main.ts#__resetBenchmark`, exposed on
-`window` for a CDP script rather than reachable from the UI). Three
-independent trials, same page session, same three prompts:
+independent, short casual-Japanese prompts — 76, 68 and 71 tokens under this
+demo's own style-prompt template (`buildStylePrompt`) — greedy decode to
+`</s>`, driven through the exact same `generate()` the demo's own button
+calls: "build once, `reset()` before generations 2 and 3" against "build
+fresh for every generation" (`examples/llm-demo/src/main.ts#__resetBenchmark`,
+exposed on `window` for a CDP script rather than reachable from the UI).
 
-| trial | reset() total (3 gens) | rebuild total (3 gens) | reduction |
-| --- | --- | --- | --- |
-| 1 | 9,164.9 ms | 14,483.1 ms | 36.7% |
-| 2 | 9,111.9 ms | 14,084.5 ms | 35.3% |
-| 3 | 9,369.8 ms | 14,128.8 ms | 33.7% |
-| **avg** | **9,215.5 ms** | **14,232.1 ms** | **35.2%, ~5.0s saved / 3 gens** |
+A first measurement round (three trials, `reset()` strategy always run
+first) reported a 35.2% average reduction, but PR #126 review correctly
+flagged that as potentially an ordering artifact: this box's own `create()`
+calls can cost more later in a page session than earlier, and running
+`reset()` first meant only the *rebuild* strategy's three `create()` calls
+ever landed in the "later, more expensive" part of the session. Re-measured
+with the order counterbalanced — four trials, alternating which strategy
+runs first (`order: "reset-first" | "rebuild-first"`, threaded through
+`__resetBenchmark` so a driving script controls it explicitly) — and with
+`create()`'s own cost timed separately from `generate()`'s in both
+strategies (two `performance.now()` pairs, not inferred from `prefillMs`,
+which structurally cannot include `create()`'s cost at all — item 6's own
+finding about the first round's write-up):
 
-Reproducible across all three trials, well outside this box's ordinary
-run-to-run noise (the per-step `stepMs` figures underneath, ~5.2-5.7 ms,
-match this repository's own earlier decode measurements almost exactly, so
-decode itself is not what moved).
+| trial | order | reset() total (3 gens) | rebuild total (3 gens) | reduction |
+| --- | --- | --- | --- | --- |
+| 1 | reset-first | 6,633.9 ms | 10,131.5 ms | 34.5% |
+| 2 | rebuild-first | 6,683.9 ms | 12,459.8 ms | 46.4% |
+| 3 | reset-first | 6,201.8 ms | 10,093.0 ms | 38.6% |
+| 4 | rebuild-first | 6,100.4 ms | 11,907.8 ms | 48.8% |
+| **avg** | — | **6,405.0 ms** | **11,148.0 ms** | **42.5%, ~4.7s saved / 3 gens** |
 
-**What this run could *not* cleanly isolate, reported rather than smoothed
-over (rule 9's "測っていない項目は「未測定」と書く"):** the per-generation
-detail (`resetPerGenDetail`) shows generation 1 of the `reset()` strategy
-(which *does* pay one `create()` call) at `prefillMs` 2,105-2,295 ms across
-the three trials — barely higher than generations 2 and 3 (which pay only
-`reset()`, ~0 cost), even though each `create()` call inside the *rebuild*
-strategy costs roughly 2,500 ms more than a `reset()`-only generation by the
-aggregate numbers above. That asymmetry (a session's *first* `create()`
-costing little, but *later* ones costing much more) was consistent across
-all three trials and is not something this measurement's own design
-(wall-clock around `create()`+`generate()`, one page session, `ResidentDevice`
-create/destroy cycles accumulating) can attribute to a specific cause —
-GPU/driver-level allocator pressure from repeated `ResidentDevice`
-create/destroy cycles within one page session is the most likely
-explanation, not investigated further here. The **aggregate** totals above
-are unaffected by this — they are the actual wall-clock time issue #120
-asks about — but a claim like "the
-2nd and 3rd generation's construction cost is exactly zero" would be
-overstating what this specific run can support; "the whole `reset()`
-strategy reliably beats the whole rebuild strategy by about a third, for
-this workload, on this hardware" is the claim these numbers back.
+Grouped by order: reset-first trials averaged **36.5%** reduction,
+rebuild-first trials averaged **47.5%** — the *opposite* of what an
+order-artifact would predict (if going first favoured a strategy, `reset()`
+running first in trials 1/3 should have shown the *larger* gap, not the
+smaller one). The counterbalanced numbers land close to the first round's
+35.2% and, if anything, a bit higher — so the original headline was not an
+artifact of running `reset()` first, and the effect holds up (36-49%
+reduction) regardless of which strategy goes first.
+
+**`create()`'s own cost, isolated** (the actual answer to what "session
+position" does to it, replacing the first round's `prefillMs`-based guess):
+averaged **1,589.0 ms** across the four single `create()` calls the `reset()`
+strategy ever pays (n=4, one per trial) against **1,914.5 ms** across the
+twelve `create()` calls the rebuild strategy pays (n=12, three per trial,
+every position in the session). A real difference (~325 ms, `create()`
+costing more when it is not the session's first GPU work) but a modest one
+— nothing close to the first round's apparent ~2,500 ms gap, which came from
+conflating `create()`'s cost with `generate()`'s inside an un-split
+`prefillMs` figure rather than from timing `create()` on its own. Per-`create()`
+variance was real and visible in both strategies (individual calls ranged
+roughly 1.5-2.8 s) and is attributed to this box being under genuine
+concurrent GPU load from other processes during this measurement (see
+below), not to `reset()` or `create()` themselves.
+
+**Measurement conditions (rule 9):** this machine was not idle during either
+round — other, unrelated GPU/browser workloads from concurrent processes
+were running throughout, and the counterbalanced round's per-`create()`
+variance above is consistent with that contention rather than with anything
+`reset()` or `create()` do internally. A fully quiet re-run was not achieved
+(a shared machine with other legitimate concurrent work, not something this
+measurement could control) — reported as a real condition of these numbers,
+not smoothed over. The **aggregate** conclusion (`reset()` reliably beats
+rebuild by roughly a third to a half, for this three-generation workload, on
+this hardware) is robust across both orderings and both measurement rounds;
+the *exact* percentage is sensitive to concurrent system load and should be
+read as "42.5% under this run's conditions", not a hardware constant.
 
 **Scope not touched:** multi-session/concurrent generation and prompt-prefix
 caching (shared-prefix KV reuse across *different* prompts) are explicitly
