@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matvecQ8, packQ8 } from "./reference.js";
+import { matvecQ8, matvecQ8Ffn, matvecQ8Residual, packQ8 } from "./reference.js";
 
 /**
  * `packQ8` / `matvecQ8` only: the questions a GPU dispatch cannot ask directly
@@ -92,5 +92,105 @@ describe("matvecQ8", () => {
     const vector = Float32Array.from([1, 1, 1, 1, 1, 1000]); // vector[5] would blow up the sum if read
     const out = matvecQ8({ weight, scale, vector, N: 1, K: 5 });
     expect(out[0]).toBeCloseTo(5, 6);
+  });
+});
+
+/**
+ * PR #127 review, item 1: `ops/matvec/q8_ffn.wgsl.test.ts`/`q8_residual.wgsl.test.ts`
+ * only ever compare the *kernel* against *this file's own reference
+ * functions* — so a bug that swaps which weight is "gate" and which is
+ * "up" **inside `matvecQ8Ffn` itself** (silu applied to the wrong
+ * projection) would still "agree" with the kernel doing the identical
+ * swap, and neither test file would ever go red. These two `describe`
+ * blocks give `matvecQ8Ffn`/`matvecQ8Residual` an independent ground truth
+ * — hand-computed dot products, `silu`/the residual add written out as
+ * plain arithmetic rather than called through any of this module's own
+ * functions — the same shape `matvecQ8`'s own "agrees with a hand-computed
+ * dot product" test above already provides for `matvecQ8`.
+ */
+describe("matvecQ8Ffn", () => {
+  it("agrees with silu(gate)*up computed by hand from two distinct dot products", () => {
+    // gate: codes [1,1,1,1], scale 1, vector [1,1,1,1] -> dot = 4, scaled 4
+    // up:   codes [3,3,3,3], scale 1, same vector      -> dot = 12, scaled 12
+    // Gate and up are deliberately different values (not a shared vector.length
+    // coincidence): swapping them would compute silu(12)*4 ~= 47.9997 instead
+    // of silu(4)*12 ~= 47.1367 below — a ~0.86 absolute difference, far outside
+    // this test's own tolerance, so a gate/up mix-up inside matvecQ8Ffn itself
+    // (not just in a caller) cannot pass this test by accident.
+    const gateCodes = Int32Array.from([1, 1, 1, 1]);
+    const upCodes = Int32Array.from([3, 3, 3, 3]);
+    const vector = Float32Array.from([1, 1, 1, 1]);
+    const weightGate = packQ8({ codes: gateCodes, N: 1, K: 4 });
+    const weightUp = packQ8({ codes: upCodes, N: 1, K: 4 });
+    const scaleGate = Float32Array.from([1]);
+    const scaleUp = Float32Array.from([1]);
+
+    const out = matvecQ8Ffn({ weightGate, scaleGate, weightUp, scaleUp, vector, N: 1, K: 4 });
+
+    // silu(x) = x / (1 + e^-x) — the plain formula, not a call into
+    // ops/activation or matvecQ8Ffn itself, so this expected value shares no
+    // code path with what is under test.
+    const gateDot = 4;
+    const upDot = 12;
+    const expected = (gateDot / (1 + Math.exp(-gateDot))) * upDot;
+    expect(expected).toBeCloseTo(47.1367, 3); // sanity-check the hand computation itself
+    expect(out[0]).toBeCloseTo(expected, 5);
+  });
+
+  it("applies each row's own gate/up scale and dot product, not row 0's", () => {
+    // Row 0: gate dot 4 (codes all 1, scale 1) -> silu(4); up dot 4 (codes
+    // all 1, scale 1) -> 4. Row 1: gate dot 8 (codes all 2, scale 1) ->
+    // silu(8); up dot 2 (codes all 1, scale 0.5) -> 2. Distinct per-row
+    // shapes on both projections, so a scale or row index applied once for
+    // the whole call (instead of per row, per projection) changes both rows'
+    // answers, not just one.
+    const gateCodes = Int32Array.from([1, 1, 1, 1, 2, 2, 2, 2]);
+    const upCodes = Int32Array.from([1, 1, 1, 1, 1, 1, 1, 1]);
+    const vector = Float32Array.from([1, 1, 1, 1]);
+    const weightGate = packQ8({ codes: gateCodes, N: 2, K: 4 });
+    const weightUp = packQ8({ codes: upCodes, N: 2, K: 4 });
+    const scaleGate = Float32Array.from([1, 1]);
+    const scaleUp = Float32Array.from([1, 0.5]);
+
+    const out = matvecQ8Ffn({ weightGate, scaleGate, weightUp, scaleUp, vector, N: 2, K: 4 });
+
+    const silu = (x: number) => x / (1 + Math.exp(-x));
+    expect(out[0]).toBeCloseTo(silu(4) * 4, 5);
+    expect(out[1]).toBeCloseTo(silu(8) * 2, 5);
+  });
+});
+
+describe("matvecQ8Residual", () => {
+  it("agrees with residual + a hand-computed dot product", () => {
+    // Same codes/scale/vector as matvecQ8's own "agrees with a hand-computed
+    // dot product" test above: dot = 1*10 - 2*20 + 3*30 - 4*40 = -100,
+    // scaled by 0.5 = -50. residual = 7, deliberately not 0 or a round
+    // number that could coincide with the projection alone, so a residual
+    // dropped on the floor (output === projection alone, -50) is
+    // distinguishable from the correct -43.
+    const codes = Int32Array.from([1, -2, 3, -4]);
+    const weight = packQ8({ codes, N: 1, K: 4 });
+    const scale = Float32Array.from([0.5]);
+    const vector = Float32Array.from([10, 20, 30, 40]);
+    const residual = Float32Array.from([7]);
+
+    const out = matvecQ8Residual({ weight, scale, vector, residual, N: 1, K: 4 });
+    expect(out[0]).toBeCloseTo(-43, 6); // -50 (the dot product) + 7 (residual)
+  });
+
+  it("adds each row's own residual and scale, not row 0's", () => {
+    // Both rows share codes/vector (dot = 4 for both), so only scale and
+    // residual distinguish the two rows' outputs — a mix-up (wrong row's
+    // scale, or residual[0] broadcast to every row) collapses the two
+    // outputs to the same number.
+    const codes = Int32Array.from([1, 1, 1, 1, 1, 1, 1, 1]);
+    const weight = packQ8({ codes, N: 2, K: 4 });
+    const scale = Float32Array.from([2, 5]);
+    const vector = Float32Array.from([1, 1, 1, 1]);
+    const residual = Float32Array.from([100, 1000]);
+
+    const out = matvecQ8Residual({ weight, scale, vector, residual, N: 2, K: 4 });
+    expect(out[0]).toBeCloseTo(100 + 4 * 2, 6); // 108
+    expect(out[1]).toBeCloseTo(1000 + 4 * 5, 6); // 1020
   });
 });

@@ -630,16 +630,32 @@ async function __resetBenchmark(
 // Issue #111: measuring the fused decode kernels' effect on forward()'s fixed cost
 // ---------------------------------------------------------------------------
 
+/** One prompt length's own prefill and per-step decode timing — `__decodeFixedCostBenchmark`'s own return shape, below. */
+interface DecodeFixedCostResult {
+  promptLength: number;
+  prefillMs: number;
+  decodeStepMs: number[];
+}
+
 /**
- * Issue #111's own completion bar: "前後のforward固定費とtok/sを実測" — this
- * issue's own motivating measurement was that `LlamaEngineQ8Resident.forward()`'s
- * wall time barely changes between a 76-token prompt and a 365-token one,
- * which only makes sense if dispatch *count* (fixed per `forward()` call),
- * not bytes moved, dominates — exactly what fusing four decode dispatches
- * into one (`ops/matvec/wgsl/q8_ffn.wgsl`) or two into one
- * (`q8_residual.wgsl`) is meant to shrink. This benchmark reproduces that
- * comparison directly against real weights and a real device, one prompt
- * length at a time, plus per-step decode timing after it.
+ * Issue #111's own completion bar: "前後のforward固定費とtok/sを実測" —
+ * measures `LlamaEngineQ8Resident.forward()`'s prefill cost at two very
+ * different prompt lengths, and decode's own per-step cost, directly
+ * against real weights and a real device, one prompt length at a time.
+ * (PR #127 review, item 5: an earlier version of this doc's own framing
+ * — "prefill barely changes between 76 and 365 tokens, which only makes
+ * sense if fusing *decode*'s dispatches should help" — conflated the two:
+ * prefill runs through `matmul`, never `matvecQ8`, so this PR's own fused
+ * kernels do not touch it, and this benchmark's own measured results
+ * (README, "Fused decode kernels (issue #111)") show exactly that —
+ * prefill's own near-flat cost at 76 vs. 365 tokens is real and
+ * reproducible, but it is unrelated to what this benchmark's decode
+ * column measures.) This benchmark reports the comparison that *does*
+ * apply — decode's per-token cost before vs. after fusing four decode
+ * dispatches into one (`ops/matvec/wgsl/q8_ffn.wgsl`) or two into one
+ * (`q8_residual.wgsl`) — plus prefill's own timing alongside it, so both
+ * numbers come from the same run rather than being assumed to move
+ * together.
  *
  * Prompt *content* does not matter for a timing measurement — only its
  * length does (`forward()` reads exactly `hiddenSize` embedding-table
@@ -658,13 +674,13 @@ async function __resetBenchmark(
  *
  * Not reachable from the UI — a CDP-driven script calls this directly, the
  * same pattern `__resetBenchmark` above already establishes.
+ *
+ * (PR #127 review, item 6: an earlier version of this PR put this doc
+ * comment directly above `DecodeFixedCostResult` instead of above this
+ * function — the interface sitting between them meant the doc silently
+ * attached to the wrong declaration. Same fix as `packQ8`'s doc in
+ * `ops/matvec/reference.ts`: moved to directly precede what it documents.)
  */
-interface DecodeFixedCostResult {
-  promptLength: number;
-  prefillMs: number;
-  decodeStepMs: number[];
-}
-
 async function __decodeFixedCostBenchmark(
   promptLengths: number[],
   decodeSteps: number,

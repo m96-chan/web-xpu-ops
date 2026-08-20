@@ -1071,19 +1071,29 @@ class doc:
    left here as "unmeasured", per rule 9, rather than guessed.
 
 **Buffer design.** `LlamaEngineQ8`'s CPU-side engine fuses Q/K/V and
-gate/up into one packed weight so one `matvecQ8` dispatch computes all of
-them — worthwhile there because each dispatch used to cost a full
+gate/up into one *packed weight buffer* so one `matvecQ8` dispatch computes
+all of them — worthwhile there because each dispatch used to cost a full
 submit+readback round trip. That reasoning does not carry over to a
 resident engine that already pays one submit for an entire token's
-dispatch chain, and fusing costs something real here: splitting a fused
-output by a byte offset into one buffer only works when that offset is a
-multiple of `minStorageBufferOffsetAlignment` (measured 256 bytes on this
-device) — the tiny fixture's own `kvDim = 32` floats lands `v`'s slice at
-byte 384, not a multiple of 256. `LlamaEngineQ8Resident` gives every
-distinct tensor its own buffer instead: a few more bandwidth-bound
-`matvecQ8` dispatches per layer than a fused version, always valid
-regardless of the model's dimensions (`harness/resident.ts#bindGroup`'s
-doc has the validation error that caught this).
+dispatch chain, and fusing a *buffer* costs something real here: splitting
+a fused output by a byte offset into one buffer only works when that
+offset is a multiple of `minStorageBufferOffsetAlignment` (measured 256
+bytes on this device) — the tiny fixture's own `kvDim = 32` floats lands
+`v`'s slice at byte 384, not a multiple of 256. `LlamaEngineQ8Resident`
+gives every distinct tensor its own buffer instead — that part is
+unchanged by issue #111, and still true for Q/K/V, which stay three
+separate buffers *and* three separate dispatches, same as at issue #110's
+own landing (`harness/resident.ts#bindGroup`'s doc has the validation
+error that caught the alignment problem above).
+
+**What issue #111 changes is *dispatch* count, not this buffer design.**
+`q8_ffn`/`q8_residual` (below) still read gate/up, and each residual
+projection's weight, from their own separate buffers — no packed-weight
+buffer, no byte-offset splitting, the alignment problem above is still
+sidestepped exactly the same way — but now cost one dispatch each instead
+of the "a few more dispatches than a fused version" this paragraph
+described before #111 existed. Buffers separate, dispatches fused: the two
+are independent axes, and #111 only moved the second one.
 
 **KV-cache writes** are a GPU-to-GPU `copyBufferToBuffer`, not
 `queue.writeBuffer`: the new token's K (after RoPE) and V already live in a
@@ -1511,10 +1521,11 @@ Both are decode-only (`llm/engine-q8-resident.ts#runDecodeStep`) — prefill
 ("プリフィル専用最適化はスコープ外"): prefill's projections go through `matmul`
 (a tiled GEMM against all prompt positions at once), not `matvecQ8`, so
 these two fused entry points do not apply there. Per decode layer this cuts
-6 dispatches to 2 (the FFN triad 4→1, each residual-add pair 2→1), taking
-one token's real dispatch count from **411 to 291** at Sarashina2.2-1B's
-shape (17→12 per layer × 24 layers, plus the unchanged final norm and two
-`lm_head` chunks — see issue #110's own count above) — a 29.2% reduction.
+8 dispatches to 3 (the FFN triad 4→1, each of the two residual-add pairs
+2→1), taking one token's real dispatch count from **411 to 291** at
+Sarashina2.2-1B's shape (17→12 per layer × 24 layers, plus the unchanged
+final norm and two `lm_head` chunks — see issue #110's own count above) —
+a 29.2% reduction.
 
 **Correctness gate.** Both fused kernels have their own `reference.ts`
 functions (`matvecQ8Ffn`, `matvecQ8Residual`, `ops/matvec/reference.ts`),
@@ -1535,15 +1546,21 @@ pre-optimization fixture) passes unchanged with the fused kernels wired in
 — worst diff `1.19e-7` abs / `1.26e-4` rel across a full generation, inside
 the same tolerance issue #110 already used.
 
-**Measured (rule 9 — RTX 5090, Chrome, non-headless, real Sarashina2.2-1B-
-alibi-v1 int8 checkpoint, `LlamaEngineQ8Resident`, synthetic-but-in-range
-token ids so prompt length is exact rather than whatever a real tokenizer
-happens to produce — see `examples/llm-demo/src/main.ts#__decodeFixedCostBenchmark`).**
-One `create()`, `reset()` between prompt lengths (issue #120), 20 decode
-steps per prompt length, first step of each excluded from the decode
-average (`llm/engine-q8-resident.wgsl.test.ts`'s own layer-count-independent
+**Measured (rule 9 — same machine as the "Real-hardware verification" section
+above: NVIDIA GeForce RTX 5090, driver 610.57.04, Linux (Arch, kernel
+7.1.5-arch1-2), Chrome 151.0.7922.71 non-headless via CDP, backend Dawn/Vulkan;
+real Sarashina2.2-1B-alibi-v1 int8 checkpoint, `LlamaEngineQ8Resident`,
+synthetic-but-in-range token ids so prompt length is exact rather than
+whatever a real tokenizer happens to produce — see
+`examples/llm-demo/src/main.ts#__decodeFixedCostBenchmark`).** One
+`create()`, `reset()` between prompt lengths (issue #120), 20 decode steps
+per prompt length, first step of each excluded from the decode average
+(`llm/engine-q8-resident.wgsl.test.ts`'s own layer-count-independent
 first-dispatch warm-up cost, ~13ms both before and after — unrelated to
-this issue's fusion, present in both columns equally):
+this issue's fusion, present in both columns equally). Single observations
+from one run each (baseline, then fused), not averaged across repeated
+runs — comparable only against a rerun under the same conditions, same as
+every other timing figure in this README (rule 9):
 
 | | baseline (pre-#111) | fused (#111) |
 | --- | --- | --- |

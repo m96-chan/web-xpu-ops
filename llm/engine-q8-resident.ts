@@ -746,8 +746,15 @@ export class LlamaEngineQ8Resident {
     const kUniform = uniformOf(device, [["u32", kvDim], ["u32", hiddenSize]]);
     const vUniform = uniformOf(device, [["u32", kvDim], ["u32", hiddenSize]]);
     const oUniform = uniformOf(device, [["u32", hiddenSize], ["u32", qDim]]);
+    // Issue #111: `gateUniform`'s `{N: ffnHidden, K: hiddenSize}` shape is
+    // shared by *both* halves of the fused FFN kernel (`q8_ffn`'s `Params`
+    // struct has one `{N, K}`, read by both the gate and up weight — see
+    // `buildFfnProjection`'s own doc), so there is no separate `upUniform`
+    // to build: gate and up projections have the exact same shape at every
+    // real config (`wGate`/`wUp` are always `[ffnHidden, hiddenSize]`), and
+    // a second, byte-identical uniform buffer would only be another buffer
+    // to keep in sync, never a different value.
     const gateUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
-    const upUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
     const downUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ffnHidden]]);
     // Issue #111: `gateUniform`/`oUniform`/`downUniform` above are reused
     // as-is by the fused decode kernels below — `q8_ffn`'s and

@@ -130,6 +130,17 @@ describe("llm/kernels.ts + llm/engine-q8-resident.ts CODE <-> examples/llm-demo 
   });
 
   it("names the same entry points per op on both sides", () => {
+    // PR #127 review, item 9: this loop's own body is the only place that
+    // actually checks per-op entry agreement — `for (const op of
+    // Object.keys(nodeSide))` over an *empty* `nodeSide` (both source
+    // regexes silently matching nothing) would run zero iterations and this
+    // test would report PASS having asserted nothing, the exact
+    // zero-assertion shape `harness/suite.ts#skipUnlessPresent`'s own doc
+    // already treats as a bug elsewhere in this repo. The "parsed at least
+    // twelve" test above would likely also fail in that scenario, but this
+    // test should not depend on a sibling test to have already caught it —
+    // asserted here, directly, so this test cannot itself pass fail-open.
+    expect(Object.keys(nodeSide).length).toBeGreaterThanOrEqual(10);
     for (const op of Object.keys(nodeSide)) {
       expect([...browserSide[op]!].sort()).toEqual([...nodeSide[op]!].sort());
     }

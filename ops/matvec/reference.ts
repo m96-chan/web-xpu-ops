@@ -1,3 +1,5 @@
+import { activation, ACTIVATION } from "../activation/reference.js";
+
 /**
  * matvec (GEMV): `out[i] = sum_k matrix[i, k] * vector[k]`
  *
@@ -129,23 +131,6 @@ export function matvecQ8({ weight, scale, vector, N, K }: MatVecQ8Args): Float32
 }
 
 /**
- * Packs per-row int8 codes (`quantize`'s output: values in `[-127, 127]`,
- * `[N, K]` row-major, one code per array element) into `matvecQ8`'s wire
- * format: `[N, ceil(K/4)]` `u32`, four codes per word, least-significant byte
- * first.
- *
- * Kept apart from `quantize` rather than folded into it: `quantize` is a
- * general activation/weight quantizer whose output (`Int32Array`, one code per
- * lane) is what a compute kernel wants to read, not what a weight wants to sit
- * in VRAM as. Packing is specific to `matvecQ8`'s storage layout, so it lives
- * beside the op that defines that layout.
- *
- * A row's trailing lanes — when `K % 4 != 0` — are left `0` rather than
- * carrying anything from a neighbouring row; `matvecQ8` never reads them, but
- * a defined value beats an uninitialised one for anyone who inspects the
- * buffer directly.
- */
-/**
  * `matvecQ8Ffn`: `silu(matvecQ8(weightGate, x)) * matvecQ8(weightUp, x)` — one
  * row, two int8 weights, in a single logical op instead of four (issue #111).
  *
@@ -153,27 +138,45 @@ export function matvecQ8({ weight, scale, vector, N, K }: MatVecQ8Args): Float32
  *
  * `llm/engine-q8-resident.ts`'s decode step computes exactly this shape every
  * layer, as four separate GPU dispatches: `matvecQ8(gate)`, `matvecQ8(up)`,
- * `activation(silu)`, `elementwise(multiply)`. Each dispatch there costs a
- * fixed per-submit overhead independent of how much data it moves (issue
- * #111's own measurement: prefill at 76 and 365 tokens takes about the same
- * wall time, which only makes sense if dispatch count, not bandwidth,
- * dominates). Fusing the four into one halves the weight-reading dispatches
- * and removes the two elementwise ones entirely, without changing the
- * arithmetic: `silu` and `*` are still applied in f32, in the same order, to
- * the same two dot products this reference computes separately below.
+ * `activation(silu)`, `elementwise(multiply)`. Issue #110 already made one
+ * decode step pay exactly one `queue.submit`/readback, so what four
+ * dispatches cost past that point is per-dispatch encoding and pass-boundary
+ * overhead, not round-trip latency — fusing them into one halves the
+ * weight-reading dispatches and removes the two elementwise ones entirely,
+ * without changing the arithmetic: `silu` and `*` are still applied in f32,
+ * in the same order, to the same two dot products this reference computes
+ * separately below. (PR #127 review, item 5: an earlier version of this doc
+ * cited this issue's own opening "prefill at 76 vs. 365 tokens costs about
+ * the same wall time" observation as the reason dispatch count dominates
+ * here — that observation is real, but it describes *prefill*'s own fixed
+ * cost, which runs through `matmul`, never `matvecQ8`, and this PR's own
+ * measurement (README, "Fused decode kernels (issue #111)") shows prefill
+ * is untouched by these two fused kernels, as expected. The actual, smaller
+ * measured effect — 7.2% lower decode latency from cutting 411 dispatches
+ * to 291 per token — is what motivates this op; see that README section
+ * for the numbers rather than the refuted inference.)
  *
  * ## Reference shape, not reference *independence*
  *
  * This composes `matvecQ8` (already the correctness definition for a single
- * quantized GEMV row, `ops/matvec/q8.wgsl.test.ts`) with `silu`'s formula
- * copied verbatim from `ops/activation/reference.ts` (rule 7 — not
- * re-derived) rather than re-deriving the packed-int8 unpacking a third
+ * quantized GEMV row, `ops/matvec/q8.wgsl.test.ts`) with `ops/activation`'s
+ * own `activation({ kind: ACTIVATION.silu })` (rule 7 — imported, not
+ * copied or re-derived a second time; same precedent as `ops/gqa/reference.ts`
+ * importing `ops/attention/reference.ts#resolveMask` rather than restating
+ * its mask logic) rather than re-deriving the packed-int8 unpacking a third
  * time. Rule 8 asks this reference to be "obviously right", and composing
- * two already-obviously-right pieces is more obviously right than a fresh
+ * three already-obviously-right pieces is more obviously right than a fresh
  * from-scratch loop would be — the risk this op actually carries is in the
  * *fusion* (does the WGSL kernel's shared single-pass-over-`vector` unpacking
  * of two weights agree with computing them apart?), which this reference,
- * built from the already-verified parts, is positioned to catch.
+ * built from the already-verified parts, is positioned to catch. (PR #127
+ * review, item 8 and item 1: an earlier version of this function copied
+ * `silu`'s formula inline instead of importing it, and had no CPU-only test
+ * independent of this file's own composition — see
+ * `ops/matvec/reference.test.ts`'s `matvecQ8Ffn`/`matvecQ8Residual`
+ * `describe` blocks for the hand-computed ground truth that catches a
+ * gate/up mix-up this function's own kernel-vs-reference tests alone could
+ * not.)
  */
 export interface MatVecQ8FfnArgs {
   /** `[N, ceil(K/4)] u32` — `matvecQ8`'s packed format, gate projection. */
@@ -193,13 +196,12 @@ export interface MatVecQ8FfnArgs {
 export function matvecQ8Ffn({ weightGate, scaleGate, weightUp, scaleUp, vector, N, K }: MatVecQ8FfnArgs): Float32Array {
   const gate = matvecQ8({ weight: weightGate, scale: scaleGate, vector, N, K });
   const up = matvecQ8({ weight: weightUp, scale: scaleUp, vector, N, K });
+  // `ops/activation`'s own silu, not a copied formula (rule 7 — PR #127
+  // review, item 8).
+  const gated = activation({ input: gate, kind: ACTIVATION.silu });
   const output = new Float32Array(N);
   for (let row = 0; row < N; row += 1) {
-    const g = gate[row]!;
-    // `silu(x) = x / (1 + e^-x)` — copied from `ops/activation/reference.ts`'s
-    // `apply(x, ACTIVATION.silu, ...)` branch, not re-derived (rule 7).
-    const silu = g / (1 + Math.exp(-g));
-    output[row] = silu * up[row]!;
+    output[row] = gated[row]! * up[row]!;
   }
   return output;
 }
@@ -239,6 +241,29 @@ export function matvecQ8Residual({ weight, scale, vector, residual, N, K }: MatV
   return output;
 }
 
+/**
+ * Packs per-row int8 codes (`quantize`'s output: values in `[-127, 127]`,
+ * `[N, K]` row-major, one code per array element) into `matvecQ8`'s wire
+ * format: `[N, ceil(K/4)]` `u32`, four codes per word, least-significant byte
+ * first.
+ *
+ * Kept apart from `quantize` rather than folded into it: `quantize` is a
+ * general activation/weight quantizer whose output (`Int32Array`, one code per
+ * lane) is what a compute kernel wants to read, not what a weight wants to sit
+ * in VRAM as. Packing is specific to `matvecQ8`'s storage layout, so it lives
+ * beside the op that defines that layout.
+ *
+ * A row's trailing lanes — when `K % 4 != 0` — are left `0` rather than
+ * carrying anything from a neighbouring row; `matvecQ8` never reads them, but
+ * a defined value beats an uninitialised one for anyone who inspects the
+ * buffer directly.
+ *
+ * (PR #127 review, item 6: an earlier version of this PR left this doc
+ * comment stranded above `matvecQ8Ffn` instead — inserted before it rather
+ * than before `packQ8`, so it silently attached to the wrong declaration
+ * and `packQ8` itself lost its hover/`.d.ts` doc entirely. Moved back to
+ * directly precede the function it actually documents.)
+ */
 export function packQ8({ codes, N, K }: { codes: Int32Array; N: number; K: number }): Uint32Array {
   const wordsPerRow = Math.ceil(K / 4);
   const packed = new Uint32Array(N * wordsPerRow);
