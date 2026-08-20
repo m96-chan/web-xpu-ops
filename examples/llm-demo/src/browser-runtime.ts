@@ -50,6 +50,18 @@ import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
 import gqaContextKernel from "../../../ops/gqa/wgsl/context.wgsl";
 import activationKernel from "../../../ops/activation/wgsl/kernel.wgsl";
 import elementwiseKernel from "../../../ops/elementwise/wgsl/kernel.wgsl";
+// `ops/permute` (issue #117's resident prefill reshape, `ops/permute/reference.ts`'s
+// doc has the full story) — `llm/engine-q8-resident.ts` is its only caller
+// today, but it is a `kernels.ts#CODE` entry too (kept, per that file's own
+// "one function per kernel entry point" scope, even though nothing in
+// `LlamaEngineQ8`'s own forward pass calls `runPermute` yet), so it stays
+// covered by this table's usual parity check.
+import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
+// `ops/dequant_transpose` (issue #117's resident prefill weight prep,
+// `ops/dequant_transpose/reference.ts`'s doc has the full story) — same
+// "kept in kernels.ts#CODE for parity, real caller builds its own bind
+// groups" shape as `permute` just above.
+import dequantTransposeKernel from "../../../ops/dequant_transpose/wgsl/kernel.wgsl";
 
 /**
  * Mirrors `llm/kernels.ts`'s `CODE` object one-for-one: `{ [op]: { [entry]:
@@ -62,6 +74,8 @@ export const WGSL_TABLE: Readonly<Record<string, Readonly<Record<string, string>
   matvec: { kernel: matvecKernel, q8: matvecQ8Kernel },
   matmul: { kernel: matmulKernel },
   rope: { kernel: ropeKernel },
+  permute: { kernel: permuteKernel },
+  dequant_transpose: { kernel: dequantTransposeKernel },
   gqa: { scores: gqaScoresKernel, context: gqaContextKernel },
   activation: { kernel: activationKernel },
   elementwise: { kernel: elementwiseKernel },

@@ -20,15 +20,14 @@
 // indexing below does not know or care which axis is "tokens" and which is
 // "heads".
 //
-// Not an `ops/` op: it has no arithmetic and nothing to be "correct" about
-// beyond "which index goes where" — a permutation, in the same allowed
-// category as the KV-cache copies `llm/engine-q8-resident.ts`'s own doc
-// already uses for the equivalent reason (issue #110: "必要な並べ替えは小さな
-// GPUコピーカーネルで(新規「演算」カーネルは書かない。並べ替え専用は可)"). Its
-// correctness gate is `llm/permute.wgsl.test.ts`, which checks it against
-// `splitHeadsMajor`/`mergeHeadsMajor` directly rather than against a
-// separate reference of its own — those two functions *are* the reference,
-// proven correct already by every engine test that exercises prefill.
+// `ops/permute/reference.ts` is the definition of correct — no arithmetic,
+// so it and this kernel do the same index bookkeeping, not the same sums.
+// `ops/permute/wgsl.test.ts` checks this kernel against that reference
+// directly, and separately against `llm/reshape.ts#splitHeadsMajor`/
+// `mergeHeadsMajor` (the functions this op exists to replace with one GPU
+// dispatch — see this file's doc above), which are the same permutation
+// under llm/'s own names and already proven correct by every engine test
+// that exercises prefill.
 
 struct Params {
   dim0: u32,
@@ -48,7 +47,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // invocation has real work, rule 1), this dispatch is sized by
   // `ceil(total / WORKGROUP_SIZE)` because `total` is rarely a multiple of
   // it — so a guard is reachable here and has to be tested, not just
-  // written (`llm/permute.wgsl.test.ts`'s non-multiple-of-256 case).
+  // written (`ops/permute/wgsl.test.ts`'s non-multiple-of-256 case).
   let idx = gid.x;
   let total = params.dim0 * params.dim1 * params.D;
   if (idx >= total) {

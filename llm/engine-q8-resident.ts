@@ -1,11 +1,9 @@
 import { kernel, params, type ResidentDevice, type ResidentOp } from "../harness/index.js";
 import type { LlamaConfig } from "./config.js";
 import { MAX_WORKGROUPS_PER_DISPATCH } from "./kernels.js";
-import { transposeRowMajor } from "./reshape.js";
 import {
   assertWeightShapesQ8,
   cloneQuantizedLinear,
-  dequantizePackedQ8,
   gatherDequantRows,
   packInt8Rows,
   type LlamaWeightsQ8,
@@ -71,8 +69,8 @@ import {
  * run on the CPU"), which is fine when every dispatch already pays a round
  * trip, and wrong here — reading Q/K/V back to reshape and re-uploading
  * would put a CPU round trip exactly where this class removes one.
- * `llm/wgsl/permute.wgsl` (issue #117) is that reshape as one GPU dispatch;
- * see its own doc for why it is not an `ops/` kernel.
+ * `ops/permute/wgsl/kernel.wgsl` (issue #117, `ops/permute/reference.ts`)
+ * is that reshape as one GPU dispatch.
  *
  * ## Prefill's own KV is scanned at S = N, not S = maxSeqLen
  *
@@ -165,8 +163,10 @@ const CODE = {
   gqaContext: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "context"),
   activation: kernel(new URL("../ops/activation/index.ts", import.meta.url)),
   elementwise: kernel(new URL("../ops/elementwise/index.ts", import.meta.url)),
-  // Issue #117's prefill reshape — see `llm/wgsl/permute.wgsl`'s own doc.
-  permute: kernel(new URL(".", import.meta.url), "permute"),
+  // Issue #117's prefill reshape — see `ops/permute/wgsl/kernel.wgsl`'s own doc.
+  permute: kernel(new URL("../ops/permute/index.ts", import.meta.url)),
+  // Issue #117's prefill weight prep — see `ops/dequant_transpose/reference.ts`'s own doc.
+  dequantTranspose: kernel(new URL("../ops/dequant_transpose/index.ts", import.meta.url)),
 };
 
 /** `ops/activation/reference.ts#ACTIVATION.silu`, copied rather than imported to avoid pulling in `ops/activation`'s whole module graph for one constant — same value, checked against `llm/kernels.ts`'s own `ACTIVATION` re-export. */
@@ -226,36 +226,50 @@ async function buildProjection(
 const MATMUL_TILE = 16;
 
 /**
- * A `QuantizedLinear`'s `[outFeatures, inFeatures]` int8 weight, dequantized
- * to f32 and transposed to `[inFeatures, outFeatures]` — `matmul`'s `b`
- * operand shape (`ops/matmul/wgsl/kernel.wgsl`: `b: [K, N]`). Packs first
- * because `dequantizePackedQ8` reads the packed wire format, the same
- * detour `LlamaEngineQ8#project`'s own prefill branch takes (that class's
- * doc: "プリフィルは...「行スケールdequantしてf32 matmul」でもよい") — this
- * function is that same operation, called once per layer per projection per
- * `runPrefillResident` call, never per token.
+ * Prepares one `matmul` projection for `runPrefillResident`: packs
+ * `linear`'s raw int8 codes (a plain per-row byte copy, no arithmetic —
+ * `ops/dequant_transpose/reference.ts`'s doc measured it at ~170ms total
+ * across Sarashina2.2-1B's 24 layers), uploads the packed weight and scale,
+ * records an `ops/dequant_transpose` dispatch that dequantizes-and-transposes
+ * it into `[inFeatures, outFeatures]` f32 (`matmul`'s `b` operand shape,
+ * `ops/matmul/wgsl/kernel.wgsl`: `b: [K, N]`) — *on the GPU*, not the three
+ * CPU passes (`packInt8Rows` then `dequantizePackedQ8` then
+ * `transposeRowMajor`) `LlamaEngineQ8#project`'s own prefill branch takes.
+ * `ops/dequant_transpose/reference.ts`'s doc has the measurement: those
+ * three CPU passes cost ~100ms/layer (~2.5s for 24 layers) on the critical
+ * path of every prefill call, dwarfing the GPU dispatch itself. Returns the
+ * bind group for `matmul`'s own dispatch, reading that same transposed
+ * buffer as `b`; the caller records the dequant dispatch *before* the
+ * matmul dispatch that depends on it (`dispatch(...)` calls are appended to
+ * `runPrefillResident`'s single `ops` list in the order given here,
+ * `pushDequant` first).
  */
-function dequantTransposed(linear: QuantizedLinear, outFeatures: number, inFeatures: number): Float32Array {
-  const packed = packInt8Rows(linear.codes, outFeatures, inFeatures);
-  const dequant = dequantizePackedQ8(packed, linear.scale, outFeatures, inFeatures);
-  return transposeRowMajor(dequant, outFeatures, inFeatures);
-}
-
-/** Uploads a dequantized-and-transposed `[K, N]` weight and binds one `matmul` dispatch: `a` (this call's shared input buffer) @ weight -> `out`. */
 async function buildMatmulProjection(
   device: ResidentDevice,
-  pipeline: GPUComputePipeline,
+  dequantPipeline: GPUComputePipeline,
+  matmulPipeline: GPUComputePipeline,
   linear: QuantizedLinear,
   outFeatures: number,
   inFeatures: number,
-  uniform: GPUBuffer,
+  matmulUniform: GPUBuffer,
   aBuf: GPUBuffer,
   outBuf: GPUBuffer,
+  pushDequant: (bindGroup: GPUBindGroup, workgroups: [number]) => void,
 ): Promise<GPUBindGroup> {
-  const weightT = dequantTransposed(linear, outFeatures, inFeatures);
-  const weightBuf = device.createStorageBuffer(weightT.byteLength);
-  device.upload(weightBuf, 0, weightT);
-  return device.bindGroup(pipeline, [aBuf, weightBuf, outBuf, uniform]);
+  const packed = packInt8Rows(linear.codes, outFeatures, inFeatures);
+  const weightBuf = device.createStorageBuffer(packed.byteLength);
+  device.upload(weightBuf, 0, packed);
+  const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
+  device.upload(scaleBuf, 0, linear.scale);
+  const weightTBuf = device.createStorageBuffer(inFeatures * outFeatures * 4);
+  const dequantUniform = uniformOf(device, [["u32", outFeatures], ["u32", inFeatures]]);
+
+  const [dequantGroup, matmulGroup] = await Promise.all([
+    device.bindGroup(dequantPipeline, [weightBuf, scaleBuf, weightTBuf, dequantUniform]),
+    device.bindGroup(matmulPipeline, [aBuf, weightTBuf, outBuf, matmulUniform]),
+  ]);
+  pushDequant(dequantGroup, [Math.ceil((outFeatures * inFeatures) / 256)]);
+  return matmulGroup;
 }
 
 interface SharedResident {
@@ -270,6 +284,8 @@ interface SharedResident {
   matmulPipeline: GPUComputePipeline;
   /** Prefill only — see `runPrefillResident`. */
   permutePipeline: GPUComputePipeline;
+  /** Prefill only — see `runPrefillResident`/`buildMatmulProjection`. */
+  dequantTransposePipeline: GPUComputePipeline;
 
   hiddenA: GPUBuffer;
   hiddenB: GPUBuffer;
@@ -362,7 +378,7 @@ export class LlamaEngineQ8Resident {
 
     const [
       rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
-      matmulPipeline, permutePipeline,
+      matmulPipeline, permutePipeline, dequantTransposePipeline,
     ] = await Promise.all([
         device.pipelineFor(CODE.rmsnorm),
         device.pipelineFor(CODE.matvecQ8),
@@ -377,6 +393,7 @@ export class LlamaEngineQ8Resident {
         // once here alongside decode's, not per `forward()` call.
         device.pipelineFor(CODE.matmul),
         device.pipelineFor(CODE.permute),
+        device.pipelineFor(CODE.dequantTranspose),
       ]);
 
     // f32 activation buffers, sized for the N = 1 decode this class runs —
@@ -510,7 +527,7 @@ export class LlamaEngineQ8Resident {
 
     const shared: SharedResident = {
       rmsnormPipeline, matvecPipeline, ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
-      matmulPipeline, permutePipeline,
+      matmulPipeline, permutePipeline, dequantTransposePipeline,
       hiddenA, hiddenB, normedBuf, normed2Buf, qOutBuf, kOutBuf, vOutBuf, qRopedBuf, kRopedBuf, attnOutBuf, projOutBuf,
       gateOutBuf, upOutBuf, gateActBuf, gatedBuf, downOutBuf, finalNormedBuf,
       ropeQUniform, ropeKUniform, gqaScoresUniform, gqaContextUniform,
@@ -678,16 +695,39 @@ export class LlamaEngineQ8Resident {
       device.upload(attnNormBuf, 0, lw.attnNorm);
       const ffnNormBuf = device.createStorageBuffer(hiddenSize * 4);
       device.upload(ffnNormBuf, 0, lw.ffnNorm);
-      const attnNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]);
-      const ffnNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]);
-
-      const wqGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wq, qDim, hiddenSize, qMmUniform, normedBuf, qOutBuf);
-      const wkGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wk, kvDim, hiddenSize, kMmUniform, normedBuf, kOutBuf);
-      const wvGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wv, kvDim, hiddenSize, vMmUniform, normedBuf, vOutBuf);
-      const woGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wo, hiddenSize, qDim, oMmUniform, attnTokenMajorBuf, projOutBuf);
-      const gateGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wGate, ffnHidden, hiddenSize, gateMmUniform, normed2Buf, gateOutBuf);
-      const upGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wUp, ffnHidden, hiddenSize, upMmUniform, normed2Buf, upOutBuf);
-      const downGroup = await buildMatmulProjection(device, s.matmulPipeline, lw.wDown, hiddenSize, ffnHidden, downMmUniform, gatedBuf, downOutBuf);
+      // All nine bind groups requested together, not one `await` at a time:
+      // `ResidentDevice.bindGroup` validates through `pushErrorScope`/
+      // `await popErrorScope()` (`harness/resident.ts`'s own doc explains
+      // why — catching an invalid binding here rather than at the eventual
+      // `batch()`), and that round trip measured real per-call latency at
+      // Sarashina2.2-1B's scale (~24 layers x 9 groups = 216 sequential
+      // awaits otherwise). `Promise.all` still issues them in order and
+      // still balances every push/pop correctly: each of the nine calls
+      // below is synchronous (dequant, upload, `pushErrorScope`,
+      // `createBindGroup`, the `popErrorScope()` *call*) right up to its own
+      // `await`, so by the time control reaches the next array element the
+      // previous one has already pushed and popped its own scope — nesting
+      // never overlaps, only the *wait* for each validation result does.
+      // Each `buildMatmulProjection` call below also records its own
+      // `ops/dequant_transpose` dispatch via `pushDequant` — synchronously,
+      // before that call's own promise resolves, so every dequant dispatch
+      // this layer needs is in `ops` before this `await` returns and the
+      // `dispatch(matmul, ...)` calls just below run (see that function's
+      // own doc for why the ordering is safe without awaiting each call
+      // individually).
+      const pushDequant = (pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number]) =>
+        dispatch(pipeline, bindGroup, workgroups);
+      const [attnNormGroup, ffnNormGroup, wqGroup, wkGroup, wvGroup, woGroup, gateGroup, upGroup, downGroup] = await Promise.all([
+        device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]),
+        device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wq, qDim, hiddenSize, qMmUniform, normedBuf, qOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wk, kvDim, hiddenSize, kMmUniform, normedBuf, kOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wv, kvDim, hiddenSize, vMmUniform, normedBuf, vOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wo, hiddenSize, qDim, oMmUniform, attnTokenMajorBuf, projOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wGate, ffnHidden, hiddenSize, gateMmUniform, normed2Buf, gateOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wUp, ffnHidden, hiddenSize, upMmUniform, normed2Buf, upOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+        buildMatmulProjection(device, s.dequantTransposePipeline, s.matmulPipeline, lw.wDown, hiddenSize, ffnHidden, downMmUniform, gatedBuf, downOutBuf, (bg, wg) => pushDequant(s.dequantTransposePipeline, bg, wg)),
+      ]);
 
       dispatch(s.rmsnormPipeline, attnNormGroup, [N]);
       dispatch(s.matmulPipeline, wqGroup, matmulWg(qDim));

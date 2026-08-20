@@ -38,9 +38,13 @@ const CODE = {
   gqaContext: opKernel("gqa", "context"),
   activation: opKernel("activation"),
   elementwise: opKernel("elementwise"),
-  // Not an `ops/` kernel — `llm/wgsl/permute.wgsl`'s own doc explains why
-  // (issue #117's GPU-resident prefill; a permutation, not an arithmetic op).
-  permute: kernel(new URL(".", import.meta.url), "permute"),
+  // Issue #117's GPU-resident prefill reshape — see `ops/permute/reference.ts`'s
+  // doc for why a pure reshape has an `ops/` directory of its own (the
+  // browser bundle's `opNameFromUrl` requires the `ops/<name>/index.ts`
+  // shape for every kernel it resolves, not just the ones with arithmetic).
+  permute: opKernel("permute"),
+  // Issue #117's prefill weight prep — see `ops/dequant_transpose/reference.ts`'s doc.
+  dequantTranspose: opKernel("dequant_transpose"),
 };
 
 const asF32 = (x: Float32Array | Int32Array | Uint32Array): Float32Array => x as Float32Array;
@@ -403,7 +407,7 @@ export interface PermuteArgs {
 }
 
 /**
- * `[dim0, dim1, D]` -> `[dim1, dim0, D]` — `llm/wgsl/permute.wgsl`'s own
+ * `[dim0, dim1, D]` -> `[dim1, dim0, D]` — `ops/permute/wgsl/kernel.wgsl`'s own
  * doc has the full "why this exists instead of `llm/reshape.ts`'s CPU
  * functions" story (issue #117's resident prefill). `splitHeadsMajor(x,
  * tokens, heads, dim)` is `runPermute({ input: x, dim0: tokens, dim1: heads,
@@ -420,6 +424,40 @@ export async function runPermute(run: Runner["run"], { input, dim0, dim1, D }: P
       { kind: "uniform", data: params([["u32", dim0], ["u32", dim1], ["u32", D]]) },
     ],
     workgroups: [Math.ceil(total / 256)],
+  });
+  return asF32(out!);
+}
+
+export interface DequantTransposeArgs {
+  /** `[outFeatures, ceil(inFeatures / 4)]` u32, row-major — `ops/matvec`'s `q8` packed wire format (`packQ8`/`llm/weights-q8.ts#packInt8Rows`). */
+  weight: Uint32Array;
+  /** `[outFeatures]`, one absmax-derived scale per row. */
+  scale: Float32Array;
+  outFeatures: number;
+  inFeatures: number;
+}
+
+/**
+ * Dequantizes-and-transposes a packed int8 weight into `matmul`'s `b`
+ * operand shape (`[inFeatures, outFeatures]`) in one GPU dispatch — issue
+ * #117's `runPrefillResident` (`llm/engine-q8-resident.ts`) uses this
+ * pattern directly against its own persistent buffers rather than through
+ * this wrapper (its per-call bind groups do not fit `Runner["run"]`'s
+ * per-dispatch-buffers contract), so this function exists for parity with
+ * every other kernel in this file and as this op's Node-side integration
+ * test path — see `ops/dequant_transpose/reference.ts`'s own doc for why
+ * the op exists at all.
+ */
+export async function runDequantTranspose(run: Runner["run"], { weight, scale, outFeatures, inFeatures }: DequantTransposeArgs): Promise<Float32Array> {
+  const [out] = await run({
+    code: CODE.dequantTranspose,
+    bindings: [
+      { kind: "storage", data: weight },
+      { kind: "storage", data: scale },
+      { kind: "out", type: "f32", length: outFeatures * inFeatures },
+      { kind: "uniform", data: params([["u32", outFeatures], ["u32", inFeatures]]) },
+    ],
+    workgroups: [Math.ceil((outFeatures * inFeatures) / 256)],
   });
   return asF32(out!);
 }
