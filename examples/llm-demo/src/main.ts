@@ -362,12 +362,21 @@ async function runGeneration(): Promise<void> {
   const useResident = residentEngineToggle.checked;
   stats.textContent = useResident ? "生成中… (GPU常駐デコード, issue #110)" : "生成中… (従来エンジン)";
 
-  // A fresh engine per generation: neither engine resets its own KV cache,
-  // and constructing a new one from the already-fetched `weights` is the
-  // correctness-preserving way to start clean (`engine-q8.ts`'s own doc —
-  // the constructor only reads `weights`, never mutates them). Cost
-  // reported separately from tok/s below, since it is one-time setup, not
-  // decode-time.
+  // A fresh engine per generation, still — `LlamaEngineQ8` has no reset
+  // path, and constructing a new one from the already-fetched `weights` is
+  // the correctness-preserving way to start clean (`engine-q8.ts`'s own doc
+  // — the constructor only reads `weights`, never mutates them).
+  // `LlamaEngineQ8Resident` *does* have one now (`reset()`, issue #120) —
+  // this button deliberately does not use it, to keep this demo's existing
+  // "every click is an independent, from-scratch generation" behaviour
+  // rather than introducing session state (which prompt-style toggle applied
+  // to which still-alive engine, how long its ~1.4 GiB of CPU-side weights
+  // stay referenced, what happens to a live `ResidentDevice` across an error)
+  // that a demo page is not the right place to design. `reset()`'s own
+  // effect is measured instead via `__resetBenchmark`, below, driven by a
+  // CDP script rather than this button (see the README's "reset():
+  // multi-generation reuse without rebuilding" section). Cost reported
+  // separately from tok/s below, since it is one-time setup, not decode-time.
   const buildStart = performance.now();
   // A `ResidentDevice` is created lazily here, per generation, rather than
   // once at load time alongside `runner` — one browser tab, two live
@@ -439,3 +448,179 @@ async function runGeneration(): Promise<void> {
     (residentDevice as Awaited<ReturnType<typeof createBrowserResidentDevice>> | null)?.destroy();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #120: measuring reset()'s own effect
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue #120's own completion bar: "reset経由の2生成目以降が構築コストゼロで動くこと
+ * の実測", a real-hardware wall-clock comparison, not an estimate (rule 9) —
+ * "構築1回+reset反復で連続 N 生成" against "都度構築 N 生成", both running
+ * the exact same `promptTexts` through the exact same `generate()` this
+ * file's own button uses, so the only thing that differs between the two
+ * loops below is whether each generation after the first pays
+ * `LlamaEngineQ8Resident.create()`'s own cost (a fresh `ResidentDevice`, a
+ * fresh `device.upload()` for every persistent `matvecQ8` weight buffer) or
+ * `reset()`'s (two field writes).
+ *
+ * Not reachable from the UI — a CDP-driven script calls this directly, the
+ * same way issue #117's own prefill numbers were measured (this README's
+ * "GPU-resident prefill" section) — so it lives outside `runGeneration`'s
+ * own click handler entirely and never runs unless something calls it by
+ * name. `policySelect.value`'s current UI selection is still used to build
+ * each prompt (`buildStylePrompt`), the same style/policy the button itself
+ * would use, so a driving script only has to set the text input, not
+ * reimplement prompt construction.
+ */
+interface BenchGenDetail {
+  createMs: number;
+  generateMs: number;
+  prefillMs: number;
+  decodeMsTotal: number;
+  decodeSteps: number;
+  promptTokenCount: number;
+}
+
+interface BenchStrategyResult {
+  totalMs: number;
+  perGenMs: number[];
+  perGenDetail: BenchGenDetail[];
+}
+
+/** `LlamaEngineQ8Resident.create()`'s own cost, timed on its own — separate
+ * from `generate()`'s, so the two are never conflated (PR #126 review, item
+ * 6: an earlier version of this file's own README write-up used `prefillMs`,
+ * which structurally cannot include `create()`'s cost at all, as evidence
+ * about `create()`'s cost — a category error this split makes impossible to
+ * repeat). */
+async function timedCreate(engineConfig: LlamaConfig, weights: LlamaWeightsQ8): Promise<{
+  engine: LlamaEngineQ8Resident;
+  device: Awaited<ReturnType<typeof createBrowserResidentDevice>>;
+  createMs: number;
+}> {
+  const t0 = performance.now();
+  const device = await createBrowserResidentDevice();
+  const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+  const createMs = performance.now() - t0;
+  return { engine, device, createMs };
+}
+
+/** One `ResidentDevice`, one `LlamaEngineQ8Resident`, `reset()` before every
+ * generation after the first — `create()`'s cost is paid exactly once,
+ * timed on its own and folded into generation 0's own `createMs`; every
+ * later generation's `createMs` is `0` by construction (no `create()` call
+ * happens). */
+async function runResetStrategy(
+  engineConfig: LlamaConfig,
+  weights: LlamaWeightsQ8,
+  promptTokenLists: number[][],
+): Promise<BenchStrategyResult> {
+  const perGenMs: number[] = [];
+  const perGenDetail: BenchGenDetail[] = [];
+  const start = performance.now();
+  const device = await createBrowserResidentDevice();
+  try {
+    const createT0 = performance.now();
+    const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+    const firstCreateMs = performance.now() - createT0;
+    for (let i = 0; i < promptTokenLists.length; i += 1) {
+      const createMs = i === 0 ? firstCreateMs : 0;
+      const genT0 = performance.now();
+      if (i > 0) engine.reset();
+      // eslint-disable-next-line no-await-in-loop
+      const { prefillMs, decodeMsTotal, decodeSteps } = await generate(engine, promptTokenLists[i]!, undefined);
+      const generateMs = performance.now() - genT0;
+      perGenMs.push(createMs + generateMs);
+      perGenDetail.push({
+        createMs,
+        generateMs,
+        prefillMs,
+        decodeMsTotal,
+        decodeSteps,
+        promptTokenCount: promptTokenLists[i]!.length,
+      });
+    }
+  } finally {
+    device.destroy();
+  }
+  return { totalMs: performance.now() - start, perGenMs, perGenDetail };
+}
+
+/** `runGeneration`'s own resident branch, unchanged — a fresh
+ * `ResidentDevice` and a fresh `LlamaEngineQ8Resident.create()` call for
+ * every generation, `create()`'s own cost timed separately from
+ * `generate()`'s every time. */
+async function runRebuildStrategy(
+  engineConfig: LlamaConfig,
+  weights: LlamaWeightsQ8,
+  promptTokenLists: number[][],
+): Promise<BenchStrategyResult> {
+  const perGenMs: number[] = [];
+  const perGenDetail: BenchGenDetail[] = [];
+  const start = performance.now();
+  for (const promptTokens of promptTokenLists) {
+    const t0 = performance.now();
+    const { engine, device, createMs } = await timedCreate(engineConfig, weights);
+    let detail: { prefillMs: number; decodeMsTotal: number; decodeSteps: number };
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      detail = await generate(engine, promptTokens, undefined);
+    } finally {
+      device.destroy();
+    }
+    const genMs = performance.now() - t0;
+    perGenMs.push(genMs);
+    perGenDetail.push({ createMs, generateMs: genMs - createMs, ...detail, promptTokenCount: promptTokens.length });
+  }
+  return { totalMs: performance.now() - start, perGenMs, perGenDetail };
+}
+
+/**
+ * Issue #120's own completion bar, re-measured per PR #126 review (items
+ * 5-7): the first version of this benchmark always ran the `reset()`
+ * strategy before the `rebuild` strategy, in every trial — and this box's
+ * own `create()` cost turned out to *rise* within a page session (measured:
+ * generation 1's ~2.1-2.3s vs. each rebuild generation's own ~4.6-4.9s,
+ * `create()`-only), so running `reset()` first meant the rebuild strategy
+ * absorbed three of those later, larger `create()` calls while `reset()`
+ * only ever paid the earliest, cheapest one — a session-position penalty
+ * riding on the rebuild side of every trial, not a `reset()` vs. rebuild
+ * difference at all. `order` lets a driving script alternate which strategy
+ * goes first, trial by trial, so that penalty lands on both sides equally
+ * across a run rather than always favouring `reset()`.
+ *
+ * Not reachable from the UI — a CDP-driven script calls this directly, the
+ * same way issue #117's own prefill numbers were measured (this README's
+ * "GPU-resident prefill" section). `policySelect.value`'s current UI
+ * selection is still used to build each prompt (`buildStylePrompt`), the
+ * same style/policy the button itself would use.
+ */
+async function __resetBenchmark(
+  promptTexts: string[],
+  order: "reset-first" | "rebuild-first" = "reset-first",
+): Promise<{
+  order: "reset-first" | "rebuild-first";
+  reset: BenchStrategyResult;
+  rebuild: BenchStrategyResult;
+}> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights, tokenizer } = loaded;
+  const promptTokenLists = promptTexts.map((text) => tokenizer.encode(buildStylePrompt(policySelect.value, text)));
+
+  const runReset = () => runResetStrategy(engineConfig, weights, promptTokenLists);
+  const runRebuild = () => runRebuildStrategy(engineConfig, weights, promptTokenLists);
+
+  let reset: BenchStrategyResult;
+  let rebuild: BenchStrategyResult;
+  if (order === "reset-first") {
+    reset = await runReset();
+    rebuild = await runRebuild();
+  } else {
+    rebuild = await runRebuild();
+    reset = await runReset();
+  }
+
+  return { order, reset, rebuild };
+}
+(window as unknown as { __resetBenchmark: typeof __resetBenchmark }).__resetBenchmark = __resetBenchmark;
