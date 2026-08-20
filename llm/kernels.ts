@@ -203,16 +203,6 @@ export async function runMatVecQ8(run: Runner["run"], { weight, scale, vector, M
   });
 }
 
-export interface MatVecQ8Args {
-  /** `[M, ceil(K/4)]` u32, row-major, `matvecQ8`'s own packed wire format (`ops/matvec/reference.ts#packQ8`). */
-  weight: Uint32Array;
-  /** `[M]`, one absmax-derived scale per row. */
-  scale: Float32Array;
-  vector: Float32Array;
-  M: number;
-  K: number;
-}
-
 export interface MatMulArgs {
   /** `[M, K]` row-major. */
   a: Float32Array;

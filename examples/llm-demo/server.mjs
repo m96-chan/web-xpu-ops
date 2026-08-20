@@ -22,6 +22,7 @@
  * is always set, since `llm/browser-weights.ts`'s progress bar reads it.
  */
 import { createReadStream, existsSync, statSync } from "node:fs";
+import { pipeline } from "node:stream";
 import { createServer } from "node:http";
 import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,7 +57,11 @@ function send(res, filePath) {
     "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
     "Content-Length": stat.size,
   });
-  createReadStream(filePath).pipe(res);
+  // pipeline, not .pipe(): a bare ReadStream 'error' (file replaced by
+  // demo:build mid-stream, I/O error in the 1.4 GiB weights read) has no
+  // listener and takes the whole server process down, and .pipe() never
+  // destroys the source when the client aborts a download, leaking the fd.
+  pipeline(createReadStream(filePath), res, () => {});
 }
 
 const server = createServer((req, res) => {
@@ -90,7 +95,10 @@ const server = createServer((req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+// 127.0.0.1, not the default 0.0.0.0: this server exposes the repository
+// root (including .git/ and untracked local files) plus an external weights
+// directory, and its only documented audience is a browser on this machine.
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`llm-demo dev server listening on http://localhost:${PORT}/`);
   console.log(`  demo:    http://localhost:${PORT}/examples/llm-demo/`);
   console.log(`  weights: ${WEIGHTS_DIR}  ->  /weights/`);

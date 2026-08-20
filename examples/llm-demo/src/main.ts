@@ -240,9 +240,17 @@ loadBtn.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 genBtn.addEventListener("click", () => {
-  runGeneration().catch((err: unknown) => {
-    stats.textContent = `生成失敗: ${err instanceof Error ? err.message : String(err)}`;
-  });
+  runGeneration()
+    .catch((err: unknown) => {
+      stats.textContent = `生成失敗: ${err instanceof Error ? err.message : String(err)}`;
+    })
+    .finally(() => {
+      // Re-enable on every outcome, not only success: an over-long prompt
+      // (forward throws past maxSeqLen) or a constraint dead-end in
+      // sampleNext would otherwise leave the button disabled until a page
+      // reload — which re-downloads the ~1.4 GiB checkpoint.
+      genBtn.disabled = false;
+    });
 });
 
 async function runGeneration(): Promise<void> {
@@ -307,6 +315,4 @@ async function runGeneration(): Promise<void> {
     `prefill: ${promptTokens.length} tok in ${prefillMs.toFixed(0)}ms (${prefillTokPerSec.toFixed(2)} tok/s) | ` +
     `decode: ${decodeSteps} tok in ${decodeMsTotal.toFixed(0)}ms (${decodeTokPerSec.toFixed(2)} tok/s)` +
     (tokens[tokens.length - 1] === vocab.eosId ? " | stopped at </s>" : " | stopped at MAX_DECODE_STEPS");
-
-  genBtn.disabled = false;
 }
