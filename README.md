@@ -899,11 +899,31 @@ byte-for-byte identical generated text between the two engines on both:
 | `brush_off` | `LlamaEngineQ8` | 69 tok, 12.0s (5.8 tok/s) | 13 tok, 16.4s (**0.79 tok/s**) |
 | `brush_off` | `LlamaEngineQ8Resident` | 69 tok, 12.9s (5.4 tok/s) | 13 tok, 0.095s (**137.6 tok/s**) |
 
-~175–200x on decode. Prefill is within run-to-run noise of itself, as
-expected — it is unchanged code. Engine construction: `LlamaEngineQ8`
-~1.0–1.1s, `LlamaEngineQ8Resident` ~1.4–1.5s (a few more `matvecQ8`
-weight/scale buffer pairs — see "buffer design" below — plus every bind
-group built up front instead of on first use).
+~175–200x on decode. The raw prefill numbers above are **not** a clean
+before/after comparison, though (PR #116 review, item 7): `runPrefill`
+(`llm/engine-q8-resident.ts`) constructs a whole `LlamaEngineQ8` delegate —
+the same "pack every projection into `matvecQ8`'s wire format" step the
+"Engine construction: ~1.0–1.1s" line below measures — on the *first*
+`forward()` call, and that call is what the demo's `prefillMs` times. For
+the non-resident row, that identical construction happens once, before
+`generate()` even starts, and is **not** counted in `prefillMs` at all — so
+the resident row's prefill number carries an extra ~1.0–1.1s the
+non-resident row's does not, not a difference in prefill compute. Subtracting
+that (using this table's own "Engine construction" figure for
+`LlamaEngineQ8`, since it is the same construction happening in both places):
+`full_gear` 12.7s − ~1.05s ≈ 11.65s (**~6.5 tok/s**, against `LlamaEngineQ8`'s
+own 6.4 tok/s) and `brush_off` 12.9s − ~1.05s ≈ 11.85s (**~5.8 tok/s**,
+against 5.8 tok/s) — once that's accounted for, prefill really is within
+run-to-run noise of itself, as expected (issue #110 left it unchanged); the
+raw ~6–8% gap the unadjusted numbers above show is this hidden construction
+cost, not a regression, and not something to report as "noise" without
+saying so (rule 9 — a claim needs its own measurement, not an assumption).
+Engine construction: `LlamaEngineQ8` ~1.0–1.1s, `LlamaEngineQ8Resident`
+~1.4–1.5s (a few more `matvecQ8` weight/scale buffer pairs — see "buffer
+design" below — plus every bind group built up front instead of on first
+use); the resident figure is `LlamaEngineQ8Resident.create()`'s own cost
+only; the *legacy delegate's* construction is the ~1.0–1.1s folded into its
+`prefill` column above instead, per the previous paragraph.
 
 **Roofline decomposition (rule 9 — measured, not estimated).** This
 machine's own bandwidth ceiling, from `harness/roofline.ts` at the time of
