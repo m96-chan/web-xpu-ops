@@ -243,9 +243,17 @@ loadBtn.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 genBtn.addEventListener("click", () => {
-  runGeneration().catch((err: unknown) => {
-    stats.textContent = `生成失敗: ${err instanceof Error ? err.message : String(err)}`;
-  });
+  runGeneration()
+    .catch((err: unknown) => {
+      stats.textContent = `生成失敗: ${err instanceof Error ? err.message : String(err)}`;
+    })
+    .finally(() => {
+      // Re-enable on every outcome, not only success: an over-long prompt
+      // (forward throws past maxSeqLen) or a constraint dead-end in
+      // sampleNext would otherwise leave the button disabled until a page
+      // reload — which re-downloads the ~1.4 GiB checkpoint.
+      genBtn.disabled = false;
+    });
 });
 
 /** Both `LlamaEngineQ8` and `LlamaEngineQ8Resident` expose exactly this — the shape the decode loop below actually needs, regardless of which one built it. */
@@ -353,6 +361,4 @@ async function runGeneration(): Promise<void> {
   } finally {
     (residentDevice as Awaited<ReturnType<typeof createBrowserResidentDevice>> | null)?.destroy();
   }
-
-  genBtn.disabled = false;
 }

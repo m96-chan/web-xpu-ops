@@ -68,7 +68,14 @@ async function fetchWithProgress(
     throw new Error(`fetchWithProgress: ${url} responded HTTP ${res.status}`);
   }
   const contentLength = res.headers.get("content-length");
-  const totalBytes = contentLength !== null && contentLength !== "" ? Number(contentLength) : null;
+  const parsedLength = contentLength !== null && contentLength !== "" ? Number(contentLength) : NaN;
+  // null, never NaN, for an unparsable header: the type promises
+  // `number | null` and NaN is neither — it reads as falsy-but-non-null in
+  // `p.totalBytes ? …` and poisons any fraction computed from it. (A
+  // Content-Encoding mismatch — decoded bytes counted against an encoded
+  // length — is the caller's clamp to make; this only guarantees the value
+  // is a real number or absent.)
+  const totalBytes = Number.isFinite(parsedLength) && parsedLength >= 0 ? parsedLength : null;
 
   if (!res.body) {
     const buffer = await res.arrayBuffer();

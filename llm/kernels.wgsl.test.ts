@@ -70,6 +70,10 @@ describe("llm/kernels wrappers", () => {
     const vector = wave(K, 0.11, 0.8);
     const got = await runMatVecQ8(run, { weight, scale, vector, M, K });
     const want = matvecQ8({ weight, scale, vector, N: M, K });
+    // Same tolerance as ops/matvec/q8.wgsl.test.ts#TOLERANCE, where the
+    // measured basis lives (worst observed rel 3.84e-5 / abs 2.60e-5 with
+    // tolerance forced to zero; ~2x headroom) — not re-measured here, since
+    // this dispatches the identical kernel on smaller shapes.
     expect(agree(got, want, { rel: 1e-4, abs: 5e-5 })).toBeNull();
   });
 
