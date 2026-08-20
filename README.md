@@ -35,6 +35,7 @@ rather than being left blank.
 | op | notes |
 | --- | --- |
 | `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
+| `matvecQ8` | W8A32 GEMV: `matvec` with the weight held as int8 instead of f32. Weight is `[N, ceil(K/4)]` `u32`, four codes packed per word least-significant byte first — the layout a little-endian host gets for free by viewing an `Int8Array`'s buffer as `Uint32Array`; scale is `[N]`, `quantize`'s per-row absmax convention, applied once per row after the dot product rather than per term. `packQ8` packs `quantize`'s `Int32Array` codes into this layout; the two compose (`packQ8(quantize(w).output, N, K)` + `quantize(w).scales`) rather than this op quantizing on its own. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row. An optional per-group `weight` of `[G, D]` for QK-norm — row `n` takes group `n % G`, so the grouped axis has to be the one just left of `D` (`[B, S, H, Dh]`, not `[B, H, S, Dh]`); `G = 1` is the single shared gamma. Reduction stays over `D` alone, matching `F.rms_norm(x, (D,)) * w` rather than `torch.nn.RMSNorm((H, Dh))`, which reduces over both. Speed unmeasured |
 | `layernorm` | two workgroup reductions; **biased** variance (`1/D`) and `eps` inside the `sqrt`, as `torch.nn.functional.layer_norm`. Speed unmeasured |
 | `group_norm` | `torch.nn.functional.group_norm`: statistics pooled over a **group of channels**, affine applied **per channel**. For `[N, C, L]` each of the `N × G` groups reduces `(C/G) × L` values, so this is not `layernorm` with a longer row — that gives one mean per channel, and the two disagree with no error and no change of shape. `G = 1` normalises the whole sample, `G = C` is InstanceNorm. Biased variance and `eps` inside the `sqrt`, both measured against torch 2.10 rather than inherited from `layernorm` (the unbiased form is out by 1.6e-1, `eps` outside the root by 4.3e-6). `C % G != 0` throws, as torch does. Speed unmeasured |
@@ -435,6 +436,85 @@ everything else in behind it.
 
 ---
 
+## `llm/`: an inference engine built from these ops
+
+`llm/` is a config-driven llama-architecture (decoder-only, GQA, RoPE, SiLU
+MLP, RMSNorm) forward pass, composed entirely from the ops above rather than a
+new fused kernel — the "`block/`" exception the roadmap notes above rules out
+does not apply, because a llama decoder is not a block that only pays off
+fused; it is a *sequence* of the primitives and kernels this repository
+already ships, and issue [#98](https://github.com/m96-chan/web-xpu-ops/issues/98)
+tracks that specific composition, not a new op.
+
+```ts
+// llm/ is source-only for now — not part of this package's published
+// `exports` (real-model use needs #96's weight converter and tokenizer,
+// both later issues), so this is a within-repo import, not a package one.
+import { LlamaEngine, TINY_FIXTURE_CONFIG } from "./llm/index.js";
+
+const engine = new LlamaEngine(config, weights, runner.run);
+const prefillLogits = await engine.forward(promptTokens); // matmul path, N > 1
+const [nextLogits] = await engine.forward([nextToken]);    // matvec path, N === 1
+```
+
+**Per layer:** `rmsnorm → QKV projection (fused) → rope(Q, K) → gqa (+ KV
+cache) → O projection → residual → rmsnorm → gate/up projection (fused) →
+silu(gate) * up → down projection → residual`, then one final
+`rmsnorm → lm_head`.
+
+**What "config-driven" means in practice** — `llm/config.ts#LlamaConfig` has
+one field per dimension a llama checkpoint's `config.json` carries (layers,
+hidden size, query/KV heads, head dim, FFN width, vocab, RoPE base, RMSNorm
+`eps`, weight tying). Two example configs live there: `TINY_FIXTURE_CONFIG`
+(2 layers, hidden 64, 4 query / 2 KV heads, FFN 128, vocab 256 — what the
+fixture below actually runs) and `SARASHINA_2_2_1B_CONFIG` (24 layers, hidden
+1792, 16 query / 8 KV heads, FFN 6272, vocab 102400, RoPE base 500000 — issue
+#96's real target, documentation only: running the actual checkpoint needs a
+weight-conversion tool and a tokenizer, both later issues).
+
+**KV cache and dispatch fusion.** The cache is pre-allocated f32,
+`[kvHeads, maxSeqLen, headDim]` per layer (`llm/kv-cache.ts`) — no growth
+during generation, optimisation left for later per the "correctness first"
+rule below. Q/K/V and gate/up are each fused into one projection weight
+(`llm/reshape.ts#concatRows` / `#splitConcatRows`) purely to cut GPU dispatch
+count: this repository's `webgpu` (Dawn-through-Node) binding is measurably
+unable to sustain an unfused prefill-then-decode run's ~195 dispatches inside
+one device's lifetime on some machines, and fusing Q/K/V and gate/up brings
+that down to ~155 without changing a single number the engine computes — see
+`llm/reshape.ts` and `llm/engine.wgsl.test.ts` for the measurement.
+
+**Correctness is a fixture, not an eyeball.** `llm/tools/gen_fixture.py`
+builds a tiny, randomly-initialised llama model with `transformers` itself
+(rule 7 — a real HF forward pass, `attn_implementation="eager"`, seeded), runs
+an 8-token prefill and a 4-step greedy decode, and writes the weights and
+logits to `llm/fixtures/tiny.*`. `llm/engine.wgsl.test.ts` runs the same
+tokens through `LlamaEngine` on a real GPU and checks logits against the
+fixture (measured: worst absolute diff **1.49e-7**, worst relative **3.4e-4**
+across prefill and decode — tighter than any individual op's own tolerance,
+because a tiny random model's logits do not accumulate error the way a
+trained one's sharper distributions might) and greedy-decoded tokens for
+exact equality. The fixture (weights + logits + a JSON manifest) is committed
+rather than generated at test time — 436 KiB total (420 KiB weights, 12 KiB
+logits, 4 KiB manifest), small enough that regenerating it on every `npm test`
+would buy nothing; see `llm/tools/gen_fixture.py` for the reproduction steps.
+
+One channel-ordering fact worth knowing if you are reading the weight-loading
+code: HF Llama's RoPE (`rotate_half`) pairs channel `i` with channel
+`i + headDim/2`, while `ops/rope` pairs **adjacent** channels `2i`/`2i+1` —
+the same rotation, numbered differently within a head. `llm/weights.ts#permuteRopeChannels`
+relabels a checkpoint's Q/K projection rows accordingly (exact, not
+approximate — the derivation and a numeric proof are in
+`llm/weights.ts` and `llm/rope-permutation.test.ts`), and
+`llm/tools/gen_fixture.py` applies the same permutation before writing
+`tiny.weights.bin`.
+
+**Scope.** f32 weights only (int8 lands after #97's quantized `matvec`
+connects); no tokenizer, sampler or browser wiring yet (later issues under
+#96). Correctness first, per the rule below — nothing here has been tuned for
+speed.
+
+---
+
 ## `llm/`: sampler and token-level constraints
 
 `llm/sampler.ts` turns a next-token logits vector into a token id — `greedy`
@@ -490,9 +570,8 @@ strict prefix of another's, or completion would be ambiguous. Such a spec is
 rejected at construction rather than silently misclassified during
 generation.
 
-Neither file is wired into an inference engine yet. `llm/` does not exist on
-`main` as anything more than this — the engine that would call `sampleNext`
-per step is a separate, later issue.
+Neither file is wired into the engine above yet — the decode loop that would
+call `sampleNext` per step is a separate, later issue.
 
 ---
 

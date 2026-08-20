@@ -33,6 +33,32 @@ Entries record **why** a change was needed. What changed is in the diff.
 
   Neither module is wired into `llm/engine.ts` yet — that integration is
   left to a follow-up issue, matching #102's stated scope.
+- `llm/`: a config-driven llama-architecture inference engine built by
+  composing existing ops (`gather` → N × [`rmsnorm` → fused QKV projection →
+  `rope` → `gqa` + a pre-allocated f32 KV cache → O projection → residual →
+  `rmsnorm` → fused gate/up projection → SiLU-gated MLP → residual] →
+  `rmsnorm` → `lm_head`), rather than a new op — issue #98. Prefill uses
+  `matmul`, decode uses `matvec`; Q/K/V and gate/up are fused into single
+  projections purely to keep this repository's `webgpu` (Dawn) binding within
+  the dispatch count it can sustain in one device's lifetime on some
+  machines, not for FLOPs. Correctness is defined by a `transformers`-generated
+  fixture (`llm/tools/gen_fixture.py`, committed at `llm/fixtures/tiny.*`,
+  436 KiB): an 8-token prefill and a 4-step greedy decode on a tiny random
+  model, checked on a real GPU to a measured tolerance (worst observed
+  absolute diff 1.49e-7, relative 3.4e-4) and exact greedy-token equality.
+  `SARASHINA_2_2_1B_CONFIG` documents the real target model's dimensions;
+  running it needs a weight converter and tokenizer, both later issues under
+  #96. Needed because wllama's WASM CPU path is too slow for in-browser
+  inference (technologies-moe/alibi-ai#3: 22.6s few-shot prefill) and WebLLM's
+  4-bit-only quantization collapses on the target Japanese model.
+- `matvecQ8`, a W8A32 GEMV in `ops/matvec`: the weight held as int8 instead of
+  f32, packed four codes per `u32` word. Decode-time GEMV is bandwidth-bound,
+  and an int8 weight is a quarter the traffic of f32 for the same values — the
+  packed layout halves that again versus one code per lane, since the whole
+  point of quantizing a weight nobody re-quantizes at inference is to spend
+  the packing cost once rather than never taking it (#97). `packQ8` packs
+  `quantize`'s existing per-row absmax codes into the layout `matvecQ8` reads,
+  so the two compose instead of `matvecQ8` inventing its own quantization.
 
 ## [0.1.0] - 2026-08-04
 
