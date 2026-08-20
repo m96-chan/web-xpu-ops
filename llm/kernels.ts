@@ -213,29 +213,6 @@ export interface MatVecQ8Args {
   K: number;
 }
 
-/**
- * `matvecQ8` (issue #97), used by `LlamaEngineQ8`'s decode path (issue #105):
- * the same GEMV as `runMatVec`, with the weight held as int8 codes packed
- * four to a `u32` word instead of f32 — a quarter the bytes moved per decode
- * step, which is what makes decode bandwidth-bound rather than
- * compute-bound at this weight size. Binding order and uniform layout are
- * copied from `ops/matvec/q8.wgsl.test.ts`, not re-derived (rule 2).
- */
-export async function runMatVecQ8(run: Runner["run"], { weight, scale, vector, M, K }: MatVecQ8Args): Promise<Float32Array> {
-  const [out] = await run({
-    code: CODE.matvecQ8,
-    bindings: [
-      { kind: "storage", data: weight },
-      { kind: "storage", data: scale },
-      { kind: "storage", data: vector },
-      { kind: "out", type: "f32", length: M },
-      { kind: "uniform", data: params([["u32", M], ["u32", K]]) },
-    ],
-    workgroups: [M],
-  });
-  return asF32(out!);
-}
-
 export interface MatMulArgs {
   /** `[M, K]` row-major. */
   a: Float32Array;
