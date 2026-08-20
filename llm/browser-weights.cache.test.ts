@@ -236,6 +236,73 @@ describe("loadWeightsQ8FromUrl — persistent cache (issue #121)", () => {
     await expect(store.list()).resolves.toEqual([]);
   });
 
+  it("review item #1: a valid cache entry is still read (not skipped) once the cache's own usage makes quota look insufficient", async () => {
+    // Repro: visit 1 writes the cache successfully (quota generous then).
+    // From visit 2 on, a real `navigator.storage.estimate()` reports
+    // `usage` that now *includes* what was just written — with the quota
+    // check gating the read as well as the write, "usage ≈ cache size ->
+    // free < required -> quota-insufficient" becomes permanent: a valid
+    // cache is never read again, and every subsequent visit re-downloads
+    // the full checkpoint forever. Reads don't consume quota — only the
+    // write path may legitimately refuse for quota reasons.
+    const store = new InMemoryChunkStore();
+    await loadWeightsQ8FromUrl(BASE, 128, undefined, makeFakeFetch(), {
+      chunkStore: store,
+      estimateQuota: async () => ({ usageBytes: 0, quotaBytes: 1_000_000_000_000 }), // generous on visit 1
+    });
+
+    const callCounts: Record<string, number> = {};
+    const { weights } = await loadWeightsQ8FromUrl(
+      BASE,
+      128,
+      undefined,
+      makeFakeFetch({ callCounts, forbid: ["codes", "scales", "norms"] }),
+      {
+        chunkStore: store,
+        // "usage" now reflects the cache this same store already holds —
+        // free space is short of `requiredBytes * headroomRatio` even
+        // though nothing new needs to be written.
+        estimateQuota: async () => ({ usageBytes: 999_999_999, quotaBytes: 1_000_000_000 }),
+      },
+    );
+
+    expectSameWeights(weights);
+    expect(callCounts.codes ?? 0).toBe(0);
+    expect(callCounts.scales ?? 0).toBe(0);
+    expect(callCounts.norms ?? 0).toBe(0);
+  });
+
+  it("review item #2: an IndexedDB read failure (get() rejecting) falls back to a network load instead of failing the whole load", async () => {
+    // Repro: a real IndexedDB `get()` can reject — storage pressure closing
+    // the connection mid-read, "Clear site data", or (deterministically) a
+    // stale v1 database whose object store name doesn't match this
+    // version's `NotFoundError`. Without a try/catch around the read path,
+    // that rejection propagates out of `loadWeightsQ8FromUrl` itself: a
+    // load that would have succeeded over plain HTTP instead fails
+    // outright, which is exactly the "フォールバック動作" issue #121's own
+    // completion condition requires and promises everywhere else in this
+    // file (write failures, corrupted chunks, a hash mismatch).
+    const store = new InMemoryChunkStore();
+    await loadWeightsQ8FromUrl(BASE, 128, undefined, makeFakeFetch(), { chunkStore: store });
+
+    const readFailingStore: ChunkStore = {
+      get: async () => {
+        throw new DOMException("connection closed", "InvalidStateError");
+      },
+      put: (key, value) => store.put(key, value),
+      delete: (key) => store.delete(key),
+      list: () => store.list(),
+    };
+
+    await expect(
+      loadWeightsQ8FromUrl(BASE, 128, undefined, makeFakeFetch(), { chunkStore: readFailingStore }),
+    ).resolves.toBeDefined();
+    const { weights } = await loadWeightsQ8FromUrl(BASE, 128, undefined, makeFakeFetch(), {
+      chunkStore: readFailingStore,
+    });
+    expectSameWeights(weights);
+  });
+
   it("a store whose writes fail (simulated QuotaExceededError) does not fail the load — the already-fetched weights are still returned", async () => {
     const store = new InMemoryChunkStore();
     // Delegates read operations to a real (empty) store and fails every

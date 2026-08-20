@@ -37,8 +37,11 @@ Entries record **why** a change was needed. What changed is in the diff.
   (`weight-cache.ts#DEFAULT_CHUNK_SIZE_BYTES`, the midpoint of this issue's own
   64–128 MiB range) before being written — a single ~1.4 GiB `IndexedDB` value is what
   this issue's own spec asks to avoid (browser blob-size implementation differences,
-  and no way to show incremental write progress). Storage is behind a small injected
-  interface, `llm/chunk-store.ts#ChunkStore` (`get`/`put`/`delete`/`list`, all
+  and no way to show incremental write progress) — written and read one chunk at a
+  time (`llm/weight-cache.ts#iterateChunks`, a generator) rather than materializing
+  every chunk of a file up front, so a ~1.4 GiB read or write peaks at roughly the
+  file's own size plus one chunk, not roughly double it. Storage is behind a small
+  injected interface, `llm/chunk-store.ts#ChunkStore` (`get`/`put`/`delete`/`list`, all
   `ArrayBuffer`-valued), so every piece of cache logic — chunk splitting, manifest-hash
   comparison, stale-version eviction, the quota/fallback decision — is unit-tested in
   Node against `InMemoryChunkStore`, with no browser and no IndexedDB; only the real
@@ -46,6 +49,42 @@ Entries record **why** a change was needed. What changed is in the diff.
   IndexedDB types, since neither this repository's `tsconfig.json` — deliberately
   `"DOM"`-lib-free — nor `@types/node` has any), needs the real-Chrome verification
   this issue's PR carries.
+
+  The quota check (`decideCacheStrategy`) gates only the *write* path, never a read —
+  a cache read frees no space and needs none, and gating it too would have made a
+  device whose reported `usage` (which includes this very cache once one write
+  succeeds) leaves too little headroom refetch the entire checkpoint on every visit
+  from then on, forever, even though the cache it just refused to read was perfectly
+  valid. A read failure (an IndexedDB `get()` rejecting — storage pressure closing the
+  connection, a stale database from an older store-name layout) is caught and treated
+  as a cache miss, the same fallback every other failure mode here already gets, rather
+  than failing the whole load. `IndexedDbChunkStore#put`/`#delete` resolve on their
+  *transaction*'s `oncomplete` (reject on `onabort`/`onerror`), not on the individual
+  request's own `onsuccess` — a large write's request can report success and still have
+  its transaction abort during commit (`QuotaExceededError`'s usual shape), and
+  resolving on the request alone let a caller believe a chunk was durably written when
+  it was not. The orphan sweep (`sweepOrphanedChunks`) now matches exact
+  `namespace`/`manifestHash`/`file`/index chunk keys against a version record's own
+  `chunkCount`, rather than a `namespace`/`manifestHash`/`file` *prefix* — re-writing
+  the same file under the same hash with a different chunk size (a changed
+  `DEFAULT_CHUNK_SIZE_BYTES`, say) used to leave every chunk beyond the new, smaller
+  `chunkCount` behind forever, since they shared the kept prefix — and it now also runs
+  (best-effort) after a cache *hit*, not only at the end of a successful cache-miss
+  write, so chunks orphaned by an interrupted write are reclaimed the next time this
+  cache is read rather than sitting unclaimed for as long as every later visit keeps
+  hitting.
+
+  Known limitation, tracked as [#124](https://github.com/m96-chan/web-xpu-ops/issues/124):
+  versioning one `manifestHash` across all three binary files means a hypothetical
+  future producer of this checkpoint format that keeps `manifest.json` byte-identical
+  while republishing one of the binaries (this repository's own `convert_weights.py`
+  does not — it regenerates `manifest.json`, and so the hash, on every run) could have
+  an interrupted overwrite leave old- and new-version chunks mixed under one hash that
+  this cache's own length check cannot tell apart from a correctly written file. Also
+  tracked, lower priority since it cannot corrupt data either way (only causes
+  redundant re-downloads and a non-deterministic "winner"):
+  [#125](https://github.com/m96-chan/web-xpu-ops/issues/125), concurrent tabs open
+  across a deploy window each detecting the other's freshly-written version as stale.
 
 - `LlamaEngineQ8Resident` (`llm/engine-q8-resident.ts`, issue #110): a
   GPU-resident decode path for `LlamaEngineQ8` — one `queue.submit` and one

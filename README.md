@@ -805,14 +805,33 @@ already passes fewer than five arguments.
   (`DEFAULT_CHUNK_SIZE_BYTES`) before being written — never one ~1.4 GiB
   `IndexedDB` value.
 - **Fallback**: IndexedDB unavailable, `indexedDB.open()` failing (Safari
-  private mode), or `navigator.storage.estimate()` reporting insufficient free
-  space all fall back transparently to a plain network load — no feature loss,
-  only a persistence difference.
+  private mode), a read failing (`get()` rejecting — storage pressure closing
+  the connection, a stale database from an older store-name layout), or
+  `navigator.storage.estimate()` reporting insufficient free space *for a
+  write* all fall back transparently to a plain network load — no feature
+  loss, only a persistence difference. The quota check gates only the write
+  path, deliberately: a read frees no space and needs none, so a device whose
+  reported `usage` includes this very cache (true from the moment one write
+  succeeds) never has that alone make a valid cache unreadable.
 - **Storage**: behind `llm/chunk-store.ts#ChunkStore` (`get`/`put`/`delete`/`list`),
   injected — `llm/idb-chunk-store.ts#createIndexedDbChunkStore` is the real
-  IndexedDB backend, `InMemoryChunkStore` is what every Node test
+  IndexedDB backend (its `put`/`delete` resolve on the owning transaction's
+  `oncomplete`, not the individual request's `onsuccess`, so a write whose
+  transaction aborts on commit — a large value's `QuotaExceededError` — is
+  reported as the failure it is), `InMemoryChunkStore` is what every Node test
   (`chunk-store.test.ts`, `weight-cache.test.ts`, `browser-weights.cache.test.ts`)
   runs the cache logic against instead.
+- **Known limitations**: versioning one hash across all three binary files
+  means a hypothetical future producer of this checkpoint format that keeps
+  `manifest.json` byte-identical while republishing only a binary could — if
+  interrupted mid-write — mix old- and new-version chunks under one hash
+  undetectably ([#124](https://github.com/m96-chan/web-xpu-ops/issues/124),
+  not reachable by this repository's own `convert_weights.py`, which always
+  changes `manifest.json` too). Concurrent tabs open across a deploy window
+  can each treat the other's freshly-written version as stale and re-download
+  ([#125](https://github.com/m96-chan/web-xpu-ops/issues/125)) — wasteful, but
+  never data-corrupting, since a load's `manifestHash` and the chunks it reads
+  always agree.
 
 **Real-hardware verification (non-headless Chrome, DevTools Network domain
 over CDP).** Driven with raw CDP (Node's own `WebSocket`, no puppeteer) against

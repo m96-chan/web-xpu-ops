@@ -223,22 +223,20 @@ describe("sweepOrphanedChunks", () => {
     const store = new InMemoryChunkStore();
     await writeCachedFile(store, "ns1", "oldHash", "codes", new Uint8Array(20).buffer, 10);
     await writeCachedFile(store, "ns1", "newHash", "codes", new Uint8Array(20).buffer, 10);
-    await writeCurrentVersion(store, "ns1", {
+    const keep: CurrentVersionRecord = {
       manifestHash: "newHash",
       files: { codes: { totalBytes: 20, chunkSizeBytes: 10, chunkCount: 2 } },
-    });
+    };
+    await writeCurrentVersion(store, "ns1", keep);
 
-    await sweepOrphanedChunks(store, "ns1", "newHash");
+    await sweepOrphanedChunks(store, "ns1", keep);
 
     const remaining = await store.list();
     expect(remaining.some((k) => k.includes("oldHash"))).toBe(false);
     expect(remaining.some((k) => k.includes("newHash"))).toBe(true);
     // The current-version record itself, whose key carries no manifestHash,
     // must survive the sweep — it is what the *next* load reads first.
-    await expect(readCurrentVersion(store, "ns1")).resolves.toEqual({
-      manifestHash: "newHash",
-      files: { codes: { totalBytes: 20, chunkSizeBytes: 10, chunkCount: 2 } },
-    });
+    await expect(readCurrentVersion(store, "ns1")).resolves.toEqual(keep);
   });
 
   it("never touches another namespace's chunks", async () => {
@@ -246,13 +244,16 @@ describe("sweepOrphanedChunks", () => {
     await writeCachedFile(store, "ns1", "hashA", "codes", new Uint8Array(10).buffer, 10);
     await writeCachedFile(store, "ns2", "hashA", "codes", new Uint8Array(10).buffer, 10);
 
-    await sweepOrphanedChunks(store, "ns1", "some-other-hash");
+    await sweepOrphanedChunks(store, "ns1", {
+      manifestHash: "some-other-hash",
+      files: { codes: { totalBytes: 0, chunkSizeBytes: 10, chunkCount: 0 } },
+    });
 
     const remaining = await store.list();
     expect(remaining.some((k) => k.includes("ns2"))).toBe(true);
   });
 
-  it("with keepManifestHash undefined, removes every chunk (and the current-version key) under the namespace", async () => {
+  it("with keep undefined, removes every chunk (and the current-version key) under the namespace", async () => {
     const store = new InMemoryChunkStore();
     await writeCachedFile(store, "ns1", "hashA", "codes", new Uint8Array(10).buffer, 10);
     await writeCurrentVersion(store, "ns1", {
@@ -264,6 +265,47 @@ describe("sweepOrphanedChunks", () => {
 
     const remaining = await store.list();
     expect(remaining.filter((k) => k.includes("ns1"))).toHaveLength(0);
+  });
+
+  it("review item #7: a chunk-size change under the SAME manifestHash leaves no stale higher-index chunks behind", async () => {
+    // Repro: first write under hashA with a small chunk size (8 chunks for
+    // an 80-byte file), then re-write the *same* file under the *same*
+    // hashA with a larger chunk size (1 chunk). A prefix-based sweep
+    // (`${namespace} ${hashA} codes `) keeps every one of the 8 old chunk
+    // keys too, since they share that prefix with the 1 new one — only an
+    // exact per-index check catches that chunks 1..7 are now orphans.
+    const store = new InMemoryChunkStore();
+    await writeCachedFile(store, "ns1", "hashA", "codes", new Uint8Array(80).buffer, 10);
+    for (let i = 0; i < 8; i += 1) {
+      await expect(store.get(chunkKey("ns1", "hashA", "codes", i))).resolves.toBeDefined();
+    }
+
+    const newInfo = await writeCachedFile(store, "ns1", "hashA", "codes", new Uint8Array(80).buffer, 96);
+    expect(newInfo.chunkCount).toBe(1);
+    const keep: CurrentVersionRecord = { manifestHash: "hashA", files: { codes: newInfo } };
+    await writeCurrentVersion(store, "ns1", keep);
+
+    await sweepOrphanedChunks(store, "ns1", keep);
+
+    await expect(store.get(chunkKey("ns1", "hashA", "codes", 0))).resolves.toBeDefined();
+    for (let i = 1; i < 8; i += 1) {
+      await expect(store.get(chunkKey("ns1", "hashA", "codes", i))).resolves.toBeUndefined();
+    }
+  });
+
+  it("keeps only the exact chunk indices info.chunkCount implies, per file, even across multiple files under one hash", async () => {
+    const store = new InMemoryChunkStore();
+    const codesInfo = await writeCachedFile(store, "ns1", "hashA", "codes", new Uint8Array(25).buffer, 10);
+    const scalesInfo = await writeCachedFile(store, "ns1", "hashA", "scales", new Uint8Array(5).buffer, 10);
+    const keep: CurrentVersionRecord = { manifestHash: "hashA", files: { codes: codesInfo, scales: scalesInfo } };
+
+    await sweepOrphanedChunks(store, "ns1", keep);
+
+    const remaining = new Set(await store.list());
+    expect(remaining.has(chunkKey("ns1", "hashA", "codes", 0))).toBe(true);
+    expect(remaining.has(chunkKey("ns1", "hashA", "codes", 1))).toBe(true);
+    expect(remaining.has(chunkKey("ns1", "hashA", "codes", 2))).toBe(true);
+    expect(remaining.has(chunkKey("ns1", "hashA", "scales", 0))).toBe(true);
   });
 });
 

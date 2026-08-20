@@ -14,6 +14,7 @@ import {
   writeCachedFile,
   writeCurrentVersion,
   type CachedFileInfo,
+  type CurrentVersionRecord,
 } from "./weight-cache.js";
 import type { LlamaWeightsQ8 } from "./weights-q8.js";
 import { assertWeightShapesQ8 } from "./weights-q8.js";
@@ -221,62 +222,119 @@ export async function loadWeightsQ8FromUrl(
     [codesBuf, scalesBuf, normsBuf] = await fetchAllFromNetwork();
   } else {
     const manifestHash = await sha256Hex(manifestBytes);
-    const sizes = expectedFileByteSizes(manifest.weights);
-    const requiredBytes = sizes.codes + sizes.scales + sizes.norms;
-    const estimateQuota = cacheOptions.estimateQuota ?? estimateStorageQuota;
-    const quota = await estimateQuota();
-    const decision = decideCacheStrategy({
-      indexedDbSupported: true,
-      quota,
-      requiredBytes,
-      headroomRatio: cacheOptions.headroomRatio,
-    });
 
-    const current = decision.useCache ? await readCurrentVersion(store, base) : undefined;
-    const cachedInfo = current?.manifestHash === manifestHash ? current.files : undefined;
-    const hit =
-      cachedInfo?.codes && cachedInfo.scales && cachedInfo.norms
-        ? await readAllCachedFiles(store, base, manifestHash, cachedInfo as Record<"codes" | "scales" | "norms", CachedFileInfo>)
-        : undefined;
+    // Attempt a cache hit first — never gated by quota (review item #1: a
+    // read consumes no storage, only a *write* can legitimately be refused
+    // for quota reasons; gating the read too meant that once one successful
+    // write made `navigator.storage.estimate()`'s own `usage` include this
+    // cache's bytes, "free space looks insufficient" became permanent and a
+    // valid cache was never read again — every subsequent visit re-downloaded
+    // the full checkpoint forever) and never allowed to fail the load
+    // (review item #2: a real IndexedDB `get()` can reject — storage
+    // pressure closing the connection mid-read, "Clear site data", a stale
+    // database from an older cache-store-name layout returning
+    // `NotFoundError` — and without a `try`/`catch` here that rejection
+    // propagated out of this function itself, turning a load that would
+    // have succeeded over plain HTTP into an outright failure; every other
+    // way this cache can be broken — a write failure, a corrupted chunk, a
+    // hash mismatch — already falls back instead of throwing, and issue
+    // #121's own completion condition ("フォールバック動作") promises the
+    // same here).
+    let hit: { codes: ArrayBuffer; scales: ArrayBuffer; norms: ArrayBuffer } | undefined;
+    let current: CurrentVersionRecord | undefined;
+    try {
+      current = await readCurrentVersion(store, base);
+      const cachedInfo = current?.manifestHash === manifestHash ? current.files : undefined;
+      hit =
+        cachedInfo?.codes && cachedInfo.scales && cachedInfo.norms
+          ? await readAllCachedFiles(store, base, manifestHash, cachedInfo as Record<"codes" | "scales" | "norms", CachedFileInfo>)
+          : undefined;
+    } catch {
+      hit = undefined;
+    }
 
     if (hit) {
       ({ codes: codesBuf, scales: scalesBuf, norms: normsBuf } = hit);
       reportCacheHit(onProgress, "codes", codesBuf.byteLength);
       reportCacheHit(onProgress, "scales", scalesBuf.byteLength);
       reportCacheHit(onProgress, "norms", normsBuf.byteLength);
+
+      // Best-effort orphan sweep on a hit too (review item #6): the write
+      // path's own sweep below only ever ran at the tail of a *miss* that
+      // fully succeeded, so chunks left behind by a write that wrote some
+      // chunks (or even this very `current` record) but crashed before
+      // reaching its own sweep would otherwise sit unreclaimed for as long
+      // as every later visit keeps hitting — which is exactly the visit
+      // pattern a working cache produces. `current` is already the record
+      // this hit just read, so this is a cheap no-op scan whenever nothing
+      // is actually orphaned.
+      try {
+        await sweepOrphanedChunks(store, base, current);
+      } catch {
+        // A failed sweep must not turn a successful hit into a failed load.
+      }
     } else {
       [codesBuf, scalesBuf, normsBuf] = await fetchAllFromNetwork();
 
-      if (decision.useCache) {
-        // Best-effort only, deliberately outside any path that could fail
-        // the load itself: the weights are already in memory from the fetch
-        // above, so a write failure here (a `QuotaExceededError` mid-write —
-        // `estimate()`'s number is a snapshot, not a reservation — or any
-        // other IndexedDB error) must never surface as this function
-        // throwing.
-        try {
+      // Best-effort only, deliberately outside any path that could fail
+      // the load itself: the weights are already in memory from the fetch
+      // above, so a write failure here (a `QuotaExceededError` mid-write —
+      // `estimate()`'s number is a snapshot, not a reservation — or any
+      // other IndexedDB error) must never surface as this function
+      // throwing. The quota check itself is computed here, not before the
+      // hit attempt above, precisely so it only ever gates this write.
+      try {
+        const sizes = expectedFileByteSizes(manifest.weights);
+        const requiredBytes = sizes.codes + sizes.scales + sizes.norms;
+        const estimateQuota = cacheOptions.estimateQuota ?? estimateStorageQuota;
+        const quota = await estimateQuota();
+        const decision = decideCacheStrategy({
+          indexedDbSupported: true,
+          quota,
+          requiredBytes,
+          headroomRatio: cacheOptions.headroomRatio,
+        });
+
+        if (decision.useCache) {
           const chunkSizeBytes = cacheOptions.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
           const requestPersist = cacheOptions.requestPersist ?? requestPersistentStorage;
           await requestPersist();
           const codesInfo = await writeCachedFile(store, base, manifestHash, "codes", codesBuf, chunkSizeBytes);
           const scalesInfo = await writeCachedFile(store, base, manifestHash, "scales", scalesBuf, chunkSizeBytes);
           const normsInfo = await writeCachedFile(store, base, manifestHash, "norms", normsBuf, chunkSizeBytes);
+          const written: CurrentVersionRecord = {
+            manifestHash,
+            files: { codes: codesInfo, scales: scalesInfo, norms: normsInfo },
+          };
           // Chunks written before the current-version record that points to
           // them, and the record written before the sweep that deletes
           // everything else: a crash between any two of these steps leaves
           // either the previous version still readable (crash before this
           // record lands) or this version readable with some harmless
           // orphaned chunks left over (crash after it lands but before the
-          // sweep) — never a `current` record pointing at chunks that were
-          // never fully written.
-          await writeCurrentVersion(store, base, {
-            manifestHash,
-            files: { codes: codesInfo, scales: scalesInfo, norms: normsInfo },
-          });
-          await sweepOrphanedChunks(store, base, manifestHash);
-        } catch {
-          // See the comment above the `try`.
+          // sweep — reclaimed by review item #6's hit-path sweep above, the
+          // next time this cache is read) — never a `current` record
+          // pointing at chunks that were never fully written.
+          //
+          // Known limitation (review item #5, tracked as issue #124): this
+          // write is not atomic across the three files. A re-publish that
+          // keeps `manifest.json` byte-identical (so `manifestHash` is
+          // unchanged) while replacing one or more of the three binaries —
+          // not how this repository's own `convert_weights.py` works (it
+          // always regenerates `manifest.json` too), but not ruled out for a
+          // different future producer of this file layout — interrupted
+          // mid-overwrite could leave a mix of old- and new-version chunks
+          // under one hash that this cache's own per-file length check
+          // cannot distinguish from a correctly written file, silently
+          // serving a corrupted checkpoint. The real fix is per-file
+          // versioning (folding something like an ETag/Last-Modified into
+          // each file's own chunk-key hash, not just the manifest's) rather
+          // than one hash shared by all three files; out of scope here.
+          await writeCurrentVersion(store, base, written);
+          await sweepOrphanedChunks(store, base, written);
         }
+      } catch {
+        // See the comment above the `try`.
       }
     }
   }

@@ -42,6 +42,10 @@ interface MinimalIDBObjectStore {
 
 interface MinimalIDBTransaction {
   objectStore(name: string): MinimalIDBObjectStore;
+  oncomplete: (() => void) | null;
+  onabort: (() => void) | null;
+  onerror: (() => void) | null;
+  readonly error: unknown;
 }
 
 interface MinimalIDBDatabase {
@@ -111,6 +115,35 @@ function wrapRequest<T>(request: MinimalIDBRequest<T>): Promise<T> {
 }
 
 /**
+ * Resolves once `transaction` *commits* (`oncomplete`), rejects if it
+ * `onabort`s or `onerror`s — never on the individual request's own
+ * `onsuccess`/`onerror`. A write request can report `onsuccess` (IndexedDB
+ * accepted and queued it) and still have its transaction abort later during
+ * commit — the textbook shape of a `QuotaExceededError` on a large value,
+ * per spec enforced at commit time, not per request. Resolving on the
+ * request instead (as an earlier revision of this module did — review item
+ * #3, reproduced deterministically in `idb-chunk-store.test.ts` with a fake
+ * `indexedDB` that fires exactly this sequence) means `put()` can report
+ * success for a chunk that was never actually written, and the caller three
+ * lines later — `browser-weights.ts`'s `writeCurrentVersion` — writes a
+ * `current` record pointing at it as if it existed. The bytes are corrupt or
+ * missing on the next read, silently, past the version this comment sits at
+ * next to `browser-weights.ts`'s own "never happens" promise about exactly
+ * that outcome.
+ *
+ * Only used for `readwrite` transactions (`put`/`delete` below); `get`/`list`
+ * stay request-based (`wrapRequest`) — a read has nothing to roll back on
+ * abort, so there is no durability gap for it to close.
+ */
+function runReadWriteTransaction(transaction: MinimalIDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(errorOf(transaction.error ?? new Error("idb-chunk-store: transaction aborted")));
+    transaction.onerror = () => reject(errorOf(transaction.error ?? new Error("idb-chunk-store: transaction error")));
+  });
+}
+
+/**
  * Opens (creating on first use) `dbName`/`storeName` and returns a
  * `ChunkStore` over it. Each operation runs in its own transaction rather
  * than sharing one across `await`s — IndexedDB auto-commits a transaction
@@ -130,12 +163,14 @@ export async function createIndexedDbChunkStore(
       return wrapRequest(store.get(key));
     },
     async put(key: string, value: ArrayBuffer): Promise<void> {
-      const store = db.transaction(storeName, "readwrite").objectStore(storeName);
-      await wrapRequest(store.put(value, key));
+      const transaction = db.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).put(value, key);
+      await runReadWriteTransaction(transaction);
     },
     async delete(key: string): Promise<void> {
-      const store = db.transaction(storeName, "readwrite").objectStore(storeName);
-      await wrapRequest(store.delete(key));
+      const transaction = db.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).delete(key);
+      await runReadWriteTransaction(transaction);
     },
     async list(): Promise<string[]> {
       const store = db.transaction(storeName, "readonly").objectStore(storeName);
