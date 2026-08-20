@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { agree, type Tolerance } from "./agree.js";
+import { createResidentDevice, type ResidentDevice } from "./resident.js";
 import { createRunner, type Dispatch, type Runner } from "./wgsl.js";
 
 /**
@@ -42,6 +43,47 @@ export function gpuTest(name: string, body: (run: Runner["run"]) => Promise<void
   it(name, async () => {
     if (!current) return;
     await body(current.run);
+  });
+}
+
+const RESIDENT_SHARED = Symbol.for("web-xpu-ops.resident-device");
+type ResidentHolder = { [RESIDENT_SHARED]?: Promise<ResidentDevice | null> };
+
+/**
+ * `useGpu`'s counterpart for `harness/resident.ts` — same one-device-for-the-run,
+ * cached-on-globalThis, torn-down-at-the-end shape, for the same reason (Dawn
+ * does not tolerate a device per test, or a device outliving the process).
+ * A separate cache key and a separate device instance from `useGpu`'s,
+ * deliberately: `ResidentDevice` is requested with different buffer-size
+ * limits (`resident.ts`'s own doc — a resident engine's weight buffers need
+ * headroom `createRunner`'s calibration-sized request does not), and sharing
+ * one device between a `Runner`-style caller and a `ResidentDevice`-style
+ * caller would mean either one's buffer lifetime assumptions could leak into
+ * the other's.
+ */
+export function useResidentGpu(): () => ResidentDevice | null {
+  beforeAll(async () => {
+    const holder = globalThis as ResidentHolder;
+    holder[RESIDENT_SHARED] ??= createResidentDevice();
+    currentResident = await holder[RESIDENT_SHARED];
+  }, 60_000);
+  afterAll(async () => {
+    const holder = globalThis as ResidentHolder;
+    if (!holder[RESIDENT_SHARED]) return;
+    const device = await holder[RESIDENT_SHARED];
+    delete holder[RESIDENT_SHARED];
+    currentResident = null;
+    device?.destroy();
+  });
+  return () => currentResident;
+}
+
+let currentResident: ResidentDevice | null = null;
+
+export function residentTest(name: string, body: (device: ResidentDevice) => Promise<void>): void {
+  it(name, async () => {
+    if (!currentResident) return;
+    await body(currentResident);
   });
 }
 

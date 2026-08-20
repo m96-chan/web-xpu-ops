@@ -1,0 +1,142 @@
+import { describe, expect } from "vitest";
+import { params } from "./wgsl.js";
+import { kernel, residentTest, useResidentGpu } from "./suite.js";
+
+const elementwiseKernel = kernel(new URL("../ops/elementwise/index.ts", import.meta.url));
+
+/**
+ * `harness/resident.ts` exists for issue #110: build every buffer, pipeline
+ * and bind group once, then run many dispatches behind one `queue.submit`,
+ * reading back only what was asked for. These tests exercise that contract
+ * directly, against a real op's real WGSL (`ops/elementwise`) rather than a
+ * toy shader — `llm/engine-q8-resident.ts` chains exactly this kernel for
+ * residual adds, so a resident-mode bug in binding order or offset handling
+ * shows up here first, at a fraction of the setup.
+ */
+describe("resident device", () => {
+  const getDevice = useResidentGpu();
+
+  residentTest("chains two dispatches through a GPU-resident intermediate buffer, one submit, one readback", async (device) => {
+    // a=[1,2,3,4], b=[10,10,10,10]: sum = a+b = [11,12,13,14], then
+    // product = sum*a = [11*1, 12*2, 13*3, 14*4] = [11, 24, 39, 56] — the
+    // second dispatch reads the first dispatch's *output buffer* straight
+    // back in as an input, with no CPU round trip in between.
+    const a = new Float32Array([1, 2, 3, 4]);
+    const b = new Float32Array([10, 10, 10, 10]);
+    const N = a.length;
+
+    const aBuf = device.createStorageBuffer(N * 4);
+    const bBuf = device.createStorageBuffer(N * 4);
+    const sumBuf = device.createStorageBuffer(N * 4);
+    const productBuf = device.createStorageBuffer(N * 4);
+    const addParams = device.createUniformBuffer(16);
+    const mulParams = device.createUniformBuffer(16);
+    const staging = device.createStorageBuffer(N * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+
+    device.upload(aBuf, 0, a);
+    device.upload(bBuf, 0, b);
+    device.upload(addParams, 0, new Uint8Array(params([["u32", N], ["u32", 0]])));
+    device.upload(mulParams, 0, new Uint8Array(params([["u32", N], ["u32", 1]])));
+
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const addGroup = await device.bindGroup(pipeline, [aBuf, bBuf, sumBuf, addParams]);
+    // Second dispatch reads the first dispatch's output straight back in as
+    // an input — no CPU round trip between them, which is the entire point.
+    const mulGroup = await device.bindGroup(pipeline, [sumBuf, aBuf, productBuf, mulParams]);
+
+    const submitsBefore = device.stats.submits;
+    const [result] = await device.batch(
+      [
+        { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
+        { kind: "dispatch", pipeline, bindGroup: mulGroup, workgroups: [1] },
+      ],
+      [{ staging, source: productBuf, sourceOffset: 0, length: N, type: "f32" }],
+    );
+
+    expect(device.stats.submits).toBe(submitsBefore + 1);
+    expect(Array.from(result as Float32Array)).toEqual([11, 24, 39, 56]);
+  });
+
+  residentTest("a copy op moves bytes between persistent buffers within the same submit", async (device) => {
+    const src = device.createStorageBuffer(16);
+    const dst = device.createStorageBuffer(16);
+    const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    device.upload(src, 0, new Float32Array([1, 2, 3, 4]));
+
+    const [result] = await device.batch(
+      [{ kind: "copy", src, srcOffset: 0, dst, dstOffset: 0, size: 16 }],
+      [{ staging, source: dst, sourceOffset: 0, length: 4, type: "f32" }],
+    );
+
+    expect(Array.from(result as Float32Array)).toEqual([1, 2, 3, 4]);
+  });
+
+  residentTest("buffers created before batch() are not recreated by repeated batches — the decode-loop invariant", async (device) => {
+    const a = device.createStorageBuffer(16);
+    const b = device.createStorageBuffer(16);
+    const out = device.createStorageBuffer(16);
+    const uniform = device.createUniformBuffer(16);
+    const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    device.upload(a, 0, new Float32Array([1, 1, 1, 1]));
+    device.upload(b, 0, new Float32Array([2, 2, 2, 2]));
+    device.upload(uniform, 0, new Uint8Array(params([["u32", 4], ["u32", 0]])));
+
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const bindGroup = await device.bindGroup(pipeline, [a, b, out, uniform]);
+
+    const buffersBefore = device.stats.buffersCreated;
+    const pipelinesBefore = device.stats.pipelinesCreated;
+    for (let step = 0; step < 5; step += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await device.batch(
+        [{ kind: "dispatch", pipeline, bindGroup, workgroups: [1] }],
+        [{ staging, source: out, sourceOffset: 0, length: 4, type: "f32" }],
+      );
+    }
+
+    expect(device.stats.buffersCreated).toBe(buffersBefore);
+    expect(device.stats.pipelinesCreated).toBe(pipelinesBefore);
+  });
+
+  residentTest("two readbacks in one batch — the lmHead chunking shape — return independent slices", async (device) => {
+    // Mirrors how `llm/engine-q8-resident.ts` reads `lmHead`'s two chunked
+    // dispatches back (`MAX_WORKGROUPS_PER_DISPATCH`, `llm/kernels.ts`) as
+    // two separate buffers rather than one buffer sliced by an unaligned
+    // byte offset (see `resident.ts#bindGroup`'s doc for why offset slicing
+    // is not used here) — one `batch()` call, one submit, two outputs.
+    const a1 = device.createStorageBuffer(16);
+    const b1 = device.createStorageBuffer(16);
+    const out1 = device.createStorageBuffer(16);
+    const uniform1 = device.createUniformBuffer(16);
+    const staging1 = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    const a2 = device.createStorageBuffer(16);
+    const b2 = device.createStorageBuffer(16);
+    const out2 = device.createStorageBuffer(16);
+    const uniform2 = device.createUniformBuffer(16);
+    const staging2 = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+    device.upload(a1, 0, new Float32Array([1, 2, 3, 4]));
+    device.upload(b1, 0, new Float32Array([10, 10, 10, 10]));
+    device.upload(uniform1, 0, new Uint8Array(params([["u32", 4], ["u32", 0]])));
+    device.upload(a2, 0, new Float32Array([5, 6, 7, 8]));
+    device.upload(b2, 0, new Float32Array([20, 20, 20, 20]));
+    device.upload(uniform2, 0, new Uint8Array(params([["u32", 4], ["u32", 0]])));
+
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const group1 = await device.bindGroup(pipeline, [a1, b1, out1, uniform1]);
+    const group2 = await device.bindGroup(pipeline, [a2, b2, out2, uniform2]);
+
+    const [chunk0, chunk1] = await device.batch(
+      [
+        { kind: "dispatch", pipeline, bindGroup: group1, workgroups: [1] },
+        { kind: "dispatch", pipeline, bindGroup: group2, workgroups: [1] },
+      ],
+      [
+        { staging: staging1, source: out1, sourceOffset: 0, length: 4, type: "f32" },
+        { staging: staging2, source: out2, sourceOffset: 0, length: 4, type: "f32" },
+      ],
+    );
+
+    expect(Array.from(chunk0 as Float32Array)).toEqual([11, 12, 13, 14]);
+    expect(Array.from(chunk1 as Float32Array)).toEqual([25, 26, 27, 28]);
+  });
+});

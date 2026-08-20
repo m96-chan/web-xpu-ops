@@ -9,6 +9,35 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `LlamaEngineQ8Resident` (`llm/engine-q8-resident.ts`, issue #110): a
+  GPU-resident decode path for `LlamaEngineQ8` — one `queue.submit` and one
+  logits-only readback per generated token, instead of the ~155 GPU↔CPU
+  round trips (one per kernel dispatch, per layer) `LlamaEngineQ8.forward`
+  pays today. Real-model measurement (`examples/llm-demo`, RTX 5090,
+  Sarashina2.2-1B-alibi-v1): decode went from **0.75–0.80 tok/s to
+  137–162 tok/s** (~175–200x), with byte-for-byte identical generated text
+  to `LlamaEngineQ8` on both prompts tested — see the PR for the full
+  before/after table, roofline decomposition and screenshots.
+
+  `harness/resident.ts` (`ResidentDevice`) is the new low-level layer this
+  runs on: build every buffer, pipeline and bind group once at construction,
+  then record many dispatches (plus GPU-to-GPU `copyBufferToBuffer` for the
+  KV-cache writes) into one command encoder per token. `harness/wgsl.ts`'s
+  existing `Runner`/`createRunner()` is unchanged and still what every op's
+  own correctness test uses (rule 8: optimize only after a reference-correct
+  baseline exists) — `ResidentDevice` exists solely for this decode path,
+  where the WGSL, binding order and uniform layout are already known correct
+  from `llm/kernels.ts`. `harness/resident.ts#runnerFromResident` adapts one
+  `ResidentDevice` back into a `Runner["run"]`, which `LlamaEngineQ8Resident`
+  uses for prefill (unchanged scope — issue #110 is decode only) instead of
+  a second native device: an earlier version took a genuinely separate
+  `Runner`, and running both engines' dispatches on two devices in one
+  process reproducibly crashed this repository's Node/Dawn binding (the
+  same failure family issue #38/#49/#107 already document).
+
+  `examples/llm-demo` gained a "GPU常駐デコード" toggle so the same page can
+  run either engine against the same loaded weights for a direct comparison.
+
 - `examples/llm-demo/`: a browser demo that loads Sarashina2.2-1B-alibi-v1
   (int8, `convert_weights.py`'s output) over HTTP and runs `LlamaEngineQ8` on
   a real WebGPU device — issue #106, and the first time this repository's

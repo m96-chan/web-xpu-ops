@@ -30,12 +30,14 @@
 import { LineFormatConstraint, type LineFormatSpec } from "../../../llm/constraints/line-format.js";
 import type { TokenCodec } from "../../../llm/constraints/token-codec.js";
 import { LlamaEngineQ8 } from "../../../llm/engine-q8.js";
+import { LlamaEngineQ8Resident } from "../../../llm/engine-q8-resident.js";
 import { sampleNext, type Constraint } from "../../../llm/sampler.js";
 import { SentencePieceTokenizer, type TokenizerVocab } from "../../../llm/tokenizer.js";
 import { loadWeightsQ8FromUrl } from "../../../llm/browser-weights.js";
 import type { LlamaConfig } from "../../../llm/config.js";
 import type { LlamaWeightsQ8 } from "../../../llm/weights-q8.js";
 import { createBrowserRunner } from "./browser-runtime.js";
+import { createBrowserResidentDevice } from "./browser-resident-runtime.js";
 
 // ---------------------------------------------------------------------------
 // Prompt format and system prompt: copied verbatim from
@@ -138,6 +140,7 @@ const styleControls = el<HTMLElement>("styleControls");
 const listenControls = el<HTMLElement>("listenControls");
 const policySelect = el<HTMLSelectElement>("policy");
 const listenConstraintToggle = el<HTMLInputElement>("listenConstraint");
+const residentEngineToggle = el<HTMLInputElement>("residentEngine");
 const inputText = el<HTMLTextAreaElement>("input");
 const genBtn = el<HTMLButtonElement>("genBtn");
 const promptPreview = el<HTMLElement>("promptPreview");
@@ -245,35 +248,26 @@ genBtn.addEventListener("click", () => {
   });
 });
 
-async function runGeneration(): Promise<void> {
+/** Both `LlamaEngineQ8` and `LlamaEngineQ8Resident` expose exactly this — the shape the decode loop below actually needs, regardless of which one built it. */
+interface ForwardEngine {
+  forward(tokens: number[]): Promise<Float32Array[]>;
+}
+
+/**
+ * The sampling loop, factored out of `runGeneration` so it runs identically
+ * over either engine — issue #110's whole point is that the *decode
+ * structure* changed, not sampling, tokenization or when to stop, so this
+ * function is exactly the part that must stay byte-for-byte the same
+ * between a `LlamaEngineQ8` run and a `LlamaEngineQ8Resident` run for the
+ * two to be a fair before/after comparison.
+ */
+async function generate(
+  engine: ForwardEngine,
+  promptTokens: number[],
+  constraint: Constraint | undefined,
+): Promise<{ tokens: number[]; prefillMs: number; decodeMsTotal: number; decodeSteps: number }> {
   if (!loaded) throw new Error("重みが未ロードです");
-  const { engineConfig, weights, tokenizer, codec, vocab, runner } = loaded;
-
-  const mode = currentMode();
-  const text = inputText.value;
-  const prompt = mode === "style" ? buildStylePrompt(policySelect.value, text) : buildListenPrompt(text);
-  promptPreview.textContent = prompt;
-
-  const promptTokens = tokenizer.encode(prompt);
-  const constraint: Constraint | undefined =
-    mode === "listen" && listenConstraintToggle.checked
-      ? new LineFormatConstraint(codec, buildListenSpec(vocab.eosId))
-      : undefined;
-
-  genBtn.disabled = true;
-  output.textContent = "";
-  stats.textContent = "生成中…";
-
-  // A fresh engine per generation: `LlamaEngineQ8` has no KV-cache reset, and
-  // packing every projection's `matvecQ8` wire format from the already-fetched
-  // `weights` is the correctness-preserving way to start a clean generation
-  // (see `engine-q8.ts`'s own doc — the constructor only reads `weights`, it
-  // does not mutate it, so building a second engine from the same loaded
-  // weights is safe). Its cost is reported separately from tok/s below, since
-  // it is a one-time setup cost, not a decode-time one.
-  const buildStart = performance.now();
-  const engine = new LlamaEngineQ8(engineConfig, weights, runner.run);
-  const buildMs = performance.now() - buildStart;
+  const { vocab, tokenizer } = loaded;
 
   const prefillStart = performance.now();
   const prefillLogits = await engine.forward(promptTokens);
@@ -298,15 +292,67 @@ async function runGeneration(): Promise<void> {
     output.textContent = tokenizer.decode(tokens);
   }
   output.textContent = tokenizer.decode(tokens);
+  return { tokens, prefillMs, decodeMsTotal, decodeSteps };
+}
 
-  const prefillTokPerSec = promptTokens.length / (prefillMs / 1000);
-  const decodeTokPerSec = decodeSteps > 0 ? decodeSteps / (decodeMsTotal / 1000) : 0;
+async function runGeneration(): Promise<void> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights, tokenizer, codec, vocab, runner } = loaded;
 
-  stats.textContent =
-    `engine construction: ${buildMs.toFixed(0)}ms | ` +
-    `prefill: ${promptTokens.length} tok in ${prefillMs.toFixed(0)}ms (${prefillTokPerSec.toFixed(2)} tok/s) | ` +
-    `decode: ${decodeSteps} tok in ${decodeMsTotal.toFixed(0)}ms (${decodeTokPerSec.toFixed(2)} tok/s)` +
-    (tokens[tokens.length - 1] === vocab.eosId ? " | stopped at </s>" : " | stopped at MAX_DECODE_STEPS");
+  const mode = currentMode();
+  const text = inputText.value;
+  const prompt = mode === "style" ? buildStylePrompt(policySelect.value, text) : buildListenPrompt(text);
+  promptPreview.textContent = prompt;
+
+  const promptTokens = tokenizer.encode(prompt);
+  const constraint: Constraint | undefined =
+    mode === "listen" && listenConstraintToggle.checked
+      ? new LineFormatConstraint(codec, buildListenSpec(vocab.eosId))
+      : undefined;
+
+  genBtn.disabled = true;
+  output.textContent = "";
+  const useResident = residentEngineToggle.checked;
+  stats.textContent = useResident ? "生成中… (GPU常駐デコード, issue #110)" : "生成中… (従来エンジン)";
+
+  // A fresh engine per generation: neither engine resets its own KV cache,
+  // and constructing a new one from the already-fetched `weights` is the
+  // correctness-preserving way to start clean (`engine-q8.ts`'s own doc —
+  // the constructor only reads `weights`, never mutates them). Cost
+  // reported separately from tok/s below, since it is one-time setup, not
+  // decode-time.
+  const buildStart = performance.now();
+  // A `ResidentDevice` is created lazily here, per generation, rather than
+  // once at load time alongside `runner` — one browser tab, two live
+  // `navigator.gpu` devices for the whole session, was exactly the shape
+  // that reproducibly crashed this repository's Node/Dawn binding
+  // (`harness/resident.ts#runnerFromResident`'s doc); a browser is far more
+  // robust than that native binding, but there is no reason to keep a
+  // second device alive between generations when nothing needs it to.
+  let residentDevice: Awaited<ReturnType<typeof createBrowserResidentDevice>> | null = null;
+  const engine: ForwardEngine = useResident
+    ? await (async () => {
+        residentDevice = await createBrowserResidentDevice();
+        return LlamaEngineQ8Resident.create(engineConfig, weights, residentDevice);
+      })()
+    : new LlamaEngineQ8(engineConfig, weights, runner.run);
+  const buildMs = performance.now() - buildStart;
+
+  try {
+    const { tokens, prefillMs, decodeMsTotal, decodeSteps } = await generate(engine, promptTokens, constraint);
+
+    const prefillTokPerSec = promptTokens.length / (prefillMs / 1000);
+    const decodeTokPerSec = decodeSteps > 0 ? decodeSteps / (decodeMsTotal / 1000) : 0;
+
+    stats.textContent =
+      `engine: ${useResident ? "LlamaEngineQ8Resident (#110)" : "LlamaEngineQ8"} | ` +
+      `construction: ${buildMs.toFixed(0)}ms | ` +
+      `prefill: ${promptTokens.length} tok in ${prefillMs.toFixed(0)}ms (${prefillTokPerSec.toFixed(2)} tok/s) | ` +
+      `decode: ${decodeSteps} tok in ${decodeMsTotal.toFixed(0)}ms (${decodeTokPerSec.toFixed(2)} tok/s)` +
+      (tokens[tokens.length - 1] === vocab.eosId ? " | stopped at </s>" : " | stopped at MAX_DECODE_STEPS");
+  } finally {
+    (residentDevice as Awaited<ReturnType<typeof createBrowserResidentDevice>> | null)?.destroy();
+  }
 
   genBtn.disabled = false;
 }

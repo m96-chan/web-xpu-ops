@@ -853,6 +853,134 @@ Engine construction (packing every projection into `matvecQ8`'s wire format)
 was ~1.0–1.1s per generation. See the PR for the full prompts, decoded
 output, and a screenshot.
 
+### `LlamaEngineQ8Resident`: GPU-resident decode (issue #110)
+
+The tok/s table above is `LlamaEngineQ8`'s own dispatch structure: one
+`Runner.run()` — its own buffer allocation, `queue.submit`, and readback —
+per kernel call, per layer, roughly 155 GPU↔CPU round trips for one decode
+step. `LlamaEngineQ8Resident` (`llm/engine-q8-resident.ts`) is the same
+model, the same WGSL, the same `matvecQ8` weights, restructured so one
+generated token costs **one `queue.submit`** and **one readback** (the final
+logits alone). Prefill is unchanged in scope (issue #110 is decode only) —
+the first `forward()` call is delegated whole to a `LlamaEngineQ8` instance
+internally; every call after that must be exactly one token.
+
+Same real checkpoint, same machine (RTX 5090, Chrome, non-headless, the
+demo's own "GPU常駐デコード" toggle), same two prompts as the table above —
+byte-for-byte identical generated text between the two engines on both:
+
+| case | engine | prefill | decode |
+| --- | --- | --- | --- |
+| `full_gear` | `LlamaEngineQ8` | 76 tok, 12.0s (6.4 tok/s) | 25 tok, 31.2s (**0.80 tok/s**) |
+| `full_gear` | `LlamaEngineQ8Resident` | 76 tok, 12.7s (6.0 tok/s) | 25 tok, 0.154s (**161.8 tok/s**) |
+| `brush_off` | `LlamaEngineQ8` | 69 tok, 12.0s (5.8 tok/s) | 13 tok, 16.4s (**0.79 tok/s**) |
+| `brush_off` | `LlamaEngineQ8Resident` | 69 tok, 12.9s (5.4 tok/s) | 13 tok, 0.095s (**137.6 tok/s**) |
+
+~175–200x on decode. Prefill is within run-to-run noise of itself, as
+expected — it is unchanged code. Engine construction: `LlamaEngineQ8`
+~1.0–1.1s, `LlamaEngineQ8Resident` ~1.4–1.5s (a few more `matvecQ8`
+weight/scale buffer pairs — see "buffer design" below — plus every bind
+group built up front instead of on first use).
+
+**Roofline decomposition (rule 9 — measured, not estimated).** This
+machine's own bandwidth ceiling, from `harness/roofline.ts` at the time of
+this measurement: **1.707 TB/s** (94–95% of the RTX 5090's 1.792 TB/s rated
+figure — the same calibration `harness/roofline.test.ts` already checks).
+Sarashina2.2-1B-alibi-v1-q8's resident weight footprint is 1,410,513,920
+bytes (codes + scales + norms, PR #108's own numbers) — every `matvecQ8`
+projection's weight is read exactly once per decode step, so that figure is
+also the minimum bytes one token must move:
+
+| quantity | value |
+| --- | --- |
+| measured bandwidth ceiling | 1.707 TB/s |
+| resident weight bytes / token | 1,410,513,920 (1.31 GiB) |
+| **bandwidth-bound lower bound** | **0.826 ms/token (1210 tok/s)** |
+| measured decode (`full_gear`) | 6.16 ms/token (161.8 tok/s) — **13.4% of the lower bound** |
+| measured decode (`brush_off`) | 7.31 ms/token (137.6 tok/s) — **11.3% of the lower bound** |
+
+The gap (~5.3–6.5 ms/token) is not unaccounted for — it is two things this
+issue's own scope left in place, both documented in `llm/engine-q8-resident.ts`'s
+class doc:
+
+1. **Attention scans `maxSeqLen`, not the true KV length.** `ops/gqa`'s
+   kernels take `S` as both the softmax loop bound *and* the per-head
+   stride into K/V (`k_head = kv_head * S * D`), so a KV cache addressed by
+   `maxSeqLen = 4096` has to be *read* with `S = 4096` every step, relying
+   on the causal mask to skip the dot product past the real position rather
+   than a shorter, growing `S`. At Sarashina2.2-1B's shape (`kvHeads=8`,
+   `headDim=112`) that is `8 × 4096 × 112 × 4 bytes ≈ 14.7 MiB` each for K
+   and V, per layer, per token — **≈ 672 MiB/token** across 24 layers,
+   comparable in order of magnitude to the 1.31 GiB weight traffic above,
+   and it does not shrink as the KV cache empties out early in a
+   generation. Fixing it needs a stride parameter `ops/gqa` does not have,
+   which is a new-kernel change this issue's scope excludes ("カーネル融合
+   〈次ISSUE〉" / "no new kernels").
+2. **~800 GPU op launches per token.** Because every projection gets its
+   own buffer rather than a fused one (below), one decode step is ~411 real
+   dispatches (17 per layer × 24 layers, plus the final norm and two
+   `lm_head` chunks) and ~384 small `copyBufferToBuffer` KV-cache writes
+   (`2 × kvHeads × numLayers`) — all inside one `queue.submit`, so this is
+   encoding and pass-boundary overhead, not per-dispatch round-trip
+   latency. Not broken out further than that: this device's
+   `timestamp-query` support times one dispatch at a time
+   (`harness/wgsl.ts#Runner.time`), and timing ~800 of them individually
+   inside one resident batch is a measurement this PR does not attempt —
+   left here as "unmeasured", per rule 9, rather than guessed.
+
+**Buffer design.** `LlamaEngineQ8`'s CPU-side engine fuses Q/K/V and
+gate/up into one packed weight so one `matvecQ8` dispatch computes all of
+them — worthwhile there because each dispatch used to cost a full
+submit+readback round trip. That reasoning does not carry over to a
+resident engine that already pays one submit for an entire token's
+dispatch chain, and fusing costs something real here: splitting a fused
+output by a byte offset into one buffer only works when that offset is a
+multiple of `minStorageBufferOffsetAlignment` (measured 256 bytes on this
+device) — the tiny fixture's own `kvDim = 32` floats lands `v`'s slice at
+byte 384, not a multiple of 256. `LlamaEngineQ8Resident` gives every
+distinct tensor its own buffer instead: a few more bandwidth-bound
+`matvecQ8` dispatches per layer than a fused version, always valid
+regardless of the model's dimensions (`harness/resident.ts#bindGroup`'s
+doc has the validation error that caught this).
+
+**KV-cache writes** are a GPU-to-GPU `copyBufferToBuffer`, not
+`queue.writeBuffer`: the new token's K (after RoPE) and V already live in a
+GPU buffer, written by dispatches a few ops earlier in the same batch, so
+routing them through the CPU to satisfy `writeBuffer`'s signature would
+undo "logits-only readback". `KVCache`'s own `[kvHeads, maxSeqLen, headDim]`
+layout means one position's write is `kvHeads` small copies, not one — see
+`llm/engine-q8-resident.ts`'s class doc.
+
+**One device, not two.** `LlamaEngineQ8Resident.create()` takes a single
+`ResidentDevice` and derives its prefill delegate's `Runner["run"]` from it
+(`harness/resident.ts#runnerFromResident`) rather than taking a second,
+independently-constructed `Runner`. An earlier version did take a second
+`Runner`, and constructing two native `webgpu` `GPUDevice`s in one Node
+process reproducibly crashed this repository's Node/Dawn binding partway
+through prefill — not on every run, and not always at the same call, the
+signature of binding instability under load (issue #38/#49/#107's own
+family) rather than a logic bug.
+
+**Correctness gate.** `llm/engine-q8-resident.wgsl.test.ts` runs the tiny
+int8 fixture's full prefill + every decode step through
+`LlamaEngineQ8Resident` and checks its logits against the fixture's own
+`prefillLogits`/`decodeLogits` and its greedy tokens against
+`fixture.decodeTokens` — the same numbers `engine-q8.wgsl.test.ts` already
+proves `LlamaEngineQ8` itself produces, so the two together are a
+transitive "matches the pre-optimization engine" proof without building
+two independent engines' worth of dispatches on one device at once (see
+that test file's own doc for why that mattered in practice on this
+machine). On a clean run, both engines' worst prefill/decode diffs against
+the Python reference are bit-identical: `abs: 1.49e-7, rel: 7.2e-4`
+(prefill) / `7.1e-4` (decode) — the same figures PR #108 recorded for
+`LlamaEngineQ8` alone. This machine's Node/Dawn binding is flaky under
+concurrent GPU load regardless of this change (confirmed by re-running
+`npm test`: pre-existing, unmodified files — `harness/timing.test.ts`,
+`llm/engine.wgsl.test.ts`, `llm/engine-q8.wgsl.test.ts` — fail the same way,
+independent of anything in this PR); `scripts/test.mjs`'s retry-once
+handles the common case, and this test passed cleanly, repeatedly, once
+retried.
+
 ### Scope
 
 Reaching into `technologies-moe/alibi-ai` (a separate repository) itself —
