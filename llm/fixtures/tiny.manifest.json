@@ -1,0 +1,216 @@
+{
+  "generatedBy": "llm/tools/gen_fixture.py",
+  "transformersVersion": "5.3.0",
+  "torchVersion": "2.10.0+cu128",
+  "weightSeed": 0,
+  "promptSeed": 123,
+  "config": {
+    "numLayers": 2,
+    "hiddenSize": 64,
+    "numHeads": 4,
+    "numKvHeads": 2,
+    "headDim": 16,
+    "ffnHidden": 128,
+    "vocabSize": 256,
+    "ropeTheta": 10000.0,
+    "rmsNormEps": 1e-05,
+    "tieEmbeddings": false
+  },
+  "promptTokens": [
+    254,
+    109,
+    126,
+    66,
+    220,
+    98,
+    230,
+    17
+  ],
+  "decodeTokens": [
+    175,
+    135,
+    233,
+    132
+  ],
+  "weights": [
+    {
+      "name": "embedTokens",
+      "shape": [
+        256,
+        64
+      ],
+      "offset": 0
+    },
+    {
+      "name": "layers.0.attnNorm",
+      "shape": [
+        64
+      ],
+      "offset": 16384
+    },
+    {
+      "name": "layers.0.wq",
+      "shape": [
+        64,
+        64
+      ],
+      "offset": 16448
+    },
+    {
+      "name": "layers.0.wk",
+      "shape": [
+        32,
+        64
+      ],
+      "offset": 20544
+    },
+    {
+      "name": "layers.0.wv",
+      "shape": [
+        32,
+        64
+      ],
+      "offset": 22592
+    },
+    {
+      "name": "layers.0.wo",
+      "shape": [
+        64,
+        64
+      ],
+      "offset": 24640
+    },
+    {
+      "name": "layers.0.ffnNorm",
+      "shape": [
+        64
+      ],
+      "offset": 28736
+    },
+    {
+      "name": "layers.0.wGate",
+      "shape": [
+        128,
+        64
+      ],
+      "offset": 28800
+    },
+    {
+      "name": "layers.0.wUp",
+      "shape": [
+        128,
+        64
+      ],
+      "offset": 36992
+    },
+    {
+      "name": "layers.0.wDown",
+      "shape": [
+        64,
+        128
+      ],
+      "offset": 45184
+    },
+    {
+      "name": "layers.1.attnNorm",
+      "shape": [
+        64
+      ],
+      "offset": 53376
+    },
+    {
+      "name": "layers.1.wq",
+      "shape": [
+        64,
+        64
+      ],
+      "offset": 53440
+    },
+    {
+      "name": "layers.1.wk",
+      "shape": [
+        32,
+        64
+      ],
+      "offset": 57536
+    },
+    {
+      "name": "layers.1.wv",
+      "shape": [
+        32,
+        64
+      ],
+      "offset": 59584
+    },
+    {
+      "name": "layers.1.wo",
+      "shape": [
+        64,
+        64
+      ],
+      "offset": 61632
+    },
+    {
+      "name": "layers.1.ffnNorm",
+      "shape": [
+        64
+      ],
+      "offset": 65728
+    },
+    {
+      "name": "layers.1.wGate",
+      "shape": [
+        128,
+        64
+      ],
+      "offset": 65792
+    },
+    {
+      "name": "layers.1.wUp",
+      "shape": [
+        128,
+        64
+      ],
+      "offset": 73984
+    },
+    {
+      "name": "layers.1.wDown",
+      "shape": [
+        64,
+        128
+      ],
+      "offset": 82176
+    },
+    {
+      "name": "finalNorm",
+      "shape": [
+        64
+      ],
+      "offset": 90368
+    },
+    {
+      "name": "lmHead",
+      "shape": [
+        256,
+        64
+      ],
+      "offset": 90432
+    }
+  ],
+  "logits": {
+    "prefill": {
+      "shape": [
+        8,
+        256
+      ],
+      "offset": 0
+    },
+    "decode": {
+      "shape": [
+        4,
+        256
+      ],
+      "offset": 2048
+    }
+  }
+}

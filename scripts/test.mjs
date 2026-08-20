@@ -36,6 +36,7 @@ import { join } from "node:path";
 
 const OPS = "ops";
 const HARNESS = "harness";
+const LLM = "llm";
 
 /** Test files, discovered the same way `vitest.config.ts` globs them. */
 function testFiles() {
@@ -52,6 +53,11 @@ function testFiles() {
   // they get a process each anyway: the alternative is a second code path.
   for (const file of readdirSync(HARNESS)) {
     if (file.endsWith(".test.ts")) found.push(join(HARNESS, file));
+  }
+  // `llm/` is flat like `harness/`, not one directory per op like `ops/`: it is
+  // a single engine, not a family of interchangeable backends per kernel.
+  for (const file of readdirSync(LLM)) {
+    if (file.endsWith(".test.ts")) found.push(join(LLM, file));
   }
   return found.sort();
 }
