@@ -127,6 +127,45 @@ Speed is **unmeasured**.
 
 ---
 
+## LLM tokenizer
+
+`llm/tokenizer.ts` is not a WGSL op — it never touches a GPU device — but it
+lives beside the ops because the LLM engine (#98) that consumes those ops
+needs text turned into token ids and back before any of them run. It is a
+from-scratch TypeScript reimplementation of **SentencePiece unigram**
+encode (Viterbi) / decode: no wasm, no vendored binary, no runtime dependency
+on the `sentencepiece` package.
+
+```ts
+import { SentencePieceTokenizer } from "web-xpu-ops/llm/tokenizer";
+
+// vocab is whatever llm/tools/export_tokenizer.py produced for your model —
+// fetch it, import it as JSON, however your bundler prefers.
+const tokenizer = new SentencePieceTokenizer(vocab);
+const ids = tokenizer.encode("<|system|>You are Alibi.</s>");
+tokenizer.decode(ids); // "<|system|>You are Alibi.</s>"
+```
+
+Every normalizer/byte-fallback/special-token behavior is read out of a real
+model rather than assumed — this matters because SentencePiece's own common
+defaults (NFKC normalization, an implicit leading `▁`) do **not** apply to
+every model, including the one this was built against
+(Sarashina2.2-1B-Instruct). `llm/tools/export_tokenizer.py` parses
+`tokenizer.model`'s protobuf directly and refuses to silently drop a
+`normalizer_spec` it does not implement; `llm/tokenizer.ts`'s module doc
+records exactly what was verified and how. Ground truth for correctness is
+Python `sentencepiece`'s `SentencePieceProcessor`, never `transformers` —
+`transformers` 5.3.0 silently converts a UNIGRAM model with no
+`tokenizer.json` beside it into an approximate BPE tokenizer that does not
+reproduce true unigram segmentation.
+
+`llm/tools/gen_fixtures.py` bakes real-tokenizer encode/decode pairs (80+
+cases: Japanese/English/mixed, code, emoji, whitespace patterns, and the
+`<|system|>`/`<|user|>`/`</s>`-style chat-template boundaries the engine
+emits) that `llm/tokenizer.test.ts` holds this implementation to exactly.
+
+---
+
 ## Install
 
 ```bash
@@ -470,7 +509,8 @@ hidden size, query/KV heads, head dim, FFN width, vocab, RoPE base, RMSNorm
 fixture below actually runs) and `SARASHINA_2_2_1B_CONFIG` (24 layers, hidden
 1792, 16 query / 8 KV heads, FFN 6272, vocab 102400, RoPE base 500000 — issue
 #96's real target, documentation only: running the actual checkpoint needs a
-weight-conversion tool and a tokenizer, both later issues).
+weight-conversion tool, a later issue — the tokenizer side is covered by
+`llm/tokenizer.ts` above).
 
 **KV cache and dispatch fusion.** The cache is pre-allocated f32,
 `[kvHeads, maxSeqLen, headDim]` per layer (`llm/kv-cache.ts`) — no growth
@@ -509,8 +549,9 @@ approximate — the derivation and a numeric proof are in
 `tiny.weights.bin`.
 
 **Scope.** f32 weights only (int8 lands after #97's quantized `matvec`
-connects); no tokenizer, sampler or browser wiring yet (later issues under
-#96). Correctness first, per the rule below — nothing here has been tuned for
+connects); the tokenizer and sampler elsewhere in this README are not wired
+into the engine yet, and there is no browser wiring (later issues under #96).
+Correctness first, per the rule below — nothing here has been tuned for
 speed.
 
 ---
