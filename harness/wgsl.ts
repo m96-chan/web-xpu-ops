@@ -196,7 +196,22 @@ export async function createRunner(): Promise<Runner | null> {
               ? GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
               : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        device.queue.writeBuffer(buffer, 0, bytes);
+        // `bytes` is always backed by a plain `ArrayBuffer` (constructed just
+        // above from either a typed-array binding's own `.buffer` or a
+        // uniform's `ArrayBuffer`), never a `SharedArrayBuffer` — but
+        // `@webgpu/types`' `GPUAllowSharedBufferSource` and TypeScript 5.7's
+        // generic `Uint8Array<ArrayBufferLike>` can't express that, so this is
+        // a type-level cast, not a runtime one. `as any` rather than naming
+        // `BufferSource`/`GPUAllowSharedBufferSource` explicitly: those types
+        // only resolve where `DOM` lib is loaded, and this file's own
+        // `tsconfig.json` deliberately has no `DOM` lib (see
+        // `tsconfig.build.json`'s note on why `ops/`/`harness` stay browser-lib-free) —
+        // the mismatch is invisible there and only surfaced once
+        // `examples/llm-demo/tsconfig.json` (issue #106) became the first
+        // program in this repo to type-check `@webgpu/types` together with
+        // `DOM`. `browser-runtime.ts#run` has the identical cast for the
+        // identical reason, in a file that *does* have `DOM` lib available.
+        device.queue.writeBuffer(buffer, 0, bytes as any);
         created.push(buffer);
         return buffer;
       });

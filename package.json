@@ -5,9 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "Yusuke Harada",
-  "repository": { "type": "git", "url": "git+https://github.com/m96-chan/web-xpu-ops.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/m96-chan/web-xpu-ops.git"
+  },
   "homepage": "https://github.com/m96-chan/web-xpu-ops#readme",
-  "bugs": { "url": "https://github.com/m96-chan/web-xpu-ops/issues" },
+  "bugs": {
+    "url": "https://github.com/m96-chan/web-xpu-ops/issues"
+  },
   "keywords": [
     "webgpu",
     "wgsl",
@@ -21,9 +26,14 @@
     "machine-learning",
     "browser"
   ],
-  "files": ["dist", "CHANGELOG.md"],
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
   "sideEffects": false,
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     "./ops/*": {
       "types": "./dist/ops/*/index.d.ts",
@@ -38,16 +48,22 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/assets.mjs",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc -p examples/llm-demo/tsconfig.json --noEmit",
     "test": "node scripts/test.mjs",
     "test:file": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "demo:build": "node examples/llm-demo/build.mjs",
+    "demo:serve": "node examples/llm-demo/server.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@webgpu/types": "^0.1.72",
+    "esbuild": "^0.28.2",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0",
     "webgpu": "^0.4.0"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }
