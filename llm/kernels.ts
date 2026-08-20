@@ -38,6 +38,13 @@ const CODE = {
   gqaContext: opKernel("gqa", "context"),
   activation: opKernel("activation"),
   elementwise: opKernel("elementwise"),
+  // Issue #117's GPU-resident prefill reshape — see `ops/permute/reference.ts`'s
+  // doc for why a pure reshape has an `ops/` directory of its own (the
+  // browser bundle's `opNameFromUrl` requires the `ops/<name>/index.ts`
+  // shape for every kernel it resolves, not just the ones with arithmetic).
+  permute: opKernel("permute"),
+  // Issue #117's prefill weight prep — see `ops/dequant_transpose/reference.ts`'s doc.
+  dequantTranspose: opKernel("dequant_transpose"),
 };
 
 const asF32 = (x: Float32Array | Int32Array | Uint32Array): Float32Array => x as Float32Array;
@@ -301,6 +308,14 @@ export interface GqaArgs {
   queryOffset: number;
   /** Defaults to `1/sqrt(D)`, `ops/gqa`'s own default. */
   scale?: number;
+  /**
+   * Issue #117. Bounds the softmax scan to `[0, sEff)`, leaving `S` as the
+   * address stride — see `ops/gqa/reference.ts`'s `sEff` doc for the full
+   * contract (`causal` must be `true` whenever `sEff < S`, and `sEff` must be
+   * at least `min(S, L + queryOffset)`). Defaults to `S`, this function's own
+   * behaviour before this field existed.
+   */
+  sEff?: number;
 }
 
 /**
@@ -319,6 +334,31 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
   const { q, k, v, H, kvHeads, L, S, D, Dv, causal, queryOffset } = args;
   const B = 1;
   const scale = args.scale ?? 1 / Math.sqrt(D);
+  const sEff = args.sEff ?? S;
+  // `sEff`'s own contract (`ops/gqa/reference.ts#groupedAttention`'s doc),
+  // copied rather than re-derived (rule 2) — before this check, a caller
+  // whose `sEff` broke that contract got a silently-too-short GPU scan here
+  // and a thrown error from the reference, two different behaviours for the
+  // same mistake (PR #119 review, item 5). `groupedAttention` throws with
+  // the same wording; this wrapper does too rather than delegating to it,
+  // since delegating would mean building `B=1`-shaped Q/K/V arrays this
+  // function does not otherwise need just to ask the reference to validate.
+  if (!Number.isInteger(sEff) || sEff < 1 || sEff > S) {
+    throw new Error(`runGqa(): sEff must be an integer in [1, S=${S}], got ${sEff}`);
+  }
+  if (!causal && sEff !== S) {
+    throw new Error(
+      `runGqa(): sEff=${sEff} < S=${S} requires causal=true — without a causal bound there is no way to prove the excluded positions were unreachable`,
+    );
+  }
+  if (causal) {
+    const needed = Math.min(S, L + queryOffset);
+    if (sEff < needed) {
+      throw new Error(
+        `runGqa(): sEff=${sEff} is too small for L=${L}, queryOffset=${queryOffset} — the last query row can attend up to key ${L - 1 + queryOffset}, so sEff must be at least ${needed}`,
+      );
+    }
+  }
   const mask = new Float32Array(B * S);
 
   const [probs] = await run({
@@ -342,6 +382,7 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
           ["u32", B],
           ["u32", 1],
           ["u32", 1],
+          ["u32", sEff],
         ]),
       },
     ],
@@ -354,7 +395,7 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
       { kind: "storage", data: asF32(probs!) },
       { kind: "storage", data: v },
       { kind: "out", type: "f32", length: B * H * L * Dv },
-      { kind: "uniform", data: params([["u32", H], ["u32", kvHeads], ["u32", L], ["u32", S], ["u32", Dv]]) },
+      { kind: "uniform", data: params([["u32", H], ["u32", kvHeads], ["u32", L], ["u32", S], ["u32", Dv], ["u32", sEff]]) },
     ],
     workgroups: [L, H, B],
   });
@@ -377,6 +418,70 @@ export async function runActivation(run: Runner["run"], { input, kind, alpha = 1
       { kind: "uniform", data: params([["u32", N], ["u32", kind], ["f32", alpha]]) },
     ],
     workgroups: [Math.ceil(N / 256)],
+  });
+  return asF32(out!);
+}
+
+export interface PermuteArgs {
+  /** `[dim0, dim1, D]` row-major. */
+  input: Float32Array;
+  dim0: number;
+  dim1: number;
+  D: number;
+}
+
+/**
+ * `[dim0, dim1, D]` -> `[dim1, dim0, D]` — `ops/permute/wgsl/kernel.wgsl`'s own
+ * doc has the full "why this exists instead of `llm/reshape.ts`'s CPU
+ * functions" story (issue #117's resident prefill). `splitHeadsMajor(x,
+ * tokens, heads, dim)` is `runPermute({ input: x, dim0: tokens, dim1: heads,
+ * D: dim })`; `mergeHeadsMajor(x, heads, tokens, dim)` is the same call with
+ * `dim0`/`dim1` swapped.
+ */
+export async function runPermute(run: Runner["run"], { input, dim0, dim1, D }: PermuteArgs): Promise<Float32Array> {
+  const total = dim0 * dim1 * D;
+  const [out] = await run({
+    code: CODE.permute,
+    bindings: [
+      { kind: "storage", data: input },
+      { kind: "out", type: "f32", length: total },
+      { kind: "uniform", data: params([["u32", dim0], ["u32", dim1], ["u32", D]]) },
+    ],
+    workgroups: [Math.ceil(total / 256)],
+  });
+  return asF32(out!);
+}
+
+export interface DequantTransposeArgs {
+  /** `[outFeatures, ceil(inFeatures / 4)]` u32, row-major — `ops/matvec`'s `q8` packed wire format (`packQ8`/`llm/weights-q8.ts#packInt8Rows`). */
+  weight: Uint32Array;
+  /** `[outFeatures]`, one absmax-derived scale per row. */
+  scale: Float32Array;
+  outFeatures: number;
+  inFeatures: number;
+}
+
+/**
+ * Dequantizes-and-transposes a packed int8 weight into `matmul`'s `b`
+ * operand shape (`[inFeatures, outFeatures]`) in one GPU dispatch — issue
+ * #117's `runPrefillResident` (`llm/engine-q8-resident.ts`) uses this
+ * pattern directly against its own persistent buffers rather than through
+ * this wrapper (its per-call bind groups do not fit `Runner["run"]`'s
+ * per-dispatch-buffers contract), so this function exists for parity with
+ * every other kernel in this file and as this op's Node-side integration
+ * test path — see `ops/dequant_transpose/reference.ts`'s own doc for why
+ * the op exists at all.
+ */
+export async function runDequantTranspose(run: Runner["run"], { weight, scale, outFeatures, inFeatures }: DequantTransposeArgs): Promise<Float32Array> {
+  const [out] = await run({
+    code: CODE.dequantTranspose,
+    bindings: [
+      { kind: "storage", data: weight },
+      { kind: "storage", data: scale },
+      { kind: "out", type: "f32", length: outFeatures * inFeatures },
+      { kind: "uniform", data: params([["u32", outFeatures], ["u32", inFeatures]]) },
+    ],
+    workgroups: [Math.ceil((outFeatures * inFeatures) / 256)],
   });
   return asF32(out!);
 }

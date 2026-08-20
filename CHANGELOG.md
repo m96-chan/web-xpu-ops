@@ -9,6 +9,48 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/gqa`'s `scores`/`context` kernels gain an `sEff` parameter (issue
+  #117): the number of key/value positions actually resident, bounding the
+  softmax scan without changing `S`, the KV cache's own address stride.
+  Uniform-passed, defaults to `S` — every existing caller (including
+  `ops/gqa`'s own reference and `llm/kernels.ts#runGqa`) is unaffected
+  unless it opts in. `LlamaEngineQ8Resident`'s decode step now passes
+  `sEff = position + 1` instead of always scanning `maxSeqLen` — the fix
+  for the "gqaの全長走査" roofline gap issue #116 measured (672 MiB/token on
+  Sarashina2.2-1B's shape) and explicitly left open, since removing it
+  needed a parameter `ops/gqa` did not have yet.
+
+  `context.wgsl`'s `v` read is unconditional (masked columns arrive as a
+  plain `0` from `scores.wgsl`'s softmax, not a skip), so an `sEff` that
+  is not honored there is numerically observable — a dedicated test poisons
+  `v` past `sEff` with `+Infinity` and checks for the resulting `NaN`.
+  `scores.wgsl`'s own bound has no such numeric signature under the
+  `causal = true` contract `sEff < S` requires (every excluded position is
+  already causally masked, by construction), so it is instead proven by
+  `seffEquivalence()` (`ops/gqa/wgsl-seff.test.ts`): running with `sEff = n` must equal running with `S`
+  itself shrunk to `n`. See `ops/gqa/reference.ts`'s `sEff` doc for the full
+  safety contract (`sEff >= min(S, L + queryOffset)` whenever `causal` is
+  true; rejected outright otherwise).
+
+- `LlamaEngineQ8Resident`'s prefill is GPU-resident now too (issue #117),
+  replacing the delegation to `LlamaEngineQ8` issue #110 left in place
+  ("プリフィルは現行方式のまま"). Every prompt token's pass through every
+  layer is encoded into one `queue.submit`, on the `matmul` path (not
+  `matvecQ8` per token — that would multiply prefill's weight traffic by
+  the prompt length). A new `ops/permute/wgsl/kernel.wgsl` kernel does `ops/gqa`'s
+  required token-major/head-major reshape on the GPU, replacing the CPU
+  round trip `LlamaEngineQ8`'s non-resident reshape (`llm/reshape.ts`)
+  would otherwise force back in. KV writes go straight into the persistent,
+  `maxSeqLen`-strided cache via one contiguous `copyBufferToBuffer` per
+  head, so `runDecodeStep` continues seamlessly with no CPU round trip
+  between prefill and the first decode step. Only the final prompt
+  position is projected through `lm_head` — **`forward()`'s prefill return
+  shape changed**: `[finalPositionLogits]`, one element, not one per prompt
+  token, matching what every real caller (`llm/engine.ts#greedyGenerate`,
+  `examples/llm-demo`) already read (`prefillLogits[prefillLogits.length - 1]`).
+  See the PR for prefill tok/s at three prompt lengths, before/after, and the
+  updated roofline table.
+
 - Persistent IndexedDB weight cache for `llm/browser-weights.ts#loadWeightsQ8FromUrl`
   (issue #121, parent #96): `technologies-moe/alibi-ai`'s browser integration was
   re-fetching the full ~1.41 GiB int8 checkpoint over HTTP on every visit — no
@@ -105,12 +147,16 @@ Entries record **why** a change was needed. What changed is in the diff.
   baseline exists) — `ResidentDevice` exists solely for this decode path,
   where the WGSL, binding order and uniform layout are already known correct
   from `llm/kernels.ts`. `harness/resident.ts#runnerFromResident` adapts one
-  `ResidentDevice` back into a `Runner["run"]`, which `LlamaEngineQ8Resident`
-  uses for prefill (unchanged scope — issue #110 is decode only) instead of
-  a second native device: an earlier version took a genuinely separate
+  `ResidentDevice` back into a `Runner["run"]` — at the time this landed,
+  `LlamaEngineQ8Resident` used it to delegate prefill to `LlamaEngineQ8`
+  unchanged (issue #110's scope was decode only) instead of constructing a
+  second native device: an earlier version took a genuinely separate
   `Runner`, and running both engines' dispatches on two devices in one
   process reproducibly crashed this repository's Node/Dawn binding (the
-  same failure family issue #38/#49/#107 already document).
+  same failure family issue #38/#49/#107 already document). Issue #117
+  later made prefill resident too and removed that delegation entirely —
+  see this file's #117 entry above; `runnerFromResident` itself remains,
+  unused by this class since.
 
   `examples/llm-demo` gained a "GPU常駐デコード" toggle so the same page can
   run either engine against the same loaded weights for a direct comparison.

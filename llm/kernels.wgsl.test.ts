@@ -1,24 +1,29 @@
 import { describe, expect } from "vitest";
 import { agree, gpuTest, useGpu } from "../harness/index.js";
 import { ACTIVATION } from "../ops/activation/index.js";
+import { dequantTranspose } from "../ops/dequant_transpose/index.js";
 import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import { gather } from "../ops/gather/index.js";
 import { groupedAttention } from "../ops/gqa/index.js";
 import { matmul } from "../ops/matmul/index.js";
 import { matvec, matvecQ8, packQ8 } from "../ops/matvec/index.js";
+import { permute } from "../ops/permute/index.js";
 import { rmsnorm } from "../ops/rmsnorm/index.js";
 import { rope } from "../ops/rope/index.js";
 import {
   runActivation,
+  runDequantTranspose,
   runElementwise,
   runGather,
   runGqa,
   runMatMul,
   runMatVec,
   runMatVecQ8,
+  runPermute,
   runRmsNorm,
   runRope,
 } from "./kernels.js";
+import { packInt8Rows } from "./weights-q8.js";
 
 /**
  * Each `llm/kernels.ts` wrapper against the same op's reference — not the
@@ -113,6 +118,82 @@ describe("llm/kernels wrappers", () => {
     const got = await runGqa(run, { q, k, v, H, kvHeads, L, S, D, Dv, causal: true, queryOffset: 0 });
     const want = groupedAttention({ q, k, v, B: 1, H, kvHeads, L, S, D, Dv, causal: true });
     expect(agree(got, want.output, { rel: 1e-5, abs: 2e-6 })).toBeNull();
+  });
+
+  /**
+   * PR #119 review, item 5: no test in this file (or anywhere else calling
+   * `runGqa` directly) ever passed a non-default `sEff` through the
+   * wrapper, so `runGqa`'s own `const sEff = args.sEff ?? S` line could be
+   * mutated to the constant `S` (discarding `args.sEff` outright) and the
+   * whole suite stayed green — `ops/gqa/wgsl-seff.test.ts`'s own `sEff`
+   * mutation coverage only exercises the raw kernel dispatch, never this
+   * wrapper's plumbing. Same decode-shaped poison technique as that file's
+   * `SEFF_CASES` (`+Infinity` past `sEff` in `v`, read unconditionally by
+   * `context.wgsl` — see that file's doc for why `k`'s own poison is a
+   * decoy): a `runGqa` that silently used `S` instead of the given `sEff`
+   * would scan into the poison and return `NaN`, not merely a slightly
+   * wrong number.
+   */
+  gpuTest("runGqa honours a non-default sEff, not just the default S (issue #117)", async (run) => {
+    const [H, kvHeads, L, S, D, Dv] = [4, 2, 1, 16, 8, 8];
+    const queryOffset = 5;
+    const sEff = queryOffset + 1;
+    const q = wave(H * L * D, 0.37);
+    const k = Float32Array.from({ length: kvHeads * S * D }, (_, idx) => {
+      const j = Math.floor(idx / D) % S;
+      return j < sEff ? wave(D, 0.11, 0.5 + idx * 1e-6)[idx % D]! : 1e4;
+    });
+    const v = Float32Array.from({ length: kvHeads * S * Dv }, (_, idx) => {
+      const j = Math.floor(idx / Dv) % S;
+      return j < sEff ? wave(Dv, 0.23, 1.25 + idx * 1e-6)[idx % Dv]! : Number.POSITIVE_INFINITY;
+    });
+    const got = await runGqa(run, { q, k, v, H, kvHeads, L, S, D, Dv, causal: true, queryOffset, sEff });
+    const want = groupedAttention({ q, k, v, B: 1, H, kvHeads, L, S, D, Dv, causal: true, queryOffset, sEff });
+    expect(agree(got, want.output, { rel: 1e-5, abs: 2e-6 })).toBeNull();
+  });
+
+  /**
+   * PR #119 review, item 5: `runGqa` forwarded `sEff` to the GPU uniform
+   * without validating it — `ops/gqa/reference.ts#groupedAttention`'s own
+   * contract (integer in `[1, S]`; `causal` required whenever `sEff < S`;
+   * at least `min(S, L + queryOffset)` under `causal`) was enforced only on
+   * the JS reference, never on this wrapper, so a caller with an off-by-one
+   * `sEff` got a silently-too-short scan from the GPU path and a thrown
+   * error from the reference path — two different behaviours for the same
+   * mistake. `runGqa` now runs the identical checks before ever touching
+   * `run`.
+   */
+  gpuTest("runGqa rejects a malformed sEff, the same contract groupedAttention() enforces", async (run) => {
+    const [H, kvHeads, L, S, D, Dv] = [4, 2, 1, 5, 8, 8];
+    const q = new Float32Array(H * L * D);
+    const k = new Float32Array(kvHeads * S * D);
+    const v = new Float32Array(kvHeads * S * Dv);
+    const base = { q, k, v, H, kvHeads, L, S, D, Dv, causal: true, queryOffset: 4 };
+    // L=1 at queryOffset=4: the only query row may attend up to key 4, so sEff must be >= 5.
+    await expect(runGqa(run, { ...base, sEff: 3 })).rejects.toThrow(/sEff/);
+    await expect(runGqa(run, { ...base, sEff: 0 })).rejects.toThrow(/sEff/);
+    await expect(runGqa(run, { ...base, sEff: 6 })).rejects.toThrow(/sEff/);
+    await expect(runGqa(run, { ...base, causal: false, sEff: 3 })).rejects.toThrow(/sEff/);
+    // Still fine at the tight legal minimum.
+    await expect(runGqa(run, { ...base, sEff: 5 })).resolves.not.toThrow();
+  });
+
+  gpuTest("runPermute agrees with permute()", async (run) => {
+    const [dim0, dim1, D] = [5, 3, 4];
+    const input = Float32Array.from({ length: dim0 * dim1 * D }, (_, i) => (i + 1) * 0.25);
+    const got = await runPermute(run, { input, dim0, dim1, D });
+    const want = permute({ input, dim0, dim1, D });
+    expect(agree(got, want, { rel: 0, abs: 0 })).toBeNull();
+  });
+
+  gpuTest("runDequantTranspose agrees with dequantTranspose()", async (run) => {
+    const [outFeatures, inFeatures] = [5, 11];
+    const codes = Int8Array.from({ length: outFeatures * inFeatures }, (_, i) => ((i * 37) % 200) - 100);
+    const scale = Float32Array.from({ length: outFeatures }, (_, i) => 0.01 + i * 1e-4);
+    const weight = packInt8Rows(codes, outFeatures, inFeatures);
+    const got = await runDequantTranspose(run, { weight, scale, outFeatures, inFeatures });
+    const want = dequantTranspose({ weight, scale, outFeatures, inFeatures });
+    expect(agree(got, want, { rel: 0, abs: 0 })).toBeNull();
   });
 
   gpuTest("runActivation agrees with activation() for silu", async (run) => {

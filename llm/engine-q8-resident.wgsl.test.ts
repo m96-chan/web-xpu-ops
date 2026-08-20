@@ -16,23 +16,16 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * file proving `LlamaEngineQ8Resident`'s tokens equal `fixture.decodeTokens`
  * establishes the same "matches the pre-optimization engine" fact the issue
  * asks for, without constructing two independent engines' worth of
- * `matvecQ8`-packed weights and dispatches on one device at once.
- *
- * That "at once" mattered in practice: an earlier version of this file did
- * build a second `LlamaEngineQ8` here (via `runnerFromResident`, issue
- * #110's own single-device fix for the *previous* instability this file
- * hit — see that function's doc), and running both engines' dispatches
- * back to back reliably crashed this repository's Node/Dawn binding
- * (`terminate called after throwing an instance of 'std::system_error'`)
- * partway through the second engine's prefill — the same failure family
- * issue #38/#49/#107 document, this time triggered by total GPU-object
- * count (`LlamaEngineQ8Resident.create()`'s own ~45 pipelines/bind groups
- * for the tiny fixture, plus a second engine's worth on top) rather than by
- * a second native device. `LlamaEngineQ8Resident`'s prefill delegation
- * already exercises `runnerFromResident` end to end on every run below (see
- * `engine-q8-resident.ts#runPrefill`), so dropping the second engine here
- * lost no coverage of that function, only the redundant second dispatch
- * load.
+ * `matvecQ8`-packed weights and dispatches on one device at once. An
+ * earlier version of this file did build a second `LlamaEngineQ8` here
+ * (via `runnerFromResident`, `harness/resident.ts`), and running both
+ * engines' dispatches back to back reliably crashed this repository's
+ * Node/Dawn binding (`terminate called after throwing an instance of
+ * 'std::system_error'`) partway through the second engine's prefill — the
+ * same failure family issue #38/#49/#107 document, this time triggered by
+ * total GPU-object count (`LlamaEngineQ8Resident.create()`'s own ~45
+ * pipelines/bind groups for the tiny fixture, plus a second engine's worth
+ * on top) rather than by a second native device.
  *
  * The two `residentTest`s below that check this fixture (the token-parity
  * gate and the "rejects a second-call multi-token forward" contract) share
@@ -55,6 +48,22 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * `config.maxSeqLen` is not, so reusing the shared engine is not an option —
  * this is new coverage, not the redundant duplication the sharing above
  * removes.
+ *
+ * Issue #117 removed the delegation to `LlamaEngineQ8` entirely — prefill
+ * is resident now (`engine-q8-resident.ts#runPrefillResident`) — so the
+ * instability the paragraphs above describe no longer applies to prefill
+ * specifically, but the fixture-comparison shape (rather than a live
+ * second engine) is kept regardless: it is still the more direct
+ * "matches the pre-optimization engine" proof, one engine, one device.
+ *
+ * `forward()`'s prefill return shape changed with #117 too: **one**
+ * element (the final prompt position's logits), not one per prompt token —
+ * see `engine-q8-resident.ts#forward`'s own doc. The shared-engine test's
+ * prefill check compares that one element against `fixture.prefillLogits`'s
+ * own last element, the same position; the `tightEngine` test below uses
+ * `debugAllPositionLogits` (test/debug-only, PR #119 review item 4) instead
+ * of `forward()` for its own prefill call, to compare *every* position
+ * against the fixture without a fourth engine — see that test's own doc.
  */
 
 const TOLERANCE = { rel: 1e-2, abs: 5e-3 };
@@ -85,19 +94,16 @@ describe("llm/engine-q8-resident / greedy tokens match the pre-optimization engi
   });
 
   residentTest("prefill logits agree with the int8 fixture, and decode matches greedily token for token", async () => {
+    // Issue #117: prefill returns exactly one element — the final prompt
+    // position's logits (see this file's own doc, and
+    // `engine-q8-resident.ts#forward`'s). Compared against the fixture's own
+    // last prefill position, the same one.
     const prefillLogits = await engine!.forward(fixture.promptTokens);
-    prefillLogits.forEach((got, t) => {
-      const worst = agree(got, fixture.prefillLogits[t]!, TOLERANCE);
-      expect(worst, worst ? `prefill token ${t}: ${JSON.stringify(worst)}` : undefined).toBeNull();
-    });
-    const worstPrefill = prefillLogits.reduce(
-      (worst, got, t) => {
-        const d = worstDiff(got, fixture.prefillLogits[t]!);
-        return { abs: Math.max(worst.abs, d.abs), rel: Math.max(worst.rel, d.rel) };
-      },
-      { abs: 0, rel: 0 },
-    );
-    console.log("resident int8 prefill worst abs/rel diff:", worstPrefill);
+    expect(prefillLogits).toHaveLength(1);
+    const fixtureLastPrefill = fixture.prefillLogits[fixture.prefillLogits.length - 1]!;
+    const worst = agree(prefillLogits[0]!, fixtureLastPrefill, TOLERANCE);
+    expect(worst, worst ? `prefill (final position): ${JSON.stringify(worst)}` : undefined).toBeNull();
+    console.log("resident int8 prefill worst abs/rel diff:", worstDiff(prefillLogits[0]!, fixtureLastPrefill));
 
     const decodeTokens: number[] = [];
     const decodeLogits: Float32Array[] = [];
@@ -162,14 +168,38 @@ describe("llm/engine-q8-resident / greedy tokens match the pre-optimization engi
    * create/destroy cycle item 9's engine-sharing above exists to remove
    * (`useResidentGpu`'s own doc — `beforeAll`/`afterAll` are per `describe`,
    * not per file).
+   *
+   * PR #119 review, item 4: this engine's own prefill call is also where
+   * the full-`N`-position fixture comparison lives now
+   * (`debugAllPositionLogits` in place of `forward()` for the prefill step
+   * only — same side effects, see that method's own doc), rather than a
+   * fourth engine built just for it. The shared-engine test above only ever
+   * compares the *last* prefill position's logits (`forward()`'s own #117
+   * contract) plus whatever decode derives from it; a bug confined to an
+   * early query position — a `permute` off-by-one in the token dimension,
+   * say — would not reliably surface there, since causal attention only
+   * carries an early position's own hidden state into later positions
+   * through one shared KV write and then straight through `softmax`
+   * (~1/position decay, per this review), not a direct, position-preserving
+   * path. A third `create()` call was measured to reintroduce exactly the
+   * "total GPU-object count" instability item 9's engine-sharing above
+   * exists to avoid (this file's own history) — reusing `tightEngine`,
+   * which already needs its own prefill call for the boundary check below,
+   * costs nothing this test was not already going to pay.
    */
   residentTest("runDecodeStep throws once every maxSeqLen position is already resident, instead of returning stale logits", async (resident) => {
     const tightConfig = { ...fixture.config, maxSeqLen: fixture.promptTokens.length };
     const tightEngine = await LlamaEngineQ8Resident.create(tightConfig, fixture.weights, resident);
 
+    const prefillLogits = await tightEngine.debugAllPositionLogits(fixture.promptTokens);
+    expect(prefillLogits).toHaveLength(fixture.promptTokens.length);
+    prefillLogits.forEach((got, t) => {
+      const worst = agree(got, fixture.prefillLogits[t]!, TOLERANCE);
+      expect(worst, worst ? `prefill position ${t}: ${JSON.stringify(worst)}` : undefined).toBeNull();
+    });
+
     // Prefill alone already fills every position this engine has room for
     // (`tokensSoFar === maxSeqLen` immediately after).
-    await tightEngine.forward(fixture.promptTokens);
     expect(tightEngine.position).toBe(tightConfig.maxSeqLen);
 
     await expect(tightEngine.forward([fixture.decodeTokens[0]!])).rejects.toThrow(/maxSeqLen/);

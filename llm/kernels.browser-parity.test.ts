@@ -69,9 +69,11 @@ describe("llm/kernels.ts CODE <-> examples/llm-demo browser-runtime WGSL_TABLE",
   const nodeSide = opsFromKernelsTs(kernelsSource);
   const browserSide = opsFromBrowserRuntime(browserSource);
 
-  it("parsed at least the ten known kernel entry points from kernels.ts (sanity check on the regex itself)", () => {
+  it("parsed at least the twelve known kernel entry points from kernels.ts (sanity check on the regex itself)", () => {
+    // 10 at issue #106; 11 then 12 since issue #117 added `permute`
+    // (`ops/permute`) and `dequantTranspose` (`ops/dequant_transpose`).
     const totalEntries = Object.values(nodeSide).reduce((sum, set) => sum + set.size, 0);
-    expect(totalEntries).toBe(10);
+    expect(totalEntries).toBe(12);
   });
 
   it("names the same ops on both sides", () => {

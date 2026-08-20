@@ -18,20 +18,16 @@
  * dispatch validation error), so drift does not stay silent.
  */
 import type { Binding, Dispatch } from "../../../harness/wgsl.js";
-/**
- * Re-exported under `harness/resident.ts`'s own name: `llm/engine-q8-resident.ts`
- * imports `runnerFromResident` as a *value* from `"../harness/index.js"`
- * (issue #110's prefill delegation — see that function's doc), and
- * `build.mjs`'s `harnessBrowserShim` redirects every `harness/index.js`
- * import — value or type — to this file, the same redirect `kernel`/`params`
- * already rely on. Without this re-export the bundle fails to resolve the
- * name at build time, not at type-check time (`examples/llm-demo/tsconfig.json`
- * only checks `src/`, so `engine-q8-resident.ts` itself is checked against
- * the real `harness/resident.ts` by the root `tsconfig.json`, never against
- * this file — esbuild's bundler is the only place the two ever have to agree,
- * and only on the *name* existing, not on identical types).
- */
-export { runnerFromBrowserResident as runnerFromResident } from "./browser-resident-runtime.js";
+
+// PR #119 review, item 8: this file used to re-export
+// `runnerFromBrowserResident` under `harness/resident.ts#runnerFromResident`'s
+// own name, for `build.mjs`'s `harnessBrowserShim` to redirect
+// `llm/engine-q8-resident.ts`'s (pre-#117) value import of it to. Issue #117
+// removed that import — `engine-q8-resident.ts` now imports only the *type*
+// `ResidentDevice` (that file's own module doc) — so nothing in this bundle
+// has resolved `runnerFromResident` as a value since, and
+// `runnerFromBrowserResident` itself (`browser-resident-runtime.ts`) was
+// deleted alongside this re-export rather than left dead.
 
 // The ten kernel entry points `llm/kernels.ts#CODE` builds via
 // `harness/suite.ts#kernel(url, name)` — one static import per `.wgsl` file
@@ -50,6 +46,18 @@ import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
 import gqaContextKernel from "../../../ops/gqa/wgsl/context.wgsl";
 import activationKernel from "../../../ops/activation/wgsl/kernel.wgsl";
 import elementwiseKernel from "../../../ops/elementwise/wgsl/kernel.wgsl";
+// `ops/permute` (issue #117's resident prefill reshape, `ops/permute/reference.ts`'s
+// doc has the full story) — `llm/engine-q8-resident.ts` is its only caller
+// today, but it is a `kernels.ts#CODE` entry too (kept, per that file's own
+// "one function per kernel entry point" scope, even though nothing in
+// `LlamaEngineQ8`'s own forward pass calls `runPermute` yet), so it stays
+// covered by this table's usual parity check.
+import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
+// `ops/dequant_transpose` (issue #117's resident prefill weight prep,
+// `ops/dequant_transpose/reference.ts`'s doc has the full story) — same
+// "kept in kernels.ts#CODE for parity, real caller builds its own bind
+// groups" shape as `permute` just above.
+import dequantTransposeKernel from "../../../ops/dequant_transpose/wgsl/kernel.wgsl";
 
 /**
  * Mirrors `llm/kernels.ts`'s `CODE` object one-for-one: `{ [op]: { [entry]:
@@ -62,6 +70,8 @@ export const WGSL_TABLE: Readonly<Record<string, Readonly<Record<string, string>
   matvec: { kernel: matvecKernel, q8: matvecQ8Kernel },
   matmul: { kernel: matmulKernel },
   rope: { kernel: ropeKernel },
+  permute: { kernel: permuteKernel },
+  dequant_transpose: { kernel: dequantTransposeKernel },
   gqa: { scores: gqaScoresKernel, context: gqaContextKernel },
   activation: { kernel: activationKernel },
   elementwise: { kernel: elementwiseKernel },

@@ -115,6 +115,38 @@ export interface GroupedAttentionArgs {
    * `[B, 1, 1]`. `maskHeads` counts **query** heads, not `kvHeads`.
    */
   maskShape?: MaskShape;
+  /**
+   * The number of key/value positions actually resident — issue #117.
+   * Default `S`, the whole cache, unchanged from every caller before this
+   * field existed.
+   *
+   * `S` stays the address stride (`k`/`v` are still `[B, kvHeads, S, D/Dv]`
+   * buffers, and `kvHeadOf`'s per-head offset is still `kvFlat * S * D`);
+   * `sEff` only bounds *which* of those `S` positions the softmax scans.
+   * Positions `[sEff, S)` are treated exactly like a fully-masked key: not
+   * summed into the row max, not summed into the softmax denominator, not
+   * read from `v`. That is a real difference from setting those positions'
+   * `mask` to `-Infinity` — a masked-but-in-range key still costs a dot
+   * product and a wasted term in the sum; an `sEff`-excluded one costs
+   * nothing, which is the entire point (a resident decode/prefill engine
+   * addresses its KV cache at `maxSeqLen` but has only filled the first
+   * `position` entries of it, and re-scanning the unfilled remainder every
+   * step is issue #116's own measured cost, 672 MiB/token on Sarashina2.2-1B's
+   * shape).
+   *
+   * A caller can only shrink `sEff` where doing so is provably safe, so this
+   * is checked rather than trusted (rule 8):
+   *
+   * - `causal` false: `sEff` must equal `S`. Without a causal bound this op
+   *   has no way to know which excluded positions were actually irrelevant —
+   *   `mask` is an opaque function of `(b, h, i, j)`, so unlike the causal
+   *   case below there is no formula here to check against.
+   * - `causal` true: every query row `i` (`0 <= i < L`) may attend up to key
+   *   `i + queryOffset`, so the row with the largest reach is the last one,
+   *   `L - 1 + queryOffset`. `sEff` must be at least `min(S, L + queryOffset)`
+   *   — anything smaller silently drops a key that row is entitled to see.
+   */
+  sEff?: number;
 }
 
 export interface GroupedAttentionResult {
@@ -173,6 +205,7 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
   const causal = args.causal ?? false;
   const queryOffset = args.queryOffset ?? 0;
   const scale = args.scale ?? defaultScale(D);
+  const sEff = args.sEff ?? S;
   const { at: bias } = resolveMask(args, "groupedAttention");
 
   if (kvHeads < 1 || !Number.isInteger(kvHeads)) {
@@ -182,6 +215,25 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
     throw new Error(
       `groupedAttention(): kvHeads=${kvHeads} must divide H=${H}; a ragged split has no defensible grouping`,
     );
+  }
+  // sEff's own contract (see the field's doc): checked, not trusted, because
+  // a wrong value here does not fail loudly on its own — it just silently
+  // drops a key some query row was entitled to see.
+  if (!Number.isInteger(sEff) || sEff < 1 || sEff > S) {
+    throw new Error(`groupedAttention(): sEff must be an integer in [1, S=${S}], got ${sEff}`);
+  }
+  if (!causal && sEff !== S) {
+    throw new Error(
+      `groupedAttention(): sEff=${sEff} < S=${S} requires causal=true — without a causal bound there is no way to prove the excluded positions were unreachable`,
+    );
+  }
+  if (causal) {
+    const needed = Math.min(S, L + queryOffset);
+    if (sEff < needed) {
+      throw new Error(
+        `groupedAttention(): sEff=${sEff} is too small for L=${L}, queryOffset=${queryOffset} — the last query row can attend up to key ${L - 1 + queryOffset}, so sEff must be at least ${needed}`,
+      );
+    }
   }
   // Shape checks, because the whole point of this op is that K and V are
   // *smaller* than Q, and the easiest mistake a caller makes when adopting it is
@@ -215,8 +267,11 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
       const vHead = kvFlat * S * Dv;
 
       for (let i = 0; i < L; i += 1) {
-        const row = new Float64Array(S);
-        for (let j = 0; j < S; j += 1) {
+        // `sEff`, not `S`: positions `[sEff, S)` are excluded from the scan
+        // entirely, not masked to `-Infinity` and then summed anyway — see
+        // `sEff`'s own doc for why that distinction is the whole point.
+        const row = new Float64Array(sEff);
+        for (let j = 0; j < sEff; j += 1) {
           if (causal && j > i + queryOffset) {
             row[j] = -Infinity;
             continue;
@@ -227,17 +282,17 @@ export function groupedAttention(args: GroupedAttentionArgs): GroupedAttentionRe
         }
 
         let max = -Infinity;
-        for (let j = 0; j < S; j += 1) max = Math.max(max, row[j]!);
+        for (let j = 0; j < sEff; j += 1) max = Math.max(max, row[j]!);
         // Every key masked: zeros, as `ops/attention` explains and torch's
         // `aten::_safe_softmax` does. Reachable only through `mask`.
         if (max === -Infinity) continue;
         let sum = 0;
-        for (let j = 0; j < S; j += 1) sum += Math.exp(row[j]! - max);
-        for (let j = 0; j < S; j += 1) probs[pHead + i * S + j] = Math.exp(row[j]! - max) / sum;
+        for (let j = 0; j < sEff; j += 1) sum += Math.exp(row[j]! - max);
+        for (let j = 0; j < sEff; j += 1) probs[pHead + i * S + j] = Math.exp(row[j]! - max) / sum;
 
         for (let c = 0; c < Dv; c += 1) {
           let acc = 0;
-          for (let j = 0; j < S; j += 1) acc += probs[pHead + i * S + j]! * v[vHead + j * Dv + c]!;
+          for (let j = 0; j < sEff; j += 1) acc += probs[pHead + i * S + j]! * v[vHead + j * Dv + c]!;
           output[oHead + i * Dv + c] = acc;
         }
       }

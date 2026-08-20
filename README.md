@@ -977,9 +977,15 @@ per kernel call, per layer, roughly 155 GPU↔CPU round trips for one decode
 step. `LlamaEngineQ8Resident` (`llm/engine-q8-resident.ts`) is the same
 model, the same WGSL, the same `matvecQ8` weights, restructured so one
 generated token costs **one `queue.submit`** and **one readback** (the final
-logits alone). Prefill is unchanged in scope (issue #110 is decode only) —
-the first `forward()` call is delegated whole to a `LlamaEngineQ8` instance
-internally; every call after that must be exactly one token.
+logits alone). Prefill was unchanged in scope at issue #110's own landing
+(decode only) — the first `forward()` call delegated whole to a
+`LlamaEngineQ8` instance internally; every call after that had to be
+exactly one token. **Issue #117 (below) made prefill resident too** —
+the rest of this section documents #110's own measurement as it stood at
+the time, prefill delegation included, since that is the comparison its
+own numbers were taken against; see "GPU-resident prefill +
+effective-seq-length bound" below for the current prefill path and its
+own numbers.
 
 Same real checkpoint, same machine (RTX 5090, Chrome, non-headless, the
 demo's own "GPU常駐デコード" toggle), same two prompts as the table above —
@@ -1116,6 +1122,200 @@ concurrent GPU load regardless of this change (confirmed by re-running
 independent of anything in this PR); `scripts/test.mjs`'s retry-once
 handles the common case, and this test passed cleanly, repeatedly, once
 retried.
+
+### GPU-resident prefill + effective-seq-length bound (issue #117)
+
+Two gaps the #110 section above names explicitly as left open: prefill still
+paid `LlamaEngineQ8`'s per-op round trips (12.0–12.7s for a 69–76 token
+prompt), and decode's attention always scanned `S = maxSeqLen`, relying on
+the causal mask to skip the arithmetic past the real KV length rather than
+not scanning it at all.
+
+**`ops/gqa` gains `sEff`.** A uniform-passed parameter that bounds the
+softmax scan itself, leaving `S` as `k`/`v`'s address stride unchanged —
+default `sEff = S`, so every existing caller (`ops/gqa`'s own reference,
+`llm/kernels.ts#runGqa`) is unaffected unless it opts in. `LlamaEngineQ8Resident`'s
+decode step now passes `sEff = position + 1` instead of always `maxSeqLen`.
+See `ops/gqa/reference.ts`'s own doc for the safety contract (`sEff >=
+min(S, L + queryOffset)` whenever `causal` is true; rejected outright
+otherwise) and `ops/gqa/wgsl-seff.test.ts`'s `SEFF_CASES`/`seffEquivalence()` for
+why `context.wgsl`'s bound is mutation-checkable numerically (`+Infinity`
+poison past `sEff`, read unconditionally there, produces `NaN` if the scan
+isn't bounded) while `scores.wgsl`'s is proven by agreement with `S` shrunk
+outright instead — the causal contract makes its own bound numerically
+invisible under any legal input, a fact worth stating rather than a test gap.
+
+**Prefill is resident now.** `runPrefillResident` (`llm/engine-q8-resident.ts`)
+encodes every prompt token's pass through every layer into the same flat op
+list `runDecodeStep` builds — one `queue.submit` for the whole prompt, one
+readback (the **final** position's logits only — `forward()`'s prefill
+return shape changed to `[finalPositionLogits]`, matching what every real
+caller already read). It keeps the `matmul` path, not `matvecQ8` per
+token — that would multiply prefill's weight traffic by the prompt length,
+the opposite of the goal. Two new ops exist for this:
+
+- `ops/permute` — the `[tokens, heads, dim]` token-major <-> `[heads,
+  tokens, dim]` head-major reshape `ops/gqa` needs, `LlamaEngineQ8`'s own
+  CPU-side `llm/reshape.ts` functions ported to one GPU dispatch (reading
+  Q/K/V back to the CPU to reshape, then re-uploading, would put a round
+  trip exactly where going resident removes one).
+- `ops/dequant_transpose` — dequantizes a packed int8 weight and transposes
+  it to `matmul`'s `[K, N]` operand shape in one GPU dispatch. Measured
+  necessary, not merely nicer: the equivalent three CPU passes
+  (`packInt8Rows` → `dequantizePackedQ8` → `transposeRowMajor`, the detour
+  `LlamaEngineQ8#project`'s own prefill branch takes from *already-packed*
+  resident weight) cost ~100ms/layer on Sarashina2.2-1B's shape — **~2.5s
+  for 24 layers, on the critical path of every prefill call** — while
+  packing raw codes (a byte copy, no arithmetic) and dequantizing+
+  transposing on the GPU instead brought that down to ~170ms total. This
+  single change took measured prefill time from 2.96s to 1.24s for a
+  76-token prompt (see the table below) — the single largest contributor
+  found in this issue's work, ahead of the round-trip elimination it was
+  layered on top of (which itself took 76-token prefill from 8.0s to 2.96s
+  by removing the CPU pack+dequant+transpose *three-pass* detour's earlier,
+  even slower form — see the PR for the intermediate numbers).
+
+KV writes go straight into the persistent, `maxSeqLen`-strided cache
+`runDecodeStep` reads: one contiguous `copyBufferToBuffer` per head (each
+moving that head's whole `N`-position block at once, since prefill's own
+attention runs against *transient* `[kvHeads, N, headDim]` buffers at `S = N`
+— already the tight bound, so `sEff` stays at its default there — not the
+persistent cache).
+
+**Prefill, three prompt lengths (RTX 5090, Chrome, real Sarashina2.2-1B-alibi-v1
+checkpoint, `LlamaEngineQ8Resident`, same session):**
+
+| case | prompt | prefill | vs. `LlamaEngineQ8` (#110 table, same prompts where reused) |
+| --- | --- | --- | --- |
+| short (`full_gear`) | 76 tok | **1.24s (61.2 tok/s)** | 12.0–12.7s (6.0–6.4 tok/s) |
+| mid (`brush_off`) | 70 tok | **1.27s (55.0 tok/s)** | 12.0–12.9s (5.4–5.8 tok/s) |
+| 聞く層級 (`listen`, few-shot + grammar) | 365 tok | **1.35s (269.0 tok/s)** | 13.4s (27.0 tok/s, unoptimized table above) |
+
+All three land in the 1-second range (issue #117's own completion bar,
+"1秒台以下"), including the longest, few-shot-heavy prompt — prefill tok/s
+actually *rises* with prompt length here because the fixed ~1.1–1.2s of
+per-generation cost (weight pack+dequant+transpose, `matmul` dispatch
+overhead) is amortized over more tokens, while the CPU-dequant portion that
+used to dominate is now flat regardless of `N` (`ops/dequant_transpose`'s
+own doc). Output text is byte-for-byte identical to the pre-#117 recordings
+above at the two prompts kept identical (`full_gear`: `【talk2】新しいGPU
+買ったから、ベンチマーク回した。\n【talk】……意外と速くて、地味に驚いた。`;
+`listen`: `policy: brush_off\ntopic: セグフォ`) — greedy tokens did not move,
+only how fast they arrived. (`brush_off`'s prompt text differs slightly
+from the #110 table's, so its output is not expected to match verbatim; it
+is style-consistent with the earlier `【base】昨日推しのライブ配信見てたら、
+朝になってた。` recording.)
+
+**Decode, re-measured with `sEff` (same session, same three prompts):**
+231.1 tok/s (`full_gear`, position ~76), 213.1–226.8 tok/s (`brush_off`,
+position ~70), 194.9–200.6 tok/s (`listen`, position ~365) — run-to-run
+variance on this box is real (a repeated `full_gear` measurement read
+172.8 tok/s once, with a single-step latency spike mid-run; every other
+repeat clustered at 220–231 tok/s), reported rather than smoothed over, per
+rule 9.
+
+**`sEff`'s own before/after, isolated by mutation** (revert `scores.wgsl`/
+`context.wgsl`'s scan bound from `s_eff` back to `S` — the exact mutation
+`ops/gqa/wgsl-seff.test.ts` catches — rebuild, remeasure in the same browser
+session, then restore):
+
+| position | with `sEff` | with `S` (pre-#117 equivalent) | speedup |
+| --- | --- | --- | --- |
+| ~76 (`full_gear`) | 231.1 tok/s | 176.1 tok/s | **1.31x** |
+| ~365 (`listen`) | 200.6 tok/s | 167.7 tok/s | **1.20x** |
+
+**Position dependence, within one run** (issue #117's own ask —
+"シーケンス位置依存があるので生成序盤/後半を分けて"): a 400-step decode run
+from `full_gear`'s prompt (`?maxDecodeSteps=400&ignoreEos=1`,
+`examples/llm-demo`'s new debug switches — `stepMs` recorded per step,
+`window.__lastRun`), position 76 -> 476:
+
+| window | position range | tok/s |
+| --- | --- | --- |
+| first 50 steps | 76–126 | 230.4 |
+| last 50 steps | 426–476 | 190.3 |
+
+A **17.4% slower** decode step at the deeper position, from `sEff` itself
+growing every step — a signature the pre-#117 code could not have had,
+confirmed by the same long-run shape under the `S`-reverted mutation: 176.1
+tok/s at position 76 vs. 167.7 tok/s at position 365 (5% apart, within this
+box's ordinary run-to-run noise, i.e. flat). Both readings are still small
+next to the ~85–89% of decode time `matvecQ8` weight bandwidth accounts for
+(roofline table below) — `sEff`'s attention-scan saving grows with position
+but starts from a small base at Sarashina2.2-1B's shape (`kvHeads=8`,
+`headDim=112`, well under `maxSeqLen=4096`'s own asymptote).
+
+**Roofline, updated.** Same machine, same calibration (`harness/roofline.ts`:
+1.707 TB/s), same model (Sarashina2.2-1B-alibi-v1-q8, 1,410,513,920 resident
+weight bytes/token, → **0.826 ms/token, 1210 tok/s bandwidth-bound lower
+bound** — unchanged, since neither the hardware nor the weight footprint
+changed):
+
+| case | measured decode | ms/token | % of lower bound | #110's own figure |
+| --- | --- | --- | --- | --- |
+| `full_gear` | 231.1 tok/s | 4.33 | **19.1%** | 13.4% |
+| `brush_off` | 213.1 tok/s | 4.69 | **17.6%** | 11.3% |
+| `listen` | 200.6 tok/s | 4.99 | **16.6%** | (not measured at #110) |
+
+A real improvement (+4.2–5.7 percentage points, +31–39% relative), entirely
+attributable to `sEff` removing the `maxSeqLen` scan — decode's dispatch
+count and structure are otherwise unchanged from #110, so the remaining gap
+to 100% is still `#110`'s own "~800 GPU op launches per token" term
+(unmeasured individually, same reasoning as that section), not a new one
+this issue introduces.
+
+**`weightTBuf`, reused per shape instead of allocated per layer** (PR #119
+review, recommended item). `runPrefillResident`'s dequant step wrote each
+layer's dequantized-and-transposed `matmul` operand (`ops/dequant_transpose`,
+above) into a **fresh** `GPUBuffer` every layer, for all 24 layers × 7
+projections (`wq`/`wk`/`wv`/`wo`/`wGate`/`wUp`/`wDown`) — none of them ever
+`destroy()`ed until the whole engine was, so a single prefill call's peak
+resident footprint included all `24 × 7` of these buffers alive at once, even
+though only one layer's worth is ever read at a time (the per-layer `for`
+loop's own `await`-ordering already guarantees each projection's dequant
+write strictly precedes that same layer's `matmul` read, before the next
+layer's dequant overwrites it). Since a `GPUBindGroup` binds to a buffer
+*object*, not its contents, the fix is to allocate one `weightTBuf` (and one
+`matmulGroup` bound to it) per projection **shape** — the 7 shapes recur
+identically across all 24 layers — build all 7 once before the layer loop
+(`setupMatmulProjectionShape`), and re-run only the dequant dispatch into the
+same buffer each layer (`dequantIntoShape`), with every transient buffer
+(packed int8 weight, scale, dequant uniform) explicitly `destroy()`ed after
+`batch()` runs, and the 7 shared `weightTBuf`s destroyed once at the very end
+of the call. Correctness verified unaffected: `llm/engine-q8-resident.wgsl.test.ts`
+and `llm/engine-q8-resident.limits.wgsl.test.ts` report the same worst
+abs/rel diffs against the fixture before and after this change (prefill
+`abs=1.19e-7, rel=2.02e-5`; decode `abs=1.49e-7, rel=7.14e-4`).
+
+Node/Dawn (the `webgpu` npm package this test suite runs against) exposes no
+live VRAM query API, so the reduction below is the same config-derived byte
+arithmetic this README already treats as measurement elsewhere (the
+resident-weight-bytes/token roofline figures above) — computed directly from
+`SARASHINA_2_2_1B_CONFIG`'s real dimensions
+(`hiddenSize=1792, numHeads=16, numKvHeads=8, headDim=112, ffnHidden=6272,
+numLayers=24`), not estimated:
+
+| | before (per layer, never destroyed) | after (shared across all layers) |
+| --- | --- | --- |
+| `weightTBuf` bytes, all 7 projections | 173,408,256 (165.4 MiB) × 24 layers | 173,408,256 (165.4 MiB), once |
+| peak `weightTBuf` residency | **4,161,798,144 (3.88 GiB)** | **173,408,256 (165.4 MiB)** |
+
+A **~3.71 GiB** reduction in this one buffer family's peak residency, on top
+of whatever the packed-int8 weight/scale/uniform buffers already freed by
+being `destroy()`ed per layer rather than accumulated (43,430,912 bytes/layer
+× 24 = 0.97 GiB, if none of those were ever destroyed either — the case
+before this fix for the ones `buildMatmulProjection`'s old per-layer
+`weightTBuf` allocation sat beside). The reviewer's own "5–7 GiB" estimate
+folds in KV-cache and per-token activation buffers this change does not
+touch (those were already `destroy()`ed on their own lifetimes, unrelated to
+`weightTBuf` sharing); this measurement is scoped to the specific buffer
+family the fix changes, not a claim about total prefill VRAM peak.
+
+**Scope not touched, same reasons #110 gave:** kernel fusion (#111),
+f16 activations, speculative decode. Prefill's own `S = N` attention (this
+issue) is a separate design point from decode's `sEff`, not the same
+mechanism reused — see `llm/engine-q8-resident.ts`'s class doc, "Prefill's
+own KV is scanned at S = N, not S = maxSeqLen".
 
 ### Scope
 

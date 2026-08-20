@@ -117,8 +117,38 @@ const WEIGHTS_BASE_URL = "/weights";
 const VOCAB_URL = "/llm/data/sarashina2.2-1b-instruct.vocab.json";
 /** `assets/llm.js`'s own `N_CTX` — kept equal so the two are comparable. */
 const MAX_SEQ_LEN = 1024;
-/** `assets/llm.js`'s own `MAX_TOKENS`. */
-const MAX_DECODE_STEPS = 200;
+/**
+ * `?maxDecodeSteps=` as a validated positive integer, not a raw `Number(...)`
+ * — PR #119 review, item 9: `Number("")` is `0`, not `NaN`, so
+ * `?maxDecodeSteps=` with no value (a stray `&maxDecodeSteps` in a pasted
+ * URL, or a browser autofill quirk) silently produced a **0-step** decode
+ * loop below — not a crash, not a short run, a measurement of nothing that
+ * still prints tok/s as if it measured something. A typo'd value (`"abc"`)
+ * already produced `NaN`, and `NaN` steps in a `for (step = 0; step <
+ * NaN; ...)` loop never runs either, so both malformed shapes shared the
+ * same silent-zero-steps failure this function now rejects instead of
+ * quietly running with, per rule 8's "壊れたことに気づけない" bar.
+ */
+function positiveIntParam(name: string, fallback: number): number {
+  const raw = new URLSearchParams(location.search).get(name);
+  if (raw === null) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new Error(`?${name}=${JSON.stringify(raw)} must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+/**
+ * `assets/llm.js`'s own `MAX_TOKENS`, overridable via `?maxDecodeSteps=` —
+ * issue #117's decode retest needs a run long enough to see `sEff`'s
+ * position dependence (`sEff = position + 1` grows every step, unlike the
+ * pre-#117 `S = maxSeqLen` scan, which was flat regardless of position), and
+ * every prompt here reaches `</s>` in 13–25 steps on its own (`?ignoreEos=1`
+ * disables that stop so a long run is not left to chance).
+ */
+const MAX_DECODE_STEPS = positiveIntParam("maxDecodeSteps", 200);
+const IGNORE_EOS = new URLSearchParams(location.search).get("ignoreEos") === "1";
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -273,7 +303,7 @@ async function generate(
   engine: ForwardEngine,
   promptTokens: number[],
   constraint: Constraint | undefined,
-): Promise<{ tokens: number[]; prefillMs: number; decodeMsTotal: number; decodeSteps: number }> {
+): Promise<{ tokens: number[]; prefillMs: number; decodeMsTotal: number; decodeSteps: number; stepMs: number[] }> {
   if (!loaded) throw new Error("重みが未ロードです");
   const { vocab, tokenizer } = loaded;
 
@@ -285,22 +315,31 @@ async function generate(
   const tokens: number[] = [];
   let decodeMsTotal = 0;
   let decodeSteps = 0;
+  // One entry per decode step — issue #117's decode retest wants
+  // early-vs-late tok/s within a single run (`sEff = position + 1` grows
+  // every step, so a long-enough run should show a slope the pre-#117
+  // `S = maxSeqLen` scan, flat regardless of position, could not have had).
+  // `decodeMsTotal`/`decodeSteps` above stay as the single aggregate number
+  // `runGeneration`'s `stats` line already reported before this existed.
+  const stepMs: number[] = [];
 
   for (let step = 0; step < MAX_DECODE_STEPS; step += 1) {
     const next = sampleNext(logits, tokens, { mode: "greedy" }, constraint);
     tokens.push(next);
-    if (next === vocab.eosId) break;
+    if (next === vocab.eosId && !IGNORE_EOS) break;
 
     const decodeStart = performance.now();
     const [nextLogits] = await engine.forward([next]);
-    decodeMsTotal += performance.now() - decodeStart;
+    const elapsed = performance.now() - decodeStart;
+    decodeMsTotal += elapsed;
     decodeSteps += 1;
+    stepMs.push(elapsed);
     logits = nextLogits!;
 
     output.textContent = tokenizer.decode(tokens);
   }
   output.textContent = tokenizer.decode(tokens);
-  return { tokens, prefillMs, decodeMsTotal, decodeSteps };
+  return { tokens, prefillMs, decodeMsTotal, decodeSteps, stepMs };
 }
 
 async function runGeneration(): Promise<void> {
@@ -356,16 +395,40 @@ async function runGeneration(): Promise<void> {
       : new LlamaEngineQ8(engineConfig, weights, runner.run);
     const buildMs = performance.now() - buildStart;
 
-    const { tokens, prefillMs, decodeMsTotal, decodeSteps } = await generate(engine, promptTokens, constraint);
+    const { tokens, prefillMs, decodeMsTotal, decodeSteps, stepMs } = await generate(engine, promptTokens, constraint);
 
     const prefillTokPerSec = promptTokens.length / (prefillMs / 1000);
     const decodeTokPerSec = decodeSteps > 0 ? decodeSteps / (decodeMsTotal / 1000) : 0;
+
+    // Issue #117's own ask: decode tok/s split early vs late in one run,
+    // since `sEff = position + 1` grows every step and the pre-#117
+    // `S = maxSeqLen` scan did not depend on position at all. Halves of
+    // `stepMs`, not a fixed window — meaningful at both a 13-step natural
+    // run and a `?maxDecodeSteps=300&ignoreEos=1` long one.
+    const half = Math.floor(stepMs.length / 2);
+    const avgTokPerSec = (ms: number[]) => (ms.length > 0 ? 1000 / (ms.reduce((a, b) => a + b, 0) / ms.length) : 0);
+    const earlyTokPerSec = avgTokPerSec(stepMs.slice(0, half));
+    const lateTokPerSec = avgTokPerSec(stepMs.slice(stepMs.length - half));
+
+    // Exposed for automated measurement (issue #117's PR) — the DOM text
+    // below is for a human reading the page, this is for a script that
+    // wants the exact numbers without parsing formatted text back out.
+    (window as unknown as { __lastRun: unknown }).__lastRun = {
+      engine: useResident ? "resident" : "legacy",
+      promptTokens: promptTokens.length,
+      prefillMs,
+      decodeSteps,
+      decodeMsTotal,
+      stepMs,
+      positionAtStep0: promptTokens.length,
+    };
 
     stats.textContent =
       `engine: ${useResident ? "LlamaEngineQ8Resident (#110)" : "LlamaEngineQ8"} | ` +
       `construction: ${buildMs.toFixed(0)}ms | ` +
       `prefill: ${promptTokens.length} tok in ${prefillMs.toFixed(0)}ms (${prefillTokPerSec.toFixed(2)} tok/s) | ` +
-      `decode: ${decodeSteps} tok in ${decodeMsTotal.toFixed(0)}ms (${decodeTokPerSec.toFixed(2)} tok/s)` +
+      `decode: ${decodeSteps} tok in ${decodeMsTotal.toFixed(0)}ms (${decodeTokPerSec.toFixed(2)} tok/s) | ` +
+      `decode early half: ${earlyTokPerSec.toFixed(2)} tok/s | decode late half: ${lateTokPerSec.toFixed(2)} tok/s` +
       (tokens[tokens.length - 1] === vocab.eosId ? " | stopped at </s>" : " | stopped at MAX_DECODE_STEPS");
   } finally {
     // The cast (not just `residentDevice?.destroy()`) is load-bearing: TS's

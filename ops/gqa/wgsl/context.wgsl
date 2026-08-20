@@ -19,6 +19,13 @@ struct Params {
   L: u32,
   S: u32,
   Dv: u32,
+  // Issue #117, same field and same contract as scores.wgsl's: bounds the
+  // `probs @ V` sum, `S` stays `v`'s per-head stride. Must be given the same
+  // value `scores.wgsl` was — `probs` columns past it were never written by
+  // that dispatch (see scores.wgsl's doc), so reading further here would read
+  // whatever this buffer held before. Default `S` (appended, not inserted —
+  // no existing field's offset moves).
+  s_eff: u32,
 }
 
 @group(0) @binding(0) var<storage, read> probs: array<f32>;
@@ -50,7 +57,7 @@ fn main(
   // One output channel per invocation, striding when Dv exceeds the workgroup.
   for (var c = local_id.x; c < params.Dv; c += WORKGROUP_SIZE) {
     var acc: f32 = 0.0;
-    for (var j: u32 = 0u; j < params.S; j += 1u) {
+    for (var j: u32 = 0u; j < params.s_eff; j += 1u) {
       acc += probs[p_row + j] * v[v_head + j * params.Dv + c];
     }
     output[o_row + c] = acc;
