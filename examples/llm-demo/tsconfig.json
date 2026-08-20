@@ -1,0 +1,21 @@
+{
+  // A separate program from the root `tsconfig.json`, not a merged one: this
+  // demo runs in a browser (needs the `DOM` lib and `@webgpu/types`'
+  // `navigator.gpu` augmentation) and the root config deliberately does not
+  // carry `DOM` — see `tsconfig.build.json`'s own comment on why `ops/`
+  // and `harness/` are checked without it. Keeping this config separate
+  // means adding a browser API here can never leak `DOM` globals into an
+  // op's reference implementation by accident.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types"],
+    "noEmit": true
+  },
+  // `build.mjs` / `server.mjs` are plain Node scripts, not TypeScript —
+  // `tsc` ignores `.mjs` without `allowJs`, and this config deliberately
+  // does not turn that on (it would also start type-checking every `.js`
+  // reachable from `src`, which is not the point here). Only `src/` — the
+  // browser bundle's own source — is what this program checks.
+  "include": ["src"]
+}

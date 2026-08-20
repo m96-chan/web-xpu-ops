@@ -9,6 +9,51 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `examples/llm-demo/`: a browser demo that loads Sarashina2.2-1B-alibi-v1
+  (int8, `convert_weights.py`'s output) over HTTP and runs `LlamaEngineQ8` on
+  a real WebGPU device — issue #106, and the first time this repository's
+  `llm/` engine has generated anything in a browser rather than under Node.
+  It closes the live-generation / `llama.cpp`-comparison / tok/s gate PR
+  #108 (issue #105) moved here: #108 could not complete a live GPU dispatch
+  on the machine it was built on (a Node+Dawn binding fragility triggered by
+  real-model-scale CPU-bound work immediately before a dispatch — issue
+  #107), and a browser's separate GPU process does not share that condition.
+  `llm/index.ts` also now re-exports `llm/tokenizer.ts` (#101), `llm/sampler.ts`
+  and `llm/constraints/line-format.ts` (#102) — a known gap since both landed,
+  called out in #106's own text, and caught by the new `llm/index.test.ts`
+  before being fixed.
+
+  `llm/browser-weights.ts#loadWeightsQ8FromUrl` is a `fetch`-based sibling of
+  `real-model-weights.ts#loadConvertedWeightsQ8`, sharing the same
+  manifest-parsing core (`weights-q8-io.ts#buildLlamaWeightsQ8`) per PR #108's
+  own note that a browser loader "should be a small adapter over the same
+  parsing logic, not a reimplementation" — it lives in `llm/` (not
+  `examples/`) and is exported from `llm/index.ts` because `fetch`/`Response`
+  are standard Web APIs this package already assumes elsewhere (`llm/tokenizer.ts`'s
+  `TextEncoder`/`TextDecoder`), unlike the `node:fs` the disk-based loader
+  needs, and because that keeps it testable with a mocked `fetch` and no
+  browser.
+
+  The demo's own WebGPU plumbing (`examples/llm-demo/src/browser-runtime.ts`)
+  is a `navigator.gpu` port of `harness/wgsl.ts#createRunner` — necessarily a
+  separate implementation, not a shared import, since `harness/wgsl.ts`
+  imports the `webgpu` package (a Node-native Dawn binding with no browser
+  build) at module scope. `llm/kernels.ts` itself needed **zero** changes to
+  run in a browser: `examples/llm-demo/build.mjs` (esbuild — the first
+  bundler this repository has needed, justified in that file's own module
+  doc) redirects `kernels.ts`'s `import { kernel, params } from
+  "../harness/index.js"` to `browser-runtime.ts`'s matching-signature
+  implementations at bundle time, and inlines all ten `.wgsl` kernel sources
+  `kernels.ts` reads via `node:fs` under Node into plain JS strings via
+  esbuild's `text` loader — `llm/kernels.browser-parity.test.ts` (text-based,
+  no `.wgsl` import, runs under `npm test`) guards the two kernel tables
+  against drifting apart. `examples/llm-demo/server.mjs` is a Node-standard-
+  library-only static file server (repository root + a `/weights/` mount
+  pointing at a converted checkpoint directory outside this repository,
+  e.g. `technologies-moe/alibi-ai`'s `third_party/webgpu-weights/`), always
+  setting `Content-Length` (no `Range` support needed) since the demo's
+  progress bar reads it.
+
 - `llm/tokenizer.ts`: a SentencePiece **unigram** tokenizer (Viterbi encode,
   matching decode) for the Sarashina2.2-1B-Instruct model the LLM engine
   (#98) targets, plus `llm/tools/export_tokenizer.py` (parses
@@ -178,6 +223,31 @@ Entries record **why** a change was needed. What changed is in the diff.
   the packing cost once rather than never taking it (#97). `packQ8` packs
   `quantize`'s existing per-row absmax codes into the layout `matvecQ8` reads,
   so the two compose instead of `matvecQ8` inventing its own quantization.
+
+### Fixed
+
+- `llm/kernels.ts#runMatVec`/`runMatVecQ8` now split a dispatch whose row
+  count `M` exceeds WebGPU's `maxComputeWorkgroupsPerDimension` (`65535` on
+  every implementation measured against this repo) into several dispatches
+  and concatenate the results, instead of asking for `workgroups: [M]`
+  directly. Found running Sarashina2.2-1B-alibi-v1 in a browser for the
+  first time (issue #106): `lm_head`'s decode-time projection
+  (`vocabSize=102400`) silently produced an all-zero logits vector on every
+  decode step — a WebGPU validation error past this limit is reported
+  asynchronously through the device's error callback, not by throwing where
+  `dispatchWorkgroups` is called, so nothing in the existing code path ever
+  saw it fail. The visible symptom was the model emitting one correct
+  character from prefill (which projects `lm_head` through the tiled
+  `matmul` path, unaffected) and then the same wrong token — id 0 — forever,
+  since argmax over an all-zero vector always picks index 0. Verified
+  end-to-end by re-running the same generation in the browser after the fix
+  and getting real, `llama.cpp`-comparable output (see #106's PR); the
+  chunking logic itself is proven against a mocked `Runner["run"]`
+  (`llm/kernels.chunking.test.ts`) rather than on real hardware at this
+  scale, because a real dispatch at 65,535 workgroups reproducibly crashed
+  this repository's own Node/Dawn binding (issue #38/#49/#107's family) —
+  exactly the fragility issue #106 exists to route real-model verification
+  around in the first place.
 
 ## [0.1.0] - 2026-08-04
 

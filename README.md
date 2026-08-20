@@ -719,8 +719,147 @@ strict prefix of another's, or completion would be ambiguous. Such a spec is
 rejected at construction rather than silently misclassified during
 generation.
 
-Neither file is wired into the engine above yet — the decode loop that would
-call `sampleNext` per step is a separate, later issue.
+`llm/index.ts` re-exports the tokenizer, the sampler and this constraint
+(issue #106 — both had landed without ever being re-exported from the
+package's own entry point, a gap #106's own text called out). The decode
+loop that calls `sampleNext` once per step is still not inside
+`LlamaEngine`/`LlamaEngineQ8` itself — a caller drives it, the way
+`examples/llm-demo/src/main.ts` does below — since a constraint is a
+generation-level policy, not something the engine's `forward` (one call, one
+set of logits) has an opinion about.
+
+---
+
+## Browser demo (`examples/llm-demo/`)
+
+Issue [#106](https://github.com/m96-chan/web-xpu-ops/issues/106): every
+piece above — tokenizer, `LlamaEngineQ8`, sampler, `LineFormatConstraint` —
+running together in a real browser tab over WebGPU, loading a real converted
+checkpoint over HTTP. This is the first time this repository's `llm/` code
+has generated anything outside Node; PR #108 could not complete a live GPU
+dispatch on the machine it was built on (a Node+Dawn binding fragility
+triggered by real-model-scale CPU-bound work immediately before a dispatch —
+[#107](https://github.com/m96-chan/web-xpu-ops/issues/107)), and moved that
+gate here on the strength of one fact: a browser's WebGPU implementation runs
+in a separate GPU process, so the "CPU-bound work in the same process right
+before a dispatch" condition #107 isolated does not exist there.
+
+### Running it
+
+```bash
+npm run demo:build   # esbuild: examples/llm-demo/src/main.ts -> dist/bundle.js
+npm run demo:serve   # node examples/llm-demo/server.mjs — Node standard library only
+```
+
+Then open `http://localhost:8770/examples/llm-demo/` in a WebGPU-capable
+browser. `demo:serve` serves this repository (so `llm/data/*.vocab.json` and
+the demo's own `dist/bundle.js` are reachable) and additionally maps
+`/weights/` onto a converted-checkpoint directory outside this repository —
+`convert_weights.py`'s output (`manifest.json` + `weights.codes.bin` +
+`weights.scales.bin` + `weights.norms.bin`), by default
+`technologies-moe/alibi-ai`'s `third_party/webgpu-weights/sarashina2.2-1b-alibi-v1-q8/`
+(override with `ALIBI_WEIGHTS_DIR`). No `Range` support — `Content-Length` is
+always set, since the page's progress bar reads it while streaming the ~1.4
+GiB `weights.codes.bin`.
+
+The page: load the weights (progress bar, byte-weighted across the four
+fetched files since `weights.codes.bin` dominates), then either mode —
+
+- **スタイラ**: `<|system|>{SYSTEM_PROMPT}</s><|user|>[{policy}] {text}</s><|assistant|>`,
+  `SYSTEM_PROMPT` and the prompt format copied verbatim from
+  `technologies-moe/alibi-ai`'s `assets/llm.js` (this issue's own
+  instruction — that file's wording is what the checkpoint was trained
+  against, per that repository's LoRA training pipeline).
+- **聞く層**: the same repository's `LISTEN_SYSTEM_PROMPT` / few-shot /
+  `<|system|>…</s>(<|user|>…</s><|assistant|>…</s>)*<|user|>{text}</s><|assistant|>`
+  prompt, decoded under a `LineFormatConstraint` built from the identical
+  spec `assets/llm.js`'s GBNF grammar
+  (`root ::= "policy: " ("full_gear" | "engage" | "brush_off") "\ntopic: "
+  [^\n]{1,24}`) describes — a toggle switches the constraint on and off, so
+  the difference it makes is directly visible.
+
+Generation is greedy, decoding token by token until `</s>` (`vocab.eosId`) or
+a step cap, with the page's tok/s split into **prefill** (one
+`engine.forward(promptTokens)` call) and **decode** (one
+`engine.forward([token])` call per step) — measured at the `forward()` call
+boundary with `performance.now()`, not from a GPU timestamp query (this
+demo's `browser-runtime.ts` does not implement `Runner.time()`; wall-clock
+around each `forward()` await is simpler and sufficient for this issue's
+ask).
+
+### Why this needed a bundler, and why `kernels.ts` did not need to change
+
+`llm/kernels.ts` reads its ten kernels' WGSL source via
+`node:fs#readFileSync` (through `harness/index.ts#kernel()`) and
+`harness/wgsl.ts#createRunner` is built on the `webgpu` npm package (Node's
+Dawn binding) — both fine for `npm test`, both unusable in a browser.
+`examples/llm-demo/build.mjs` (esbuild, this repository's first bundler —
+justified in that file's own module doc) resolves `kernels.ts`'s
+`import { kernel, params } from "../harness/index.js"` to
+`examples/llm-demo/src/browser-runtime.ts` at bundle time instead — a
+`navigator.gpu`-based `Runner` port of `harness/wgsl.ts#createRunner`, plus
+`kernel()`/`params()` implementations with the identical signatures, sourcing
+their WGSL from ten `.wgsl` files esbuild's `text` loader inlines as JS
+strings. The redirect is an `onResolve` hook keyed on the import specifier,
+and `llm/kernels.browser-parity.test.ts` (plain text parsing, no `.wgsl`
+import, runs under `npm test`) fails if the two kernel tables ever name
+different ops or entry points.
+
+`kernels.ts` itself did need one real change, found by this demo rather than
+assumed ahead of it: `runMatVec`/`runMatVecQ8` dispatch one workgroup per
+output row with no tiling, which is exact and cheap until the row count
+exceeds WebGPU's `maxComputeWorkgroupsPerDimension` (`65535`, measured the
+same on Dawn/Node and Chrome). Sarashina2.2-1B-alibi-v1's `lm_head`
+(`vocabSize=102400`) is past that, and past it a dispatch is not rejected
+loudly — the validation error is reported through the device's own
+asynchronous error callback, not by throwing where `dispatchWorkgroups` is
+called — so every decode step's logits silently came back all zero and
+argmax always picked token 0. Both functions now split a too-wide dispatch
+into several within the limit and concatenate the results; see the
+`CHANGELOG`'s `### Fixed` entry and `llm/kernels.chunking.test.ts` for the
+full story, including why that test's proof is a mocked `Runner["run"]`
+rather than a real GPU dispatch at 65,535 workgroups (which reproducibly
+crashed this repository's own Node/Dawn binding — the `#38`/`#49`/`#107`
+family again).
+
+### Real-hardware verification (RTX 5090, Chrome, non-headless)
+
+Three generations, greedy, against the real Sarashina2.2-1B-alibi-v1 int8
+checkpoint, compared to `llama-server`'s `/completion` endpoint (same GGUF
+family, `temperature: 0`, `top_k: 1` — raw completion, not its chat-template
+path, so the exact same prompt string reaches both engines). Quantization
+schemes differ (this engine: per-row absmax int8; `llama.cpp`: GGUF `Q8_0`
+block quantization), so token-for-token identity is not expected, but on the
+`full_gear` case it happened anyway:
+
+| case | this engine (browser) | `llama.cpp` (`Q8_0`) |
+| --- | --- | --- |
+| `full_gear` | `【talk2】新しいGPU買ったから、ベンチマーク回した。\n【talk】……意外と速くて、地味に驚いた。` | identical |
+| `brush_off` | `【base】昨日推しのライブ配信見てたら、朝になってた。` | `【base】……あれ、もう朝じゃん。` (diverges after `【base】`) |
+| 聞く層 (constrained) | `policy: brush_off\ntopic: セグフォ` | `policy: full_gear\ntopic: セグフォの直し方` (diverges at the very first enum choice) |
+
+tok/s (unoptimized — no batching or overlap between dispatches, one
+`await` per kernel call):
+
+| case | prefill | decode |
+| --- | --- | --- |
+| `full_gear` | 76 tok, 12.6s (6.0 tok/s) | 25 tok, 33.0s (0.76 tok/s) |
+| `brush_off` | 69 tok, 12.1s (5.7 tok/s) | 13 tok, 17.3s (0.75 tok/s) |
+| 聞く層 | 363 tok, 13.4s (27.0 tok/s) | 13 tok, 18.3s (0.71 tok/s) |
+
+Weight load (1.41 GiB over loopback HTTP, warm OS page cache): ~600–650ms —
+not representative of a real network, only of this fetch-and-parse path.
+Engine construction (packing every projection into `matvecQ8`'s wire format)
+was ~1.0–1.1s per generation. See the PR for the full prompts, decoded
+output, and a screenshot.
+
+### Scope
+
+Reaching into `technologies-moe/alibi-ai` (a separate repository) itself —
+wiring this engine into that project's actual chat UI, not just reusing its
+prompt wording — is out of scope here and tracked on that repository's own
+side. Mobile WebGPU and UI polish are likewise out of scope (issue #106's own
+text).
 
 ---
 

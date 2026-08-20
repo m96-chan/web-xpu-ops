@@ -5,7 +5,7 @@ import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import { gather } from "../ops/gather/index.js";
 import { groupedAttention } from "../ops/gqa/index.js";
 import { matmul } from "../ops/matmul/index.js";
-import { matvec } from "../ops/matvec/index.js";
+import { matvec, matvecQ8, packQ8 } from "../ops/matvec/index.js";
 import { rmsnorm } from "../ops/rmsnorm/index.js";
 import { rope } from "../ops/rope/index.js";
 import {
@@ -15,6 +15,7 @@ import {
   runGqa,
   runMatMul,
   runMatVec,
+  runMatVecQ8,
   runRmsNorm,
   runRope,
 } from "./kernels.js";
@@ -59,6 +60,17 @@ describe("llm/kernels wrappers", () => {
     const got = await runMatVec(run, { matrix, vector, M, K });
     const want = matvec({ matrix, vector, M, K });
     expect(agree(got, want)).toBeNull();
+  });
+
+  gpuTest("runMatVecQ8 agrees with matvecQ8()", async (run) => {
+    const [M, K] = [6, 40];
+    const codes = Int32Array.from({ length: M * K }, (_, i) => Math.round(Math.sin(i * 0.37) * 100));
+    const weight = packQ8({ codes, N: M, K });
+    const scale = Float32Array.from({ length: M }, (_, i) => 0.02 * (i + 1) + 0.007);
+    const vector = wave(K, 0.11, 0.8);
+    const got = await runMatVecQ8(run, { weight, scale, vector, M, K });
+    const want = matvecQ8({ weight, scale, vector, N: M, K });
+    expect(agree(got, want, { rel: 1e-4, abs: 5e-5 })).toBeNull();
   });
 
   gpuTest("runMatMul agrees with matmul()", async (run) => {

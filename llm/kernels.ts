@@ -92,6 +92,57 @@ export async function runRmsNorm(
   return asF32(out!);
 }
 
+/**
+ * `runMatVec`/`runMatVecQ8` dispatch one workgroup per output row
+ * (`workgroups: [M]`, no tiling — see `ops/matvec/wgsl/kernel.wgsl` and
+ * `q8.wgsl`'s own docs), which is exact and cheap until `M` exceeds
+ * `maxComputeWorkgroupsPerDimension`. Every WebGPU implementation measured
+ * against this repo — Dawn on Linux/NVIDIA (Node, and Chrome) — reports that
+ * limit as `65535`, the spec's own required default; hard-coded here rather
+ * than threaded through from an adapter because `Runner["run"]` (this
+ * module's only handle on the device) carries no way to ask it, by design —
+ * `llm/kernels.ts` and its two `Runner` implementations (Node's
+ * `harness/wgsl.ts`, the browser demo's `browser-runtime.ts`) do not
+ * otherwise know anything device-specific.
+ *
+ * A dispatch past the limit is not rejected loudly: WebGPU reports the
+ * validation error asynchronously through the device's own error callback,
+ * not by throwing where `dispatchWorkgroups` is called, so the visible
+ * *symptom* is a compute pass that silently does nothing — every row of
+ * `output` stays at its buffer's zero-initialized default. First hit running
+ * this engine's real target model (Sarashina2.2-1B, `vocabSize=102400`) in a
+ * browser (issue #106): `lm_head`'s decode-time projection
+ * (`LlamaEngineQ8`'s `project`, `tokens === 1`) dispatches `matvecQ8` with
+ * `M=102400`, and every decode step after the first (which the prefill's
+ * `matmul` path — tiled, unaffected — still gets right) produced the same
+ * wrong token, because argmax over an all-zero logits vector always picks
+ * index 0. Below the limit this is a single dispatch, identical to before.
+ */
+const MAX_WORKGROUPS_PER_DISPATCH = 65535;
+
+/**
+ * Runs a one-workgroup-per-row dispatch over `M` rows, splitting into
+ * multiple dispatches of at most `MAX_WORKGROUPS_PER_DISPATCH` rows each
+ * when `M` exceeds it, and concatenating the results back into one `[M]`
+ * output — see `MAX_WORKGROUPS_PER_DISPATCH`'s own doc for why this exists.
+ * No WGSL changes: the shader has no idea how many dispatches contributed to
+ * `output`, and does not need to — each chunk's dispatch writes rows
+ * `[0, rowCount)` of its own `"out"` binding, and `dispatchChunk` is given
+ * the row range to source its *inputs* from.
+ */
+async function dispatchRowsChunked(
+  M: number,
+  dispatchChunk: (rowStart: number, rowCount: number) => Promise<Float32Array>,
+): Promise<Float32Array> {
+  if (M <= MAX_WORKGROUPS_PER_DISPATCH) return dispatchChunk(0, M);
+  const result = new Float32Array(M);
+  for (let rowStart = 0; rowStart < M; rowStart += MAX_WORKGROUPS_PER_DISPATCH) {
+    const rowCount = Math.min(MAX_WORKGROUPS_PER_DISPATCH, M - rowStart);
+    result.set(await dispatchChunk(rowStart, rowCount), rowStart);
+  }
+  return result;
+}
+
 export interface MatVecArgs {
   /** `[M, K]` row-major. */
   matrix: Float32Array;
@@ -101,17 +152,19 @@ export interface MatVecArgs {
 }
 
 export async function runMatVec(run: Runner["run"], { matrix, vector, M, K }: MatVecArgs): Promise<Float32Array> {
-  const [out] = await run({
-    code: CODE.matvec,
-    bindings: [
-      { kind: "storage", data: matrix },
-      { kind: "storage", data: vector },
-      { kind: "out", type: "f32", length: M },
-      { kind: "uniform", data: params([["u32", M], ["u32", K]]) },
-    ],
-    workgroups: [M],
+  return dispatchRowsChunked(M, async (rowStart, rowCount) => {
+    const [out] = await run({
+      code: CODE.matvec,
+      bindings: [
+        { kind: "storage", data: matrix.subarray(rowStart * K, (rowStart + rowCount) * K) },
+        { kind: "storage", data: vector },
+        { kind: "out", type: "f32", length: rowCount },
+        { kind: "uniform", data: params([["u32", rowCount], ["u32", K]]) },
+      ],
+      workgroups: [rowCount],
+    });
+    return asF32(out!);
   });
-  return asF32(out!);
 }
 
 export interface MatVecQ8Args {
@@ -133,18 +186,21 @@ export interface MatVecQ8Args {
  * copied from `ops/matvec/q8.wgsl.test.ts`, not re-derived (rule 2).
  */
 export async function runMatVecQ8(run: Runner["run"], { weight, scale, vector, M, K }: MatVecQ8Args): Promise<Float32Array> {
-  const [out] = await run({
-    code: CODE.matvecQ8,
-    bindings: [
-      { kind: "storage", data: weight },
-      { kind: "storage", data: scale },
-      { kind: "storage", data: vector },
-      { kind: "out", type: "f32", length: M },
-      { kind: "uniform", data: params([["u32", M], ["u32", K]]) },
-    ],
-    workgroups: [M],
+  const wordsPerRow = Math.ceil(K / 4);
+  return dispatchRowsChunked(M, async (rowStart, rowCount) => {
+    const [out] = await run({
+      code: CODE.matvecQ8,
+      bindings: [
+        { kind: "storage", data: weight.subarray(rowStart * wordsPerRow, (rowStart + rowCount) * wordsPerRow) },
+        { kind: "storage", data: scale.subarray(rowStart, rowStart + rowCount) },
+        { kind: "storage", data: vector },
+        { kind: "out", type: "f32", length: rowCount },
+        { kind: "uniform", data: params([["u32", rowCount], ["u32", K]]) },
+      ],
+      workgroups: [rowCount],
+    });
+    return asF32(out!);
   });
-  return asF32(out!);
 }
 
 export interface MatMulArgs {
