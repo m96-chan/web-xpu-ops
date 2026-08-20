@@ -10,13 +10,19 @@ single implementation is imported by both rather than reimplemented twice
   row, `quantize`'s own guard against a division by zero).
 - **Rounding**: `quantize()` uses JS's `Math.round`, which rounds ties
   **toward +Infinity** (`Math.round(62.5) === 63`, `Math.round(-62.5) === -62`)
-  — not "round half away from zero" and not "round half to even". That is
-  exactly `floor(x + 0.5)`, so this module uses `np.floor(x + 0.5)` rather
-  than `np.round` (numpy's default is round-half-to-even/banker's rounding,
-  which disagrees with `Math.round` at every `.5` boundary: `np.round(62.5)`
-  is `62`, `Math.round(62.5)` is `63`). Verified, not assumed (rule 2) — see
+  — not "round half away from zero" and not "round half to even". numpy's
+  `np.round` is banker's rounding and disagrees at every `.5` boundary
+  (`np.round(62.5)` is `62`). The tempting `np.floor(x + 0.5)` is *also*
+  wrong, in a narrower band: for `x` just below a half-integer (e.g.
+  `0.49999999999999994`, the largest double below 0.5) the addition `x + 0.5`
+  itself rounds up to `1.0` before `floor` sees it, giving `1` where
+  `Math.round` gives `0`. So this module computes
+  `floor(x) + (x - floor(x) >= 0.5)`, which introduces no second rounding:
+  `x - floor(x)` is exact in IEEE double for every finite `x` whose fraction
+  can decide the comparison. Verified, not assumed (rule 2) — see
   `quantize-parity.test.ts`, which spawns this module's `--selftest` and
-  diffs its output against `ops/quantize/reference.ts#quantize` directly.
+  diffs its output against `ops/quantize/reference.ts#quantize` directly,
+  including a row constructed inside that double-rounding band.
 - All arithmetic promoted to float64 before rounding, mirroring the fact that
   JS numbers (and therefore every intermediate in `quantize()`) are float64
   regardless of the `Float32Array` the values are read from/written to; only
@@ -43,7 +49,10 @@ def quantize_per_row(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     with np.errstate(divide="ignore", invalid="ignore"):
         inverse64 = np.where(absmax == 0, 0.0, 127.0 / absmax)
     scaled = w64 * inverse64[:, None]
-    codes = np.clip(np.floor(scaled + 0.5), -127, 127).astype(np.int8)
+    # Math.round semantics without the double rounding of floor(x + 0.5):
+    # see the module doc's Rounding note.
+    floored = np.floor(scaled)
+    codes = np.clip(floored + (scaled - floored >= 0.5), -127, 127).astype(np.int8)
     scale = scale64.astype(np.float32)
     return codes, scale
 
@@ -66,6 +75,14 @@ def _selftest() -> None:
         [3.0, -1.0, 2.5, -2.5, 0.25, -0.75],
         [0.0, 0.0, 0.0],  # all-zero row: scale must be 1, not a division by zero
         [-5.0, 5.0, 2.0, -2.0, 1.0],
+        # Double-rounding band: both values are exactly float32-representable,
+        # and 0.005327165126800537 * (127 / 1.3530999422073364) is
+        # 0.49999999999999994 — the largest double below 0.5. Math.round gives
+        # 0; naive floor(x + 0.5) gives 1, because the addition itself rounds
+        # x + 0.5 up to 1.0 before floor sees it. This row is what tells the
+        # two apart when every input is representable in the f32 the TS
+        # reference reads.
+        [1.3530999422073364, 0.005327165126800537, -0.005327165126800537],
     ]
     out = []
     for row in rows:

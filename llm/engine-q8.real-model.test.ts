@@ -69,12 +69,15 @@ interface RunResult {
   tokPerSecExcludingFirstStep: number;
 }
 
-describe("LlamaEngineQ8 / real Sarashina2.2-1B-alibi-v1 generation", () => {
+// skipIf, not an early return inside the body: `return` reports a green PASS
+// with zero assertions run, and this repository has already been bitten by
+// exactly that (gpuTest's own `if (!current) return;`). A skip is visible in
+// the summary; a vacuous pass tells #106's implementer the real-model gate
+// ran when it never did.
+describe.skipIf(!present)("LlamaEngineQ8 / real Sarashina2.2-1B-alibi-v1 generation", () => {
   useGpu();
 
   gpuTest("prefill + greedy decode on the real converted checkpoint", async (run) => {
-    if (!present) return;
-
     const { config, weights } = loadConvertedWeightsQ8(REAL_MODEL_Q8_DIR, MAX_SEQ_LEN);
     const promptData = JSON.parse(readFileSync(PROMPT_TOKENS_PATH, "utf8")) as { promptText: string; tokenIds: number[] };
     const promptTokens = promptData.tokenIds;
