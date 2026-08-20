@@ -139,4 +139,20 @@ describe("resident device", () => {
     expect(Array.from(chunk0 as Float32Array)).toEqual([11, 12, 13, 14]);
     expect(Array.from(chunk1 as Float32Array)).toEqual([25, 26, 27, 28]);
   });
+
+  /**
+   * PR #116 review, item 4: `pipelineFor` built its `GPUComputePipeline` with
+   * no error scope around `createComputePipeline` — unlike `bindGroup`
+   * (this file's own tests already exercise that scope indirectly) and
+   * `wgsl.ts#dispatch`'s identical push/pop around the same call. A bogus
+   * `entry` name is exactly the case that scope exists for (issue #46's own
+   * failure mode: `layout: "auto"` still builds *a* pipeline layout for a
+   * shader with no such entry point, so nothing before this failed loudly)
+   * — without it, this call would instead throw much later and more opaquely
+   * out of `bindGroup`'s own validation (a different call, a confusing
+   * error), or not until the compute pass never wrote its expected output.
+   */
+  residentTest("pipelineFor rejects a shader/entry pair the module does not export", async (device) => {
+    await expect(device.pipelineFor(elementwiseKernel, "no_such_entry_point")).rejects.toThrow(/pipeline is not valid/);
+  });
 });

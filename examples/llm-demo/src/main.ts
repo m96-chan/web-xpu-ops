@@ -354,16 +354,25 @@ async function runGeneration(): Promise<void> {
   // (`harness/resident.ts#runnerFromResident`'s doc); a browser is far more
   // robust than that native binding, but there is no reason to keep a
   // second device alive between generations when nothing needs it to.
+  //
+  // `residentDevice` is assigned *inside* the `try` below, not before it
+  // (PR #116 review, item 3): `createBrowserResidentDevice()` can succeed
+  // while the following `LlamaEngineQ8Resident.create()` still throws (an
+  // undersized GPU rejecting one of its buffer allocations, say) — with the
+  // device construction outside `try`/`finally`, that throw propagated past
+  // the `finally` that destroys it, leaking one live `GPUDevice` per failed
+  // click. Every native resource this function creates now lives entirely
+  // inside the `try` it is destroyed in.
   let residentDevice: Awaited<ReturnType<typeof createBrowserResidentDevice>> | null = null;
-  const engine: ForwardEngine = useResident
-    ? await (async () => {
-        residentDevice = await createBrowserResidentDevice();
-        return LlamaEngineQ8Resident.create(engineConfig, weights, residentDevice);
-      })()
-    : new LlamaEngineQ8(engineConfig, weights, runner.run);
-  const buildMs = performance.now() - buildStart;
-
   try {
+    const engine: ForwardEngine = useResident
+      ? await (async () => {
+          residentDevice = await createBrowserResidentDevice();
+          return LlamaEngineQ8Resident.create(engineConfig, weights, residentDevice);
+        })()
+      : new LlamaEngineQ8(engineConfig, weights, runner.run);
+    const buildMs = performance.now() - buildStart;
+
     const { tokens, prefillMs, decodeMsTotal, decodeSteps, stepMs } = await generate(engine, promptTokens, constraint);
 
     const prefillTokPerSec = promptTokens.length / (prefillMs / 1000);
@@ -400,6 +409,11 @@ async function runGeneration(): Promise<void> {
       `decode early half: ${earlyTokPerSec.toFixed(2)} tok/s | decode late half: ${lateTokPerSec.toFixed(2)} tok/s` +
       (tokens[tokens.length - 1] === vocab.eosId ? " | stopped at </s>" : " | stopped at MAX_DECODE_STEPS");
   } finally {
+    // The cast (not just `residentDevice?.destroy()`) is load-bearing: TS's
+    // control-flow narrowing loses track of `residentDevice`'s declared type
+    // across the `try`'s `await`/closure boundary and narrows it to `never`
+    // here without it — the same workaround the pre-#116 version of this
+    // `finally` already needed for the identical reason.
     (residentDevice as Awaited<ReturnType<typeof createBrowserResidentDevice>> | null)?.destroy();
   }
 }
