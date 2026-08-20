@@ -118,6 +118,28 @@ const VOCAB_URL = "/llm/data/sarashina2.2-1b-instruct.vocab.json";
 /** `assets/llm.js`'s own `N_CTX` — kept equal so the two are comparable. */
 const MAX_SEQ_LEN = 1024;
 /**
+ * `?maxDecodeSteps=` as a validated positive integer, not a raw `Number(...)`
+ * — PR #119 review, item 9: `Number("")` is `0`, not `NaN`, so
+ * `?maxDecodeSteps=` with no value (a stray `&maxDecodeSteps` in a pasted
+ * URL, or a browser autofill quirk) silently produced a **0-step** decode
+ * loop below — not a crash, not a short run, a measurement of nothing that
+ * still prints tok/s as if it measured something. A typo'd value (`"abc"`)
+ * already produced `NaN`, and `NaN` steps in a `for (step = 0; step <
+ * NaN; ...)` loop never runs either, so both malformed shapes shared the
+ * same silent-zero-steps failure this function now rejects instead of
+ * quietly running with, per rule 8's "壊れたことに気づけない" bar.
+ */
+function positiveIntParam(name: string, fallback: number): number {
+  const raw = new URLSearchParams(location.search).get(name);
+  if (raw === null) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new Error(`?${name}=${JSON.stringify(raw)} must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+/**
  * `assets/llm.js`'s own `MAX_TOKENS`, overridable via `?maxDecodeSteps=` —
  * issue #117's decode retest needs a run long enough to see `sEff`'s
  * position dependence (`sEff = position + 1` grows every step, unlike the
@@ -125,7 +147,7 @@ const MAX_SEQ_LEN = 1024;
  * every prompt here reaches `</s>` in 13–25 steps on its own (`?ignoreEos=1`
  * disables that stop so a long run is not left to chance).
  */
-const MAX_DECODE_STEPS = Number(new URLSearchParams(location.search).get("maxDecodeSteps") ?? 200);
+const MAX_DECODE_STEPS = positiveIntParam("maxDecodeSteps", 200);
 const IGNORE_EOS = new URLSearchParams(location.search).get("ignoreEos") === "1";
 
 // ---------------------------------------------------------------------------

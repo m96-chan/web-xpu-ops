@@ -37,7 +37,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   ("プリフィルは現行方式のまま"). Every prompt token's pass through every
   layer is encoded into one `queue.submit`, on the `matmul` path (not
   `matvecQ8` per token — that would multiply prefill's weight traffic by
-  the prompt length). A new `llm/wgsl/permute.wgsl` kernel does `ops/gqa`'s
+  the prompt length). A new `ops/permute/wgsl/kernel.wgsl` kernel does `ops/gqa`'s
   required token-major/head-major reshape on the GPU, replacing the CPU
   round trip `LlamaEngineQ8`'s non-resident reshape (`llm/reshape.ts`)
   would otherwise force back in. KV writes go straight into the persistent,

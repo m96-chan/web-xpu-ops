@@ -31,7 +31,6 @@
  * instead of restating them makes that class of drift impossible rather
  * than merely checked.
  */
-import type { Binding, Dispatch } from "../../../harness/wgsl.js";
 import type { ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
 
 export type { ResidentDevice, ResidentOp, ResidentReadback };
@@ -162,61 +161,5 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     destroy() {
       device.destroy();
     },
-  };
-}
-
-/**
- * `harness/resident.ts#runnerFromResident`'s browser counterpart — see that
- * function's doc for why `LlamaEngineQ8Resident`'s prefill delegate needs
- * one of these rather than a second device, and why every buffer it creates
- * must be destroyed after the one dispatch it served (the leak that first
- * looked like Node/Dawn instability before this file's Node counterpart
- * added the same cleanup).
- */
-export function runnerFromBrowserResident(
-  device: ResidentDevice,
-): (dispatch: Dispatch) => Promise<(Float32Array | Int32Array | Uint32Array)[]> {
-  return async function run(dispatch) {
-    const { code, entry = "main", bindings, workgroups } = dispatch;
-    const pipeline = await device.pipelineFor(code, entry);
-
-    const buffers: GPUBuffer[] = [];
-    const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];
-
-    for (const binding of bindings) {
-      if (binding.kind === "out") {
-        const buffer = device.createStorageBuffer(binding.length * 4);
-        buffers.push(buffer);
-        outputs.push({ spec: binding, buffer });
-      } else if (binding.kind === "scratch") {
-        buffers.push(device.createStorageBuffer(Math.max(4, binding.length * 4)));
-      } else if (binding.kind === "uniform") {
-        const buffer = device.createUniformBuffer(binding.data.byteLength);
-        device.upload(buffer, 0, new Uint8Array(binding.data));
-        buffers.push(buffer);
-      } else {
-        const buffer = device.createStorageBuffer(binding.data.byteLength);
-        device.upload(buffer, 0, binding.data);
-        buffers.push(buffer);
-      }
-    }
-
-    const bindGroup = await device.bindGroup(pipeline, buffers);
-    const stagingBuffers = outputs.map(({ spec }) => device.createStorageBuffer(spec.length * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ));
-    const readback = outputs.map(({ spec, buffer }, index) => ({
-      staging: stagingBuffers[index]!,
-      source: buffer,
-      sourceOffset: 0,
-      length: spec.length,
-      type: spec.type,
-    }));
-
-    try {
-      return await device.batch([{ kind: "dispatch", pipeline, bindGroup, workgroups }], readback);
-    } finally {
-      for (const buffer of buffers) buffer.destroy();
-      for (const { buffer } of outputs) buffer.destroy();
-      for (const staging of stagingBuffers) staging.destroy();
-    }
   };
 }

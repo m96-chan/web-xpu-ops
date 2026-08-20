@@ -1,4 +1,5 @@
 import { describe, expect } from "vitest";
+import { runnerFromResident } from "./resident.js";
 import { params } from "./wgsl.js";
 import { kernel, residentTest, useResidentGpu } from "./suite.js";
 
@@ -154,5 +155,62 @@ describe("resident device", () => {
    */
   residentTest("pipelineFor rejects a shader/entry pair the module does not export", async (device) => {
     await expect(device.pipelineFor(elementwiseKernel, "no_such_entry_point")).rejects.toThrow(/pipeline is not valid/);
+  });
+
+  /**
+   * PR #119 review, item 8: `runnerFromResident` had zero direct test
+   * coverage — every existing check of it was indirect, through
+   * `llm/engine-q8-resident.wgsl.test.ts`'s pre-#117 history (see that
+   * function's own doc), and issue #117 removed the one production call site
+   * that history describes (`llm/engine-q8-resident.ts` no longer imports
+   * it — that file's own module doc says so directly). A function reachable
+   * only from its own doc comment, with no test pinning its behaviour, is
+   * exactly the kind of drift this repository's own culture (rule 8) exists
+   * to catch before it rots silently; this test exercises it directly
+   * against the same `Runner["run"]` calling convention `createRunner()`
+   * uses (`harness/wgsl.ts`), so a future caller of `ResidentDevice` that
+   * needs a `Runner` (the reason this file's own doc says it is kept) has a
+   * green regression test to lean on rather than an unverified utility.
+   */
+  residentTest("runnerFromResident wraps a ResidentDevice as a Runner['run'] — one dispatch, ephemeral buffers, per-call readback", async (device) => {
+    const run = runnerFromResident(device);
+    const a = new Float32Array([1, 2, 3, 4]);
+    const b = new Float32Array([10, 10, 10, 10]);
+    const N = a.length;
+
+    const buffersBefore = device.stats.buffersCreated;
+    const [sum] = await run({
+      code: elementwiseKernel,
+      bindings: [
+        { kind: "storage", data: a },
+        { kind: "storage", data: b },
+        { kind: "out", type: "f32", length: N },
+        { kind: "uniform", data: params([["u32", N], ["u32", 0]]) },
+      ],
+      workgroups: [1],
+    });
+
+    expect(Array.from(sum as Float32Array)).toEqual([11, 12, 13, 14]);
+    // Every buffer this call touched is `createStorageBuffer`/`createUniformBuffer`
+    // ephemeral scaffolding (inputs, the "out" buffer, and its staging
+    // buffer) — unlike `ResidentDevice`'s own persistent buffers (the ones
+    // the "decode-loop invariant" test above pins), a second call through
+    // the same `run` must not find any of that scaffolding still around to
+    // reuse; each call creates its own.
+    const buffersAfterFirst = device.stats.buffersCreated;
+    expect(buffersAfterFirst).toBeGreaterThan(buffersBefore);
+
+    const [sum2] = await run({
+      code: elementwiseKernel,
+      bindings: [
+        { kind: "storage", data: a },
+        { kind: "storage", data: b },
+        { kind: "out", type: "f32", length: N },
+        { kind: "uniform", data: params([["u32", N], ["u32", 0]]) },
+      ],
+      workgroups: [1],
+    });
+    expect(Array.from(sum2 as Float32Array)).toEqual([11, 12, 13, 14]);
+    expect(device.stats.buffersCreated).toBeGreaterThan(buffersAfterFirst);
   });
 });

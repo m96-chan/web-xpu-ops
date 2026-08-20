@@ -18,20 +18,16 @@
  * dispatch validation error), so drift does not stay silent.
  */
 import type { Binding, Dispatch } from "../../../harness/wgsl.js";
-/**
- * Re-exported under `harness/resident.ts`'s own name: `llm/engine-q8-resident.ts`
- * imports `runnerFromResident` as a *value* from `"../harness/index.js"`
- * (issue #110's prefill delegation — see that function's doc), and
- * `build.mjs`'s `harnessBrowserShim` redirects every `harness/index.js`
- * import — value or type — to this file, the same redirect `kernel`/`params`
- * already rely on. Without this re-export the bundle fails to resolve the
- * name at build time, not at type-check time (`examples/llm-demo/tsconfig.json`
- * only checks `src/`, so `engine-q8-resident.ts` itself is checked against
- * the real `harness/resident.ts` by the root `tsconfig.json`, never against
- * this file — esbuild's bundler is the only place the two ever have to agree,
- * and only on the *name* existing, not on identical types).
- */
-export { runnerFromBrowserResident as runnerFromResident } from "./browser-resident-runtime.js";
+
+// PR #119 review, item 8: this file used to re-export
+// `runnerFromBrowserResident` under `harness/resident.ts#runnerFromResident`'s
+// own name, for `build.mjs`'s `harnessBrowserShim` to redirect
+// `llm/engine-q8-resident.ts`'s (pre-#117) value import of it to. Issue #117
+// removed that import — `engine-q8-resident.ts` now imports only the *type*
+// `ResidentDevice` (that file's own module doc) — so nothing in this bundle
+// has resolved `runnerFromResident` as a value since, and
+// `runnerFromBrowserResident` itself (`browser-resident-runtime.ts`) was
+// deleted alongside this re-export rather than left dead.
 
 // The ten kernel entry points `llm/kernels.ts#CODE` builds via
 // `harness/suite.ts#kernel(url, name)` — one static import per `.wgsl` file

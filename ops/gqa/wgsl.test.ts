@@ -441,8 +441,20 @@ const SEFF_TESTS = SEFF_CASES.map(({ name, args }) => prepare(name, args));
  * scanned positions are summed identically, not merely "the poisoned tail was
  * avoided" (see `SEFF_CASES`'s doc for why that is a materially different
  * claim from the poison check above).
+ *
+ * A plain function, not a module-scope `const ... = SEFF_CASES.map(...)`:
+ * an earlier version computed every case's `groupedAttention()` pair (this
+ * function's own body, twice per case) at module *collect* time, alongside
+ * `SEFF_CASES`'/`SEFF_TESTS`' own module-scope work — measured on this
+ * machine to reproduce the file's Node/Dawn worker instability (PR #119
+ * review; the #49/#107 family this repo already documents) at roughly 4 of
+ * every 5 runs, well before `useGpu()`'s `beforeAll` even requests an
+ * adapter. Deferred here into the one `it()` body below that actually needs
+ * it, run once per case, at test-execution time — the shape every other
+ * per-case computation in this file already uses (`check()`, `prepare()`'s
+ * own callers).
  */
-const SEFF_EQUIVALENCE = SEFF_CASES.map(({ name, args }) => {
+function seffEquivalence(args: GroupedAttentionArgs): { truncated: GroupedAttentionResult; shrunk: GroupedAttentionResult } {
   const { B, kvHeads, D, Dv, sEff } = args;
   const n = sEff!;
   const kFull = args.k;
@@ -454,12 +466,10 @@ const SEFF_EQUIVALENCE = SEFF_CASES.map(({ name, args }) => {
     vShrunk.set(vFull.subarray(bh * args.S * Dv, bh * args.S * Dv + n * Dv), bh * n * Dv);
   }
   return {
-    label: name,
-    args,
     truncated: groupedAttention(args),
     shrunk: groupedAttention({ ...args, S: n, k: kShrunk, v: vShrunk, sEff: undefined }),
   };
-});
+}
 
 const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED, ...MASK_TESTS, FULLY_MASKED, ...SEFF_TESTS];
 
@@ -618,8 +628,9 @@ describe("gqa / wgsl", () => {
     }
   });
 
-  for (const { label, args, truncated, shrunk } of SEFF_EQUIVALENCE) {
-    it(`sEff-truncated output equals S shrunk to sEff at ${label}`, () => {
+  for (const { name, args } of SEFF_CASES) {
+    it(`sEff-truncated output equals S shrunk to sEff at ${name}`, () => {
+      const { truncated, shrunk } = seffEquivalence(args);
       const { B, H, L, S } = args;
       const n = args.sEff!;
       // shrunk's probs buffer is `[.., n]` wide (S was shrunk to n outright);

@@ -1264,6 +1264,53 @@ to 100% is still `#110`'s own "~800 GPU op launches per token" term
 (unmeasured individually, same reasoning as that section), not a new one
 this issue introduces.
 
+**`weightTBuf`, reused per shape instead of allocated per layer** (PR #119
+review, recommended item). `runPrefillResident`'s dequant step wrote each
+layer's dequantized-and-transposed `matmul` operand (`ops/dequant_transpose`,
+above) into a **fresh** `GPUBuffer` every layer, for all 24 layers × 7
+projections (`wq`/`wk`/`wv`/`wo`/`wGate`/`wUp`/`wDown`) — none of them ever
+`destroy()`ed until the whole engine was, so a single prefill call's peak
+resident footprint included all `24 × 7` of these buffers alive at once, even
+though only one layer's worth is ever read at a time (the per-layer `for`
+loop's own `await`-ordering already guarantees each projection's dequant
+write strictly precedes that same layer's `matmul` read, before the next
+layer's dequant overwrites it). Since a `GPUBindGroup` binds to a buffer
+*object*, not its contents, the fix is to allocate one `weightTBuf` (and one
+`matmulGroup` bound to it) per projection **shape** — the 7 shapes recur
+identically across all 24 layers — build all 7 once before the layer loop
+(`setupMatmulProjectionShape`), and re-run only the dequant dispatch into the
+same buffer each layer (`dequantIntoShape`), with every transient buffer
+(packed int8 weight, scale, dequant uniform) explicitly `destroy()`ed after
+`batch()` runs, and the 7 shared `weightTBuf`s destroyed once at the very end
+of the call. Correctness verified unaffected: `llm/engine-q8-resident.wgsl.test.ts`
+and `llm/engine-q8-resident.limits.wgsl.test.ts` report the same worst
+abs/rel diffs against the fixture before and after this change (prefill
+`abs=1.19e-7, rel=2.02e-5`; decode `abs=1.49e-7, rel=7.14e-4`).
+
+Node/Dawn (the `webgpu` npm package this test suite runs against) exposes no
+live VRAM query API, so the reduction below is the same config-derived byte
+arithmetic this README already treats as measurement elsewhere (the
+resident-weight-bytes/token roofline figures above) — computed directly from
+`SARASHINA_2_2_1B_CONFIG`'s real dimensions
+(`hiddenSize=1792, numHeads=16, numKvHeads=8, headDim=112, ffnHidden=6272,
+numLayers=24`), not estimated:
+
+| | before (per layer, never destroyed) | after (shared across all layers) |
+| --- | --- | --- |
+| `weightTBuf` bytes, all 7 projections | 173,408,256 (165.4 MiB) × 24 layers | 173,408,256 (165.4 MiB), once |
+| peak `weightTBuf` residency | **4,161,798,144 (3.88 GiB)** | **173,408,256 (165.4 MiB)** |
+
+A **~3.71 GiB** reduction in this one buffer family's peak residency, on top
+of whatever the packed-int8 weight/scale/uniform buffers already freed by
+being `destroy()`ed per layer rather than accumulated (43,430,912 bytes/layer
+× 24 = 0.97 GiB, if none of those were ever destroyed either — the case
+before this fix for the ones `buildMatmulProjection`'s old per-layer
+`weightTBuf` allocation sat beside). The reviewer's own "5–7 GiB" estimate
+folds in KV-cache and per-token activation buffers this change does not
+touch (those were already `destroy()`ed on their own lifetimes, unrelated to
+`weightTBuf` sharing); this measurement is scoped to the specific buffer
+family the fix changes, not a claim about total prefill VRAM peak.
+
 **Scope not touched, same reasons #110 gave:** kernel fusion (#111),
 f16 activations, speculative decode. Prefill's own `S = N` attention (this
 issue) is a separate design point from decode's `sEff`, not the same

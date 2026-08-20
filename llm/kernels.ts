@@ -335,6 +335,30 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
   const B = 1;
   const scale = args.scale ?? 1 / Math.sqrt(D);
   const sEff = args.sEff ?? S;
+  // `sEff`'s own contract (`ops/gqa/reference.ts#groupedAttention`'s doc),
+  // copied rather than re-derived (rule 2) — before this check, a caller
+  // whose `sEff` broke that contract got a silently-too-short GPU scan here
+  // and a thrown error from the reference, two different behaviours for the
+  // same mistake (PR #119 review, item 5). `groupedAttention` throws with
+  // the same wording; this wrapper does too rather than delegating to it,
+  // since delegating would mean building `B=1`-shaped Q/K/V arrays this
+  // function does not otherwise need just to ask the reference to validate.
+  if (!Number.isInteger(sEff) || sEff < 1 || sEff > S) {
+    throw new Error(`runGqa(): sEff must be an integer in [1, S=${S}], got ${sEff}`);
+  }
+  if (!causal && sEff !== S) {
+    throw new Error(
+      `runGqa(): sEff=${sEff} < S=${S} requires causal=true — without a causal bound there is no way to prove the excluded positions were unreachable`,
+    );
+  }
+  if (causal) {
+    const needed = Math.min(S, L + queryOffset);
+    if (sEff < needed) {
+      throw new Error(
+        `runGqa(): sEff=${sEff} is too small for L=${L}, queryOffset=${queryOffset} — the last query row can attend up to key ${L - 1 + queryOffset}, so sEff must be at least ${needed}`,
+      );
+    }
+  }
   const mask = new Float32Array(B * S);
 
   const [probs] = await run({
