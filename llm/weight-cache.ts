@@ -1,0 +1,380 @@
+import type { ChunkStore } from "./chunk-store.js";
+import type { QuotaEstimate } from "./storage-quota.js";
+import type { WeightManifestEntry } from "./weights-q8-io.js";
+
+/**
+ * The persistent-weight-cache logic (issue #121, parent #96 / alibi-ai's
+ * "re-fetches 1.4GB of weights every visit"): chunk splitting, manifest-hash
+ * versioning, stale-version eviction, and the quota/fallback decision.
+ * Every function here is either pure or takes a `ChunkStore` as a plain
+ * parameter — nothing imports `indexedDB` or `navigator` — so all of it runs
+ * under `npm test` in Node, against `InMemoryChunkStore`
+ * (`chunk-store.test.ts`), with no browser and no GPU. `browser-weights.ts`
+ * is the only caller that wires this logic to a real
+ * `idb-chunk-store.ts#createIndexedDbChunkStore` and real `fetch`.
+ */
+
+// ---------------------------------------------------------------------------
+// Hashing
+// ---------------------------------------------------------------------------
+
+/**
+ * SHA-256 of `bytes`, lowercase hex — the manifest-content hash issue #121
+ * asks for ("manifestの内容ハッシュをキーにし、不一致時のみ再DL"), computed
+ * via `crypto.subtle` (WebCrypto), the one hashing API available, with the
+ * identical surface, in both a browser and Node (`@types/node`'s global
+ * `crypto: webcrypto.Crypto`, no `"DOM"` lib required — see
+ * `idb-chunk-store.ts`'s doc on why *that* module needs local ambient types
+ * and this one does not).
+ */
+export async function sha256Hex(bytes: ArrayBufferLike): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as ArrayBuffer);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// ---------------------------------------------------------------------------
+// Chunking
+// ---------------------------------------------------------------------------
+
+/**
+ * The default chunk size a cached file is split into before being written to
+ * a `ChunkStore` — 96 MiB, the midpoint of issue #121's own 64–128 MiB
+ * range, chosen (not measured against other in-range sizes — see the
+ * README's real-hardware section for what *was* measured) to comfortably
+ * avoid both ends' known failure modes without a comparative sweep: a
+ * single ~1.4 GiB value is exactly what this issue's own spec says to avoid
+ * (browser blob-size implementation differences, no incremental write
+ * progress), while a much smaller chunk size would multiply this
+ * checkpoint's ~15-chunk `codes.bin` write into hundreds of small
+ * `IndexedDB` transactions for no benefit this cache's access pattern
+ * (whole-file read, whole-file write) needs. Real-Chrome verification (this
+ * issue's PR) confirms this value round-trips the real ~1.4 GiB checkpoint
+ * correctly; it does not compare it against other in-range sizes. Nothing in
+ * this file's logic depends on the exact value, so it stayed a named
+ * constant rather than a magic number regardless.
+ */
+export const DEFAULT_CHUNK_SIZE_BYTES = 96 * 1024 * 1024;
+
+/**
+ * Yields `buffer` as consecutive, non-overlapping `ArrayBuffer` slices of at
+ * most `chunkSizeBytes`, one at a time — `writeCachedFile` iterates this
+ * directly (review item #8) rather than going through `splitIntoChunks`
+ * below, so it never holds a second ~full-file-sized array of chunk copies
+ * alongside the original `buffer` while writing a ~1.4 GiB file; each chunk
+ * is eligible for garbage collection as soon as its `store.put()` resolves
+ * and the next iteration requests a new one. A zero-length `buffer` still
+ * yields exactly one (zero-length) chunk — never zero chunks — so
+ * `writeCachedFile` always writes at least one chunk key and `readCachedFile`
+ * (which reads exactly `chunkCount` chunks) can reconstruct a genuinely
+ * empty file instead of reading "0 chunks" as "cache miss".
+ */
+export function* iterateChunks(buffer: ArrayBuffer, chunkSizeBytes: number): Generator<ArrayBuffer, void, undefined> {
+  if (!(chunkSizeBytes > 0)) {
+    throw new Error(`iterateChunks: chunkSizeBytes must be positive, got ${chunkSizeBytes}`);
+  }
+  const total = buffer.byteLength;
+  if (total === 0) {
+    yield buffer.slice(0, 0);
+    return;
+  }
+  for (let offset = 0; offset < total; offset += chunkSizeBytes) {
+    yield buffer.slice(offset, Math.min(offset + chunkSizeBytes, total));
+  }
+}
+
+/** `Array.from(iterateChunks(...))` — every chunk materialized at once, in
+ * one array. Fine (and simpler to assert against) for the small buffers
+ * `weight-cache.test.ts` uses; `writeCachedFile` deliberately does *not* use
+ * this (see `iterateChunks`'s own doc) once real, checkpoint-sized files are
+ * involved. */
+export function splitIntoChunks(buffer: ArrayBuffer, chunkSizeBytes: number): ArrayBuffer[] {
+  return Array.from(iterateChunks(buffer, chunkSizeBytes));
+}
+
+/** The inverse of `splitIntoChunks`: concatenates `chunks` back into one
+ * contiguous `ArrayBuffer`, in the order given. */
+export function joinChunks(chunks: readonly ArrayBuffer[]): ArrayBuffer {
+  const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
+}
+
+// ---------------------------------------------------------------------------
+// Expected file sizes, from the manifest alone
+// ---------------------------------------------------------------------------
+
+/** Bytes each of the three files (`weights.codes.bin` / `.scales.bin` /
+ * `.norms.bin`) a converted checkpoint is expected to be — computed purely
+ * from `manifest.json`'s own entries (each entry's `offset`/`codesOffset`/
+ * `scaleOffset` plus its `shape`, the exact fields `weights-q8-io.ts#buildLlamaWeightsQ8`
+ * already indexes with), never from an HTTP `Content-Length` or a `HEAD`
+ * request. This is what lets the quota pre-check
+ * (`decideCacheStrategy`) run *before* any of the three files is fetched —
+ * the manifest itself (tens of KB) is the only network round trip it needs.
+ * Verified against the real converted checkpoint
+ * (`third_party/webgpu-weights/sarashina2.2-1b-alibi-v1-q8`, this issue's PR)
+ * to equal the three files' actual sizes exactly. */
+export function expectedFileByteSizes(entries: readonly WeightManifestEntry[]): {
+  codes: number;
+  scales: number;
+  norms: number;
+} {
+  let codes = 0;
+  let scales = 0;
+  let norms = 0;
+  for (const entry of entries) {
+    if (entry.kind === "quant") {
+      const [n, k] = entry.shape;
+      codes = Math.max(codes, entry.codesOffset + n * k);
+      scales = Math.max(scales, (entry.scaleOffset + n) * 4);
+    } else {
+      const elements = entry.shape.reduce((a, b) => a * b, 1);
+      norms = Math.max(norms, (entry.offset + elements) * 4);
+    }
+  }
+  return { codes, scales, norms };
+}
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+/**
+ * `namespace` is a caller-chosen cache scope — `browser-weights.ts` uses the
+ * checkpoint's own `baseUrl`, so two different deployments (or a dev vs.
+ * prod URL) never share cache entries. A NUL byte (never a valid character
+ * in any of `namespace`/`manifestHash`/`file`) separates the fields so no
+ * combination of inputs can produce a key collision by concatenation.
+ *
+ * Built with `String.fromCharCode(0)`, not any escape-sequence literal: a
+ * review of this PR caught two *raw* NUL bytes actually on disk in an
+ * earlier revision of this file (one here, one in this doc comment's own
+ * prose) — an escape sequence typed as source text had, somewhere between
+ * being typed and landing in this file, been decoded into the literal byte
+ * it describes. That made this file's git diff render as `Binary files
+ * differ` (git's own heuristic: a NUL anywhere in the first several KB
+ * marks a file binary), permanently breaking diff/blame/line-merge/grep on
+ * it. `String.fromCharCode(0)` produces the identical runtime value with
+ * zero bytes of ambiguity in the source text — nothing here is an escape
+ * sequence for anything else to mis-decode.
+ */
+const FIELD_SEP = String.fromCharCode(0);
+
+export function chunkKey(namespace: string, manifestHash: string, file: string, index: number): string {
+  return [namespace, manifestHash, file, "chunk", String(index)].join(FIELD_SEP);
+}
+
+/** The one key, per namespace, that names the currently-valid manifest hash
+ * and each file's chunk bookkeeping — read first on every load
+ * (`readCurrentVersion`) to decide cache-hit vs. cache-miss without
+ * `list()`ing anything. Carries no `manifestHash` in the key itself (unlike
+ * `chunkKey`) since its whole job is to say what that hash currently is. */
+export function currentVersionKey(namespace: string): string {
+  return [namespace, "current"].join(FIELD_SEP);
+}
+
+// ---------------------------------------------------------------------------
+// The current-version record
+// ---------------------------------------------------------------------------
+
+export interface CachedFileInfo {
+  totalBytes: number;
+  chunkSizeBytes: number;
+  chunkCount: number;
+}
+
+export interface CurrentVersionRecord {
+  manifestHash: string;
+  files: Record<string, CachedFileInfo>;
+}
+
+function encodeJson(value: unknown): ArrayBuffer {
+  return new TextEncoder().encode(JSON.stringify(value)).buffer as ArrayBuffer;
+}
+
+/** `undefined` both when nothing has been written yet and when what's
+ * stored is not valid JSON — a corrupt record is indistinguishable from "no
+ * cache" to every caller, and "no cache" is always safe (it just triggers a
+ * normal fetch-and-write), so there is no reason to throw here instead. */
+export async function readCurrentVersion(store: ChunkStore, namespace: string): Promise<CurrentVersionRecord | undefined> {
+  const raw = await store.get(currentVersionKey(namespace));
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(new TextDecoder().decode(raw)) as CurrentVersionRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function writeCurrentVersion(store: ChunkStore, namespace: string, record: CurrentVersionRecord): Promise<void> {
+  await store.put(currentVersionKey(namespace), encodeJson(record));
+}
+
+// ---------------------------------------------------------------------------
+// Per-file read/write
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads back a file previously written by `writeCachedFile` with the same
+ * `namespace`/`manifestHash`/`file`, using `info` (from a
+ * `CurrentVersionRecord`) to know how many chunks to read. Returns
+ * `undefined` — never throws — for anything that makes the cache entry
+ * untrustworthy: a chunk `info` says should exist but doesn't (partial
+ * write, or a store that evicted individual keys under pressure), a chunk
+ * larger than the remaining declared space, or a reconstructed length that
+ * disagrees with `info.totalBytes` (corrupt bookkeeping). Either way the
+ * caller's correct response is the same as a plain cache miss: fetch over
+ * HTTP instead.
+ *
+ * Copies each chunk into one pre-allocated `Uint8Array(info.totalBytes)` as
+ * it arrives (review item #8), rather than collecting every chunk into an
+ * array and `joinChunks`-ing them afterward — for a real ~1.4 GiB file the
+ * array-then-join version peaks at roughly 2x the file's size (every chunk,
+ * live at once, *plus* the freshly allocated joined buffer); this peaks at
+ * 1x plus one in-flight chunk.
+ */
+export async function readCachedFile(
+  store: ChunkStore,
+  namespace: string,
+  manifestHash: string,
+  file: string,
+  info: CachedFileInfo,
+): Promise<ArrayBuffer | undefined> {
+  const out = new Uint8Array(info.totalBytes);
+  let offset = 0;
+  for (let i = 0; i < info.chunkCount; i += 1) {
+    const chunk = await store.get(chunkKey(namespace, manifestHash, file, i));
+    if (!chunk) return undefined;
+    if (offset + chunk.byteLength > out.byteLength) return undefined;
+    out.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+  if (offset !== out.byteLength) return undefined;
+  return out.buffer;
+}
+
+/**
+ * Writes `buffer` under `chunkKey(namespace, manifestHash, file, i)`, one
+ * `iterateChunks` slice at a time (review item #8 — see that function's own
+ * doc for why this doesn't go through `splitIntoChunks`, which would
+ * materialize every slice before the first `store.put()`), returning the
+ * `CachedFileInfo` a caller stores in the namespace's `CurrentVersionRecord`
+ * (`writeCurrentVersion`) to make the write visible to future loads. Writing
+ * the chunks and recording that write are deliberately two separate steps —
+ * see `browser-weights.ts`'s own doc on why that ordering is what keeps a
+ * crash mid-write from corrupting an *existing* cache hit.
+ */
+export async function writeCachedFile(
+  store: ChunkStore,
+  namespace: string,
+  manifestHash: string,
+  file: string,
+  buffer: ArrayBuffer,
+  chunkSizeBytes: number,
+): Promise<CachedFileInfo> {
+  let chunkCount = 0;
+  for (const chunk of iterateChunks(buffer, chunkSizeBytes)) {
+    await store.put(chunkKey(namespace, manifestHash, file, chunkCount), chunk);
+    chunkCount += 1;
+  }
+  return { totalBytes: buffer.byteLength, chunkSizeBytes, chunkCount };
+}
+
+// ---------------------------------------------------------------------------
+// Stale-version eviction / orphan cleanup
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes every key under `namespace` except `currentVersionKey(namespace)`
+ * itself and the *exact* chunk keys `keep` implies — one
+ * `chunkKey(namespace, keep.manifestHash, file, i)` per `file` in
+ * `keep.files`, for `i` in `[0, chunkCount)` — via one `store.list()` pass,
+ * rather than by trusting a hash/file *prefix* match. That makes this
+ * function double as both issue #121's "古い版は削除" (called with the
+ * just-written new version after a successful cache-miss write) *and* a
+ * general orphan sweep for chunks left behind by a write that was
+ * interrupted before it reached `writeCurrentVersion` — those orphans carry
+ * no hash `readCurrentVersion` will ever report as current, so nothing but a
+ * `list()`-based sweep like this one would ever find and reclaim them.
+ * `keep: undefined` clears the namespace entirely, including its
+ * current-version record.
+ *
+ * Exact keys, not a prefix, because two writes can share every prefix
+ * component and still not share which indices are current: re-writing the
+ * *same* file under the *same* `manifestHash` with a different
+ * `chunkSizeBytes` changes `chunkCount` (review item #7 — reproduced with 8
+ * old chunks vs. 1 new one, all sharing the `${namespace} ${hash} ${file} `
+ * prefix) without changing the hash a prefix-based sweep keyed on. Chunks
+ * `keep`'s own `chunkCount` no longer accounts for are exactly as orphaned
+ * as a whole previous version's chunks are, and get removed the same way.
+ */
+export async function sweepOrphanedChunks(store: ChunkStore, namespace: string, keep: CurrentVersionRecord | undefined): Promise<void> {
+  const keys = await store.list();
+  const namespacePrefix = `${namespace}${FIELD_SEP}`;
+  const currentKey = currentVersionKey(namespace);
+  const keepKeys =
+    keep &&
+    new Set(
+      Object.entries(keep.files).flatMap(([file, info]) =>
+        Array.from({ length: info.chunkCount }, (_unused, i) => chunkKey(namespace, keep.manifestHash, file, i)),
+      ),
+    );
+  for (const key of keys) {
+    if (!key.startsWith(namespacePrefix)) continue;
+    if (keepKeys && key === currentKey) continue;
+    if (keepKeys?.has(key)) continue;
+    await store.delete(key);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Quota / fallback decision
+// ---------------------------------------------------------------------------
+
+export interface CacheStrategyDecision {
+  useCache: boolean;
+  reason: "indexeddb-unavailable" | "quota-unknown-optimistic" | "quota-insufficient" | "ok";
+}
+
+/**
+ * The one decision issue #121 calls "フォールバック判定": whether to attempt
+ * the persistent cache at all for this load, or go straight to (or fall
+ * back to) plain HTTP — no feature loss either way, only a persistence
+ * difference (`browser-weights.ts`'s own doc). `indexedDbSupported: false`
+ * (Node, or a browser with IndexedDB genuinely absent) always wins. When
+ * IndexedDB is present but `navigator.storage.estimate()` did not return a
+ * usable number (`quota: null` — `storage-quota.ts#estimateStorageQuota`'s
+ * own contract), this proceeds *optimistically* rather than refusing:
+ * `estimate()` is itself not universally implemented, and refusing to cache
+ * on every browser that lacks it would make the cache silently ineffective
+ * far more often than a wrong optimistic attempt would (which only costs
+ * one failed write, caught and treated as no-op by
+ * `browser-weights.ts`'s own try/catch around the write path — the runtime
+ * safety net this upfront check is not the only line of defense for).
+ */
+export function decideCacheStrategy(params: {
+  indexedDbSupported: boolean;
+  quota: QuotaEstimate | null;
+  requiredBytes: number;
+  /** Headroom multiplier applied to `requiredBytes` before comparing
+   * against free space — the persisted cache is not the only thing sharing
+   * this origin's quota, and IndexedDB's own storage overhead is not zero
+   * either. Defaults to `1.1` (10% margin). */
+  headroomRatio?: number;
+}): CacheStrategyDecision {
+  if (!params.indexedDbSupported) return { useCache: false, reason: "indexeddb-unavailable" };
+  if (params.quota === null) return { useCache: true, reason: "quota-unknown-optimistic" };
+  const headroomRatio = params.headroomRatio ?? 1.1;
+  const freeBytes = params.quota.quotaBytes - params.quota.usageBytes;
+  if (freeBytes < params.requiredBytes * headroomRatio) {
+    return { useCache: false, reason: "quota-insufficient" };
+  }
+  return { useCache: true, reason: "ok" };
+}

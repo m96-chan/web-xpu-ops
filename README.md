@@ -785,6 +785,99 @@ the demo's own `dist/bundle.js` are reachable) and additionally maps
 always set, since the page's progress bar reads it while streaming the ~1.4
 GiB `weights.codes.bin`.
 
+### Persistent weight cache (issue #121)
+
+`loadWeightsQ8FromUrl` (`llm/browser-weights.ts`) caches the checkpoint into
+IndexedDB by default — the demo above (and `technologies-moe/alibi-ai`'s own
+integration, this issue's parent #96) no longer re-fetches ~1.4 GiB on every
+visit. No demo-side code changed to get this: caching is on unless the fifth
+argument's `enabled` is `false`, and every one of the demo's existing calls
+already passes fewer than five arguments.
+
+- **Versioning**: the cache key includes a SHA-256 hash of `manifest.json`'s
+  raw bytes (`llm/weight-cache.ts#sha256Hex`). `manifest.json` itself (tens of
+  KB) is fetched on every load — the only way to know whether a cached
+  checkpoint is still current — but `weights.codes.bin`/`.scales.bin`/`.norms.bin`
+  (1.41 GiB combined) are not, on a cache hit. A re-converted checkpoint under
+  the same URL is detected by its changed hash and re-downloaded automatically;
+  the previous version's chunks are then swept from IndexedDB.
+- **Chunking**: each cached file is split into 96 MiB chunks
+  (`DEFAULT_CHUNK_SIZE_BYTES`) before being written — never one ~1.4 GiB
+  `IndexedDB` value.
+- **Fallback**: IndexedDB unavailable, `indexedDB.open()` failing (Safari
+  private mode), a read failing (`get()` rejecting — storage pressure closing
+  the connection, a stale database from an older store-name layout), or
+  `navigator.storage.estimate()` reporting insufficient free space *for a
+  write* all fall back transparently to a plain network load — no feature
+  loss, only a persistence difference. The quota check gates only the write
+  path, deliberately: a read frees no space and needs none, so a device whose
+  reported `usage` includes this very cache (true from the moment one write
+  succeeds) never has that alone make a valid cache unreadable.
+- **Storage**: behind `llm/chunk-store.ts#ChunkStore` (`get`/`put`/`delete`/`list`),
+  injected — `llm/idb-chunk-store.ts#createIndexedDbChunkStore` is the real
+  IndexedDB backend (its `put`/`delete` resolve on the owning transaction's
+  `oncomplete`, not the individual request's `onsuccess`, so a write whose
+  transaction aborts on commit — a large value's `QuotaExceededError` — is
+  reported as the failure it is), `InMemoryChunkStore` is what every Node test
+  (`chunk-store.test.ts`, `weight-cache.test.ts`, `browser-weights.cache.test.ts`)
+  runs the cache logic against instead.
+- **Known limitations**: versioning one hash across all three binary files
+  means a hypothetical future producer of this checkpoint format that keeps
+  `manifest.json` byte-identical while republishing only a binary could — if
+  interrupted mid-write — mix old- and new-version chunks under one hash
+  undetectably ([#124](https://github.com/m96-chan/web-xpu-ops/issues/124),
+  not reachable by this repository's own `convert_weights.py`, which always
+  changes `manifest.json` too). Concurrent tabs open across a deploy window
+  can each treat the other's freshly-written version as stale and re-download
+  ([#125](https://github.com/m96-chan/web-xpu-ops/issues/125)) — wasteful, but
+  never data-corrupting, since a load's `manifestHash` and the chunks it reads
+  always agree.
+
+**Real-hardware verification (non-headless Chrome, DevTools Network domain
+over CDP).** Driven with raw CDP (Node's own `WebSocket`, no puppeteer) against
+a real, visible Chrome window — a dedicated `--user-data-dir` and
+`--remote-debugging-port`, `examples/llm-demo/server.mjs` on a private port,
+both pointed at a scratch copy of the real converted checkpoint (`manifest.json`
+copied, the three large binaries symlinked — no 1.4 GiB duplicated, and no
+interference with another verification running against the repository's own
+default checkpoint directory at the same time). `Network.loadingFinished`'s
+`encodedDataLength` (bytes actually received over the wire, including headers)
+is what "network transfer" below means — not an assumption from the page's own
+progress bar:
+
+| step | `weights.codes.bin` | `.scales.bin` | `.norms.bin` | requests issued | page-reported load time |
+| --- | --- | --- | --- | --- | --- |
+| 1. First load (cold cache) | 1,407,451,307 B | 2,711,720 B | 351,399 B | 1 each | 2507 ms |
+| 2. Reload (cache hit) | **0 B** | **0 B** | **0 B** | **0** (no `Network.requestWillBeSent` at all) | 848 ms |
+| 3. `manifest.json` mutated by 1 byte, reload | 1,407,451,307 B | 2,711,720 B | 351,399 B | 1 each | 1995 ms |
+
+Step 2 is the strongest form of this issue's "reload transfers 0 bytes":
+not merely 0 bytes counted, but zero `Network.requestWillBeSent` events for
+any of the three files — the cache path never calls `fetch` on them at all.
+`manifest.json` itself (~37 KB) is fetched in all three steps, per this file's
+own "Versioning" note above. Step 3's manifest was mutated by appending one
+byte (`printf ' ' >> manifest.json` — valid JSON either side, so the parsed
+config/weights are identical; only the file's bytes, and so its SHA-256,
+differ) to simulate a re-converted checkpoint under an unchanged URL, and
+`IndexedDB`'s key count stayed at 17 (16 chunks + 1 version record) across the
+mutation rather than growing to 33 — the old version's chunks were swept, not
+accumulated. `navigator.storage.estimate()` reported `usage: 1,409,094,418`
+bytes after step 1, matching the checkpoint's real size.
+
+Load-time notes: both server and browser were on the same machine (loopback
+HTTP), so step 1's 2507 ms is network-plus-parse over localhost, not a real
+internet download — the ~3x speedup to 848 ms on a cache hit is from skipping
+`fetch` and streaming-decode entirely in favor of several `IndexedDB` reads
+plus a buffer join, and would be a much larger, latency-dominated win on a
+real network (this repository's own default deployment, `alibi-ai`, is served
+over the internet, not loopback). Chunk size: 96 MiB
+(`DEFAULT_CHUNK_SIZE_BYTES`, the midpoint of this issue's 64–128 MiB range) —
+14 chunks for `weights.codes.bin`, 1 each for `.scales.bin`/`.norms.bin` at
+this checkpoint's size; not swept across multiple chunk sizes for this issue,
+since nothing in `weight-cache.ts`'s logic depends on the exact value and nothing
+in this run's numbers suggested it was a bottleneck worth tuning before
+shipping.
+
 The page: load the weights (progress bar, byte-weighted across the four
 fetched files since `weights.codes.bin` dominates), then either mode —
 
