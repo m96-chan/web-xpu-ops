@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideCacheStrategy,
+  InMemoryChunkStore,
+  isIndexedDbSupported,
   LineFormatConstraint,
   LlamaEngineQ8,
   loadWeightsQ8FromUrl,
@@ -45,5 +48,13 @@ describe("llm/index.ts wiring", () => {
 
   it("still exports the int8 engine (issue #105, already wired before this issue)", () => {
     expect(typeof LlamaEngineQ8).toBe("function");
+  });
+
+  it("exports the persistent weight cache's storage double and decision logic (issue #121)", () => {
+    expect(typeof InMemoryChunkStore).toBe("function");
+    expect(typeof isIndexedDbSupported).toBe("function");
+    // Node has no `indexedDB` global — this is the real, unmocked "false".
+    expect(isIndexedDbSupported()).toBe(false);
+    expect(typeof decideCacheStrategy).toBe("function");
   });
 });

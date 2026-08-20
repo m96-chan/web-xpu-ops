@@ -1,5 +1,20 @@
+import type { ChunkStore } from "./chunk-store.js";
 import type { LlamaConfig } from "./config.js";
+import { createIndexedDbChunkStore, isIndexedDbSupported } from "./idb-chunk-store.js";
 import type { LoadedRealModelQ8 } from "./real-model-weights.js";
+import { estimateStorageQuota, requestPersistentStorage, type QuotaEstimate } from "./storage-quota.js";
+import {
+  decideCacheStrategy,
+  DEFAULT_CHUNK_SIZE_BYTES,
+  expectedFileByteSizes,
+  readCachedFile,
+  readCurrentVersion,
+  sha256Hex,
+  sweepOrphanedChunks,
+  writeCachedFile,
+  writeCurrentVersion,
+  type CachedFileInfo,
+} from "./weight-cache.js";
 import type { LlamaWeightsQ8 } from "./weights-q8.js";
 import { assertWeightShapesQ8 } from "./weights-q8.js";
 import { buildLlamaWeightsQ8, llamaConfigFromManifest, type WeightManifestConfig, type WeightManifestEntry } from "./weights-q8-io.js";
@@ -104,28 +119,191 @@ async function fetchWithProgress(
 }
 
 /**
+ * Options for the persistent IndexedDB weight cache (issue #121, parent #96
+ * / alibi-ai's "re-fetches 1.4GB of weights every visit"). Every field is
+ * optional and every field's default is the real-browser behavior — a
+ * caller that passes nothing gets caching, on, backed by a real
+ * `idb-chunk-store.ts#createIndexedDbChunkStore()`, with real
+ * `navigator.storage` quota checks. `chunkStore`/`estimateQuota`/`requestPersist`
+ * exist to be overridden so `browser-weights.cache.test.ts` can exercise
+ * every branch of this file's cache logic in Node, with no IndexedDB and no
+ * `navigator` — the same reasoning `weight-cache.ts`'s own injected
+ * `ChunkStore` parameter follows.
+ */
+export interface WeightCacheOptions {
+  /** `false` always fetches over HTTP and never touches IndexedDB — this
+   * issue's own opt-out ("既定ON・オプトアウト可"). Defaults to `true`. */
+  enabled?: boolean;
+  /** Overrides the `ChunkStore` this loader caches into — mainly for tests
+   * (`InMemoryChunkStore`). When omitted, a real `IndexedDbChunkStore` is
+   * opened automatically, and if that is not possible (Node — no
+   * `indexedDB` global at all — or a browser where `indexedDB.open()`
+   * itself fails, e.g. Safari private mode) this loader transparently falls
+   * back to a plain network load: no feature loss, only a persistence
+   * difference, exactly this issue's own "フォールバック" requirement. */
+  chunkStore?: ChunkStore;
+  /** Bytes per chunk written to the store. Defaults to
+   * `weight-cache.ts#DEFAULT_CHUNK_SIZE_BYTES`. */
+  chunkSizeBytes?: number;
+  /** Forwarded to `weight-cache.ts#decideCacheStrategy`. */
+  headroomRatio?: number;
+  /** Overrides the quota check (`storage-quota.ts#estimateStorageQuota` by
+   * default). */
+  estimateQuota?: () => Promise<QuotaEstimate | null>;
+  /** Overrides the persistence request (`storage-quota.ts#requestPersistentStorage`
+   * by default). */
+  requestPersist?: () => Promise<boolean>;
+}
+
+/** `explicit` first; otherwise a real `IndexedDbChunkStore` if this
+ * environment has IndexedDB and opening it actually succeeds, else
+ * `undefined` — the single point every "should this load use the cache at
+ * all" decision in `loadWeightsQ8FromUrl` reduces to. */
+async function resolveChunkStore(explicit: ChunkStore | undefined): Promise<ChunkStore | undefined> {
+  if (explicit) return explicit;
+  if (!isIndexedDbSupported()) return undefined;
+  try {
+    return await createIndexedDbChunkStore();
+  } catch {
+    return undefined;
+  }
+}
+
+/** `{file, loadedBytes: totalBytes, totalBytes}` — issue #121's own
+ * "進捗コールバックは既存のfetch進捗と統一(キャッシュヒット時は即時100%)": a
+ * cache hit reports one tick per file, already at 100%, through the exact
+ * same `onProgress` shape a network fetch reports many ticks through. */
+function reportCacheHit(onProgress: ((p: WeightFetchProgress) => void) | undefined, file: string, totalBytes: number): void {
+  onProgress?.({ file, loadedBytes: totalBytes, totalBytes });
+}
+
+/**
  * Loads a `convert_weights.py`-format checkpoint served under `baseUrl`
  * (`${baseUrl}/manifest.json`, `${baseUrl}/weights.codes.bin`, etc.) over
  * `fetch`. `fetchImpl` defaults to the global `fetch` and is overridable for
  * testing without a network or a browser.
+ *
+ * `manifest.json` is always fetched over the network — computing its
+ * content hash (issue #121's versioning key) is the only way to know
+ * whether a previously-cached `weights.codes.bin`/`.scales.bin`/`.norms.bin`
+ * (1.41 GiB combined, the overwhelming majority of this checkpoint) is still
+ * current, and the manifest itself is tens of KB, not gigabytes — the "0
+ * bytes on reload" this issue's PR proves on real hardware is about the
+ * three big binaries, which a cache hit below never requests at all, not
+ * about this one small, unavoidable check.
  */
 export async function loadWeightsQ8FromUrl(
   baseUrl: string,
   maxSeqLen: number,
   onProgress?: (progress: WeightFetchProgress) => void,
   fetchImpl: typeof fetch = fetch,
+  cacheOptions: WeightCacheOptions = {},
 ): Promise<LoadedRealModelQ8> {
   const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
 
   const manifestBytes = await fetchWithProgress(`${base}/manifest.json`, "manifest", fetchImpl, onProgress);
   const manifest: ConvertedManifest = JSON.parse(new TextDecoder("utf-8").decode(manifestBytes));
 
-  const codesBuf = await fetchWithProgress(`${base}/weights.codes.bin`, "codes", fetchImpl, onProgress);
-  const scalesBuf = await fetchWithProgress(`${base}/weights.scales.bin`, "scales", fetchImpl, onProgress);
-  const normsBuf = await fetchWithProgress(`${base}/weights.norms.bin`, "norms", fetchImpl, onProgress);
+  const fetchAllFromNetwork = async (): Promise<[ArrayBuffer, ArrayBuffer, ArrayBuffer]> => [
+    await fetchWithProgress(`${base}/weights.codes.bin`, "codes", fetchImpl, onProgress),
+    await fetchWithProgress(`${base}/weights.scales.bin`, "scales", fetchImpl, onProgress),
+    await fetchWithProgress(`${base}/weights.norms.bin`, "norms", fetchImpl, onProgress),
+  ];
+
+  const enabled = cacheOptions.enabled ?? true;
+  const store = enabled ? await resolveChunkStore(cacheOptions.chunkStore) : undefined;
+
+  let codesBuf: ArrayBuffer;
+  let scalesBuf: ArrayBuffer;
+  let normsBuf: ArrayBuffer;
+
+  if (!store) {
+    [codesBuf, scalesBuf, normsBuf] = await fetchAllFromNetwork();
+  } else {
+    const manifestHash = await sha256Hex(manifestBytes);
+    const sizes = expectedFileByteSizes(manifest.weights);
+    const requiredBytes = sizes.codes + sizes.scales + sizes.norms;
+    const estimateQuota = cacheOptions.estimateQuota ?? estimateStorageQuota;
+    const quota = await estimateQuota();
+    const decision = decideCacheStrategy({
+      indexedDbSupported: true,
+      quota,
+      requiredBytes,
+      headroomRatio: cacheOptions.headroomRatio,
+    });
+
+    const current = decision.useCache ? await readCurrentVersion(store, base) : undefined;
+    const cachedInfo = current?.manifestHash === manifestHash ? current.files : undefined;
+    const hit =
+      cachedInfo?.codes && cachedInfo.scales && cachedInfo.norms
+        ? await readAllCachedFiles(store, base, manifestHash, cachedInfo as Record<"codes" | "scales" | "norms", CachedFileInfo>)
+        : undefined;
+
+    if (hit) {
+      ({ codes: codesBuf, scales: scalesBuf, norms: normsBuf } = hit);
+      reportCacheHit(onProgress, "codes", codesBuf.byteLength);
+      reportCacheHit(onProgress, "scales", scalesBuf.byteLength);
+      reportCacheHit(onProgress, "norms", normsBuf.byteLength);
+    } else {
+      [codesBuf, scalesBuf, normsBuf] = await fetchAllFromNetwork();
+
+      if (decision.useCache) {
+        // Best-effort only, deliberately outside any path that could fail
+        // the load itself: the weights are already in memory from the fetch
+        // above, so a write failure here (a `QuotaExceededError` mid-write —
+        // `estimate()`'s number is a snapshot, not a reservation — or any
+        // other IndexedDB error) must never surface as this function
+        // throwing.
+        try {
+          const chunkSizeBytes = cacheOptions.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
+          const requestPersist = cacheOptions.requestPersist ?? requestPersistentStorage;
+          await requestPersist();
+          const codesInfo = await writeCachedFile(store, base, manifestHash, "codes", codesBuf, chunkSizeBytes);
+          const scalesInfo = await writeCachedFile(store, base, manifestHash, "scales", scalesBuf, chunkSizeBytes);
+          const normsInfo = await writeCachedFile(store, base, manifestHash, "norms", normsBuf, chunkSizeBytes);
+          // Chunks written before the current-version record that points to
+          // them, and the record written before the sweep that deletes
+          // everything else: a crash between any two of these steps leaves
+          // either the previous version still readable (crash before this
+          // record lands) or this version readable with some harmless
+          // orphaned chunks left over (crash after it lands but before the
+          // sweep) — never a `current` record pointing at chunks that were
+          // never fully written.
+          await writeCurrentVersion(store, base, {
+            manifestHash,
+            files: { codes: codesInfo, scales: scalesInfo, norms: normsInfo },
+          });
+          await sweepOrphanedChunks(store, base, manifestHash);
+        } catch {
+          // See the comment above the `try`.
+        }
+      }
+    }
+  }
 
   const config: LlamaConfig = llamaConfigFromManifest(manifest.config, maxSeqLen);
   const weights: LlamaWeightsQ8 = buildLlamaWeightsQ8(manifest.weights, codesBuf, scalesBuf, normsBuf, config.numLayers);
   assertWeightShapesQ8(config, weights);
   return { config, weights };
+}
+
+/** Reads `codes`/`scales`/`norms` from `store` under one manifest hash,
+ * returning `undefined` (never throwing) the moment any one of them is
+ * missing or corrupt (`weight-cache.ts#readCachedFile`'s own contract) — a
+ * partially-evicted cache entry is exactly as much a cache miss as no entry
+ * at all, since `buildLlamaWeightsQ8` needs all three files to build
+ * anything. */
+async function readAllCachedFiles(
+  store: ChunkStore,
+  namespace: string,
+  manifestHash: string,
+  info: Record<"codes" | "scales" | "norms", CachedFileInfo>,
+): Promise<{ codes: ArrayBuffer; scales: ArrayBuffer; norms: ArrayBuffer } | undefined> {
+  const codes = await readCachedFile(store, namespace, manifestHash, "codes", info.codes);
+  if (!codes) return undefined;
+  const scales = await readCachedFile(store, namespace, manifestHash, "scales", info.scales);
+  if (!scales) return undefined;
+  const norms = await readCachedFile(store, namespace, manifestHash, "norms", info.norms);
+  if (!norms) return undefined;
+  return { codes, scales, norms };
 }

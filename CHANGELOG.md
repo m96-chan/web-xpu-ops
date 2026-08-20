@@ -9,6 +9,44 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- Persistent IndexedDB weight cache for `llm/browser-weights.ts#loadWeightsQ8FromUrl`
+  (issue #121, parent #96): `technologies-moe/alibi-ai`'s browser integration was
+  re-fetching the full ~1.41 GiB int8 checkpoint over HTTP on every visit — no
+  caching layer existed between `fetch` and the page. Caching is on by default and
+  falls back transparently (no feature loss, only a persistence difference) when
+  IndexedDB is unavailable (Node, a browser with none at all) or `indexedDB.open()`
+  itself fails (Safari private mode's own failure shape) or when
+  `navigator.storage.estimate()` reports too little free space for the checkpoint —
+  pass `{ enabled: false }` as `loadWeightsQ8FromUrl`'s new fifth argument to opt out
+  entirely.
+
+  Versioning is a SHA-256 hash of `manifest.json`'s raw bytes (`llm/weight-cache.ts#sha256Hex`,
+  via WebCrypto — available identically in Node and every browser this package
+  targets), embedded in every cache key: a re-converted checkpoint under the same URL
+  is detected and re-downloaded automatically, and the previous version's chunks are
+  swept from the store once the new one is fully written (`sweepOrphanedChunks`,
+  which doubles as a general orphan-chunk cleanup for a write interrupted mid-way, via
+  one `ChunkStore.list()` pass rather than exact bookkeeping of what to delete). The
+  manifest itself (tens of KB) is still fetched over the network on every load — it is
+  the only way to learn whether a cached checkpoint is still current — but the three
+  large binaries it may cache (`weights.codes.bin` / `.scales.bin` / `.norms.bin`,
+  1.41 GiB combined) are not, on a cache hit; see the README's real-hardware section
+  for the DevTools Network-panel proof.
+
+  Each of the three cached files is split into 96 MiB chunks
+  (`weight-cache.ts#DEFAULT_CHUNK_SIZE_BYTES`, the midpoint of this issue's own
+  64–128 MiB range) before being written — a single ~1.4 GiB `IndexedDB` value is what
+  this issue's own spec asks to avoid (browser blob-size implementation differences,
+  and no way to show incremental write progress). Storage is behind a small injected
+  interface, `llm/chunk-store.ts#ChunkStore` (`get`/`put`/`delete`/`list`, all
+  `ArrayBuffer`-valued), so every piece of cache logic — chunk splitting, manifest-hash
+  comparison, stale-version eviction, the quota/fallback decision — is unit-tested in
+  Node against `InMemoryChunkStore`, with no browser and no IndexedDB; only the real
+  backend, `llm/idb-chunk-store.ts#createIndexedDbChunkStore` (hand-rolled minimal
+  IndexedDB types, since neither this repository's `tsconfig.json` — deliberately
+  `"DOM"`-lib-free — nor `@types/node` has any), needs the real-Chrome verification
+  this issue's PR carries.
+
 - `LlamaEngineQ8Resident` (`llm/engine-q8-resident.ts`, issue #110): a
   GPU-resident decode path for `LlamaEngineQ8` — one `queue.submit` and one
   logits-only readback per generated token, instead of the ~155 GPU↔CPU

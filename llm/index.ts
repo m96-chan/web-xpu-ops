@@ -7,7 +7,22 @@ export { argmax, greedyGenerate, LlamaEngine } from "./engine.js";
 export { LlamaEngineQ8 } from "./engine-q8.js";
 export { KVCache } from "./kv-cache.js";
 export { loadConvertedWeightsQ8, type LoadedRealModelQ8 } from "./real-model-weights.js";
-export { loadWeightsQ8FromUrl, type WeightFetchProgress } from "./browser-weights.js";
+export { loadWeightsQ8FromUrl, type WeightCacheOptions, type WeightFetchProgress } from "./browser-weights.js";
+export { InMemoryChunkStore, type ChunkStore } from "./chunk-store.js";
+export {
+  createIndexedDbChunkStore,
+  isIndexedDbSupported,
+  DEFAULT_IDB_DATABASE_NAME,
+  DEFAULT_IDB_STORE_NAME,
+} from "./idb-chunk-store.js";
+export { estimateStorageQuota, requestPersistentStorage, type QuotaEstimate } from "./storage-quota.js";
+export {
+  decideCacheStrategy,
+  DEFAULT_CHUNK_SIZE_BYTES,
+  type CacheStrategyDecision,
+  type CachedFileInfo,
+  type CurrentVersionRecord,
+} from "./weight-cache.js";
 export {
   type Constraint,
   sampleNext,
