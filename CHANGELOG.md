@@ -35,7 +35,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   the packing cost once rather than never taking it (#97). `packQ8` packs
   `quantize`'s existing per-row absmax codes into the layout `matvecQ8` reads,
   so the two compose instead of `matvecQ8` inventing its own quantization.
->>>>>>> origin/main
 
 ## [0.1.0] - 2026-08-04
 
