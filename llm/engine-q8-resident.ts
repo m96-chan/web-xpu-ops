@@ -1,4 +1,6 @@
 import { kernel, params, runnerFromResident, type ResidentDevice, type ResidentOp, type Runner } from "../harness/index.js";
+import { ACTIVATION } from "../ops/activation/index.js";
+import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import type { LlamaConfig } from "./config.js";
 import { LlamaEngineQ8 } from "./engine-q8.js";
 import { MAX_WORKGROUPS_PER_DISPATCH } from "./kernels.js";
@@ -111,12 +113,6 @@ const CODE = {
   activation: kernel(new URL("../ops/activation/index.ts", import.meta.url)),
   elementwise: kernel(new URL("../ops/elementwise/index.ts", import.meta.url)),
 };
-
-/** `ops/activation/reference.ts#ACTIVATION.silu`, copied rather than imported to avoid pulling in `ops/activation`'s whole module graph for one constant — same value, checked against `llm/kernels.ts`'s own `ACTIVATION` re-export. */
-const SILU = 1;
-/** `ops/elementwise/reference.ts#ELEMENTWISE`. */
-const ELEMENTWISE_ADD = 0;
-const ELEMENTWISE_MULTIPLY = 1;
 
 /** `runRope`'s uniform layout (`llm/kernels.ts`): field index 3 is `pos_offset` (u32). Copied, not re-derived — rule 2. */
 const ROPE_POS_OFFSET_BYTE = 3 * 4;
@@ -304,9 +300,9 @@ export class LlamaEngineQ8Resident {
     const gateUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
     const upUniform = uniformOf(device, [["u32", ffnHidden], ["u32", hiddenSize]]);
     const downUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ffnHidden]]);
-    const siluUniform = uniformOf(device, [["u32", ffnHidden], ["u32", SILU], ["f32", 1]]);
-    const addUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ELEMENTWISE_ADD]]);
-    const mulUniform = uniformOf(device, [["u32", ffnHidden], ["u32", ELEMENTWISE_MULTIPLY]]);
+    const siluUniform = uniformOf(device, [["u32", ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1]]);
+    const addUniform = uniformOf(device, [["u32", hiddenSize], ["u32", ELEMENTWISE.add]]);
+    const mulUniform = uniformOf(device, [["u32", ffnHidden], ["u32", ELEMENTWISE.multiply]]);
 
     // `pos_offset` (index 3) is rewritten every decode step
     // (`ROPE_POS_OFFSET_BYTE`); every other field is architecture-wide and
@@ -452,6 +448,21 @@ export class LlamaEngineQ8Resident {
   private async runDecodeStep(tokenId: number): Promise<Float32Array[]> {
     const { numLayers, numKvHeads, headDim, hiddenSize, ffnHidden, numHeads, maxSeqLen, vocabSize } = this.config;
     const at = this.tokensSoFar;
+    // `LlamaEngine`/`LlamaEngineQ8`'s own `forward()` reject a call once
+    // `posOffset + N > maxSeqLen` (see those files) before touching the KV
+    // cache; this decode path bypasses `KVCache.write` entirely (a GPU-to-GPU
+    // copy instead — see the class doc), so nothing else catches this. Past
+    // this point, `at` unchecked would land the KV-cache copy below
+    // (`(h * maxSeqLen + at) * headDim * 4`) into the next head's region, or
+    // past the end of the buffer for the last head — a validation error with
+    // no error scope around `batch()`'s encoder, which invalidates the whole
+    // command buffer silently and resolves with the *previous* step's stale
+    // logits rather than failing (PR #116 review, item 1;
+    // `engine-q8-resident.wgsl.test.ts`'s "maxSeqLen boundary" test is the
+    // regression coverage).
+    if (at + 1 > maxSeqLen) {
+      throw new Error(`LlamaEngineQ8Resident.forward: position ${at + 1} exceeds maxSeqLen=${maxSeqLen}`);
+    }
     const s = this.shared;
 
     const embedVec = gatherDequantRows(this.embedTokens, [tokenId], hiddenSize);

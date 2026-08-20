@@ -38,6 +38,12 @@ Entries record **why** a change was needed. What changed is in the diff.
   `examples/llm-demo` gained a "GPU常駐デコード" toggle so the same page can
   run either engine against the same loaded weights for a direct comparison.
 
+  PR #116 review: `LlamaEngineQ8Resident.forward` now throws once a decode
+  step would exceed `maxSeqLen` (`LlamaEngineQ8`/`LlamaEngine`'s own decode
+  paths already do), instead of a KV-cache GPU-to-GPU copy silently landing
+  past the buffer it was meant for and the call resolving with the previous
+  step's stale logits.
+
 - `examples/llm-demo/`: a browser demo that loads Sarashina2.2-1B-alibi-v1
   (int8, `convert_weights.py`'s output) over HTTP and runs `LlamaEngineQ8` on
   a real WebGPU device — issue #106, and the first time this repository's
