@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { concatRows, mergeHeadsMajor, splitConcatRows, splitHeadsMajor, transposeRowMajor } from "./reshape.js";
+import { concatRows, concatRowsInt8, mergeHeadsMajor, splitConcatRows, splitHeadsMajor, transposeRowMajor } from "./reshape.js";
 
 describe("transposeRowMajor", () => {
   it("transposes a non-square matrix", () => {
@@ -91,5 +91,20 @@ describe("concatRows / splitConcatRows", () => {
     const [q, k] = splitConcatRows(fusedOut, 1, [2, 1]);
     expect(Array.from(q!)).toEqual(Array.from(project(wq, 2, x)));
     expect(Array.from(k!)).toEqual(Array.from(project(wk, 1, x)));
+  });
+});
+
+describe("concatRowsInt8", () => {
+  it("stacks int8 matrices along the row axis, same as concatRows for f32", () => {
+    const a = Int8Array.from([1, -2, 3, 4]); // [2, 2]
+    const b = Int8Array.from([-5, 6]); // [1, 2]
+    expect(Array.from(concatRowsInt8([a, b], [2, 1], 2))).toEqual([1, -2, 3, 4, -5, 6]);
+  });
+
+  it("preserves two's-complement negative codes (not the unsigned byte value)", () => {
+    const a = Int8Array.from([-128, 127]); // [1, 2]
+    const b = Int8Array.from([-1, 0]); // [1, 2]
+    const out = concatRowsInt8([a, b], [1, 1], 2);
+    expect(Array.from(out)).toEqual([-128, 127, -1, 0]);
   });
 });
