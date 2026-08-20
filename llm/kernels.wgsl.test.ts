@@ -125,9 +125,9 @@ describe("llm/kernels wrappers", () => {
    * `runGqa` directly) ever passed a non-default `sEff` through the
    * wrapper, so `runGqa`'s own `const sEff = args.sEff ?? S` line could be
    * mutated to the constant `S` (discarding `args.sEff` outright) and the
-   * whole suite stayed green — `ops/gqa/wgsl.test.ts`'s own `sEff` mutation
-   * coverage only exercises the raw kernel dispatch, never this wrapper's
-   * plumbing. Same decode-shaped poison technique as that file's
+   * whole suite stayed green — `ops/gqa/wgsl-seff.test.ts`'s own `sEff`
+   * mutation coverage only exercises the raw kernel dispatch, never this
+   * wrapper's plumbing. Same decode-shaped poison technique as that file's
    * `SEFF_CASES` (`+Infinity` past `sEff` in `v`, read unconditionally by
    * `context.wgsl` — see that file's doc for why `k`'s own poison is a
    * decoy): a `runGqa` that silently used `S` instead of the given `sEff`

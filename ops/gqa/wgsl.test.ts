@@ -1,20 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { agree, expectAgrees, gpuTest, kernel, params, useGpu, type Runner } from "../../harness/index.js";
+import { gpuTest, useGpu } from "../../harness/index.js";
 import { attention } from "../attention/reference.js";
-import {
-  defaultScale,
-  groupedAttention,
-  kvCacheBytes,
-  type GroupedAttentionArgs,
-  type GroupedAttentionResult,
-} from "./reference.js";
+import { groupedAttention, kvCacheBytes, type GroupedAttentionArgs } from "./reference.js";
+import { check, prepare, wave, WG, type Prepared } from "./testing.js";
 
-// Two files rather than two entry points in one, for the reason `attention`
-// measured and wrote down (#46): `layout: "auto"` drops the bindings an entry
-// point does not statically name, the harness binds group 0 as a contiguous
-// list, and the mismatch reads back zeros without raising.
-const scoresCode = kernel(import.meta.url, "scores");
-const contextCode = kernel(import.meta.url, "context");
+/**
+ * `sEff`'s own cases (issue #117's whole point) are in `wgsl-seff.test.ts` —
+ * split for the dispatch budget, not by subject; see `testing.ts`'s own doc
+ * for why (issue #68, not the CPU-cost theory PR #119's first review round
+ * suspected).
+ */
 
 /**
  * Every input, expected value and uniform is built at module scope; the test
@@ -27,88 +22,6 @@ const contextCode = kernel(import.meta.url, "context");
  * over (once for the reference, once for the expanded cross-check), so it is
  * squarely in that trap.
  */
-
-/** Must match `WORKGROUP_SIZE` in both kernels. */
-const WG = 256;
-
-const wave = (n: number, k: number, phase = 0) =>
-  Float32Array.from({ length: n }, (_, i) => Math.sin(i * k + phase) * 1.5);
-
-/**
- * Measured, not widened until green.
- *
- * The arithmetic is `attention`'s — the same three f32 sums (the Q.K dots, the
- * softmax row sum, the probs@V sum) against an f64 reference — and sharing KV
- * heads changes which K rows are read, not how they are summed. Worst actually
- * observed across every case in this file, from an instrumented run with the
- * tolerance disabled:
- *
- *   probs   rel 1.71e-6   abs 2.38e-7
- *   output  rel 1.88e-3   abs 9.54e-7
- *
- * Identical across repeated runs, to every digit — this device's f32 reduction
- * order is fixed, so these are the numbers and not a sample of them.
- *
- * `abs` is the measure that carries this op, for the reason `attention` records:
- * `output` sums probabilities against a sine wave, so elements cancel to near
- * zero and a relative bound against a near-zero true value stops meaning
- * anything. That 1.88e-3 relative is 9.54e-7 absolute — one ulp at exponent
- * -20 — on an element whose true value is near zero. `agree` passes an element
- * on either measure, so it passes on absolute, and a relative-only bound of 1e-5
- * would fail a correct kernel.
- *
- * abs 2e-6 is 2.1x the worst absolute deviation observed. Deliberately not more:
- * everything this file exists to catch moves elements by order 0.1 to 10, five
- * orders of magnitude clear of the bound, so there is nothing to buy by widening
- * it. Confirmed by mutation, not assumed.
- */
-const TOLERANCE = { rel: 1e-5, abs: 2e-6 };
-
-type Prepared = {
-  name: string;
-  args: GroupedAttentionArgs;
-  want: GroupedAttentionResult;
-  scoresParams: ArrayBuffer;
-  contextParams: ArrayBuffer;
-  /**
-   * What gets bound at binding 2. Not optional: a bias of zeros *is* "no mask",
-   * which is what torch's own reference does (`attn_bias = torch.zeros(L, S)`,
-   * added unconditionally). See `ops/attention/wgsl.test.ts`.
-   */
-  maskData: Float32Array;
-};
-
-function prepare(name: string, args: GroupedAttentionArgs): Prepared {
-  const [mb, mh, mr] = args.maskShape ?? [args.B, 1, 1];
-  return {
-    name,
-    args,
-    want: groupedAttention(args),
-    maskData: args.mask ?? new Float32Array(args.B * args.S),
-    scoresParams: params([
-      ["u32", args.H],
-      ["u32", args.kvHeads],
-      ["u32", args.L],
-      ["u32", args.S],
-      ["u32", args.D],
-      ["f32", args.scale ?? defaultScale(args.D)],
-      ["u32", args.causal ? 1 : 0],
-      ["i32", args.queryOffset ?? 0],
-      ["u32", mb],
-      ["u32", mh],
-      ["u32", mr],
-      ["u32", args.sEff ?? args.S],
-    ]),
-    contextParams: params([
-      ["u32", args.H],
-      ["u32", args.kvHeads],
-      ["u32", args.L],
-      ["u32", args.S],
-      ["u32", args.Dv],
-      ["u32", args.sEff ?? args.S],
-    ]),
-  };
-}
 
 type Case = Omit<GroupedAttentionArgs, "q" | "k" | "v"> & { why: string };
 
@@ -332,187 +245,7 @@ const FULLY_MASKED = (() => {
   });
 })();
 
-/**
- * Issue #117's whole point, isolated so a broken `s_eff` fails *only* here.
- *
- * `S` is allocated large (a stand-in for `maxSeqLen`), and every case below
- * sets `sEff` to exactly what the query rows need — the tightest legal value,
- * `min(S, L + queryOffset)` (`sEff`'s own doc in reference.ts). K and V past
- * `sEff` are poisoned, but the two kernels need *different* poison to be
- * caught, because they read past-`sEff` memory under genuinely different
- * conditions:
- *
- * - `scores.wgsl` only reads `k` (and `mask`) inside
- *   `if (causal == 0u || j <= i + query_offset)` — and `sEff`'s own contract
- *   requires `causal == true` with `sEff >= that same bound` whenever
- *   `sEff < S`, which means **every** position `[sEff, S)` is already
- *   causally excluded for every row, for any legal `sEff`. So a `k` value at
- *   `k`'s address is never read there regardless of whether the loop that
- *   would reach it stops at `s_eff` or continues to `S` — the poison in `k`
- *   below is a decoy, kept only so a reader checking this file does not
- *   wonder why `k` looks unpoisoned. Reverting `scores.wgsl`'s loop bound
- *   from `s_eff` back to `S` is real (it does more iterations and more
- *   `probs` writes — the bandwidth issue #116 measured), but it is *not*
- *   something any legal input can catch by comparing `probs` values: the
- *   extra iterations all take the `else` branch and write the same `MASKED`
- *   sentinel a softmax turns into the same `0` a fresh buffer already held.
- *   `SEFF_EQUIVALENCE` below is the correctness proof for `scores.wgsl`
- *   instead of a poison check, for exactly this reason.
- * - `context.wgsl` reads `v` **unconditionally** —
- *   `acc += probs[p_row + j] * v[v_head + j * params.Dv + c]` has no `if` —
- *   because by the time `context.wgsl` runs, `scores.wgsl` has already
- *   turned every masked column into a plain `0.0` in `probs`, and
- *   `context.wgsl` never re-derives which columns those were. `0 * poison`
- *   is `0` for any finite poison, so a *finite* decoy would be silently
- *   swallowed here too — this is why `v`'s poison below is `+Infinity`:
- *   `0 * Infinity` is `NaN` in IEEE 754, and `NaN` cannot round-trip through
- *   `agree()`'s tolerance check as a pass (`harness/agree.ts`: a `NaN`
- *   difference fails both the `abs` and `rel` bounds, since every comparison
- *   against `NaN` is `false`). A kernel that scanned `S` instead of `s_eff`
- *   in `context.wgsl` reads that `Infinity`, multiplies it by the `0` at that
- *   column, and produces `NaN` in `output` — caught here, at every case,
- *   while every other test in this file (none of which sets `sEff`, or pass
- *   finite `v`) stays green.
- */
-const SEFF_K_DECOY = 1e4;
-
-const SEFF_CASES: { name: string; args: GroupedAttentionArgs }[] = (() => {
-  const decode = (() => {
-    // Decode-shaped: L = 1, causal, queryOffset = the position being
-    // generated. sEff = queryOffset + 1 is exactly what LlamaEngineQ8Resident's
-    // decode step passes (llm/engine-q8-resident.ts) — everything at or past
-    // it in the cache has not been written yet.
-    const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 1, 16, 8, 8];
-    const queryOffset = 5;
-    const sEff = queryOffset + 1;
-    return {
-      name: `decode-shaped: L=1 causal@${queryOffset}, sEff=${sEff} of S=${S}`,
-      args: {
-        q: wave(B * H * L * D, 0.37),
-        // Row-major per KV head: live rows [0, sEff), decoy rows [sEff, S) —
-        // never read under any legal sEff (see this block's doc).
-        k: Float32Array.from({ length: B * kvHeads * S * D }, (_, idx) => {
-          const j = Math.floor(idx / D) % S;
-          return j < sEff ? wave(D, 0.11, 0.5 + idx * 1e-6)[idx % D]! : SEFF_K_DECOY;
-        }),
-        // Row-major per KV head: live rows [0, sEff), +Infinity rows
-        // [sEff, S) — the mutation-sensitive poison (see this block's doc).
-        v: Float32Array.from({ length: B * kvHeads * S * Dv }, (_, idx) => {
-          const j = Math.floor(idx / Dv) % S;
-          return j < sEff ? wave(Dv, 0.23, 1.25 + idx * 1e-6)[idx % Dv]! : Number.POSITIVE_INFINITY;
-        }),
-        B, H, kvHeads, L, S, D, Dv, causal: true, queryOffset, sEff,
-      } satisfies GroupedAttentionArgs,
-    };
-  })();
-
-  const prefill = (() => {
-    // Prefill-shaped: L > 1 in one batched dispatch, sEff set to exactly the
-    // last row's reach (L + queryOffset) — the tight bound every row in the
-    // batch is allowed to use (earlier rows need less, and the per-element
-    // causal check already stops them there).
-    const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 5, 20, 8, 8];
-    const queryOffset = 3;
-    const sEff = L + queryOffset;
-    return {
-      name: `prefill-shaped: L=${L} causal@${queryOffset}, sEff=${sEff} of S=${S}`,
-      args: {
-        q: wave(B * H * L * D, 0.41),
-        k: Float32Array.from({ length: B * kvHeads * S * D }, (_, idx) => {
-          const j = Math.floor(idx / D) % S;
-          return j < sEff ? wave(D, 0.13, 0.5 + idx * 1e-6)[idx % D]! : SEFF_K_DECOY;
-        }),
-        v: Float32Array.from({ length: B * kvHeads * S * Dv }, (_, idx) => {
-          const j = Math.floor(idx / Dv) % S;
-          return j < sEff ? wave(Dv, 0.29, 1.25 + idx * 1e-6)[idx % Dv]! : Number.POSITIVE_INFINITY;
-        }),
-        B, H, kvHeads, L, S, D, Dv, causal: true, queryOffset, sEff,
-      } satisfies GroupedAttentionArgs,
-    };
-  })();
-
-  return [decode, prefill];
-})();
-
-const SEFF_TESTS = SEFF_CASES.map(({ name, args }) => prepare(name, args));
-
-/**
- * `sEff = n` must equal `S = n` outright (K/V sliced to `n`, no poison): the
- * scanned positions are summed identically, not merely "the poisoned tail was
- * avoided" (see `SEFF_CASES`'s doc for why that is a materially different
- * claim from the poison check above).
- *
- * A plain function, not a module-scope `const ... = SEFF_CASES.map(...)`:
- * an earlier version computed every case's `groupedAttention()` pair (this
- * function's own body, twice per case) at module *collect* time, alongside
- * `SEFF_CASES`'/`SEFF_TESTS`' own module-scope work — measured on this
- * machine to reproduce the file's Node/Dawn worker instability (PR #119
- * review; the #49/#107 family this repo already documents) at roughly 4 of
- * every 5 runs, well before `useGpu()`'s `beforeAll` even requests an
- * adapter. Deferred here into the one `it()` body below that actually needs
- * it, run once per case, at test-execution time — the shape every other
- * per-case computation in this file already uses (`check()`, `prepare()`'s
- * own callers).
- */
-function seffEquivalence(args: GroupedAttentionArgs): { truncated: GroupedAttentionResult; shrunk: GroupedAttentionResult } {
-  const { B, kvHeads, D, Dv, sEff } = args;
-  const n = sEff!;
-  const kFull = args.k;
-  const vFull = args.v;
-  const kShrunk = new Float32Array(B * kvHeads * n * D);
-  const vShrunk = new Float32Array(B * kvHeads * n * Dv);
-  for (let bh = 0; bh < B * kvHeads; bh += 1) {
-    kShrunk.set(kFull.subarray(bh * args.S * D, bh * args.S * D + n * D), bh * n * D);
-    vShrunk.set(vFull.subarray(bh * args.S * Dv, bh * args.S * Dv + n * Dv), bh * n * Dv);
-  }
-  return {
-    truncated: groupedAttention(args),
-    shrunk: groupedAttention({ ...args, S: n, k: kShrunk, v: vShrunk, sEff: undefined }),
-  };
-}
-
-const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED, ...MASK_TESTS, FULLY_MASKED, ...SEFF_TESTS];
-
-/**
- * Runs the real two-dispatch pipeline and checks both halves.
- *
- * The attention matrix fed to the second dispatch is the one the first dispatch
- * produced, not the reference's, so the seam between them is exercised.
- */
-async function check(run: Runner["run"], p: Prepared): Promise<void> {
-  const { B, H, L, S, Dv } = p.args;
-
-  const [raw] = await run({
-    code: scoresCode,
-    bindings: [
-      { kind: "storage", data: p.args.q },
-      { kind: "storage", data: p.args.k },
-      { kind: "storage", data: p.maskData },
-      { kind: "out", type: "f32", length: B * H * L * S },
-      { kind: "uniform", data: p.scoresParams },
-    ],
-    workgroups: [L, H, B],
-  });
-  const probs = raw as Float32Array;
-  const worst = agree(probs, p.want.probs, TOLERANCE);
-  expect(worst, worst ? `probs: ${JSON.stringify(worst)}` : undefined).toBeNull();
-
-  await expectAgrees(
-    run,
-    {
-      code: contextCode,
-      bindings: [
-        { kind: "storage", data: probs },
-        { kind: "storage", data: p.args.v },
-        { kind: "out", type: "f32", length: B * H * L * Dv },
-        { kind: "uniform", data: p.contextParams },
-      ],
-      workgroups: [L, H, B],
-    },
-    [p.want.output],
-    TOLERANCE,
-  );
-}
+const ALL: Prepared[] = [...SHAPE_TESTS, ...GROUPINGS, OVERFLOW, PADDED, ...MASK_TESTS, FULLY_MASKED];
 
 /**
  * Reference-level facts, computed here rather than in the test bodies for the
@@ -626,57 +359,6 @@ describe("gqa / wgsl", () => {
     for (const kvHeads of [0, -1, 1.5]) {
       expect(() => groupedAttention({ ...args, kvHeads })).toThrow(/positive integer/);
     }
-  });
-
-  for (const { name, args } of SEFF_CASES) {
-    it(`sEff-truncated output equals S shrunk to sEff at ${name}`, () => {
-      const { truncated, shrunk } = seffEquivalence(args);
-      const { B, H, L, S } = args;
-      const n = args.sEff!;
-      // shrunk's probs buffer is `[.., n]` wide (S was shrunk to n outright);
-      // truncated's is `[.., S]` wide with the tail at 0 (never scanned — see
-      // `sEff`'s own doc). Pad shrunk out to the same shape to compare.
-      const padded = new Float32Array(B * H * L * S);
-      for (let row = 0; row < B * H * L; row += 1) padded.set(shrunk.probs.subarray(row * n, (row + 1) * n), row * S);
-      expect(Array.from(truncated.probs)).toEqual(Array.from(padded));
-      expect(Array.from(truncated.output)).toEqual(Array.from(shrunk.output));
-    });
-  }
-
-  it("rejects an sEff outside [1, S]", () => {
-    const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 1, 5, 4, 4];
-    const args = {
-      q: new Float32Array(B * H * L * D), k: new Float32Array(B * kvHeads * S * D), v: new Float32Array(B * kvHeads * S * Dv),
-      B, H, kvHeads, L, S, D, Dv, causal: true,
-    };
-    expect(() => groupedAttention({ ...args, sEff: 0 })).toThrow(/sEff must be an integer in \[1, S=5\]/);
-    expect(() => groupedAttention({ ...args, sEff: 6 })).toThrow(/sEff must be an integer in \[1, S=5\]/);
-    expect(() => groupedAttention({ ...args, sEff: 2.5 })).toThrow(/sEff must be an integer in \[1, S=5\]/);
-    expect(() => groupedAttention({ ...args, sEff: 5 })).not.toThrow();
-  });
-
-  it("rejects a truncated sEff without causal=true", () => {
-    const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 1, 5, 4, 4];
-    const args = {
-      q: new Float32Array(B * H * L * D), k: new Float32Array(B * kvHeads * S * D), v: new Float32Array(B * kvHeads * S * Dv),
-      B, H, kvHeads, L, S, D, Dv,
-    };
-    expect(() => groupedAttention({ ...args, sEff: 3 })).toThrow(/requires causal=true/);
-    expect(() => groupedAttention({ ...args, sEff: 5 })).not.toThrow();
-  });
-
-  it("rejects a causal sEff too small for the last query row's reach", () => {
-    // L=3, queryOffset=4: the last row (i=2) may attend up to key 2+4=6, so
-    // sEff must be at least 7.
-    const [B, H, kvHeads, L, S, D, Dv] = [1, 4, 2, 3, 10, 4, 4];
-    const args = {
-      q: new Float32Array(B * H * L * D), k: new Float32Array(B * kvHeads * S * D), v: new Float32Array(B * kvHeads * S * Dv),
-      B, H, kvHeads, L, S, D, Dv, causal: true, queryOffset: 4,
-    };
-    expect(() => groupedAttention({ ...args, sEff: 6 })).toThrow(/must be at least 7/);
-    expect(() => groupedAttention({ ...args, sEff: 7 })).not.toThrow();
-    // S itself can be the tighter bound when S - 1 < L - 1 + queryOffset.
-    expect(() => groupedAttention({ ...args, S: 6, k: new Float32Array(B * kvHeads * 6 * D), v: new Float32Array(B * kvHeads * 6 * Dv), sEff: 6 })).not.toThrow();
   });
 
   it("rejects K and V sized for the query heads instead of the KV heads", () => {

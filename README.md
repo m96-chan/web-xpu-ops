@@ -1138,7 +1138,7 @@ default `sEff = S`, so every existing caller (`ops/gqa`'s own reference,
 decode step now passes `sEff = position + 1` instead of always `maxSeqLen`.
 See `ops/gqa/reference.ts`'s own doc for the safety contract (`sEff >=
 min(S, L + queryOffset)` whenever `causal` is true; rejected outright
-otherwise) and `ops/gqa/wgsl.test.ts`'s `SEFF_CASES`/`SEFF_EQUIVALENCE` for
+otherwise) and `ops/gqa/wgsl-seff.test.ts`'s `SEFF_CASES`/`seffEquivalence()` for
 why `context.wgsl`'s bound is mutation-checkable numerically (`+Infinity`
 poison past `sEff`, read unconditionally there, produces `NaN` if the scan
 isn't bounded) while `scores.wgsl`'s is proven by agreement with `S` shrunk
@@ -1216,7 +1216,7 @@ rule 9.
 
 **`sEff`'s own before/after, isolated by mutation** (revert `scores.wgsl`/
 `context.wgsl`'s scan bound from `s_eff` back to `S` — the exact mutation
-`ops/gqa/wgsl.test.ts` catches — rebuild, remeasure in the same browser
+`ops/gqa/wgsl-seff.test.ts` catches — rebuild, remeasure in the same browser
 session, then restore):
 
 | position | with `sEff` | with `S` (pre-#117 equivalent) | speedup |

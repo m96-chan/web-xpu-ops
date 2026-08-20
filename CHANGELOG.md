@@ -27,7 +27,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   `scores.wgsl`'s own bound has no such numeric signature under the
   `causal = true` contract `sEff < S` requires (every excluded position is
   already causally masked, by construction), so it is instead proven by
-  `SEFF_EQUIVALENCE`: running with `sEff = n` must equal running with `S`
+  `seffEquivalence()` (`ops/gqa/wgsl-seff.test.ts`): running with `sEff = n` must equal running with `S`
   itself shrunk to `n`. See `ops/gqa/reference.ts`'s `sEff` doc for the full
   safety contract (`sEff >= min(S, L + queryOffset)` whenever `causal` is
   true; rejected outright otherwise).
