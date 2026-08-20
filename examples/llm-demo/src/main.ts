@@ -29,6 +29,7 @@
  */
 import { LineFormatConstraint, type LineFormatSpec } from "../../../llm/constraints/line-format.js";
 import type { TokenCodec } from "../../../llm/constraints/token-codec.js";
+import { argmax } from "../../../llm/engine.js";
 import { LlamaEngineQ8 } from "../../../llm/engine-q8.js";
 import { LlamaEngineQ8Resident } from "../../../llm/engine-q8-resident.js";
 import { sampleNext, type Constraint } from "../../../llm/sampler.js";
@@ -624,3 +625,100 @@ async function __resetBenchmark(
   return { order, reset, rebuild };
 }
 (window as unknown as { __resetBenchmark: typeof __resetBenchmark }).__resetBenchmark = __resetBenchmark;
+
+// ---------------------------------------------------------------------------
+// Issue #111: measuring the fused decode kernels' effect on forward()'s fixed cost
+// ---------------------------------------------------------------------------
+
+/** One prompt length's own prefill and per-step decode timing — `__decodeFixedCostBenchmark`'s own return shape, below. */
+interface DecodeFixedCostResult {
+  promptLength: number;
+  prefillMs: number;
+  decodeStepMs: number[];
+}
+
+/**
+ * Issue #111's own completion bar: "前後のforward固定費とtok/sを実測" —
+ * measures `LlamaEngineQ8Resident.forward()`'s prefill cost at two very
+ * different prompt lengths, and decode's own per-step cost, directly
+ * against real weights and a real device, one prompt length at a time.
+ * (PR #127 review, item 5: an earlier version of this doc's own framing
+ * — "prefill barely changes between 76 and 365 tokens, which only makes
+ * sense if fusing *decode*'s dispatches should help" — conflated the two:
+ * prefill runs through `matmul`, never `matvecQ8`, so this PR's own fused
+ * kernels do not touch it, and this benchmark's own measured results
+ * (README, "Fused decode kernels (issue #111)") show exactly that —
+ * prefill's own near-flat cost at 76 vs. 365 tokens is real and
+ * reproducible, but it is unrelated to what this benchmark's decode
+ * column measures.) This benchmark reports the comparison that *does*
+ * apply — decode's per-token cost before vs. after fusing four decode
+ * dispatches into one (`ops/matvec/wgsl/q8_ffn.wgsl`) or two into one
+ * (`q8_residual.wgsl`) — plus prefill's own timing alongside it, so both
+ * numbers come from the same run rather than being assumed to move
+ * together.
+ *
+ * Prompt *content* does not matter for a timing measurement — only its
+ * length does (`forward()` reads exactly `hiddenSize` embedding-table
+ * bytes per token, regardless of which row) — so this builds synthetic
+ * token id sequences (`i % vocabSize`, always in range) instead of relying
+ * on `tokenizer.encode` to land on an exact requested length, which a real
+ * tokenizer over real text cannot promise.
+ *
+ * One `LlamaEngineQ8Resident`/`ResidentDevice` for every prompt length in
+ * `promptLengths`, `reset()` (issue #120) between them rather than a fresh
+ * `create()` — the same "don't let `create()`'s own ~1.4 GiB weight
+ * re-upload leak into a measurement that is not about `create()`" reasoning
+ * `runResetStrategy` above already established, load-bearing here for the
+ * same reason: `createMs` is reported once, separately, so a slow first
+ * `create()` call cannot be mistaken for a slow `forward()`.
+ *
+ * Not reachable from the UI — a CDP-driven script calls this directly, the
+ * same pattern `__resetBenchmark` above already establishes.
+ *
+ * (PR #127 review, item 6: an earlier version of this PR put this doc
+ * comment directly above `DecodeFixedCostResult` instead of above this
+ * function — the interface sitting between them meant the doc silently
+ * attached to the wrong declaration. Same fix as `packQ8`'s doc in
+ * `ops/matvec/reference.ts`: moved to directly precede what it documents.)
+ */
+async function __decodeFixedCostBenchmark(
+  promptLengths: number[],
+  decodeSteps: number,
+): Promise<{ createMs: number; results: DecodeFixedCostResult[] }> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights } = loaded;
+  const device = await createBrowserResidentDevice();
+  try {
+    const createT0 = performance.now();
+    const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+    const createMs = performance.now() - createT0;
+
+    const results: DecodeFixedCostResult[] = [];
+    for (let i = 0; i < promptLengths.length; i += 1) {
+      const promptLength = promptLengths[i]!;
+      if (i > 0) engine.reset();
+      const tokens = Array.from({ length: promptLength }, (_, j) => j % engineConfig.vocabSize);
+
+      const prefillT0 = performance.now();
+      const prefillLogits = await engine.forward(tokens);
+      const prefillMs = performance.now() - prefillT0;
+
+      let logits = prefillLogits[prefillLogits.length - 1]!;
+      const decodeStepMs: number[] = [];
+      for (let s = 0; s < decodeSteps; s += 1) {
+        const next = argmax(logits);
+        const stepT0 = performance.now();
+        // eslint-disable-next-line no-await-in-loop
+        const [nextLogits] = await engine.forward([next]);
+        decodeStepMs.push(performance.now() - stepT0);
+        logits = nextLogits!;
+      }
+      results.push({ promptLength, prefillMs, decodeStepMs });
+    }
+    return { createMs, results };
+  } finally {
+    device.destroy();
+  }
+}
+(window as unknown as { __decodeFixedCostBenchmark: typeof __decodeFixedCostBenchmark }).__decodeFixedCostBenchmark =
+  __decodeFixedCostBenchmark;
