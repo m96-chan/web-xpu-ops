@@ -9,14 +9,19 @@ import { matmulQ8 } from "./reference.js";
  * test file its own process, but that only helps *between* files, not within
  * one). The edge-case tests (`q8-edges.wgsl.test.ts`) are a *second* split
  * beyond that, measured rather than assumed (rule 1/2, "GPUオブジェクト数の
- * 崖"): this file's twelve shape cases plus those three edge cases (fifteen
- * `gpuTest`s total, each with a 5-binding dispatch — one more binding than
- * plain `matmul`'s own four, `weight`+`scale` where that kernel has one `b`)
- * crashed this binding's GPU worker (`Fatal glibc error ... tpp.c`) when run
- * together in one process; the same fifteen split 12/3 across two files, or
- * either group alone, ran clean every time it was tried. Plain `matmul`'s
- * own `wgsl.test.ts` gets away with fourteen 4-binding dispatches in one
- * file — this op's extra binding per dispatch is enough to move the cliff.
+ * 崖"): this file's twelve shape cases plus those three edge cases, fifteen
+ * `gpuTest`s total in one process, crashed this binding's GPU worker
+ * (`Fatal glibc error ... tpp.c`); the same fifteen split 12/3 across two
+ * files, or either group alone, ran clean every time it was tried.
+ *
+ * *Why* fifteen of this op's dispatches crash where plain `matmul`'s own
+ * fourteen (`ops/matmul/wgsl.test.ts`) do not is not established here —
+ * this op's dispatch has one more binding (`weight`+`scale` where plain
+ * `matmul` has one `b`), which is a plausible contributor, but that was
+ * never isolated against dispatch count on its own (e.g. fifteen 4-binding
+ * dispatches in one process, untried), so it stays a plausible factor, not
+ * a claimed cause — rule 2's "推測でコードを書かない" applies to this file's
+ * own doc, not only to the kernel.
  */
 const code = kernel(import.meta.url, "q8");
 

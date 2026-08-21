@@ -27,9 +27,10 @@ Entries record **why** a change was needed. What changed is in the diff.
 
   **Measured, and the result is smaller than hypothesized — reported
   honestly rather than assumed (rule 9):** `examples/llm-demo`'s
-  `__decodeFixedCostBenchmark` (RTX 5090, Chrome, real Sarashina2.2-1B-alibi-v1
-  checkpoint, synthetic token ids, one `LlamaEngineQ8Resident` instance,
-  `reset()` between calls — the exact "聞く層+スタイラ, reset() 運用" shape
+  `__decodeFixedCostBenchmark` (RTX 5090, NVIDIA driver 610.57.04, Chrome
+  151.0.7922.71, real Sarashina2.2-1B-alibi-v1 checkpoint, synthetic token
+  ids, one `LlamaEngineQ8Resident` instance, `reset()` between calls — the
+  exact "聞く層+スタイラ, reset() 運用" shape
   this issue asked about), 8 samples per prompt length across three runs,
   comparing this change against the immediately preceding commit (PR #127,
   `dequant_transpose`+`matmul` still in the prefill path):

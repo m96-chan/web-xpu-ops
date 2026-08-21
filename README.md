@@ -1610,10 +1610,11 @@ own `[M, ceil(K/4)]` wire format — no transpose, no intermediate buffer.
 
 **Measured, and the result is smaller than this issue's own hypothesis —
 reported as measured, not as hoped for (rule 9).** `examples/llm-demo`'s
-`__decodeFixedCostBenchmark` (RTX 5090, Chrome, real Sarashina2.2-1B-alibi-v1
-checkpoint, synthetic token ids so the comparison is about prompt *length*
-only, one `LlamaEngineQ8Resident` instance with `reset()` between calls —
-the "聞く層+スタイラ, reset() 運用" shape this issue asked about), 8 samples
+`__decodeFixedCostBenchmark` (RTX 5090, NVIDIA driver 610.57.04, Chrome
+151.0.7922.71, real Sarashina2.2-1B-alibi-v1 checkpoint, synthetic token ids
+so the comparison is about prompt *length* only, one `LlamaEngineQ8Resident`
+instance with `reset()` between calls — the "聞く層+スタイラ, reset() 運用"
+shape this issue asked about), 8 samples
 per prompt length across three separate runs, comparing this change against
 the immediately preceding commit (`dequant_transpose`+`matmul` still in the
 prefill path):
