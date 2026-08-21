@@ -49,6 +49,7 @@ rather than being left blank.
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
+| `matmulQ8` | W8A32 GEMM: `matmul` with the right-hand operand held as an int8 weight instead of f32, `matvecQ8`'s own `[M, ceil(K/4)]` `u32` packed wire format read in-kernel — no separate dequant/transpose pass. Scale is `[M]`, `quantize`'s per-row absmax convention, applied once per output element. Speed unmeasured |
 | `transpose` | turned through workgroup memory so both read and write stay consecutive |
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
@@ -1161,18 +1162,21 @@ encodes every prompt token's pass through every layer into the same flat op
 list `runDecodeStep` builds — one `queue.submit` for the whole prompt, one
 readback (the **final** position's logits only — `forward()`'s prefill
 return shape changed to `[finalPositionLogits]`, matching what every real
-caller already read). It keeps the `matmul` path, not `matvecQ8` per
-token — that would multiply prefill's weight traffic by the prompt length,
-the opposite of the goal. Two new ops exist for this:
+caller already read). It kept a `matmul`-shaped path rather than `matvecQ8`
+per token — that would multiply prefill's weight traffic by the prompt
+length, the opposite of the goal (still true today: see "int8 prefill
+matmul (matmulQ8)" below, which changed *which* `matmul`-shaped kernel runs,
+not this decision). Two new ops existed for this at the time:
 
 - `ops/permute` — the `[tokens, heads, dim]` token-major <-> `[heads,
   tokens, dim]` head-major reshape `ops/gqa` needs, `LlamaEngineQ8`'s own
   CPU-side `llm/reshape.ts` functions ported to one GPU dispatch (reading
   Q/K/V back to the CPU to reshape, then re-uploading, would put a round
-  trip exactly where going resident removes one).
-- `ops/dequant_transpose` — dequantizes a packed int8 weight and transposes
+  trip exactly where going resident removes one). Still part of prefill's
+  own kernel set today.
+- `ops/dequant_transpose` — dequantized a packed int8 weight and transposed
   it to `matmul`'s `[K, N]` operand shape in one GPU dispatch. Measured
-  necessary, not merely nicer: the equivalent three CPU passes
+  necessary, not merely nicer, at the time: the equivalent three CPU passes
   (`packInt8Rows` → `dequantizePackedQ8` → `transposeRowMajor`, the detour
   `LlamaEngineQ8#project`'s own prefill branch takes from *already-packed*
   resident weight) cost ~100ms/layer on Sarashina2.2-1B's shape — **~2.5s
@@ -1185,6 +1189,15 @@ the opposite of the goal. Two new ops exist for this:
   layered on top of (which itself took 76-token prefill from 8.0s to 2.96s
   by removing the CPU pack+dequant+transpose *three-pass* detour's earlier,
   even slower form — see the PR for the intermediate numbers).
+
+  **No longer part of prefill's own kernel set** — issue #128 (below)
+  replaced this dispatch and plain `matmul` together with `matmulQ8`, which
+  reads the packed int8 weight in-kernel and needs neither. `ops/dequant_transpose`
+  itself still exists and is still exercised elsewhere (`llm/kernels.ts#runDequantTranspose`'s
+  own Node-side integration test, and `examples/llm-demo`'s WGSL parity
+  table), so this bullet is left as issue #117's own historical record
+  rather than rewritten — the "int8 prefill matmul (matmulQ8)" section is
+  where prefill's *current* weight-read path is described.
 
 KV writes go straight into the persistent, `maxSeqLen`-strided cache
 `runDecodeStep` reads: one contiguous `copyBufferToBuffer` per head (each
@@ -1593,6 +1606,73 @@ above, and this issue's fusions do measurably shrink it (7-8%), just not the
 prefill's own dispatch count (its `matmul`+`dequantTranspose`+`permute`
 chain, a structurally different kernel set from decode's `matvecQ8`) is
 tracked as separate, future work.
+
+### int8 prefill matmul: `matmulQ8` (issue #128)
+
+The "future work" the previous section names directly: issue #117's
+`ops/dequant_transpose`+plain `matmul` pair dequantized-and-transposed every
+projection's packed int8 weight into a `[K, M]` f32 buffer once per
+`forward()` call, purely so `matmul` had an operand to read — a full GPU
+write of `inFeatures * outFeatures` f32 values immediately followed by a
+full read of the same, on every prefill regardless of prompt length.
+`matmulQ8` (`ops/matmul/reference.ts`) removes that pass: the tiled GEMM
+kernel reads the packed int8 weight directly, in-kernel, using `matvecQ8`'s
+own `[M, ceil(K/4)]` wire format — no transpose, no intermediate buffer.
+`runPrefillResident` packs and uploads each layer's weight straight into
+`matmulQ8`'s bind group instead.
+
+**Measured, and the result is smaller than this issue's own hypothesis —
+reported as measured, not as hoped for (rule 9).** `examples/llm-demo`'s
+`__decodeFixedCostBenchmark` (RTX 5090, NVIDIA driver 610.57.04, Chrome
+151.0.7922.71, real Sarashina2.2-1B-alibi-v1 checkpoint, synthetic token ids
+so the comparison is about prompt *length* only, one `LlamaEngineQ8Resident`
+instance with `reset()` between calls — the "聞く層+スタイラ, reset() 運用"
+shape this issue asked about), 8 samples
+per prompt length across three separate runs, comparing this change against
+the immediately preceding commit (`dequant_transpose`+`matmul` still in the
+prefill path):
+
+| prompt length | before (`dequant_transpose`+`matmul`) | after (`matmulQ8`) | delta |
+| --- | --- | --- | --- |
+| 76 tok | 1197.0ms avg (1157.5–1273.3ms, n=8) | 1175.0ms avg (1138.8–1200.7ms, n=8) | ~22ms (~1.8%) |
+| 365 tok | 1275.9ms avg (1262.0–1308.7ms, n=8) | 1273.0ms avg (1253.7–1285.4ms, n=8) | ~3ms (~0.2%) |
+
+(The "before" column here reproduces the #111 table above almost exactly —
+1180.6/1279.8ms there vs. 1197.0/1275.9ms here — a useful cross-check that
+both measurements are reading the same real cost, not an artifact of one
+session.)
+
+Both deltas sit inside the run-to-run spread of either condition (roughly
+±30-50ms at these prompt lengths, on an otherwise-idle GPU — `nvidia-smi`
+read 0% utilization between runs, so this is not contention from another
+process on the machine). `ops/dequant_transpose/reference.ts`'s own doc
+measured its *GPU-side* cost at ~170ms total across 24 layers back at issue
+#117 — real, but small enough next to prefill's ~1.15-1.28s fixed cost that
+removing it outright lands inside this measurement's own noise floor rather
+than producing a visible win.
+
+The fixed cost this issue set out to explain — 76-token and 365-token
+prompts landing at effectively the same wall-clock time (`alibi-ai`'s own
+"プリフィル固定費≈1.2秒がトークン数非依存" observation) — reproduces exactly
+in both the before and after numbers above, so it is real. Its source is
+**not** primarily `dequant_transpose`, contrary to this issue's own working
+hypothesis. The most likely remaining source, unmeasured here and out of
+this change's scope: `runPrefillResident`'s per-layer `Promise.all` of nine
+`device.bindGroup()` calls (the #117 section above already names the
+`pushErrorScope`/`await popErrorScope()` round trip inside each one) still
+runs once per layer — 24 sequential awaited rounds per prefill call,
+independent of prompt length. A plausible next target, not a confirmed
+cause; finding out needs its own measurement, not assumed here.
+
+Correctness: `llm/engine-q8-resident.wgsl.test.ts`'s fixture gate (prefill
+and decode logits vs. the pre-optimization engine) passes unchanged — abs
+diff ~1.2e-7 for prefill logits, matching the pre-existing float32 rounding
+noise this fixture's tolerance was already sized for, not a new source of
+error. `ops/dequant_transpose` itself is untouched and still exercised —
+`llm/kernels.ts#runDequantTranspose` (its own Node-side integration test
+path) and `examples/llm-demo/src/browser-runtime.ts`'s WGSL parity table
+both still reference it; only `runPrefillResident`'s one production call
+site moved to `matmulQ8`.
 
 ### Scope
 

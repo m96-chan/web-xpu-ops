@@ -112,17 +112,18 @@ describe("llm/kernels.ts + llm/engine-q8-resident.ts CODE <-> examples/llm-demo 
   const nodeSide = unionTables(kernelsSide, engineResidentSide);
   const browserSide = opsFromBrowserRuntime(browserSource);
 
-  it("parsed at least the twelve known kernels.ts entry points, and engine-q8-resident.ts's own ten plus two fused ones (sanity check on the regexes themselves)", () => {
+  it("parsed at least the twelve known kernels.ts entry points, and engine-q8-resident.ts's own eleven (sanity check on the regexes themselves)", () => {
     // kernels.ts: 10 at issue #106; 11 then 12 since issue #117 added
     // `permute` (`ops/permute`) and `dequantTranspose` (`ops/dequant_transpose`).
     const kernelsTotal = Object.values(kernelsSide).reduce((sum, set) => sum + set.size, 0);
     expect(kernelsTotal).toBe(12);
-    // engine-q8-resident.ts: the same ten kernels.ts already covers
-    // (rmsnorm, matvecQ8, matmul, rope, gqaScores, gqaContext, activation,
-    // elementwise, permute, dequantTranspose) plus issue #111's
-    // `matvecQ8Ffn`/`matvecQ8Residual`.
+    // engine-q8-resident.ts: eight of kernels.ts's ten (rmsnorm, matvecQ8,
+    // rope, gqaScores, gqaContext, activation, elementwise, permute — not
+    // plain `matmul` or `dequantTranspose`, both dropped from this file by
+    // issue #128, replaced by `matmulQ8`) plus issue #111's
+    // `matvecQ8Ffn`/`matvecQ8Residual` plus issue #128's `matmulQ8`.
     const engineResidentTotal = Object.values(engineResidentSide).reduce((sum, set) => sum + set.size, 0);
-    expect(engineResidentTotal).toBe(12);
+    expect(engineResidentTotal).toBe(11);
   });
 
   it("names the same ops on both sides", () => {

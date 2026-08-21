@@ -56,6 +56,12 @@ import matvecQ8Kernel from "../../../ops/matvec/wgsl/q8.wgsl";
 import matvecQ8FfnKernel from "../../../ops/matvec/wgsl/q8_ffn.wgsl";
 import matvecQ8ResidualKernel from "../../../ops/matvec/wgsl/q8_residual.wgsl";
 import matmulKernel from "../../../ops/matmul/wgsl/kernel.wgsl";
+// Issue #128: `LlamaEngineQ8Resident.runPrefillResident`'s prefill weight
+// path — reads the packed int8 weight directly, in-kernel, replacing the
+// dequant_transpose+matmul pair below for that one call site (`kernels.ts`
+// still asks for both, for parity/integration-test purposes — see those
+// imports' own doc a few lines down).
+import matmulQ8Kernel from "../../../ops/matmul/wgsl/q8.wgsl";
 import ropeKernel from "../../../ops/rope/wgsl/kernel.wgsl";
 import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
 import gqaContextKernel from "../../../ops/gqa/wgsl/context.wgsl";
@@ -68,10 +74,12 @@ import elementwiseKernel from "../../../ops/elementwise/wgsl/kernel.wgsl";
 // `LlamaEngineQ8`'s own forward pass calls `runPermute` yet), so it stays
 // covered by this table's usual parity check.
 import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
-// `ops/dequant_transpose` (issue #117's resident prefill weight prep,
-// `ops/dequant_transpose/reference.ts`'s doc has the full story) — same
-// "kept in kernels.ts#CODE for parity, real caller builds its own bind
-// groups" shape as `permute` just above.
+// `ops/dequant_transpose` (`ops/dequant_transpose/reference.ts`'s doc has
+// the full story) — issue #128 removed its one production caller
+// (`LlamaEngineQ8Resident.runPrefillResident`, replaced by `matmulQ8` above),
+// but `kernels.ts#CODE` still asks for it (its own `runDequantTranspose`
+// wrapper is this op's Node-side integration test path — that file's own
+// doc), so it stays in this table too.
 import dequantTransposeKernel from "../../../ops/dequant_transpose/wgsl/kernel.wgsl";
 
 /**
@@ -83,7 +91,7 @@ export const WGSL_TABLE: Readonly<Record<string, Readonly<Record<string, string>
   gather: { kernel: gatherKernel },
   rmsnorm: { kernel: rmsnormKernel },
   matvec: { kernel: matvecKernel, q8: matvecQ8Kernel, q8_ffn: matvecQ8FfnKernel, q8_residual: matvecQ8ResidualKernel },
-  matmul: { kernel: matmulKernel },
+  matmul: { kernel: matmulKernel, q8: matmulQ8Kernel },
   rope: { kernel: ropeKernel },
   permute: { kernel: permuteKernel },
   dequant_transpose: { kernel: dequantTransposeKernel },

@@ -7,6 +7,66 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Added
+
+- `ops/matmul` gets a `matmulQ8` entry point (issue #128): the same tiled
+  GEMM as plain `matmul`, but the right-hand operand is read as a packed
+  int8 weight — `matvecQ8`'s own `[M, ceil(K/4)]` wire format — with
+  in-kernel dequant instead of a separate f32 operand. `LlamaEngineQ8Resident.runPrefillResident`
+  used this to replace `ops/dequant_transpose`+plain `matmul`: that pair
+  dequantized-and-transposed every projection's packed weight into a
+  `[K, M]` f32 buffer once per `forward()` call, purely so `matmul` had an
+  operand to read — a full GPU write of `inFeatures * outFeatures` f32
+  values immediately followed by a full read of the same, on every prefill
+  regardless of prompt length. `matmulQ8` removes that pass: no transpose,
+  no intermediate buffer, the kernel reads the packed weight directly.
+  `ops/dequant_transpose` itself is unchanged and still used —
+  `llm/kernels.ts#runDequantTranspose` (that op's own Node-side integration
+  test path) and `examples/llm-demo/src/browser-runtime.ts`'s WGSL parity
+  table both still reference it.
+
+  **Measured, and the result is smaller than hypothesized — reported
+  honestly rather than assumed (rule 9):** `examples/llm-demo`'s
+  `__decodeFixedCostBenchmark` (RTX 5090, NVIDIA driver 610.57.04, Chrome
+  151.0.7922.71, real Sarashina2.2-1B-alibi-v1 checkpoint, synthetic token
+  ids, one `LlamaEngineQ8Resident` instance, `reset()` between calls — the
+  exact "聞く層+スタイラ, reset() 運用" shape
+  this issue asked about), 8 samples per prompt length across three runs,
+  comparing this change against the immediately preceding commit (PR #127,
+  `dequant_transpose`+`matmul` still in the prefill path):
+
+  | prompt length | before (dequant_transpose+matmul) | after (matmulQ8) | delta |
+  | --- | --- | --- | --- |
+  | 76 tok | 1197.0ms avg (1157.5–1273.3ms, n=8) | 1175.0ms avg (1138.8–1200.7ms, n=8) | ~22ms (~1.8%) |
+  | 365 tok | 1275.9ms avg (1262.0–1308.7ms, n=8) | 1273.0ms avg (1253.7–1285.4ms, n=8) | ~3ms (~0.2%) |
+
+  Both deltas sit inside the run-to-run spread of either condition (roughly
+  ±30–50ms at this prompt length, on an otherwise-idle GPU — `nvidia-smi`
+  checked at 0% utilization between runs, so this is not GPU contention from
+  another process). `ops/dequant_transpose/reference.ts`'s own doc measured
+  its *own* GPU-side cost at ~170ms total across 24 layers for one
+  projection shape at issue #117's time — a real number, but small enough
+  next to prefill's ~1.15–1.28s fixed cost that removing it outright lands
+  inside this measurement's own noise floor rather than producing a visible
+  win. The fixed cost this issue set out to explain (76-token and 365-token
+  prompts landing at effectively the same wall-clock time, `alibi-ai`'s own
+  "プリフィル固定費≈1.2秒がトークン数非依存" observation) reproduces exactly
+  in both the before and after numbers above — so it is real, but its source
+  is **not** primarily `dequant_transpose`, contrary to this issue's own
+  working hypothesis. The most likely remaining source, unmeasured here and
+  out of this change's scope: `runPrefillResident`'s per-layer `Promise.all`
+  of nine `device.bindGroup()` calls (`PR #119 review, item 7`'s own doc
+  already named the `pushErrorScope`/`await popErrorScope()` round trip
+  inside each one) still runs once per layer, 24 sequential awaited rounds
+  per prefill call, independent of prompt length — a plausible next target,
+  not confirmed as the cause.
+
+  Correctness: `llm/engine-q8-resident.wgsl.test.ts`'s fixture gate (prefill
+  and decode logits vs. the pre-optimization engine) passes unchanged — abs
+  diff ~1.2e-7 for prefill logits, matching the pre-existing float32
+  rounding noise this fixture's tolerance was already sized for, not a new
+  source of error.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
