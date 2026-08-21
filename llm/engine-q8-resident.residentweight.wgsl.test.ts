@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { beforeAll, describe, expect } from "vitest";
 import { residentTest, useResidentGpu } from "../harness/index.js";
 import { argmax } from "./engine.js";
@@ -12,7 +11,7 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * files' own module docs already give, PR #116 review item 9): one shared
  * engine, built once in `beforeAll`, exercised by both tests below in order.
  *
- * ## Gate 1: bit-for-bit logits
+ * ## Gate 1: bit-for-bit logits — an in-session A/B diff, not a golden file
  *
  * `runPrefillResident`'s `matmulQ8` bind group used to be built from a
  * *fresh* `packInt8Rows(linear.codes, ...)` on every `forward()` call
@@ -20,20 +19,41 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * `bindMatmulQ8`, which binds the exact `GPUBuffer`s `buildProjection`
  * uploaded once in `create()` for decode's own `matvecQ8` bind groups —
  * `engine-q8-resident.ts#bindMatmulQ8`'s own doc has the full argument for
- * why the bytes are identical either way. `tiny_q8.resident_prefill_golden.json`
- * is a literal capture of this exact fixture's prefill + 4-step decode
- * logits, taken from this repository's `matmulQ8IntoShape`-based code
- * (`git stash` back to the commit immediately before issue #142's own
- * changes, same tiny fixture, same token sequence) — not the fixture's own
+ * why the bytes are identical either way. Not the fixture's own
  * Python-derived `prefillLogits`/`decodeLogits` (`engine-q8-resident.wgsl.test.ts`'s
  * own gate, which allows `TOLERANCE = {rel: 1e-2, abs: 5e-3}` because that
  * comparison crosses a reference-implementation boundary, PyTorch vs this
- * repository's own WGSL). This file's own comparison does not cross any such
- * boundary — both sides are this same `LlamaEngineQ8Resident` reading the
- * same packed int8 bytes through the same `matmulQ8` kernel, only *which
- * buffer* holds those bytes differs — so equality is asserted exactly
- * (`toEqual`, no tolerance), per #130's own established criterion: "1ビット
- * でも動いたら丸めではなく設計の違い" (issue #142's own background).
+ * repository's own WGSL) — this file's own comparison does not cross any
+ * such boundary, so `toEqual` (no tolerance) is the right bar, per #130's
+ * own established criterion: "1ビットでも動いたら丸めではなく設計の違い"
+ * (issue #142's own background).
+ *
+ * An earlier version of this test asserted that against a **golden JSON
+ * fixture** — a literal capture of this exact fixture's prefill/decode
+ * logits, taken once from this repository's own `matmulQ8IntoShape`-based
+ * code on one machine (`git stash` back to the commit immediately before
+ * issue #142's own changes). Review caught the problem with that shape:
+ * prefill runs through `rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos`, and
+ * `gqa`'s softmax `exp` — all vendor/driver-dependent at the ULP level
+ * (rule 2, "GPU の挙動は特に推測しない"), so a literal-float fixture is only
+ * guaranteed reproducible **on the machine that captured it**, not across
+ * adapters, and not necessarily across a driver update on the *same*
+ * machine either. `engine-q8-resident.wgsl.test.ts`'s own sibling gate
+ * already accounts for exactly this by comparing against the Python
+ * fixture with a tolerance, not exact equality — pinning a *second*,
+ * stricter, single-machine-only fixture next to it was inconsistent with
+ * that.
+ *
+ * `debugPrefillWithPackedWeights` (`engine-q8-resident.ts`, issue #142,
+ * test/debug-only) is the fix: it runs the exact same prefill through the
+ * pre-#142 `matmulQ8IntoShape` path instead of `bindMatmulQ8`, on the
+ * *same* engine instance, in the *same* test, on the *same* device. The
+ * claim issue #142 actually needs — "these two paths compute the same
+ * thing" — only requires the two to agree with **each other**, on whatever
+ * this session's own device happens to compute; it never needs a value
+ * that survives being written to disk and read back on a different
+ * machine. An in-session diff proves exactly that claim and nothing more,
+ * which is also exactly what portability requires.
  *
  * ## Gate 2: no new GPU resource per prefill call
  *
@@ -47,7 +67,9 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * property ("プリフィルが新規GPUリソースを確保しない") as something a test can hold
  * the class honest to, the same way `harness/resident.test.ts`'s own
  * "buffers created before batch() are not recreated by repeated batches"
- * test holds `runDecodeStep`'s steady state honest.
+ * test holds `runDecodeStep`'s steady state honest. This one *is* a plain
+ * integer count, not a float — no ULP/vendor portability concern, so a
+ * measured numeric threshold is the right shape here, unlike Gate 1 above.
  *
  * `THRESHOLD` below is a **measured** bound, not a guess (rule 2): running
  * this fixture's own prefill through the pre-#142 `matmulQ8IntoShape`
@@ -68,9 +90,6 @@ const THRESHOLD = 60;
 describe("llm/engine-q8-resident / issue #142 — resident weight buffers in prefill", () => {
   const getResident = useResidentGpu();
   const fixture = loadTinyFixtureQ8();
-  const golden = JSON.parse(
-    readFileSync(new URL("./fixtures/tiny_q8.resident_prefill_golden.json", import.meta.url), "utf8"),
-  ) as { prefillLogits: number[]; decodeLogits: number[][] };
 
   let engine: LlamaEngineQ8Resident | undefined;
 
@@ -80,26 +99,49 @@ describe("llm/engine-q8-resident / issue #142 — resident weight buffers in pre
     engine = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, resident);
   });
 
-  residentTest("prefill and decode logits are bit-for-bit identical to the pre-#142 (matmulQ8IntoShape) capture", async () => {
-    const prefillLogits = await engine!.forward(fixture.promptTokens);
-    expect(Array.from(prefillLogits[0]!)).toEqual(golden.prefillLogits);
-
-    let next = argmax(prefillLogits[0]!);
+  residentTest("prefill and decode logits are bit-for-bit identical whether matmulQ8's weight comes from bindMatmulQ8 (resident) or matmulQ8IntoShape (packed) — same session, same device", async () => {
+    // First generation on the shared engine: the pre-#142 packed-weight
+    // path (`debugPrefillWithPackedWeights`'s own doc — test/debug-only,
+    // never reachable from `forward()`). `tokensSoFar` starts at 0 straight
+    // out of `beforeAll`'s `create()`, so this is a valid first prefill.
+    const packedPrefill = await engine!.debugPrefillWithPackedWeights(fixture.promptTokens);
+    const packedDecode: Float32Array[] = [];
+    let next = argmax(packedPrefill[0]!);
     for (let s = 0; s < fixture.decodeTokens.length; s += 1) {
       // eslint-disable-next-line no-await-in-loop
       const [logits] = await engine!.forward([next]);
-      expect(Array.from(logits!)).toEqual(golden.decodeLogits[s]);
+      packedDecode.push(logits!);
       next = argmax(logits!);
     }
+
+    // Second, independent generation on the same engine instance (issue
+    // #120's `reset()`), same tokens: the production resident-weight path.
+    engine!.reset();
+    const residentPrefill = await engine!.forward(fixture.promptTokens);
+    const residentDecode: Float32Array[] = [];
+    next = argmax(residentPrefill[0]!);
+    for (let s = 0; s < fixture.decodeTokens.length; s += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const [logits] = await engine!.forward([next]);
+      residentDecode.push(logits!);
+      next = argmax(logits!);
+    }
+
+    // Bit-for-bit, not merely within tolerance — see this file's own "Gate
+    // 1" doc above for why exact equality is the right bar here.
+    expect(Array.from(residentPrefill[0]!)).toEqual(Array.from(packedPrefill[0]!));
+    residentDecode.forEach((got, s) => {
+      expect(Array.from(got)).toEqual(Array.from(packedDecode[s]!));
+    });
   });
 
   residentTest("a second prefill (after reset()) allocates well under the pre-#142 per-call weight-repack cost", async (resident) => {
-    // Relies on the previous test having already run this shared engine's
-    // first prefill + decode — `reset()` here starts a second, independent
-    // generation on the same instance (issue #120), which is exactly the
-    // case issue #142's own background names ("再パック済みバイト列は
-    // create()時点で既にGPU上に存在する" — true on *every* prefill call, not
-    // just the first).
+    // Relies on the previous test having already left this shared engine
+    // mid-generation (its own resident-path decode loop) — `reset()` here
+    // starts a third, independent generation on the same instance (issue
+    // #120), which is exactly the case issue #142's own background names
+    // ("再パック済みバイト列は create()時点で既にGPU上に存在する" — true on
+    // *every* prefill call, not just the first).
     engine!.reset();
     const before = resident.stats.buffersCreated;
     await engine!.forward(fixture.promptTokens);

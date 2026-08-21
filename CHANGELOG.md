@@ -145,18 +145,27 @@ Entries record **why** a change was needed. What changed is in the diff.
   | 365 tok | 1344.4ms median (1326.9–1378.9ms, n=8) | 120.6ms median (119.0–121.6ms, n=8; one 317.0ms outlier under concurrent GPU load) | ~11.1x |
 
   Correctness: prefill and decode logits are **bit-for-bit identical**
-  (`llm/engine-q8-resident.residentweight.wgsl.test.ts`) to a capture taken
-  from the pre-#142 `matmulQ8IntoShape` code — not merely within tolerance,
-  exact equality, per #130's own established criterion ("1ビットでも動いたら
-  丸めではなく設計の違い"): both paths read the identical packed bytes through
-  the identical `matmulQ8` kernel, so any difference would mean a design
-  bug, not rounding. `resident.stats.buffersCreated`'s own per-prefill-call
-  delta drops from a measured 75 to a measured 47 for the fixture in that
-  same test (28 fewer buffers = `2 × 7 projections × 2 layers`, exactly the
+  whether `matmulQ8`'s weight comes from `bindMatmulQ8` (resident) or the
+  pre-#142 `matmulQ8IntoShape` (packed) — `llm/engine-q8-resident.ts` keeps
+  the latter as a test/debug-only method, `debugPrefillWithPackedWeights`,
+  precisely so `llm/engine-q8-resident.residentweight.wgsl.test.ts` can run
+  both paths on the **same engine, same session, same device** and diff
+  their output directly, rather than pinning literal floats from one
+  GPU/driver into a fixture file — `rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos`
+  and `gqa`'s softmax `exp` are all vendor/driver-dependent at the ULP level
+  (rule 2), so only an in-session comparison is portable; a golden-fixture
+  version of this test was caught in review for exactly that reason and
+  replaced before merge. Exact equality (`toEqual`, no tolerance), per
+  #130's own established criterion ("1ビットでも動いたら丸めではなく設計の
+  違い"): both paths read the identical packed bytes through the identical
+  `matmulQ8` kernel, so any difference would mean a design bug, not
+  rounding. `resident.stats.buffersCreated`'s own per-prefill-call delta
+  drops from a measured 75 to a measured 47 for the fixture in that same
+  test (28 fewer buffers = `2 × 7 projections × 2 layers`, exactly the
   weight+scale pair this change stops re-allocating) — asserted with a
-  margin threshold, mutation-confirmed by temporarily reverting `bindMatmulQ8`
-  back to `matmulQ8IntoShape` and watching the assertion fail at the
-  measured pre-#142 value.
+  margin threshold, mutation-confirmed by temporarily reverting
+  `bindMatmulQ8` back to `matmulQ8IntoShape` and watching the assertion
+  fail at the measured pre-#142 value.
 
 ## [0.2.0] - 2026-08-21
 

@@ -1941,19 +1941,29 @@ the code they measured, and the ~29.7x/~11.1x speedup below is against
 column.
 
 Correctness: prefill and decode logits are **bit-for-bit identical**
-(`llm/engine-q8-resident.residentweight.wgsl.test.ts`) to a capture taken
-from the pre-#142 `matmulQ8IntoShape` code on this same tiny fixture — not
-within tolerance, exact equality, per issue #130's own established
-criterion ("1ビットでも動いたら丸めではなく設計の違い"): both paths read the
-identical packed bytes through the identical `matmulQ8` kernel, so any
-difference would mean a design bug, not floating-point rounding.
-`resident.stats.buffersCreated`'s own per-prefill-call delta drops from a
-measured 75 to a measured 47 for that fixture (`numLayers: 2`) — 28 fewer
-buffers, exactly `2 (weight + scale) × 7 (projections) × 2 (layers)`, the
-weight/scale pair this change stops re-allocating — asserted with a margin
-threshold in the same test file, mutation-confirmed by temporarily
-reverting `bindMatmulQ8` back to `matmulQ8IntoShape` during development and
-watching the assertion fail at the measured pre-#142 value (75).
+whether `matmulQ8`'s weight comes from `bindMatmulQ8` (resident) or the
+pre-#142 `matmulQ8IntoShape` (packed) — `debugPrefillWithPackedWeights`
+(`llm/engine-q8-resident.ts`, test/debug-only) runs the packed path on
+demand so `llm/engine-q8-resident.residentweight.wgsl.test.ts` can diff it
+against a plain `forward()` prefill **on the same engine, in the same
+session, on the same device**, rather than against a golden capture pinned
+to one GPU/driver. `rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos` and `gqa`'s
+softmax `exp` are all vendor/driver-dependent at the ULP level (rule 2), so
+a literal-float fixture is reproducible only on the machine that captured
+it — an earlier version of this test used exactly that shape and was
+caught and replaced in review before merge, since it is not portable the
+way an in-session A/B diff is. Exact equality, not within tolerance, per
+issue #130's own established criterion ("1ビットでも動いたら丸めではなく設計の
+違い"): both paths read the identical packed bytes through the identical
+`matmulQ8` kernel, so any difference would mean a design bug, not
+floating-point rounding. `resident.stats.buffersCreated`'s own
+per-prefill-call delta drops from a measured 75 to a measured 47 for that
+fixture (`numLayers: 2`) — 28 fewer buffers, exactly `2 (weight + scale) ×
+7 (projections) × 2 (layers)`, the weight/scale pair this change stops
+re-allocating — asserted with a margin threshold in the same test file,
+mutation-confirmed by temporarily reverting `bindMatmulQ8` back to
+`matmulQ8IntoShape` during development and watching the assertion fail at
+the measured pre-#142 value (75).
 
 ### Scope
 

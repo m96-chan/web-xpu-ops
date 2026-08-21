@@ -66,7 +66,31 @@ export interface ForwardProfile {
    * against.
    */
   wantGpuBreakdown: boolean;
-  /** One entry per `matmulQ8IntoShape` call this `forward()` made (prefill's own per-layer, per-projection weight pack) — `packInt8Rows`'s own CPU cost, issue #131 item 1. Empty for a decode step: `runDecodeStep` never calls `matmulQ8IntoShape` (its weights were packed once, in `create()`, via `buildProjection` — see that function's own doc). */
+  /**
+   * One entry per `matmulQ8IntoShape` call this `forward()` made —
+   * `packInt8Rows`'s own CPU cost, issue #131 item 1.
+   *
+   * **Empty for a production `forward()` call, prefill included, as of
+   * issue #142.** Before #142, this field's whole reason to exist was
+   * prefill's own per-layer, per-projection weight pack (`wq`/`wk`/`wv`/
+   * `wo`/gate/up/`wDown`, all seven via `matmulQ8IntoShape`) — #142 replaced
+   * every one of those seven calls with `bindMatmulQ8`, which binds
+   * `LayerResident`'s already-resident `ResidentWeight`s directly and never
+   * calls `matmulQ8IntoShape` (no `packProfile` parameter to record into,
+   * because there is no `packInt8Rows` call left to time). **Do not read
+   * `packEntries.length === 0` as "this was a decode step"** — a profiled
+   * *prefill* call now reports empty `packEntries` too, which is the
+   * expected, desired shape post-#142, not a sign profiling broke.
+   *
+   * The one remaining, non-empty case is `debugAllPositionLogits`'s
+   * debug-only full-`N`-position path (`runPrefillResident`'s
+   * `debugAllPositions` branch): `lm_head`'s own weight is not chunked to
+   * match `matmulQ8`'s tile shape the way `wq`/etc.'s resident buffers are
+   * (`matmulQ8IntoShape`'s own doc explains why reusing `lmHeadChunks` here
+   * was not worth it), so that one path still calls `matmulQ8IntoShape` —
+   * and only `forward()`'s real, production callers never reach
+   * `debugAllPositionLogits` at all.
+   */
   packEntries: { layer: number; proj: string; ms: number; bytes: number }[];
   /** Cumulative `performance.now()` time across every `device.upload()` (`queue.writeBuffer`) call this `forward()` made, and the total bytes those calls wrote — issue #131 item 2. This is the *enqueue* cost (the synchronous call into `queue.writeBuffer`), not a measurement of when the device-side copy actually lands; `submitToDoneMs` below is where that device-side cost surfaces, folded in with every dispatch's own GPU time. */
   uploadMs: number;
@@ -100,13 +124,20 @@ export interface ForwardProfile {
    * across every layer — unlike `bindGroupMs` above, this *is* additive
    * against `totalMs`, because it brackets the whole concurrent block once
    * per layer rather than each of the nine calls inside it individually.
-   * Covers that block's own CPU work too (`packInt8Rows` runs synchronously,
-   * before its own call's `await`, inside the same `Promise.all` entries —
-   * see `matmulQ8IntoShape`'s doc), so this is the number to compare against
-   * `totalMs` for "how much of one `forward()` call this phase actually
-   * cost", not `packMs`/`bindGroupMs` read in isolation. `0` for a decode
-   * step: `runDecodeStep` has no equivalent per-token block (every group it
-   * binds was built once, in `create()`).
+   * This is the number to compare against `totalMs` for "how much of one
+   * `forward()` call this phase actually cost", not `bindGroupMs` read in
+   * isolation. `0` for a decode step: `runDecodeStep` has no equivalent
+   * per-token block (every group it binds was built once, in `create()`).
+   *
+   * As of issue #142, this block's own CPU work is nine `device.bindGroup(...)`
+   * calls and nothing else — the seven `matmulQ8IntoShape` calls this used
+   * to include (each with its own synchronous `packInt8Rows` running before
+   * its own call's `await`, inside the same `Promise.all` entries) are
+   * `bindMatmulQ8` calls now, which do no CPU packing at all. So unlike
+   * before #142, `layerSetupMs` is **not** a proxy for `packEntries`'s own
+   * cost any more (`packEntries` is empty for production prefill post-#142
+   * — see that field's own doc) — it is purely the wall-clock cost of
+   * building this layer's nine bind groups.
    */
   layerSetupMs: number;
   /** Set once `device.batch(...)` resolves: GPU submit-to-completion wait and the readback `mapAsync` phase, timed separately (`BatchProfileSink`'s own doc) — issue #131 item 4's CPU-visible half. `null` until `batch()` writes them. */
@@ -719,6 +750,39 @@ async function matmulQ8IntoShape(
   return { bindGroup, transient: [weightBuf, scaleBuf] };
 }
 
+/**
+ * Issue #142: chooses between `bindMatmulQ8` (production — resident
+ * `weight`, no pack) and `matmulQ8IntoShape` (`usePackedWeights: true` —
+ * pre-#142 behavior, packs `linear` fresh) for one projection, and — only
+ * for the packed branch — collects the transient `weightBuf`/`scaleBuf`
+ * pair it allocated into `transientSink` so `runPrefillResident`'s own
+ * `for (const buf of transientBuffers) buf.destroy()` still reaches them
+ * (`bindMatmulQ8`'s own resident buffers are never transient and never go
+ * in this sink — see that function's own doc).
+ *
+ * Exists only so `runPrefillResident`'s `usePackedWeights` parameter (see
+ * its own doc) can switch all seven per-layer projections between the two
+ * paths with one flag, for `debugPrefillWithPackedWeights`'s in-session A/B
+ * comparison — every real caller (`usePackedWeights` always `false`) still
+ * resolves this to a plain `bindMatmulQ8(...)` call, unwrapped.
+ */
+function projectMatmulQ8(
+  usePackedWeights: boolean,
+  device: ResidentDevice,
+  matmulQ8Pipeline: GPUComputePipeline,
+  shape: MatmulQ8ProjectionShape,
+  weight: ResidentWeight,
+  linear: QuantizedLinear,
+  packProfile: { sink: ForwardProfile; layer: number; proj: string } | undefined,
+  transientSink: GPUBuffer[],
+): Promise<GPUBindGroup> {
+  if (!usePackedWeights) return bindMatmulQ8(device, matmulQ8Pipeline, shape, weight);
+  return matmulQ8IntoShape(device, matmulQ8Pipeline, shape, linear, packProfile).then((r) => {
+    transientSink.push(...r.transient);
+    return r.bindGroup;
+  });
+}
+
 interface SharedResident {
   rmsnormPipeline: GPUComputePipeline;
   matvecPipeline: GPUComputePipeline;
@@ -1245,9 +1309,47 @@ export class LlamaEngineQ8Resident {
    * transient pair, which is exactly what removes the CPU repack this
    * method used to pay on every one of those "on every generation after a
    * `reset()`" re-runs the paragraph above still describes for the `N`-sized
-   * scratch.
+   * scratch. `usePackedWeights` below (default `false`, `bindMatmulQ8`) can
+   * force this back to the pre-#142 `matmulQ8IntoShape` behavior — see that
+   * parameter's own doc.
    */
-  private async runPrefillResident(tokens: number[], debugAllPositions = false, profile?: ForwardProfile): Promise<Float32Array[]> {
+  private async runPrefillResident(
+    tokens: number[],
+    debugAllPositions = false,
+    profile?: ForwardProfile,
+    /**
+     * Test/debug-only (issue #142): `true` makes every one of the seven
+     * per-layer projections go through the pre-#142 `matmulQ8IntoShape`
+     * (fresh `packInt8Rows` + `device.upload`, discarded once `batch()`
+     * resolves) instead of `bindMatmulQ8` (this layer's resident
+     * `ResidentWeight`, built once in `create()`) — same kernel
+     * (`matmulQ8`), same dispatch shape, same uniform, different *source*
+     * for the weight/scale bytes bound into it.
+     *
+     * Exists solely so `debugPrefillWithPackedWeights` (below) can give
+     * `engine-q8-resident.residentweight.wgsl.test.ts` an in-session A/B
+     * comparison: the same `LlamaEngineQ8Resident`, the same device, one
+     * prefill run through each path, diffed directly — rather than a
+     * golden capture of literal floats from one GPU/driver pinned into a
+     * fixture file. `rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos`, and `gqa`'s
+     * softmax `exp` are all vendor/driver-dependent at the ULP level (rule
+     * 2 — "GPU の挙動は特に推測しない"), so a literal-float fixture asserts
+     * more than issue #142's own claim actually supports: that fixture's
+     * exact bytes are only guaranteed reproducible *on the machine that
+     * captured them*, not portable across adapters or even across a driver
+     * update on the same machine. The claim `bindMatmulQ8`/
+     * `matmulQ8IntoShape` produce identical output *does* hold everywhere,
+     * because it only requires the two paths to agree with each other on
+     * whatever this session's own device happens to compute — which is
+     * exactly what an in-session diff checks and a golden file does not.
+     *
+     * `false` (the default) for every real caller — `forward()` never
+     * passes this argument at all, so production prefill is unaffected;
+     * this parameter only exists to be flipped by this method's own
+     * debug-only caller.
+     */
+    usePackedWeights = false,
+  ): Promise<Float32Array[]> {
     // Issue #131: whole-call wall time, stopped at this method's very last
     // line (after `this.tokensSoFar`/`this.weights` bookkeeping, so it
     // covers exactly what a caller's own `performance.now()` bracket around
@@ -1454,27 +1556,31 @@ export class LlamaEngineQ8Resident {
       // time control reaches the next array element the previous one has
       // already pushed and popped its own scope — nesting never overlaps,
       // only the *wait* for each validation result does. Issue #142: the
-      // seven `matmulQ8IntoShape` calls this used to run (each its own
-      // `packInt8Rows` + two `device.upload`s ahead of its own `bindGroup`)
-      // are now `bindMatmulQ8` calls — no pack, no upload, just a bind
-      // group against `layer`'s already-resident weight buffers, so
-      // `profile.packEntries` (issue #131) has no entries for these seven
-      // projections any more (`bindMatmulQ8` takes no `packProfile` — there
-      // is nothing left to time). Issue #131: wall-clock around the whole
-      // concurrent block, not each call inside it — see
+      // seven `matmulQ8IntoShape` calls this used to run unconditionally
+      // (each its own `packInt8Rows` + two `device.upload`s ahead of its
+      // own `bindGroup`) are `projectMatmulQ8` calls now — `bindMatmulQ8`
+      // (no pack, no upload, just a bind group against `layer`'s
+      // already-resident weight buffers) for every real caller
+      // (`usePackedWeights` false), or the original `matmulQ8IntoShape`
+      // behavior when `debugPrefillWithPackedWeights` sets it true (see
+      // both parameters' own doc). `profile.packEntries` (issue #131) has
+      // no entries for these seven projections in the production case —
+      // `bindMatmulQ8` takes no `packProfile`, there is nothing left to
+      // time. Issue #131: wall-clock around the whole concurrent block, not
+      // each call inside it — see
       // `ForwardProfile.layerSetupMs`'s own doc for why this is the additive
       // number and `bindGroupMs` (summed per-call) is not.
       const layerSetupStart = profile ? performance.now() : 0;
       const [attnNormGroup, ffnNormGroup, wq, wk, wv, wo, gate, up, down] = await Promise.all([
         device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]),
         device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, wqShape, layer.wqWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, wkShape, layer.wkWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, wvShape, layer.wvWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, woShape, layer.woWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, gateShape, layer.gateWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, upShape, layer.upWeight),
-        bindMatmulQ8(device, s.matmulQ8Pipeline, downShape, layer.downWeight),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, wqShape, layer.wqWeight, lw.wq, profile && { sink: profile, layer: l, proj: "wq" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, wkShape, layer.wkWeight, lw.wk, profile && { sink: profile, layer: l, proj: "wk" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, wvShape, layer.wvWeight, lw.wv, profile && { sink: profile, layer: l, proj: "wv" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, woShape, layer.woWeight, lw.wo, profile && { sink: profile, layer: l, proj: "wo" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, gateShape, layer.gateWeight, lw.wGate, profile && { sink: profile, layer: l, proj: "wGate" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, upShape, layer.upWeight, lw.wUp, profile && { sink: profile, layer: l, proj: "wUp" }, transientBuffers),
+        projectMatmulQ8(usePackedWeights, device, s.matmulQ8Pipeline, downShape, layer.downWeight, lw.wDown, profile && { sink: profile, layer: l, proj: "wDown" }, transientBuffers),
       ]);
       if (profile) profile.layerSetupMs += performance.now() - layerSetupStart;
 
@@ -1570,15 +1676,20 @@ export class LlamaEngineQ8Resident {
     // #142): every layer's transient norm-gain buffer, plus — only on the
     // debug-only `debugAllPositions` path — `weights.lmHead`'s own transient
     // packed-weight/scale from `matmulQ8IntoShape` (see that function's own
-    // doc for why lmHead alone still packs fresh here). `batch()` above has
-    // resolved, so the GPU has finished reading all of them; nothing here is
-    // referenced by anything this call still needs (the persistent KV cache
-    // and `s.finalNormedBuf`/`lmHeadChunks` writes are copies, already
-    // landed in buffers this class owns for the long term, not these). Every
-    // *production* projection's own weight/scale buffer is no longer in this
-    // list at all — issue #142's `bindMatmulQ8` binds `this.layers[l]`'s
-    // resident `ResidentWeight`s directly, which `create()` owns for the
-    // engine's whole lifetime, not this call.
+    // doc for why lmHead alone still packs fresh here), plus — only when
+    // `usePackedWeights` (issue #142's own debug-only escape hatch,
+    // `debugPrefillWithPackedWeights`) is `true` — every projection's own
+    // transient weight/scale pair, collected by `projectMatmulQ8`'s own
+    // `transientSink` argument. `batch()` above has resolved, so the GPU has
+    // finished reading all of them; nothing here is referenced by anything
+    // this call still needs (the persistent KV cache and
+    // `s.finalNormedBuf`/`lmHeadChunks` writes are copies, already landed in
+    // buffers this class owns for the long term, not these). In the
+    // production case (`usePackedWeights` false, every real caller), every
+    // projection's own weight/scale buffer is not in this list at all —
+    // issue #142's `bindMatmulQ8` binds `this.layers[l]`'s resident
+    // `ResidentWeight`s directly, which `create()` owns for the engine's
+    // whole lifetime, not this call.
     for (const buf of transientBuffers) buf.destroy();
 
     this.assertSameEpoch(epoch, debugAllPositions ? "debugAllPositionLogits" : "forward");
@@ -1620,6 +1731,35 @@ export class LlamaEngineQ8Resident {
       throw new Error("LlamaEngineQ8Resident.debugAllPositionLogits: only valid before prefill has run");
     }
     return this.runPrefillResident(tokens, true);
+  }
+
+  /**
+   * Test/debug-only (issue #142): runs prefill through the pre-#142
+   * `matmulQ8IntoShape` per-call weight-repack path instead of
+   * `bindMatmulQ8`'s resident buffers — same kernel, same dispatch shape,
+   * different *source* for the seven per-layer projections' weight/scale
+   * bytes. See `runPrefillResident`'s own `usePackedWeights` parameter doc
+   * for the full reasoning.
+   *
+   * Exists purely so `engine-q8-resident.residentweight.wgsl.test.ts` can
+   * compare this method's own output against a plain `forward()` prefill,
+   * **in the same session, on the same device** — the portable way to
+   * assert issue #142's own "bit-for-bit identical" claim, since the raw
+   * float values a real prefill computes are not portable across
+   * GPU/driver combinations (`rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos`,
+   * `gqa`'s softmax `exp` — rule 2) the way a same-session, same-device A/B
+   * diff is. Never called by `forward()`, `runDecodeStep`, or anything else
+   * this class's own production path reaches.
+   *
+   * Same one-call-per-generation contract as `forward()`'s own prefill
+   * branch and `debugAllPositionLogits` above: valid as this instance's
+   * first call, or again after `reset()` (issue #120).
+   */
+  async debugPrefillWithPackedWeights(tokens: number[]): Promise<Float32Array[]> {
+    if (this.tokensSoFar !== 0) {
+      throw new Error("LlamaEngineQ8Resident.debugPrefillWithPackedWeights: only valid before prefill has run");
+    }
+    return this.runPrefillResident(tokens, false, undefined, true);
   }
 
   /**
