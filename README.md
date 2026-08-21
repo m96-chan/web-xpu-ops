@@ -1640,7 +1640,11 @@ prefill path):
 (The "before" column here reproduces the #111 table above almost exactly —
 1180.6/1279.8ms there vs. 1197.0/1275.9ms here — a useful cross-check that
 both measurements are reading the same real cost, not an artifact of one
-session.)
+session. **A later session's own measurement of this same N=76 prefill,
+against this same documented hardware/software configuration, read ~2000ms
+instead — see "Where prefill's ~1.2s fixed cost actually goes" below for
+the direct same-page cross-check and why this gap is reported as
+unexplained rather than assumed away.**)
 
 Both deltas sit inside the run-to-run spread of either condition (roughly
 ±30-50ms at these prompt lengths, on an otherwise-idle GPU — `nvidia-smi`
@@ -1746,6 +1750,40 @@ original comparison was against a *different* PR's *differently-conditioned*
 measurement, not against this run's own unprofiled baseline, so there was
 no way to tell instrumentation overhead from ordinary session-to-session
 variance. Re-measured below against that control.
+
+**This section's own control (2097.7ms, table below) is ~1.8x the ~1175.0ms
+the "int8 prefill matmul" section above reports for the same N=76, under
+what both sections describe as identical conditions (same GPU/driver/Chrome/
+checkpoint, same `reset()`-between-generations cadence) — flagged in review
+as a discrepancy this README must not leave silently standing next to each
+other. Checked directly rather than left as two competing numbers: **in one
+page load**, `__decodeFixedCostBenchmark` (the exact function the ~1175.0ms
+figure above came from) was called, then `__prefillProfileBenchmark`
+immediately after, then `__decodeFixedCostBenchmark` again — three calls,
+same session, same loaded weights, same device:
+
+| call | N=76 prefill |
+| --- | --- |
+| `__decodeFixedCostBenchmark` (1st) | 1969.0ms / 2096.0ms (two repeats) |
+| `__prefillProfileBenchmark` control | 2041.5ms / 2065.4ms |
+| `__decodeFixedCostBenchmark` (2nd, after the other function ran) | 2112.5ms / 2048.2ms |
+
+**The two functions agree with each other (1969-2112ms across both, no
+function-attributable gap) and neither is anywhere near 1175.0ms.** This
+rules out "which benchmark function measures it" as the explanation — the
+*same* function that produced 1175.0ms for #128 now measures ~2000ms in the
+same repository, same machine, same documented conditions. What changed is
+not identified: this run's own environment (this machine, at measurement
+time) is genuinely slower at this workload than whatever state it was in
+when #128's own numbers were recorded, for a reason this measurement did
+not isolate further — GPU/driver/Chrome version and checkpoint identity were
+all checked and match, so the gap sits somewhere those fields do not
+capture. Per rule 9, this is reported as **unexplained**, not guessed at:
+the #128 section's own 1175.0ms and this section's own numbers below were
+both real measurements on this repository, just not comparable to each
+other as an absolute value — only this section's own control-vs-profiled
+comparison (same session, same run) is being used for #131's own
+conclusion.
 
 **Measured (rule 9 — RTX 5090, NVIDIA driver 610.57.04, Linux/Arch kernel
 7.1.5-arch1-2, Chrome 151.0.7922.71 non-headless via CDP on a dedicated
