@@ -91,4 +91,19 @@ describe("published surface", () => {
     // — npm would otherwise publish a tarball with none of it.
     expect(pkg.files).toContain("dist");
   });
+
+  it("keeps a subpath for the kernels", () => {
+    // `scripts/assets.mjs` guards the copy — it walks `ops/` rather than a
+    // hand-written list, and fails the build when an op has no `.wgsl` at all.
+    // What it does not check is whether a consumer can reach what it copied:
+    // that depends on this `exports` entry, which nothing else observes.
+    // Losing it would leave every kernel in the tarball and unreachable,
+    // silently, since the backend a WGSL consumer needs is invisible to the
+    // type system (issue #138).
+    const kernelSubpaths = Object.entries(pkg.exports)
+      .filter(([subpath]) => subpath.endsWith(".wgsl"))
+      .map(([subpath]) => subpath);
+
+    expect(kernelSubpaths).not.toEqual([]);
+  });
 });
