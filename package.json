@@ -1,6 +1,6 @@
 {
   "name": "web-xpu-ops",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Web primitive layer implementations for xPU: one reference per op, one implementation per backend, and tests that hold them together.",
   "type": "module",
   "license": "MIT",
@@ -43,6 +43,18 @@
     "./llm/tokenizer": {
       "types": "./dist/llm/tokenizer.d.ts",
       "default": "./dist/llm/tokenizer.js"
+    },
+    "./llm/kv-cache": {
+      "types": "./dist/llm/kv-cache.d.ts",
+      "default": "./dist/llm/kv-cache.js"
+    },
+    "./llm/reshape": {
+      "types": "./dist/llm/reshape.d.ts",
+      "default": "./dist/llm/reshape.js"
+    },
+    "./llm/sampler": {
+      "types": "./dist/llm/sampler.d.ts",
+      "default": "./dist/llm/sampler.js"
     },
     "./package.json": "./package.json"
   },

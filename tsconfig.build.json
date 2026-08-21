@@ -38,5 +38,23 @@
     // `@webgpu/types` package), so it does not weaken that guard.
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["ops/*/index.ts", "llm/tokenizer.ts"]
+  // `llm/` entries are named one at a time, unlike `ops/*/index.ts`, and the
+  // difference is not stylistic. An op's directory *is* its API: adding an op
+  // and widening the published surface are the same act, so a glob states the
+  // intent correctly. `llm/` is not that — it holds ~50 files, and several of
+  // them (`engine-q8-resident`, `browser-weights`, `real-model-weights`,
+  // `idb-chunk-store`, `storage-quota`) are working code nobody has decided to
+  // freeze as API yet. Globbing it would collapse "compile this" and "let
+  // consumers import this" into one decision, and #106's wiring work would
+  // widen the surface as a side effect. The three below are what a downstream
+  // consumer asked for by name (issue #138); each is self-contained, importing
+  // nothing and touching no ambient type, which is why they build under
+  // `types: []`.
+  "include": [
+    "ops/*/index.ts",
+    "llm/tokenizer.ts",
+    "llm/kv-cache.ts",
+    "llm/reshape.ts",
+    "llm/sampler.ts"
+  ]
 }
