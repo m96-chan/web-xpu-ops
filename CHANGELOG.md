@@ -66,6 +66,29 @@ Entries record **why** a change was needed. What changed is in the diff.
   rounding noise this fixture's tolerance was already sized for, not a new
   source of error.
 
+## [0.2.0] - 2026-08-21
+
+### Added
+
+- The published package carries `llm/kv-cache`, `llm/reshape` and
+  `llm/sampler`. Only `llm/tokenizer` shipped before, which made every other
+  `llm/` module unreachable from an installed copy — a consumer linked with
+  `file:` reads deep relative paths and so bypasses `exports` entirely, which
+  is why this survived until a downstream project (voxshot, issue #138) tried
+  to depend on a published version rather than a linked checkout. The three
+  are named individually in `tsconfig.build.json` rather than globbed: an op's
+  directory *is* its API, so `ops/*` is a correct statement of intent, while
+  `llm/` still holds working code nobody has frozen as API, and a glob would
+  make "compile this" and "let consumers import this" the same decision.
+  `harness/distribution.test.ts` now fails when `exports` promises a module
+  `include` never builds, so the two cannot drift apart again silently.
+
+  This release is also the first to carry `ops/matvec`'s int8 entry points
+  (`matvecQ8`, `packQ8`, and the fused `matvecQ8Ffn`/`matvecQ8Residual`) and
+  their `.wgsl` kernels. They have been on `main` since #97/#99 but no release
+  followed, so 0.1.0 offers `matvec` alone — enough for a codec, not for a
+  quantized LM.
+
 - `ops/matvec`: two decode-only fused entry points, `q8_ffn`
   (`silu(wGate·x) * (wUp·x)`, one dispatch reading both gate and up weights)
   and `q8_residual` (`residual + w·x`, folding a post-projection residual
@@ -1112,5 +1135,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   should be reported against, and the resolution grammar has target and dtype
   rungs that no kernel yet uses. A major version would claim those are settled.
 
-[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/m96-chan/web-xpu-ops/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m96-chan/web-xpu-ops/releases/tag/v0.1.0
