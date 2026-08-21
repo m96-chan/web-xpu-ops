@@ -1,4 +1,4 @@
-import { kernel, params, type ResidentDevice, type ResidentOp } from "../harness/index.js";
+import { kernel, params, type BatchProfile, type ResidentDevice, type ResidentOp } from "../harness/index.js";
 import { ACTIVATION } from "../ops/activation/index.js";
 import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import type { LlamaConfig } from "./config.js";
@@ -11,6 +11,199 @@ import {
   type LlamaWeightsQ8,
   type QuantizedLinear,
 } from "./weights-q8.js";
+
+/**
+ * Issue #131: an opt-in, per-call breakdown of one `forward()` call's own
+ * wall time — the ~1.2s prefill fixed cost issue #131 exists to attribute,
+ * not estimate. Passed by the caller (`undefined` by default, every real
+ * caller in this repository today) and filled in as `runPrefillResident`/
+ * `runDecodeStep` run; `forward()` never reads it back, so it costs nothing
+ * to plumb through a call site that does not want it.
+ *
+ * Every timed quantity below is `performance.now()`, not inferred from GPU
+ * timestamps — issue #131's own background is explicit that the leading
+ * candidate (`matmulQ8IntoShape`'s `packInt8Rows` + `queue.writeBuffer`) is
+ * CPU/transfer work a GPU timestamp query cannot see at all (it sits
+ * *before* the compute pass that timestamp brackets), so a wall-clock
+ * breakdown of the whole call is load-bearing here, not a fallback for a
+ * device that lacks `timestamp-query` (that fallback is `gpuEntries: []` +
+ * `gpuTimestampsSupported: false`, both below, and is a separate concern
+ * from why `packMs`/`uploadMs`/`bindGroupMs` are wall-clock unconditionally).
+ */
+export interface ForwardProfile {
+  /**
+   * **Input, set by the caller before `forward()`, never touched by this
+   * file except to read it** — unlike every field below, which
+   * `runPrefillResident`/`runDecodeStep` reset to a fresh value at the start
+   * of every call (see those methods' own note on reuse safety).
+   *
+   * `false` (`createForwardProfile()`'s own default) gets every CPU-side
+   * field below (`packEntries`, `uploadMs`, `bindGroupMs`, `layerSetupMs`,
+   * `submitToDoneMs`, `readbackMs`, `totalMs`) at effectively no cost over
+   * an unprofiled call — `runPrefillResident`/`runDecodeStep` batch every
+   * dispatch the same single/few-pass way production does, because no
+   * per-dispatch `labels` array is even built. `true` additionally asks for
+   * `gpuEntries`, which costs a dedicated compute pass **per labeled
+   * dispatch** (`BatchProfile`'s own doc: `GPUComputePassTimestampWrites`
+   * only covers a whole pass, not a point inside one) — real GPU-side
+   * overhead, ~500 extra pass boundaries at Sarashina2.2-1B's 24-layer
+   * scale, that inflates `submitToDoneMs` and this call's own `totalMs`
+   * measurably.
+   *
+   * PR #141 review: an earlier version of this file always built the
+   * `labels` array whenever any `profile` was passed at all, so the mere
+   * act of asking for `packMs`/`layerSetupMs` silently paid the GPU
+   * pass-splitting tax too — the measured effect was severe enough that the
+   * CPU-only fields (`packInt8Rows` alone) came out *larger* than an
+   * entirely unprofiled prefill's own total from an earlier PR's
+   * measurement, which cannot be right for a sub-phase of that same call.
+   * Splitting the two costs apart is what this flag is for: a caller who
+   * wants the wall-clock CPU breakdown without paying for (or muddying it
+   * with) the GPU pass-splitting overhead sets nothing; a caller who
+   * explicitly wants the GPU-side kernel-time shares sets this `true` and
+   * reads `totalMs` from *that* run only as "GPU-breakdown-mode total", not
+   * as the production-shaped number the CPU-only fields are compared
+   * against.
+   */
+  wantGpuBreakdown: boolean;
+  /** One entry per `matmulQ8IntoShape` call this `forward()` made (prefill's own per-layer, per-projection weight pack) — `packInt8Rows`'s own CPU cost, issue #131 item 1. Empty for a decode step: `runDecodeStep` never calls `matmulQ8IntoShape` (its weights were packed once, in `create()`, via `buildProjection` — see that function's own doc). */
+  packEntries: { layer: number; proj: string; ms: number; bytes: number }[];
+  /** Cumulative `performance.now()` time across every `device.upload()` (`queue.writeBuffer`) call this `forward()` made, and the total bytes those calls wrote — issue #131 item 2. This is the *enqueue* cost (the synchronous call into `queue.writeBuffer`), not a measurement of when the device-side copy actually lands; `submitToDoneMs` below is where that device-side cost surfaces, folded in with every dispatch's own GPU time. */
+  uploadMs: number;
+  uploadBytes: number;
+  /**
+   * Sum of every individual `device.bindGroup(...)` call's own `performance.now()`
+   * duration — issue #131 item 3's "24 rounds of `Promise.all(device.bindGroup())`"
+   * for prefill (nine per layer), or decode's much smaller "each dispatch's
+   * group already exists" case (decode does not call `bindGroup` in its own
+   * steady-state loop — see `LayerResident`'s own doc — so this stays ~0
+   * there, a useful contrast).
+   *
+   * **Not wall-clock, and can legitimately exceed `totalMs`**: prefill issues
+   * nine of these per layer through one `Promise.all(...)`, so their
+   * individual await windows overlap in real time — summing them adds up
+   * each call's own round trip (`pushErrorScope`/`createBindGroup`/`await
+   * popErrorScope()`, `harness/resident.ts#bindGroup`'s own doc) as if they
+   * ran one after another, which is not what the wall clock saw. Measured
+   * directly: this sum reached ~11.6s on one real 76-token prefill whose own
+   * `totalMs` was ~2.2s (this repository's own #131 measurement run) —
+   * proof the concurrency is real and this field alone cannot be read as "X
+   * seconds of the call's own wall time". `layerSetupMs` below is the
+   * wall-clock figure for the phase this overlaps with; use that one to
+   * answer "how much of `totalMs`".
+   */
+  bindGroupMs: number;
+  bindGroupCalls: number;
+  /**
+   * Wall-clock `performance.now()` time spent inside `runPrefillResident`'s
+   * own per-layer `await Promise.all([...])` (issue #131 item 3), summed
+   * across every layer — unlike `bindGroupMs` above, this *is* additive
+   * against `totalMs`, because it brackets the whole concurrent block once
+   * per layer rather than each of the nine calls inside it individually.
+   * Covers that block's own CPU work too (`packInt8Rows` runs synchronously,
+   * before its own call's `await`, inside the same `Promise.all` entries —
+   * see `matmulQ8IntoShape`'s doc), so this is the number to compare against
+   * `totalMs` for "how much of one `forward()` call this phase actually
+   * cost", not `packMs`/`bindGroupMs` read in isolation. `0` for a decode
+   * step: `runDecodeStep` has no equivalent per-token block (every group it
+   * binds was built once, in `create()`).
+   */
+  layerSetupMs: number;
+  /** Set once `device.batch(...)` resolves: GPU submit-to-completion wait and the readback `mapAsync` phase, timed separately (`BatchProfileSink`'s own doc) — issue #131 item 4's CPU-visible half. `null` until `batch()` writes them. */
+  submitToDoneMs: number | null;
+  readbackMs: number | null;
+  /** Per-labeled-dispatch GPU time from timestamp-query (`label` is `"L<layer>:<kernel>"`, or `"final_norm"`/`"lm_head_chunk<i>"` for the ops outside the per-layer loop) — issue #131 item 4's GPU-visible half. Always `[]` when `gpuTimestampsSupported` is `false`; see `BatchProfileSink.gpuEntries`'s own doc for why that is not the same as "measured zero". */
+  gpuEntries: { label: string; seconds: number }[];
+  /** `device.timestampsSupported` at the time this call ran — carried alongside `gpuEntries` so a report can say "measured, GPU total was very small" instead of misreading `gpuEntries: []` as "GPU took no time" on a device that never supports the query at all. */
+  gpuTimestampsSupported: boolean;
+  /** Whole-call wall time, `performance.now()`-timed around this entire `forward()` call — the number this issue's own title names. */
+  totalMs: number;
+}
+
+export function createForwardProfile(): ForwardProfile {
+  return {
+    wantGpuBreakdown: false,
+    packEntries: [],
+    uploadMs: 0,
+    uploadBytes: 0,
+    bindGroupMs: 0,
+    bindGroupCalls: 0,
+    layerSetupMs: 0,
+    submitToDoneMs: null,
+    readbackMs: null,
+    gpuEntries: [],
+    gpuTimestampsSupported: false,
+    totalMs: 0,
+  };
+}
+
+/**
+ * Resets every *output* field of `profile` in place — everything except
+ * `wantGpuBreakdown`, the one field the caller sets and this file only
+ * reads (see that field's own doc) — called once at the very start of
+ * `runPrefillResident`/`runDecodeStep` whenever `profile` is given.
+ *
+ * PR #141 review, item 7: without this, a `ForwardProfile` reused across
+ * two `forward()` calls (the same object passed twice, deliberately or by
+ * mistake) mixed two different call's data in an inconsistent way —
+ * `packEntries`/`bindGroupMs`/`bindGroupCalls`/`layerSetupMs`/`uploadMs`/
+ * `uploadBytes` *accumulate* (`+=`/`.push`) across both calls, while
+ * `submitToDoneMs`/`readbackMs`/`gpuEntries`/`totalMs` *overwrite* and so
+ * only ever reflect the second call — neither behaviour is obviously
+ * correct, and a caller could easily read the object without realising
+ * which fields meant what. Resetting every output field to
+ * `createForwardProfile()`'s own zero state at the top of every profiled
+ * call makes "one `forward()` call, one profile snapshot" true regardless
+ * of whether the caller passes a fresh object or reuses one.
+ */
+function resetForwardProfileOutputs(profile: ForwardProfile, timestampsSupported: boolean): void {
+  profile.packEntries = [];
+  profile.uploadMs = 0;
+  profile.uploadBytes = 0;
+  profile.bindGroupMs = 0;
+  profile.bindGroupCalls = 0;
+  profile.layerSetupMs = 0;
+  profile.submitToDoneMs = null;
+  profile.readbackMs = null;
+  profile.gpuEntries = [];
+  profile.gpuTimestampsSupported = timestampsSupported;
+  profile.totalMs = 0;
+}
+
+/**
+ * Wraps `device.upload`/`device.bindGroup` with `performance.now()` timing
+ * into `sink` (issue #131 items 2-3) — every other member of `device`
+ * (`createStorageBuffer`, `pipelineFor`, `batch`, `stats`, `destroy`,
+ * `timestampsSupported`) passes straight through unwrapped. `batch` itself
+ * is profiled separately, via the `BatchProfile` argument `runPrefillResident`/
+ * `runDecodeStep` build alongside their own `ops`/`labels` arrays (item 4) —
+ * this wrapper has no visibility into which `ops` entries batch() will
+ * dispatch, so it cannot time that half itself.
+ *
+ * A plain object spread, not a class: `createResidentDevice`/
+ * `createBrowserResidentDevice` both return object literals whose methods
+ * close over their own `device`/`stats` rather than reading `this`, so
+ * spreading and overriding two of them here is safe — nothing here depends
+ * on identity beyond "has these methods".
+ */
+function instrumentDevice(device: ResidentDevice, sink: ForwardProfile): ResidentDevice {
+  return {
+    ...device,
+    upload(buffer, offset, data) {
+      const t0 = performance.now();
+      device.upload(buffer, offset, data);
+      sink.uploadMs += performance.now() - t0;
+      sink.uploadBytes += data.byteLength;
+    },
+    async bindGroup(pipeline, buffers) {
+      const t0 = performance.now();
+      const group = await device.bindGroup(pipeline, buffers);
+      sink.bindGroupMs += performance.now() - t0;
+      sink.bindGroupCalls += 1;
+      return group;
+    },
+  };
+}
 
 /**
  * Issue #110: `LlamaEngineQ8`'s decode path, restructured so one generated
@@ -427,8 +620,14 @@ async function matmulQ8IntoShape(
   matmulQ8Pipeline: GPUComputePipeline,
   shape: MatmulQ8ProjectionShape,
   linear: QuantizedLinear,
+  /** Issue #131 item 1: when given, times this call's own `packInt8Rows` and records it under `layer`/`proj` — `undefined` for every call site that does not care (this function's own callers pass it only from a profiled `forward()`). */
+  packProfile?: { sink: ForwardProfile; layer: number; proj: string },
 ): Promise<{ bindGroup: GPUBindGroup; transient: GPUBuffer[] }> {
+  const packStart = packProfile ? performance.now() : 0;
   const packed = packInt8Rows(linear.codes, shape.outFeatures, shape.inFeatures);
+  if (packProfile) {
+    packProfile.sink.packEntries.push({ layer: packProfile.layer, proj: packProfile.proj, ms: performance.now() - packStart, bytes: packed.byteLength });
+  }
   const weightBuf = device.createStorageBuffer(packed.byteLength);
   device.upload(weightBuf, 0, packed);
   const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
@@ -890,13 +1089,23 @@ export class LlamaEngineQ8Resident {
    * touching `this.weights`, which stays available for exactly this (a
    * second prefill); see both fields' own doc.
    */
-  async forward(tokens: number[]): Promise<Float32Array[]> {
+  /**
+   * `profile` (issue #131): optional, and never read by this method itself —
+   * passed straight to whichever of `runPrefillResident`/`runDecodeStep`
+   * this call routes to, so a driving script can ask for a per-call
+   * breakdown of where this `forward()` call's own wall time went (`
+   * ForwardProfile`'s own doc). `undefined` (every call site in this
+   * repository outside issue #131's own measurement script) costs nothing:
+   * every profiled branch below is behind a truthy check on this same
+   * argument.
+   */
+  async forward(tokens: number[], profile?: ForwardProfile): Promise<Float32Array[]> {
     if (tokens.length === 0) throw new Error("LlamaEngineQ8Resident.forward: tokens must be non-empty");
-    if (this.tokensSoFar === 0) return this.runPrefillResident(tokens);
+    if (this.tokensSoFar === 0) return this.runPrefillResident(tokens, false, profile);
     if (tokens.length !== 1) {
       throw new Error("LlamaEngineQ8Resident.forward: after prefill, every call must be exactly one token (decode)");
     }
-    return this.runDecodeStep(tokens[0]!);
+    return this.runDecodeStep(tokens[0]!, profile);
   }
 
   /**
@@ -919,7 +1128,12 @@ export class LlamaEngineQ8Resident {
    * that method's own doc for which cost `reset()` actually removes (it is
    * not this one).
    */
-  private async runPrefillResident(tokens: number[], debugAllPositions = false): Promise<Float32Array[]> {
+  private async runPrefillResident(tokens: number[], debugAllPositions = false, profile?: ForwardProfile): Promise<Float32Array[]> {
+    // Issue #131: whole-call wall time, stopped at this method's very last
+    // line (after `this.tokensSoFar`/`this.weights` bookkeeping, so it
+    // covers exactly what a caller's own `performance.now()` bracket around
+    // `forward()` would have measured).
+    const callStart = profile ? performance.now() : 0;
     // PR #126 review, item 3: captured before this call's first `await`, so
     // a `reset()` racing against this call is unambiguously "before" or
     // "after" this snapshot — see `assertSameEpoch`'s own doc.
@@ -952,7 +1166,12 @@ export class LlamaEngineQ8Resident {
         `LlamaEngineQ8Resident.forward: prompt length ${N} needs a ${probsBufBytes}-byte attention (probsBuf) storage buffer, past the WebGPU spec's guaranteed maxStorageBufferBindingSize=${DEFAULT_MAX_STORAGE_BINDING_BYTES} — some adapters negotiate more (ResidentDevice does not expose which), so this is a conservative rejection, not a hard ceiling on capable hardware`,
       );
     }
-    const device = this.device;
+    // Issue #131 items 2-3: every `device.upload`/`device.bindGroup` call
+    // below is timed transparently once `profile` is given — see
+    // `instrumentDevice`'s own doc. Every other caller (`profile` undefined)
+    // gets `this.device` back unchanged, same object, no wrapper allocated.
+    const device = profile ? instrumentDevice(this.device, profile) : this.device;
+    if (profile) resetForwardProfileOutputs(profile, this.device.timestampsSupported);
     const s = this.shared;
 
     // ---- N-sized scratch, reused across every layer of this call (not across calls — see this method's doc). ----
@@ -1044,10 +1263,29 @@ export class LlamaEngineQ8Resident {
     const add2Group = await device.bindGroup(s.elementwisePipeline, [hiddenB, downOutBuf, hiddenA, addUniform]);
 
     const ops: ResidentOp[] = [];
-    const dispatch = (pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number] | [number, number] | [number, number, number]) =>
+    // Issue #131 item 4 / PR #141 review item 3: only built when the caller
+    // explicitly opted into the GPU breakdown (`ForwardProfile.wantGpuBreakdown`
+    // — see that field's own doc for why this is a *second*, separate
+    // opt-in from `profile` itself). `undefined` here means `device.batch(...)`
+    // below never sees a `labels` array at all, so it batches every dispatch
+    // the same single/few-pass way an unprofiled call does — no per-dispatch
+    // pass-splitting tax for a caller who only wants the CPU-side fields.
+    // Kept parallel to `ops` (one push per `ops.push`, a `copy` entry always
+    // `null`) whenever it does exist, same as before.
+    const labels: (string | null)[] | undefined = profile?.wantGpuBreakdown ? [] : undefined;
+    const dispatch = (
+      pipeline: GPUComputePipeline,
+      bindGroup: GPUBindGroup,
+      workgroups: [number] | [number, number] | [number, number, number],
+      label?: string,
+    ) => {
       ops.push({ kind: "dispatch", pipeline, bindGroup, workgroups });
-    const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) =>
+      labels?.push(label ?? null);
+    };
+    const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) => {
       ops.push({ kind: "copy", src, srcOffset, dst, dstOffset, size });
+      labels?.push(null);
+    };
     const wg256 = (elements: number) => Math.ceil(elements / 256);
     const matmulWg = (outFeatures: number): [number, number] => [Math.ceil(outFeatures / MATMUL_TILE), Math.ceil(N / MATMUL_TILE)];
 
@@ -1095,40 +1333,46 @@ export class LlamaEngineQ8Resident {
       // `await`, so by the time control reaches the next array element the
       // previous one has already pushed and popped its own scope — nesting
       // never overlaps, only the *wait* for each validation result does.
+      // Issue #131: wall-clock around the whole concurrent block, not each
+      // call inside it — see `ForwardProfile.layerSetupMs`'s own doc for why
+      // this is the additive number and `bindGroupMs` (summed per-call) is
+      // not.
+      const layerSetupStart = profile ? performance.now() : 0;
       const [attnNormGroup, ffnNormGroup, wq, wk, wv, wo, gate, up, down] = await Promise.all([
         device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]),
         device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wqShape, lw.wq),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wkShape, lw.wk),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wvShape, lw.wv),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, woShape, lw.wo),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, gateShape, lw.wGate),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, upShape, lw.wUp),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, downShape, lw.wDown),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wqShape, lw.wq, profile && { sink: profile, layer: l, proj: "wq" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wkShape, lw.wk, profile && { sink: profile, layer: l, proj: "wk" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wvShape, lw.wv, profile && { sink: profile, layer: l, proj: "wv" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, woShape, lw.wo, profile && { sink: profile, layer: l, proj: "wo" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, gateShape, lw.wGate, profile && { sink: profile, layer: l, proj: "wGate" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, upShape, lw.wUp, profile && { sink: profile, layer: l, proj: "wUp" }),
+        matmulQ8IntoShape(device, s.matmulQ8Pipeline, downShape, lw.wDown, profile && { sink: profile, layer: l, proj: "wDown" }),
       ]);
+      if (profile) profile.layerSetupMs += performance.now() - layerSetupStart;
       transientBuffers.push(...wq.transient, ...wk.transient, ...wv.transient, ...wo.transient, ...gate.transient, ...up.transient, ...down.transient);
 
-      dispatch(s.rmsnormPipeline, attnNormGroup, [N]);
-      dispatch(s.matmulQ8Pipeline, wq.bindGroup, matmulWg(qDim));
-      dispatch(s.matmulQ8Pipeline, wk.bindGroup, matmulWg(kvDim));
-      dispatch(s.matmulQ8Pipeline, wv.bindGroup, matmulWg(kvDim));
-      dispatch(s.ropePipeline, ropeQGroup, [wg256((N * qDim) / 2)]);
-      dispatch(s.ropePipeline, ropeKGroup, [wg256((N * kvDim) / 2)]);
-      dispatch(s.permutePipeline, splitQGroup, [wg256(N * qDim)]);
-      dispatch(s.permutePipeline, splitKGroup, [wg256(N * kvDim)]);
-      dispatch(s.permutePipeline, splitVGroup, [wg256(N * kvDim)]);
-      dispatch(s.gqaScoresPipeline, gqaScoresGroup, [N, numHeads, 1]);
-      dispatch(s.gqaContextPipeline, gqaContextGroup, [N, numHeads, 1]);
-      dispatch(s.permutePipeline, mergeGroup, [wg256(N * qDim)]);
-      dispatch(s.matmulQ8Pipeline, wo.bindGroup, matmulWg(hiddenSize));
-      dispatch(s.elementwisePipeline, add1Group, [wg256(N * hiddenSize)]);
-      dispatch(s.rmsnormPipeline, ffnNormGroup, [N]);
-      dispatch(s.matmulQ8Pipeline, gate.bindGroup, matmulWg(ffnHidden));
-      dispatch(s.matmulQ8Pipeline, up.bindGroup, matmulWg(ffnHidden));
-      dispatch(s.activationPipeline, siluGroup, [wg256(N * ffnHidden)]);
-      dispatch(s.elementwisePipeline, mulGroup, [wg256(N * ffnHidden)]);
-      dispatch(s.matmulQ8Pipeline, down.bindGroup, matmulWg(hiddenSize));
-      dispatch(s.elementwisePipeline, add2Group, [wg256(N * hiddenSize)]);
+      dispatch(s.rmsnormPipeline, attnNormGroup, [N], profile && `L${l}:rmsnorm_attn`);
+      dispatch(s.matmulQ8Pipeline, wq.bindGroup, matmulWg(qDim), profile && `L${l}:matmulQ8_wq`);
+      dispatch(s.matmulQ8Pipeline, wk.bindGroup, matmulWg(kvDim), profile && `L${l}:matmulQ8_wk`);
+      dispatch(s.matmulQ8Pipeline, wv.bindGroup, matmulWg(kvDim), profile && `L${l}:matmulQ8_wv`);
+      dispatch(s.ropePipeline, ropeQGroup, [wg256((N * qDim) / 2)], profile && `L${l}:rope_q`);
+      dispatch(s.ropePipeline, ropeKGroup, [wg256((N * kvDim) / 2)], profile && `L${l}:rope_k`);
+      dispatch(s.permutePipeline, splitQGroup, [wg256(N * qDim)], profile && `L${l}:permute_split_q`);
+      dispatch(s.permutePipeline, splitKGroup, [wg256(N * kvDim)], profile && `L${l}:permute_split_k`);
+      dispatch(s.permutePipeline, splitVGroup, [wg256(N * kvDim)], profile && `L${l}:permute_split_v`);
+      dispatch(s.gqaScoresPipeline, gqaScoresGroup, [N, numHeads, 1], profile && `L${l}:gqa_scores`);
+      dispatch(s.gqaContextPipeline, gqaContextGroup, [N, numHeads, 1], profile && `L${l}:gqa_context`);
+      dispatch(s.permutePipeline, mergeGroup, [wg256(N * qDim)], profile && `L${l}:permute_merge`);
+      dispatch(s.matmulQ8Pipeline, wo.bindGroup, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_wo`);
+      dispatch(s.elementwisePipeline, add1Group, [wg256(N * hiddenSize)], profile && `L${l}:elementwise_add1`);
+      dispatch(s.rmsnormPipeline, ffnNormGroup, [N], profile && `L${l}:rmsnorm_ffn`);
+      dispatch(s.matmulQ8Pipeline, gate.bindGroup, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_gate`);
+      dispatch(s.matmulQ8Pipeline, up.bindGroup, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_up`);
+      dispatch(s.activationPipeline, siluGroup, [wg256(N * ffnHidden)], profile && `L${l}:activation_silu`);
+      dispatch(s.elementwisePipeline, mulGroup, [wg256(N * ffnHidden)], profile && `L${l}:elementwise_mul`);
+      dispatch(s.matmulQ8Pipeline, down.bindGroup, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_down`);
+      dispatch(s.elementwisePipeline, add2Group, [wg256(N * hiddenSize)], profile && `L${l}:elementwise_add2`);
 
       // Into the persistent, maxSeqLen-strided cache `runDecodeStep` reads —
       // one contiguous copy per head (this layer's whole N-position block),
@@ -1144,7 +1388,7 @@ export class LlamaEngineQ8Resident {
     const finalNormBuf = device.createStorageBuffer(hiddenSize * 4);
     device.upload(finalNormBuf, 0, weights.finalNorm);
     const finalNormGroup = await device.bindGroup(s.rmsnormPipeline, [hiddenA, finalNormBuf, finalNormedAllBuf, rmsUniform]);
-    dispatch(s.rmsnormPipeline, finalNormGroup, [N]);
+    dispatch(s.rmsnormPipeline, finalNormGroup, [N], profile && "final_norm");
 
     let logits: Float32Array[];
     if (debugAllPositions) {
@@ -1158,14 +1402,16 @@ export class LlamaEngineQ8Resident {
       const lmHeadMmUniform = uniformOf(device, [["u32", N], ["u32", vocabSize], ["u32", hiddenSize]]);
       const logitsAllBuf = device.createStorageBuffer(N * vocabSize * 4);
       const lmHeadShape = matmulQ8ProjectionShape(vocabSize, hiddenSize, lmHeadMmUniform, finalNormedAllBuf, logitsAllBuf);
-      const lmHead = await matmulQ8IntoShape(device, s.matmulQ8Pipeline, lmHeadShape, weights.lmHead);
+      const lmHead = await matmulQ8IntoShape(device, s.matmulQ8Pipeline, lmHeadShape, weights.lmHead, profile && { sink: profile, layer: numLayers, proj: "lm_head" });
       transientBuffers.push(...lmHead.transient);
-      dispatch(s.matmulQ8Pipeline, lmHead.bindGroup, matmulWg(vocabSize));
+      dispatch(s.matmulQ8Pipeline, lmHead.bindGroup, matmulWg(vocabSize), profile && "lm_head");
 
       const stagingAll = device.createStorageBuffer(N * vocabSize * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
-      const [allLogitsFlat] = await device.batch(ops, [
-        { staging: stagingAll, source: logitsAllBuf, sourceOffset: 0, length: N * vocabSize, type: "f32" },
-      ]);
+      const [allLogitsFlat] = await device.batch(
+        ops,
+        [{ staging: stagingAll, source: logitsAllBuf, sourceOffset: 0, length: N * vocabSize, type: "f32" }],
+        profile && { labels, sink: profile },
+      );
       logits = [];
       for (let t = 0; t < N; t += 1) logits.push((allLogitsFlat as Float32Array).slice(t * vocabSize, (t + 1) * vocabSize));
     } else {
@@ -1178,12 +1424,12 @@ export class LlamaEngineQ8Resident {
       // position instead of one would undo most of what going resident
       // buys prefill.
       copy(finalNormedAllBuf, (N - 1) * hiddenSize * 4, s.finalNormedBuf, 0, hiddenSize * 4);
-      for (const chunk of this.lmHeadChunks) dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount]);
+      this.lmHeadChunks.forEach((chunk, i) => dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount], profile && `lm_head_chunk${i}`));
 
       const readback = this.lmHeadChunks.map((chunk) => ({
         staging: chunk.staging, source: chunk.outBuf, sourceOffset: 0, length: chunk.rowCount, type: "f32" as const,
       }));
-      const results = await device.batch(ops, readback);
+      const results = await device.batch(ops, readback, profile && { labels, sink: profile });
 
       const finalLogits = new Float32Array(vocabSize);
       let offset = 0;
@@ -1212,6 +1458,7 @@ export class LlamaEngineQ8Resident {
     // `reset()` needs it available for a second prefill. Routing now reads
     // `this.tokensSoFar` directly (PR #126 review, item 4), so there is no
     // separate flag to flip.
+    if (profile) profile.totalMs = performance.now() - callStart;
     return logits;
   }
 
@@ -1254,7 +1501,8 @@ export class LlamaEngineQ8Resident {
    * embedding gather (`gatherDequantRows`, one row) `LlamaEngineQ8` already
    * does the same way.
    */
-  private async runDecodeStep(tokenId: number): Promise<Float32Array[]> {
+  private async runDecodeStep(tokenId: number, profile?: ForwardProfile): Promise<Float32Array[]> {
+    const callStart = profile ? performance.now() : 0;
     const { numLayers, numKvHeads, headDim, hiddenSize, ffnHidden, numHeads, maxSeqLen, vocabSize } = this.config;
     const at = this.tokensSoFar;
     // PR #126 review, item 3: same reasoning as `runPrefillResident`'s own
@@ -1276,12 +1524,20 @@ export class LlamaEngineQ8Resident {
       throw new Error(`LlamaEngineQ8Resident.forward: position ${at + 1} exceeds maxSeqLen=${maxSeqLen}`);
     }
     const s = this.shared;
+    // Issue #131: same instrumented-wrapper opt-in as `runPrefillResident` —
+    // see `instrumentDevice`'s own doc. Decode's steady-state loop calls no
+    // `device.bindGroup` at all (every group was built once, in `create()` —
+    // `LayerResident`'s own doc) and only a handful of small `upload`s
+    // (below), so `packEntries`/`bindGroupMs` staying near-zero here, next
+    // to prefill's own, is itself part of this issue's answer.
+    const device = profile ? instrumentDevice(this.device, profile) : this.device;
+    if (profile) resetForwardProfileOutputs(profile, this.device.timestampsSupported);
 
     const embedVec = gatherDequantRows(this.embedTokens, [tokenId], hiddenSize);
-    this.device.upload(s.hiddenA, 0, embedVec);
-    this.device.upload(s.ropeQUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
-    this.device.upload(s.ropeKUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
-    this.device.upload(s.gqaScoresUniform, GQA_QUERY_OFFSET_BYTE, new Int32Array([at]));
+    device.upload(s.hiddenA, 0, embedVec);
+    device.upload(s.ropeQUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
+    device.upload(s.ropeKUniform, ROPE_POS_OFFSET_BYTE, new Uint32Array([at]));
+    device.upload(s.gqaScoresUniform, GQA_QUERY_OFFSET_BYTE, new Int32Array([at]));
     // Issue #117: `s_eff = at + 1` — this step's cache write (below) fills
     // position `at`, so positions `0..at` are the whole valid cache, and
     // `ops/gqa`'s scan need not reach past it to `maxSeqLen`. Both uniforms
@@ -1290,50 +1546,62 @@ export class LlamaEngineQ8Resident {
     // must agree, or `context.wgsl` reads `probs` columns `scores.wgsl` never
     // wrote this step).
     const sEff = new Uint32Array([at + 1]);
-    this.device.upload(s.gqaScoresUniform, GQA_SCORES_S_EFF_BYTE, sEff);
-    this.device.upload(s.gqaContextUniform, GQA_CONTEXT_S_EFF_BYTE, sEff);
+    device.upload(s.gqaScoresUniform, GQA_SCORES_S_EFF_BYTE, sEff);
+    device.upload(s.gqaContextUniform, GQA_CONTEXT_S_EFF_BYTE, sEff);
 
     const ops: ResidentOp[] = [];
-    const dispatch = (pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number] | [number, number] | [number, number, number]) =>
+    // PR #141 review item 3 / `ForwardProfile.wantGpuBreakdown`'s own doc —
+    // same gating as `runPrefillResident`'s own `labels`.
+    const labels: (string | null)[] | undefined = profile?.wantGpuBreakdown ? [] : undefined;
+    const dispatch = (
+      pipeline: GPUComputePipeline,
+      bindGroup: GPUBindGroup,
+      workgroups: [number] | [number, number] | [number, number, number],
+      label?: string,
+    ) => {
       ops.push({ kind: "dispatch", pipeline, bindGroup, workgroups });
-    const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) =>
+      labels?.push(label ?? null);
+    };
+    const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) => {
       ops.push({ kind: "copy", src, srcOffset, dst, dstOffset, size });
+      labels?.push(null);
+    };
 
     for (let l = 0; l < numLayers; l += 1) {
       const layer = this.layers[l]!;
-      dispatch(s.rmsnormPipeline, layer.attnNormGroup, [1]);
-      dispatch(s.matvecPipeline, layer.wqGroup, [numHeads * headDim]);
-      dispatch(s.matvecPipeline, layer.wkGroup, [numKvHeads * headDim]);
-      dispatch(s.matvecPipeline, layer.wvGroup, [numKvHeads * headDim]);
-      dispatch(s.ropePipeline, s.ropeQGroup, [Math.ceil((numHeads * headDim) / 2 / 256)]);
-      dispatch(s.ropePipeline, s.ropeKGroup, [Math.ceil((numKvHeads * headDim) / 2 / 256)]);
+      dispatch(s.rmsnormPipeline, layer.attnNormGroup, [1], profile && `L${l}:rmsnorm_attn`);
+      dispatch(s.matvecPipeline, layer.wqGroup, [numHeads * headDim], profile && `L${l}:matvecQ8_wq`);
+      dispatch(s.matvecPipeline, layer.wkGroup, [numKvHeads * headDim], profile && `L${l}:matvecQ8_wk`);
+      dispatch(s.matvecPipeline, layer.wvGroup, [numKvHeads * headDim], profile && `L${l}:matvecQ8_wv`);
+      dispatch(s.ropePipeline, s.ropeQGroup, [Math.ceil((numHeads * headDim) / 2 / 256)], profile && `L${l}:rope_q`);
+      dispatch(s.ropePipeline, s.ropeKGroup, [Math.ceil((numKvHeads * headDim) / 2 / 256)], profile && `L${l}:rope_k`);
       for (let h = 0; h < numKvHeads; h += 1) {
         copy(s.kRopedBuf, h * headDim * 4, layer.kCacheBuf, (h * maxSeqLen + at) * headDim * 4, headDim * 4);
         copy(s.vOutBuf, h * headDim * 4, layer.vCacheBuf, (h * maxSeqLen + at) * headDim * 4, headDim * 4);
       }
-      dispatch(s.gqaScoresPipeline, layer.scoresGroup, [1, numHeads, 1]);
-      dispatch(s.gqaContextPipeline, layer.contextGroup, [1, numHeads, 1]);
+      dispatch(s.gqaScoresPipeline, layer.scoresGroup, [1, numHeads, 1], profile && `L${l}:gqa_scores`);
+      dispatch(s.gqaContextPipeline, layer.contextGroup, [1, numHeads, 1], profile && `L${l}:gqa_context`);
       // Issue #111: `hiddenB = hiddenA + wo · attnOutBuf` — one dispatch
       // (`matvecQ8Residual`) in place of the old `matvecQ8(wo)` +
       // `elementwise(add)` pair. See `LayerResident.woGroup`'s own doc.
-      dispatch(s.matvecResidualPipeline, layer.woGroup, [hiddenSize]);
-      dispatch(s.rmsnormPipeline, layer.ffnNormGroup, [1]);
+      dispatch(s.matvecResidualPipeline, layer.woGroup, [hiddenSize], profile && `L${l}:matvecQ8Residual_wo`);
+      dispatch(s.rmsnormPipeline, layer.ffnNormGroup, [1], profile && `L${l}:rmsnorm_ffn`);
       // Issue #111: `gatedBuf = silu(wGate · normed2Buf) * (wUp · normed2Buf)`
       // — one dispatch (`matvecQ8Ffn`) in place of the old two `matvecQ8`
       // dispatches plus `activation(silu)` plus `elementwise(multiply)`. See
       // `LayerResident.ffnGroup`'s own doc.
-      dispatch(s.matvecFfnPipeline, layer.ffnGroup, [ffnHidden]);
+      dispatch(s.matvecFfnPipeline, layer.ffnGroup, [ffnHidden], profile && `L${l}:matvecQ8Ffn`);
       // Issue #111: `hiddenA = hiddenB + wDown · gatedBuf` — same fusion as
       // `woGroup` above. See `LayerResident.downGroup`'s own doc.
-      dispatch(s.matvecResidualPipeline, layer.downGroup, [hiddenSize]);
+      dispatch(s.matvecResidualPipeline, layer.downGroup, [hiddenSize], profile && `L${l}:matvecQ8Residual_down`);
     }
-    dispatch(s.rmsnormPipeline, s.finalNormGroup, [1]);
-    for (const chunk of this.lmHeadChunks) dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount]);
+    dispatch(s.rmsnormPipeline, s.finalNormGroup, [1], profile && "final_norm");
+    this.lmHeadChunks.forEach((chunk, i) => dispatch(s.matvecPipeline, chunk.group, [chunk.rowCount], profile && `lm_head_chunk${i}`));
 
     const readback = this.lmHeadChunks.map((chunk) => ({
       staging: chunk.staging, source: chunk.outBuf, sourceOffset: 0, length: chunk.rowCount, type: "f32" as const,
     }));
-    const results = await this.device.batch(ops, readback);
+    const results = await device.batch(ops, readback, profile && { labels, sink: profile });
 
     const logits = new Float32Array(vocabSize);
     let offset = 0;
@@ -1349,6 +1617,7 @@ export class LlamaEngineQ8Resident {
     // `runPrefillResident`'s own absolute `this.tokensSoFar = N`.
     this.assertSameEpoch(epoch, "forward");
     this.tokensSoFar += 1;
+    if (profile) profile.totalMs = performance.now() - callStart;
     return [logits];
   }
 }
