@@ -7,14 +7,25 @@ import { loadTinyFixtureQ8 } from "./fixture-q8.js";
  * Issue #131: `ForwardProfile` is an opt-in breakdown of one `forward()`
  * call's own wall time — CPU pack (`packInt8Rows`), upload (`queue.writeBuffer`),
  * bind-group creation, GPU submit-to-completion wait, readback, and (when
- * `timestamp-query` is negotiated) per-dispatch GPU time. These tests gate
- * two things a real-model measurement cannot check for itself: that asking
- * for a profile does not change what `forward()` computes (issue #131's own
- * scope is measurement-only — a profiler that perturbs the answer would be
- * exactly the kind of "積分よりバグ" this repository's rule 8 exists to catch),
- * and that the profile's own shape matches what `runPrefillResident`/
+ * both `timestamp-query` is negotiated *and* the caller opts into
+ * `wantGpuBreakdown`) per-dispatch GPU time. These tests gate two things a
+ * real-model measurement cannot check for itself: that asking for a profile
+ * does not change what `forward()` computes (issue #131's own scope is
+ * measurement-only — a profiler that perturbs the answer would be exactly
+ * the kind of "積分よりバグ" this repository's rule 8 exists to catch), and
+ * that the profile's own shape matches what `runPrefillResident`/
  * `runDecodeStep` actually do (per layer/projection counts, tied to the tiny
  * fixture's own `numLayers=2`, `vocabSize=256` config — see `config.ts`).
+ *
+ * PR #141 review: `wantGpuBreakdown` defaults `false` (`createForwardProfile()`'s
+ * own default), and only the two tests below that actually read `gpuEntries`
+ * set it `true` — every other test leaves it off, so their own `totalMs`/
+ * `layerSetupMs` reflect the cheap, production-shaped single/few-pass
+ * batching an unprofiled call would also use, not the per-dispatch
+ * pass-splitting `wantGpuBreakdown: true` costs (`ForwardProfile`'s own doc
+ * has the full reasoning — an earlier version of this file did not have
+ * this distinction, and its own `packInt8Rows`-alone numbers came out
+ * larger than an unrelated PR's entirely unprofiled prefill total).
  */
 describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
   const getResident = useResidentGpu();
@@ -28,6 +39,15 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
   });
 
   residentTest("a profiled prefill produces identical logits to an unprofiled one", async () => {
+    // Issue #131 review: every `residentTest` below starts with `reset()`
+    // (issue #120), unconditionally — the same "one shared engine, every
+    // test resets first" pattern `reset.wgsl.test.ts` establishes, so no
+    // test here depends on running immediately after another one in a
+    // specific order. A no-op on this first test (the engine is already at
+    // `tokensSoFar = 0` straight out of `beforeAll`'s `create()`), but kept
+    // for the same reason `reset.wgsl.test.ts`'s own first test keeps it:
+    // consistency beats relying on position-in-file.
+    engine!.reset();
     const unprofiled = await LlamaEngineQ8Resident.create(fixture.config, fixture.weights, getResident()!);
     const unprofiledLogits = await unprofiled.forward(fixture.promptTokens);
 
@@ -44,6 +64,14 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
   });
 
   residentTest("prefill's profile reports one packEntries row per layer per matmulQ8 projection", async () => {
+    // Issue #131 review: the previous test already ran this shared `engine`
+    // through one prefill (`forward(fixture.promptTokens, ...)`), so without
+    // `reset()` (issue #120) this call would route into `runDecodeStep`
+    // (`tokensSoFar !== 0`) and be rejected by #126's own "after prefill,
+    // every call must be exactly one token" guard — reproduced and confirmed
+    // by running this file as a whole (not one `it` at a time), the same
+    // fresh-engine-per-generation pattern `reset.wgsl.test.ts` establishes.
+    engine!.reset();
     const profile = createForwardProfile();
     await engine!.forward(fixture.promptTokens, profile);
 
@@ -88,9 +116,16 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     expect(profile.totalMs).toBeGreaterThan(0);
   });
 
-  residentTest("prefill's GPU breakdown, when timestamp-query is supported, has one entry per labeled dispatch", async () => {
+  residentTest("prefill's GPU breakdown, when opted into and timestamp-query is supported, has at most one entry per labeled dispatch", async () => {
+    // Same reset()-before-reprefill requirement as the previous test — see
+    // its own comment.
+    engine!.reset();
     const resident = getResident()!;
     const profile = createForwardProfile();
+    // Explicit opt-in (PR #141 review) — without this, `labels` is never
+    // built at all and `gpuEntries` stays `[]` regardless of hardware
+    // support (`ForwardProfile.wantGpuBreakdown`'s own doc).
+    profile.wantGpuBreakdown = true;
     await engine!.forward(fixture.promptTokens, profile);
 
     expect(profile.gpuTimestampsSupported).toBe(resident.timestampsSupported);
@@ -102,20 +137,42 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     // 21 labeled dispatches per layer (see `runPrefillResident`'s own
     // `dispatch(...)` call sites) + 1 final_norm + 1 lm_head chunk (the tiny
     // fixture's vocabSize=256 fits in a single `lmHeadChunks` entry — see
-    // `MAX_WORKGROUPS_PER_DISPATCH`).
-    expect(profile.gpuEntries.length).toBe(numLayers * 21 + 1 + 1);
+    // `MAX_WORKGROUPS_PER_DISPATCH`). An *upper* bound, not exact equality:
+    // `harness/resident.ts#batch` drops any query pair whose measured delta
+    // is exactly zero (the driver declining to serve it — that function's
+    // own doc), which is a real, hardware-dependent possibility for the
+    // smallest dispatches in this tiny fixture, not a bug this test should
+    // fail on (PR #141 review, item 4 — this exact assertion was flagged as
+    // liable to go red by chance for that reason).
+    const expectedMax = numLayers * 21 + 1 + 1;
+    expect(profile.gpuEntries.length).toBeGreaterThan(0);
+    expect(profile.gpuEntries.length).toBeLessThanOrEqual(expectedMax);
     const labels = new Set(profile.gpuEntries.map((e) => e.label));
+    // `matmulQ8` is the one kernel family this issue's own measurement finds
+    // GPU-dominant among (`README`'s "Where prefill's ~1.2s..." section) —
+    // its dispatches are the least likely of any label here to measure an
+    // exact-zero delta, so asserting its presence (rather than every label)
+    // keeps this robust against the same zero-filtering noted above.
     expect(labels.has("L0:matmulQ8_wq")).toBe(true);
-    expect(labels.has("final_norm")).toBe(true);
-    expect(labels.has("lm_head_chunk0")).toBe(true);
     for (const entry of profile.gpuEntries) expect(entry.seconds).toBeGreaterThan(0);
   });
 
   residentTest("decode's profile shows near-zero CPU pack/bindGroup cost, unlike prefill's own", async () => {
-    // Relies on the prefill test above having already run on this shared
-    // `engine` (vitest runs `it`s in one `describe` serially) — decode
-    // needs `position > 0`.
+    // Self-contained, not relying on a preceding test's own side effect
+    // (issue #131 review) — `reset()` (issue #120) then an *unprofiled*
+    // prefill to reach a real decode-eligible position (`tokensSoFar > 0`);
+    // the profile under test below is only the one decode step that
+    // follows. A `reset()` immediately followed by a single-token
+    // `forward()` would *not* exercise decode at all — `tokensSoFar === 0`
+    // still routes a 1-token call into prefill (`forward()`'s own doc), so
+    // this needs a real multi-token prefill first, the same reason
+    // `reset.wgsl.test.ts`'s own decode-touching tests all re-prefill after
+    // `reset()` rather than jumping straight to a single-token call.
+    engine!.reset();
+    await engine!.forward(fixture.promptTokens);
+
     const profile = createForwardProfile();
+    profile.wantGpuBreakdown = true;
     await engine!.forward([fixture.decodeTokens[0]!], profile);
 
     // `runDecodeStep` never calls `matmulQ8IntoShape` — every weight buffer
@@ -142,8 +199,11 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     if (profile.gpuTimestampsSupported) {
       const { numLayers } = fixture.config;
       // 12 labeled dispatches per layer (`runDecodeStep`'s own doc: "12→per
-      // layer") + final_norm + 1 lm_head chunk.
-      expect(profile.gpuEntries.length).toBe(numLayers * 12 + 1 + 1);
+      // layer") + final_norm + 1 lm_head chunk — an upper bound, not exact
+      // equality, for the same zero-delta-filtering reason the prefill GPU
+      // breakdown test above documents.
+      expect(profile.gpuEntries.length).toBeGreaterThan(0);
+      expect(profile.gpuEntries.length).toBeLessThanOrEqual(numLayers * 12 + 1 + 1);
     }
   });
 });

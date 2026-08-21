@@ -262,15 +262,25 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
         const label = profile?.labels ? (profile.labels[i] ?? null) : null;
-        if (profile?.labels) {
+        // PR #141 review, item 3: gated on `wantsGpuTiming` (device negotiated
+        // `timestamp-query` *and* the caller asked for a breakdown), not on
+        // `profile?.labels` alone. An earlier version split every dispatch
+        // into its own pass whenever `labels` was merely present, even on a
+        // device that cannot serve `timestamp-query` at all — pure pass-
+        // boundary overhead for zero GPU numbers, and (worse, on a device
+        // that *can* serve timestamps) real overhead a caller who only wants
+        // `ForwardProfile`'s CPU-side fields (`packMs`/`layerSetupMs`/
+        // `submitToDoneMs`) never asked to pay — see `ForwardProfile.wantGpuBreakdown`'s
+        // own doc for the caller-facing half of this fix.
+        if (wantsGpuTiming) {
           // Profiling mode: every dispatch this batch records gets its own
           // pass — even an unlabeled one — so a labeled dispatch's own
           // timestamps never span work outside it. See `BatchProfile`'s own
           // doc for why this is real overhead confined to opt-in calls.
           endPass();
-          const timeThis = querySet && label != null;
+          const timeThis = label != null;
           pass = encoder.beginComputePass(
-            timeThis ? { timestampWrites: { querySet, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
+            timeThis ? { timestampWrites: { querySet: querySet!, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
           );
           if (timeThis) queryCursor += 2;
         } else if (!pass) {
@@ -296,61 +306,79 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     if (querySet) {
       queryResolved = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
       queryReadable = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      // PR #141 review, item 5: these two are real `GPUBuffer`s this call
+      // allocates, same as any `createStorageBuffer`/`createUniformBuffer`
+      // call — `stats.buffersCreated` is supposed to be the complete count a
+      // test can snapshot to prove a loop allocates nothing (this file's own
+      // `ResidentDevice.stats` doc), and creating them via a raw
+      // `device.createBuffer(...)` here bypassed that count entirely.
+      stats.buffersCreated += 2;
       encoder.resolveQuerySet(querySet, 0, queryCount, queryResolved, 0);
       encoder.copyBufferToBuffer(queryResolved, 0, queryReadable, 0, queryCount * 8);
     }
 
-    device.queue.submit([encoder.finish()]);
-    stats.submits += 1;
+    try {
+      device.queue.submit([encoder.finish()]);
+      stats.submits += 1;
 
-    // Issue #131 item 4's CPU half: how long the GPU took to actually finish
-    // this submission, timed separately from the readback `mapAsync` calls
-    // below (`onSubmittedWorkDone` resolves once the GPU is done, before any
-    // buffer is mapped) — without this, `batch()`'s only prior signal that
-    // work had finished was the first `mapAsync` resolving, which folds GPU
-    // completion wait and the readback round trip into one number.
-    if (profile) {
-      const t0 = performance.now();
-      await device.queue.onSubmittedWorkDone();
-      profile.sink.submitToDoneMs = performance.now() - t0;
-    }
-
-    const readbackT0 = profile ? performance.now() : 0;
-    const results: (Float32Array | Int32Array | Uint32Array)[] = [];
-    for (const r of readback) {
-      await r.staging.mapAsync(GPUMapMode.READ);
-      const bytes = r.staging.getMappedRange().slice(0);
-      r.staging.unmap();
-      results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
-    }
-    if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
-
-    if (querySet && queryReadable) {
-      await queryReadable.mapAsync(GPUMapMode.READ);
-      const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
-      queryReadable.unmap();
-      const entries: { label: string; seconds: number }[] = [];
-      for (const [k, label] of labeledSlots.entries()) {
-        // Timestamps are nanoseconds; a zero delta means the driver declined
-        // to serve that particular query (`wgsl.ts#dispatch`'s own doc) —
-        // not a real zero-duration dispatch, so it is left out rather than
-        // reported as one.
-        const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
-        if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+      // Issue #131 item 4's CPU half: how long the GPU took to actually
+      // finish this submission, timed separately from the readback
+      // `mapAsync` calls below (`onSubmittedWorkDone` resolves once the GPU
+      // is done, before any buffer is mapped) — without this, `batch()`'s
+      // only prior signal that work had finished was the first `mapAsync`
+      // resolving, which folds GPU completion wait and the readback round
+      // trip into one number.
+      if (profile) {
+        const t0 = performance.now();
+        await device.queue.onSubmittedWorkDone();
+        profile.sink.submitToDoneMs = performance.now() - t0;
       }
-      profile!.sink.gpuEntries = entries;
-      querySet.destroy();
-      queryResolved!.destroy();
-      queryReadable.destroy();
-    } else if (profile?.labels) {
-      // Labels were requested but this device never negotiated
-      // `timestamp-query` — `sink.gpuEntries` stays `[]`, distinguishable
-      // from "measured, all zero" only via `timestampsSupported` (see that
-      // field's own doc); nothing here claims a GPU number it does not have.
-      profile.sink.gpuEntries = [];
-    }
 
-    return results;
+      const readbackT0 = profile ? performance.now() : 0;
+      const results: (Float32Array | Int32Array | Uint32Array)[] = [];
+      for (const r of readback) {
+        await r.staging.mapAsync(GPUMapMode.READ);
+        const bytes = r.staging.getMappedRange().slice(0);
+        r.staging.unmap();
+        results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
+      }
+      if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
+
+      if (querySet && queryReadable) {
+        await queryReadable.mapAsync(GPUMapMode.READ);
+        const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
+        queryReadable.unmap();
+        const entries: { label: string; seconds: number }[] = [];
+        for (const [k, label] of labeledSlots.entries()) {
+          // Timestamps are nanoseconds; a zero delta means the driver
+          // declined to serve that particular query (`wgsl.ts#dispatch`'s
+          // own doc) — not a real zero-duration dispatch, so it is left out
+          // rather than reported as one.
+          const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
+          if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+        }
+        profile!.sink.gpuEntries = entries;
+      } else if (profile?.labels) {
+        // Labels were requested but this device never negotiated
+        // `timestamp-query` — `sink.gpuEntries` stays `[]`, distinguishable
+        // from "measured, all zero" only via `timestampsSupported` (see that
+        // field's own doc); nothing here claims a GPU number it does not
+        // have.
+        profile.sink.gpuEntries = [];
+      }
+
+      return results;
+    } finally {
+      // PR #141 review, item 6: unconditional, not only on the success path
+      // an earlier version took — a `mapAsync` rejection (or anything else
+      // thrown between `submit` and here) used to leave the query set and
+      // its two staging buffers alive with nothing left to ever destroy
+      // them, the same class of leak `runnerFromResident`'s own `finally`
+      // block exists to avoid.
+      querySet?.destroy();
+      queryResolved?.destroy();
+      queryReadable?.destroy();
+    }
   }
 
   return {

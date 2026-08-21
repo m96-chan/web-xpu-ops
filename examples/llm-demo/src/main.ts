@@ -727,30 +727,56 @@ async function __decodeFixedCostBenchmark(
 // Issue #131: where prefill's ~1.2s fixed cost actually goes
 // ---------------------------------------------------------------------------
 
-/** One prompt length's own prefill profile plus one decode step's, for contrast — `__prefillProfileBenchmark`'s own return shape, below. */
+/** One prompt length's own control/profiled prefill and decode step — `__prefillProfileBenchmark`'s own return shape, below. */
 interface PrefillProfileResult {
   promptLength: number;
+  /**
+   * PR #141 review: a **genuinely unprofiled** `forward()` call — `profile`
+   * argument entirely omitted, not merely `wantGpuBreakdown: false` — timed
+   * the same plain `performance.now()` way `__decodeFixedCostBenchmark`
+   * above already times prefill, run in the *same* browser session
+   * immediately before the profiled call below at the same prompt length
+   * (one more `reset()` in between). Exists so a driving script can compute
+   * `prefill.totalMs - controlPrefillMs` directly, rather than comparing
+   * this run's own instrumented number against a *different* PR's
+   * differently-conditioned measurement — the gap an earlier version of
+   * this README section did not check for, and which review found real.
+   */
+  controlPrefillMs: number;
+  /** Same idea as `controlPrefillMs`, for the one decode step below. */
+  controlDecodeMs: number;
   prefill: ForwardProfile;
   /** One `forward([token])` call immediately after this prompt length's prefill — issue #131's own scope asks for "1トークンdecode" alongside prefill, as a contrast case (`ForwardProfile`'s own doc: decode's `packEntries`/`bindGroupCalls` should be near-zero, unlike prefill's). */
   decodeStep: ForwardProfile;
 }
 
 /**
- * Issue #131's own measurement entry point: for each prompt length, runs one
- * real `forward()` prefill and one real decode step through the **unmodified**
- * production dispatch chain (`ForwardProfile`'s own doc — passing a profile
- * changes no arithmetic, only which `performance.now()`/timestamp-query calls
- * get made around it), against real weights and a real device, and returns
- * the full breakdown for a driving script to tabulate.
+ * Issue #131's own measurement entry point: for each prompt length, runs a
+ * control (unprofiled) prefill + decode step, then a profiled prefill +
+ * decode step, all through the **unmodified** production dispatch chain
+ * (`ForwardProfile`'s own doc — passing a profile changes no arithmetic,
+ * only which `performance.now()`/timestamp-query calls get made around it)
+ * against real weights and a real device, and returns the full breakdown
+ * for a driving script to tabulate.
+ *
+ * `gpuBreakdown` (default `false`, PR #141 review): forwarded straight into
+ * `prefill.wantGpuBreakdown`/`decodeStep.wantGpuBreakdown` — leave it off
+ * for a run whose own `prefill.totalMs` should be directly comparable to
+ * `controlPrefillMs` (`ForwardProfile.wantGpuBreakdown`'s own doc: `true`
+ * costs a dedicated compute pass per labeled dispatch, real GPU-side
+ * overhead this issue's own headline numbers must not be measured under),
+ * and only pass `true` for a separate run whose sole purpose is reading
+ * `gpuEntries`' kernel-time shares.
  *
  * Same shape as `__decodeFixedCostBenchmark` immediately above (one `create()`,
- * `reset()` between prompt lengths so a slow `create()` cannot be mistaken
+ * `reset()` between every generation so a slow `create()` cannot be mistaken
  * for a slow `forward()`, synthetic-but-in-range token ids so prompt length
  * is exact) — not reachable from the UI, a CDP-driven script calls this
  * directly.
  */
 async function __prefillProfileBenchmark(
   promptLengths: number[],
+  gpuBreakdown = false,
 ): Promise<{ createMs: number; timestampsSupported: boolean; results: PrefillProfileResult[] }> {
   if (!loaded) throw new Error("重みが未ロードです");
   const { engineConfig, weights } = loaded;
@@ -766,17 +792,30 @@ async function __prefillProfileBenchmark(
       if (i > 0) engine.reset();
       const tokens = Array.from({ length: promptLength }, (_, j) => j % engineConfig.vocabSize);
 
+      // Control first, own reset() beforehand — see `PrefillProfileResult.controlPrefillMs`'s own doc.
+      const controlT0 = performance.now();
+      // eslint-disable-next-line no-await-in-loop
+      const controlLogits = await engine.forward(tokens);
+      const controlPrefillMs = performance.now() - controlT0;
+      const controlNext = argmax(controlLogits[controlLogits.length - 1]!);
+      const controlStepT0 = performance.now();
+      // eslint-disable-next-line no-await-in-loop
+      await engine.forward([controlNext]);
+      const controlDecodeMs = performance.now() - controlStepT0;
+
+      engine.reset();
       const prefill = createForwardProfile();
+      prefill.wantGpuBreakdown = gpuBreakdown;
       // eslint-disable-next-line no-await-in-loop
       const prefillLogits = await engine.forward(tokens, prefill);
 
       const decodeStep = createForwardProfile();
-      // eslint-disable-next-line no-await-in-loop
+      decodeStep.wantGpuBreakdown = gpuBreakdown;
       const next = argmax(prefillLogits[prefillLogits.length - 1]!);
       // eslint-disable-next-line no-await-in-loop
       await engine.forward([next], decodeStep);
 
-      results.push({ promptLength, prefill, decodeStep });
+      results.push({ promptLength, controlPrefillMs, controlDecodeMs, prefill, decodeStep });
     }
     return { createMs, timestampsSupported: device.timestampsSupported, results };
   } finally {

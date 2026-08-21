@@ -31,6 +31,41 @@ import {
  * from why `packMs`/`uploadMs`/`bindGroupMs` are wall-clock unconditionally).
  */
 export interface ForwardProfile {
+  /**
+   * **Input, set by the caller before `forward()`, never touched by this
+   * file except to read it** — unlike every field below, which
+   * `runPrefillResident`/`runDecodeStep` reset to a fresh value at the start
+   * of every call (see those methods' own note on reuse safety).
+   *
+   * `false` (`createForwardProfile()`'s own default) gets every CPU-side
+   * field below (`packEntries`, `uploadMs`, `bindGroupMs`, `layerSetupMs`,
+   * `submitToDoneMs`, `readbackMs`, `totalMs`) at effectively no cost over
+   * an unprofiled call — `runPrefillResident`/`runDecodeStep` batch every
+   * dispatch the same single/few-pass way production does, because no
+   * per-dispatch `labels` array is even built. `true` additionally asks for
+   * `gpuEntries`, which costs a dedicated compute pass **per labeled
+   * dispatch** (`BatchProfile`'s own doc: `GPUComputePassTimestampWrites`
+   * only covers a whole pass, not a point inside one) — real GPU-side
+   * overhead, ~500 extra pass boundaries at Sarashina2.2-1B's 24-layer
+   * scale, that inflates `submitToDoneMs` and this call's own `totalMs`
+   * measurably.
+   *
+   * PR #141 review: an earlier version of this file always built the
+   * `labels` array whenever any `profile` was passed at all, so the mere
+   * act of asking for `packMs`/`layerSetupMs` silently paid the GPU
+   * pass-splitting tax too — the measured effect was severe enough that the
+   * CPU-only fields (`packInt8Rows` alone) came out *larger* than an
+   * entirely unprofiled prefill's own total from an earlier PR's
+   * measurement, which cannot be right for a sub-phase of that same call.
+   * Splitting the two costs apart is what this flag is for: a caller who
+   * wants the wall-clock CPU breakdown without paying for (or muddying it
+   * with) the GPU pass-splitting overhead sets nothing; a caller who
+   * explicitly wants the GPU-side kernel-time shares sets this `true` and
+   * reads `totalMs` from *that* run only as "GPU-breakdown-mode total", not
+   * as the production-shaped number the CPU-only fields are compared
+   * against.
+   */
+  wantGpuBreakdown: boolean;
   /** One entry per `matmulQ8IntoShape` call this `forward()` made (prefill's own per-layer, per-projection weight pack) — `packInt8Rows`'s own CPU cost, issue #131 item 1. Empty for a decode step: `runDecodeStep` never calls `matmulQ8IntoShape` (its weights were packed once, in `create()`, via `buildProjection` — see that function's own doc). */
   packEntries: { layer: number; proj: string; ms: number; bytes: number }[];
   /** Cumulative `performance.now()` time across every `device.upload()` (`queue.writeBuffer`) call this `forward()` made, and the total bytes those calls wrote — issue #131 item 2. This is the *enqueue* cost (the synchronous call into `queue.writeBuffer`), not a measurement of when the device-side copy actually lands; `submitToDoneMs` below is where that device-side cost surfaces, folded in with every dispatch's own GPU time. */
@@ -87,6 +122,7 @@ export interface ForwardProfile {
 
 export function createForwardProfile(): ForwardProfile {
   return {
+    wantGpuBreakdown: false,
     packEntries: [],
     uploadMs: 0,
     uploadBytes: 0,
@@ -99,6 +135,39 @@ export function createForwardProfile(): ForwardProfile {
     gpuTimestampsSupported: false,
     totalMs: 0,
   };
+}
+
+/**
+ * Resets every *output* field of `profile` in place — everything except
+ * `wantGpuBreakdown`, the one field the caller sets and this file only
+ * reads (see that field's own doc) — called once at the very start of
+ * `runPrefillResident`/`runDecodeStep` whenever `profile` is given.
+ *
+ * PR #141 review, item 7: without this, a `ForwardProfile` reused across
+ * two `forward()` calls (the same object passed twice, deliberately or by
+ * mistake) mixed two different call's data in an inconsistent way —
+ * `packEntries`/`bindGroupMs`/`bindGroupCalls`/`layerSetupMs`/`uploadMs`/
+ * `uploadBytes` *accumulate* (`+=`/`.push`) across both calls, while
+ * `submitToDoneMs`/`readbackMs`/`gpuEntries`/`totalMs` *overwrite* and so
+ * only ever reflect the second call — neither behaviour is obviously
+ * correct, and a caller could easily read the object without realising
+ * which fields meant what. Resetting every output field to
+ * `createForwardProfile()`'s own zero state at the top of every profiled
+ * call makes "one `forward()` call, one profile snapshot" true regardless
+ * of whether the caller passes a fresh object or reuses one.
+ */
+function resetForwardProfileOutputs(profile: ForwardProfile, timestampsSupported: boolean): void {
+  profile.packEntries = [];
+  profile.uploadMs = 0;
+  profile.uploadBytes = 0;
+  profile.bindGroupMs = 0;
+  profile.bindGroupCalls = 0;
+  profile.layerSetupMs = 0;
+  profile.submitToDoneMs = null;
+  profile.readbackMs = null;
+  profile.gpuEntries = [];
+  profile.gpuTimestampsSupported = timestampsSupported;
+  profile.totalMs = 0;
 }
 
 /**
@@ -1102,7 +1171,7 @@ export class LlamaEngineQ8Resident {
     // `instrumentDevice`'s own doc. Every other caller (`profile` undefined)
     // gets `this.device` back unchanged, same object, no wrapper allocated.
     const device = profile ? instrumentDevice(this.device, profile) : this.device;
-    if (profile) profile.gpuTimestampsSupported = this.device.timestampsSupported;
+    if (profile) resetForwardProfileOutputs(profile, this.device.timestampsSupported);
     const s = this.shared;
 
     // ---- N-sized scratch, reused across every layer of this call (not across calls — see this method's doc). ----
@@ -1194,12 +1263,16 @@ export class LlamaEngineQ8Resident {
     const add2Group = await device.bindGroup(s.elementwisePipeline, [hiddenB, downOutBuf, hiddenA, addUniform]);
 
     const ops: ResidentOp[] = [];
-    // Issue #131 item 4: parallel to `ops` (kept in lockstep by every
-    // `dispatch`/`copy` call below, whether or not `profile` is set — a
-    // `copy` entry is always `null`, `BatchProfile`'s own doc says why that
-    // is fine), only ever read by `device.batch(...)` below when `profile`
-    // asks for a GPU breakdown.
-    const labels: (string | null)[] = [];
+    // Issue #131 item 4 / PR #141 review item 3: only built when the caller
+    // explicitly opted into the GPU breakdown (`ForwardProfile.wantGpuBreakdown`
+    // — see that field's own doc for why this is a *second*, separate
+    // opt-in from `profile` itself). `undefined` here means `device.batch(...)`
+    // below never sees a `labels` array at all, so it batches every dispatch
+    // the same single/few-pass way an unprofiled call does — no per-dispatch
+    // pass-splitting tax for a caller who only wants the CPU-side fields.
+    // Kept parallel to `ops` (one push per `ops.push`, a `copy` entry always
+    // `null`) whenever it does exist, same as before.
+    const labels: (string | null)[] | undefined = profile?.wantGpuBreakdown ? [] : undefined;
     const dispatch = (
       pipeline: GPUComputePipeline,
       bindGroup: GPUBindGroup,
@@ -1207,11 +1280,11 @@ export class LlamaEngineQ8Resident {
       label?: string,
     ) => {
       ops.push({ kind: "dispatch", pipeline, bindGroup, workgroups });
-      if (profile) labels.push(label ?? null);
+      labels?.push(label ?? null);
     };
     const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) => {
       ops.push({ kind: "copy", src, srcOffset, dst, dstOffset, size });
-      if (profile) labels.push(null);
+      labels?.push(null);
     };
     const wg256 = (elements: number) => Math.ceil(elements / 256);
     const matmulWg = (outFeatures: number): [number, number] => [Math.ceil(outFeatures / MATMUL_TILE), Math.ceil(N / MATMUL_TILE)];
@@ -1458,7 +1531,7 @@ export class LlamaEngineQ8Resident {
     // (below), so `packEntries`/`bindGroupMs` staying near-zero here, next
     // to prefill's own, is itself part of this issue's answer.
     const device = profile ? instrumentDevice(this.device, profile) : this.device;
-    if (profile) profile.gpuTimestampsSupported = this.device.timestampsSupported;
+    if (profile) resetForwardProfileOutputs(profile, this.device.timestampsSupported);
 
     const embedVec = gatherDequantRows(this.embedTokens, [tokenId], hiddenSize);
     device.upload(s.hiddenA, 0, embedVec);
@@ -1477,7 +1550,9 @@ export class LlamaEngineQ8Resident {
     device.upload(s.gqaContextUniform, GQA_CONTEXT_S_EFF_BYTE, sEff);
 
     const ops: ResidentOp[] = [];
-    const labels: (string | null)[] = [];
+    // PR #141 review item 3 / `ForwardProfile.wantGpuBreakdown`'s own doc —
+    // same gating as `runPrefillResident`'s own `labels`.
+    const labels: (string | null)[] | undefined = profile?.wantGpuBreakdown ? [] : undefined;
     const dispatch = (
       pipeline: GPUComputePipeline,
       bindGroup: GPUBindGroup,
@@ -1485,11 +1560,11 @@ export class LlamaEngineQ8Resident {
       label?: string,
     ) => {
       ops.push({ kind: "dispatch", pipeline, bindGroup, workgroups });
-      if (profile) labels.push(label ?? null);
+      labels?.push(label ?? null);
     };
     const copy = (src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number) => {
       ops.push({ kind: "copy", src, srcOffset, dst, dstOffset, size });
-      if (profile) labels.push(null);
+      labels?.push(null);
     };
 
     for (let l = 0; l < numLayers; l += 1) {

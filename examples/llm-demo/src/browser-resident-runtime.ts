@@ -144,11 +144,13 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
         const label = profile?.labels ? (profile.labels[i] ?? null) : null;
-        if (profile?.labels) {
+        // PR #141 review, item 3 — gated on `wantsGpuTiming`, not merely
+        // `profile?.labels`; see `harness/resident.ts#batch`'s own comment.
+        if (wantsGpuTiming) {
           endPass();
-          const timeThis = querySet && label != null;
+          const timeThis = label != null;
           pass = encoder.beginComputePass(
-            timeThis ? { timestampWrites: { querySet, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
+            timeThis ? { timestampWrites: { querySet: querySet!, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
           );
           if (timeThis) queryCursor += 2;
         } else if (!pass) {
@@ -169,49 +171,55 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     if (querySet) {
       queryResolved = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
       queryReadable = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      // PR #141 review, item 5 — see `harness/resident.ts#batch`'s own doc.
+      stats.buffersCreated += 2;
       encoder.resolveQuerySet(querySet, 0, queryCount, queryResolved, 0);
       encoder.copyBufferToBuffer(queryResolved, 0, queryReadable, 0, queryCount * 8);
     }
 
-    device.queue.submit([encoder.finish()]);
-    stats.submits += 1;
+    try {
+      device.queue.submit([encoder.finish()]);
+      stats.submits += 1;
 
-    if (profile) {
-      const t0 = performance.now();
-      await device.queue.onSubmittedWorkDone();
-      profile.sink.submitToDoneMs = performance.now() - t0;
-    }
-
-    const readbackT0 = profile ? performance.now() : 0;
-    const results: (Float32Array | Int32Array | Uint32Array)[] = [];
-    for (const r of readback) {
-      // eslint-disable-next-line no-await-in-loop
-      await r.staging.mapAsync(GPUMapMode.READ);
-      const bytes = r.staging.getMappedRange().slice(0);
-      r.staging.unmap();
-      results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
-    }
-    if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
-
-    if (querySet && queryReadable) {
-      // eslint-disable-next-line no-await-in-loop
-      await queryReadable.mapAsync(GPUMapMode.READ);
-      const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
-      queryReadable.unmap();
-      const entries: { label: string; seconds: number }[] = [];
-      for (const [k, label] of labeledSlots.entries()) {
-        const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
-        if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+      if (profile) {
+        const t0 = performance.now();
+        await device.queue.onSubmittedWorkDone();
+        profile.sink.submitToDoneMs = performance.now() - t0;
       }
-      profile!.sink.gpuEntries = entries;
-      querySet.destroy();
-      queryResolved!.destroy();
-      queryReadable.destroy();
-    } else if (profile?.labels) {
-      profile.sink.gpuEntries = [];
-    }
 
-    return results;
+      const readbackT0 = profile ? performance.now() : 0;
+      const results: (Float32Array | Int32Array | Uint32Array)[] = [];
+      for (const r of readback) {
+        // eslint-disable-next-line no-await-in-loop
+        await r.staging.mapAsync(GPUMapMode.READ);
+        const bytes = r.staging.getMappedRange().slice(0);
+        r.staging.unmap();
+        results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
+      }
+      if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
+
+      if (querySet && queryReadable) {
+        // eslint-disable-next-line no-await-in-loop
+        await queryReadable.mapAsync(GPUMapMode.READ);
+        const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
+        queryReadable.unmap();
+        const entries: { label: string; seconds: number }[] = [];
+        for (const [k, label] of labeledSlots.entries()) {
+          const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
+          if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+        }
+        profile!.sink.gpuEntries = entries;
+      } else if (profile?.labels) {
+        profile.sink.gpuEntries = [];
+      }
+
+      return results;
+    } finally {
+      // PR #141 review, item 6 — see `harness/resident.ts#batch`'s own doc.
+      querySet?.destroy();
+      queryResolved?.destroy();
+      queryReadable?.destroy();
+    }
   }
 
   return {
