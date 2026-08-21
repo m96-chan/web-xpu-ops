@@ -9,6 +9,29 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
+  gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
+  per-call breakdown of where one `forward()` call's own wall time goes —
+  `packInt8Rows` CPU cost, `queue.writeBuffer` bytes/time, bind-group
+  creation (both a raw per-call sum and the wall-clock time of prefill's own
+  per-layer `Promise.all` block), GPU submit-to-completion wait, readback,
+  and — when the device negotiated `timestamp-query` — one GPU duration per
+  labeled dispatch. `undefined` by default (every existing caller), so this
+  changes no dispatch, no bind group and no arithmetic for anyone not asking
+  for it; proved directly by a bit-for-bit logits comparison between a
+  profiled and an unprofiled prefill call
+  (`llm/engine-q8-resident.profile.wgsl.test.ts`). Exists to answer #131's
+  own question — a reviewer comment on PR #130 named
+  `matmulQ8IntoShape`'s per-`forward()` re-pack-and-reupload of the same
+  ~1 GiB of weight bytes decode already keeps resident as prefill's likely
+  fixed cost, and this measures it directly instead of guessing again.
+  README's new "Where prefill's ~1.2s fixed cost actually goes" section has
+  the measured numbers: `packInt8Rows` alone is ~77-79% of prefill's own
+  wall time, ~94-98% once the whole per-layer setup block it sits inside is
+  counted, against 2-6% for actual GPU kernel time. **No optimization is
+  included in this change** — per this issue's own scope, only the
+  measurement.
+
 - `ops/matmul` gets a `matmulQ8` entry point (issue #128): the same tiled
   GEMM as plain `matmul`, but the right-hand operand is read as a packed
   int8 weight — `matvecQ8`'s own `[M, ceil(K/4)]` wire format — with

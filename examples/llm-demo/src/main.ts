@@ -31,7 +31,7 @@ import { LineFormatConstraint, type LineFormatSpec } from "../../../llm/constrai
 import type { TokenCodec } from "../../../llm/constraints/token-codec.js";
 import { argmax } from "../../../llm/engine.js";
 import { LlamaEngineQ8 } from "../../../llm/engine-q8.js";
-import { LlamaEngineQ8Resident } from "../../../llm/engine-q8-resident.js";
+import { createForwardProfile, LlamaEngineQ8Resident, type ForwardProfile } from "../../../llm/engine-q8-resident.js";
 import { sampleNext, type Constraint } from "../../../llm/sampler.js";
 import { SentencePieceTokenizer, type TokenizerVocab } from "../../../llm/tokenizer.js";
 import { loadWeightsQ8FromUrl } from "../../../llm/browser-weights.js";
@@ -722,3 +722,66 @@ async function __decodeFixedCostBenchmark(
 }
 (window as unknown as { __decodeFixedCostBenchmark: typeof __decodeFixedCostBenchmark }).__decodeFixedCostBenchmark =
   __decodeFixedCostBenchmark;
+
+// ---------------------------------------------------------------------------
+// Issue #131: where prefill's ~1.2s fixed cost actually goes
+// ---------------------------------------------------------------------------
+
+/** One prompt length's own prefill profile plus one decode step's, for contrast — `__prefillProfileBenchmark`'s own return shape, below. */
+interface PrefillProfileResult {
+  promptLength: number;
+  prefill: ForwardProfile;
+  /** One `forward([token])` call immediately after this prompt length's prefill — issue #131's own scope asks for "1トークンdecode" alongside prefill, as a contrast case (`ForwardProfile`'s own doc: decode's `packEntries`/`bindGroupCalls` should be near-zero, unlike prefill's). */
+  decodeStep: ForwardProfile;
+}
+
+/**
+ * Issue #131's own measurement entry point: for each prompt length, runs one
+ * real `forward()` prefill and one real decode step through the **unmodified**
+ * production dispatch chain (`ForwardProfile`'s own doc — passing a profile
+ * changes no arithmetic, only which `performance.now()`/timestamp-query calls
+ * get made around it), against real weights and a real device, and returns
+ * the full breakdown for a driving script to tabulate.
+ *
+ * Same shape as `__decodeFixedCostBenchmark` immediately above (one `create()`,
+ * `reset()` between prompt lengths so a slow `create()` cannot be mistaken
+ * for a slow `forward()`, synthetic-but-in-range token ids so prompt length
+ * is exact) — not reachable from the UI, a CDP-driven script calls this
+ * directly.
+ */
+async function __prefillProfileBenchmark(
+  promptLengths: number[],
+): Promise<{ createMs: number; timestampsSupported: boolean; results: PrefillProfileResult[] }> {
+  if (!loaded) throw new Error("重みが未ロードです");
+  const { engineConfig, weights } = loaded;
+  const device = await createBrowserResidentDevice();
+  try {
+    const createT0 = performance.now();
+    const engine = await LlamaEngineQ8Resident.create(engineConfig, weights, device);
+    const createMs = performance.now() - createT0;
+
+    const results: PrefillProfileResult[] = [];
+    for (let i = 0; i < promptLengths.length; i += 1) {
+      const promptLength = promptLengths[i]!;
+      if (i > 0) engine.reset();
+      const tokens = Array.from({ length: promptLength }, (_, j) => j % engineConfig.vocabSize);
+
+      const prefill = createForwardProfile();
+      // eslint-disable-next-line no-await-in-loop
+      const prefillLogits = await engine.forward(tokens, prefill);
+
+      const decodeStep = createForwardProfile();
+      // eslint-disable-next-line no-await-in-loop
+      const next = argmax(prefillLogits[prefillLogits.length - 1]!);
+      // eslint-disable-next-line no-await-in-loop
+      await engine.forward([next], decodeStep);
+
+      results.push({ promptLength, prefill, decodeStep });
+    }
+    return { createMs, timestampsSupported: device.timestampsSupported, results };
+  } finally {
+    device.destroy();
+  }
+}
+(window as unknown as { __prefillProfileBenchmark: typeof __prefillProfileBenchmark }).__prefillProfileBenchmark =
+  __prefillProfileBenchmark;

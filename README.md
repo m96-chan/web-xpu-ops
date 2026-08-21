@@ -1674,6 +1674,123 @@ path) and `examples/llm-demo/src/browser-runtime.ts`'s WGSL parity table
 both still reference it; only `runPrefillResident`'s one production call
 site moved to `matmulQ8`.
 
+### Where prefill's ~1.2s fixed cost actually goes (issue #131)
+
+The previous section's own PR (#130) removed `dequant_transpose` and found
+the ~1.2s fixed cost barely moved (22ms/1.8% at 76 tokens, inside noise) —
+the working hypothesis it set out to test was **wrong**, and its own
+write-up named a next candidate without measuring it: `runPrefillResident`'s
+per-layer `matmulQ8IntoShape` packs and re-uploads every projection's weight
+**on every `forward()` call** (`packInt8Rows`, CPU, then `queue.writeBuffer`,
+~1 GiB total) even though the *same* packed bytes are already resident on
+the GPU for decode (`buildProjection`, built once in `create()`). This issue
+does not optimize anything — per its own scope, it only measures which of
+four candidates (CPU pack, transfer, GPU kernel time, CPU
+submit/bindGroup/readback overhead) the ~1.2s actually is, so a fix (if one
+lands) has a target instead of a guess.
+
+**Method.** `ForwardProfile` (`llm/engine-q8-resident.ts`), an opt-in
+argument threaded through `forward()`/`runPrefillResident()`/`runDecodeStep()`
+— `undefined` by every existing caller, so passing nothing changes no
+dispatch, no bind group, and no arithmetic (proved directly: a profiled
+prefill call's logits are asserted bit-for-bit identical to an unprofiled
+one, `llm/engine-q8-resident.profile.wgsl.test.ts`). When given, it records:
+
+- `packInt8Rows`'s own CPU cost, `performance.now()`-timed per layer per
+  projection (item 1) — necessarily wall-clock, not `timestamp-query`: this
+  work runs entirely on the CPU, before any compute pass exists, so a GPU
+  timestamp query cannot see it at all.
+- `queue.writeBuffer` bytes and CPU enqueue time (item 2).
+- Per-call `device.bindGroup(...)` await time, and — because prefill issues
+  nine of those per layer inside one `Promise.all(...)`, so their individual
+  await windows overlap — **also** the wall-clock time of that whole block
+  (`layerSetupMs`), which is the number that is actually additive against
+  the call's own total (item 3; the per-call sum is not — measured directly,
+  see below).
+- `harness/resident.ts#batch()` extended with an opt-in `BatchProfile`: GPU
+  submit-to-completion wait via `queue.onSubmittedWorkDone()`, the readback
+  `mapAsync` phase timed separately from that, and — when the device
+  negotiated `timestamp-query` — one GPU-side duration per labeled dispatch,
+  via a dedicated compute pass per labeled dispatch (WebGPU's
+  `GPUComputePassTimestampWrites` only covers a whole pass, not a point
+  inside one, so per-dispatch attribution costs a pass boundary; real,
+  measurable overhead, confined to this opt-in path — item 4). Ported
+  identically into `examples/llm-demo/src/browser-resident-runtime.ts`
+  (this repository's established Node/browser duplication for this exact
+  module). No fallback branch was exercised on this measurement's own
+  hardware — `timestamp-query` was negotiated on every run below
+  (`ResidentDevice.timestampsSupported`/`ForwardProfile.gpuTimestampsSupported`
+  both `true`); an environment without the feature gets `submitToDoneMs`/
+  `readbackMs` (no GPU feature needed) but an empty, explicitly-flagged
+  `gpuEntries` rather than a fabricated zero.
+
+**Measured (rule 9 — RTX 5090, NVIDIA driver 610.57.04, Linux/Arch kernel
+7.1.5-arch1-2, Chrome 151.0.7922.71 non-headless via CDP on a dedicated
+`--user-data-dir`/`--remote-debugging-port`, adapter `vendor: nvidia,
+architecture: blackwell`, backend Dawn/Vulkan; real Sarashina2.2-1B-alibi-v1
+int8 checkpoint, 24 layers, `hiddenSize=1792`, `vocabSize=102400`;
+`examples/llm-demo/src/main.ts#__prefillProfileBenchmark`, synthetic-but-
+in-range token ids so prompt length is exact; one `LlamaEngineQ8Resident`,
+`reset()` between prompt lengths; 8 samples per prompt length across one
+CDP-driven run). This machine was **not idle**: other sessions' Chrome and
+`examples/llm-demo/server.mjs` processes were running concurrently
+throughout (`ps aux` during this run showed multiple unrelated Chrome
+renderer/server processes; `nvidia-smi` spot-checks read 3-4% utilization
+and ~7.4 GiB already resident from other processes) — the same
+"GPU共有デスクトップ" caveat issue #120's own measurement section already
+gives, reported rather than smoothed over):
+
+| | N=76 (mean, range, n=8) | N=365 (mean, range, n=8) |
+| --- | --- | --- |
+| **prefill `totalMs`** | **2138.7ms** (2114.0–2172.5) | **2197.9ms** (2184.3–2214.9) |
+| `packInt8Rows` CPU sum (item 1) | 1689.9ms (**79.0%** of total) | 1688.4ms (**76.8%**) |
+| layer-setup wall-clock — pack+upload+bindGroup, one `Promise.all` per layer × 24 (items 1-3 combined, additive) | 2086.8ms (**97.6%**) | 2056.5ms (**93.6%**) |
+| `queue.writeBuffer` CPU enqueue (item 2) | 39.8ms | 39.1ms |
+| `queue.writeBuffer` bytes | ~1.043 GiB | ~1.045 GiB |
+| GPU kernel time, timestamp-query, 168 `matmulQ8` dispatches + smaller kernels (item 4) | 39.55ms (**1.85%**) | 131.51ms (**5.98%**) |
+| submit→GPU-done wait (item 4, CPU-visible half) | 45.1ms (2.1%) | 136.1ms (6.2%) |
+| readback (`mapAsync`) | 0.3ms | 0.4ms |
+| **decode, 1 token, same call** `totalMs` | 25.6ms (14.2–40.8) | 18.5ms (13.8–42.4) |
+| decode `packEntries` / `bindGroupCalls` | **0 / 0** | **0 / 0** |
+| decode submit→GPU-done wait | 24.9ms (**97%** of decode total) | 17.4ms (**94%**) |
+
+**`packInt8Rows` alone accounts for ~77-79% of prefill's own wall time, and
+the whole per-layer setup block it sits inside (pack + upload + bind-group
+validation, one `Promise.all` per layer) accounts for ~94-98% — GPU kernel
+time is 2-6% and scales with `N` as expected for a GEMM's row count, while
+the CPU-side setup cost does not (2086.8ms at N=76 vs. 2056.5ms at N=365,
+same fixed-cost-independent-of-prompt-length shape issue #128/#130 already
+established, now attributed to a specific phase rather than left as
+"something in `runPrefillResident`").** This confirms the reviewer's own
+comment on this issue: the same ~1 GiB of packed weight bytes
+`buildProjection` already uploaded once, for decode, in `create()`, is
+re-packed and re-uploaded by `matmulQ8IntoShape` on every single `forward()`
+call. Decode's own profile is the direct contrast: `packEntries`/
+`bindGroupCalls` are exactly zero every run (`runDecodeStep` never calls
+`matmulQ8IntoShape` — its bind groups were all built once, in `create()`),
+and its ~15-40ms total is almost entirely the GPU submit-to-completion wait,
+not CPU setup — the same work, done once instead of once per call, costs
+nothing per-token.
+
+`bindGroupMs` (the sum of each individual `device.bindGroup()` call's own
+await, not wall-clock) is reported in the code but **not** in the table
+above deliberately — it reached ~11.5-12.1s on these same runs, larger than
+`totalMs` itself, because prefill's nine per-layer calls run concurrently
+under `Promise.all` and their individual await windows overlap; summing
+them is not a wall-clock quantity and would misstate this section's own
+conclusion if read as one. `layerSetupMs` (wall-clock around the whole
+`Promise.all` block) is the number this section actually uses, and is
+additive against `totalMs` by construction — see `ForwardProfile`'s own doc
+for the full reasoning, kept here only as a pointer so a future reader does
+not rediscover the same trap by eyeballing the raw JSON.
+
+**Scope.** No optimization is included here — per this issue's own
+completion condition, only the breakdown. The likely fix (keep the decode-
+side resident weight/scale buffers alive and bind them into `matmulQ8`
+instead of re-packing per call) is named, not attempted; it is tracked as
+its own follow-up issue so a correctness-first, one-change-at-a-time PR can
+review it against this measurement rather than against a hypothesis.
+
 ### Scope
 
 Reaching into `technologies-moe/alibi-ai` (a separate repository) itself —

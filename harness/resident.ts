@@ -47,6 +47,54 @@ export interface ResidentReadback {
   type: "f32" | "i32" | "u32";
 }
 
+/**
+ * Issue #131: an opt-in argument to `batch()` that asks it to also report
+ * *where* one `batch()` call's own wall time went, split the way #131's own
+ * background comment does — CPU submit-to-completion wait, the readback
+ * `mapAsync` phase, and (when the device negotiated `timestamp-query` and
+ * `labels` names a dispatch) that dispatch's own GPU-side duration.
+ *
+ * `labels` is parallel to the `ops` array `batch()` already takes — one
+ * entry per op, `null`/absent for an op nobody asked to time individually.
+ * A non-null label on a `"dispatch"` op makes `batch()` end whatever compute
+ * pass was open and start a fresh one *just for that dispatch*, with its own
+ * `timestampWrites` pair — WebGPU's `GPUComputePassTimestampWrites` only
+ * covers the whole pass it is attached to (there is no per-dispatch
+ * timestamp inside one pass), so per-dispatch GPU attribution costs a pass
+ * boundary per labeled dispatch. That is real, measurable overhead next to
+ * `llm/engine-q8-resident.ts`'s normal one-pass-per-batch encoding, and
+ * exists only when a caller opts in by passing `labels` — every existing
+ * caller (every real decode/prefill step) passes no third argument at all,
+ * so nothing about its own encoding changes.
+ *
+ * `sink` is written into once `batch()` resolves, not returned separately —
+ * the caller constructs it (typically `{ submitToDoneMs: null, readbackMs:
+ * null, gpuEntries: [] }`) and passes the same object in, so a driving
+ * script can read it straight off the object it already holds.
+ */
+export interface BatchProfile {
+  labels?: (string | null | undefined)[];
+  sink: BatchProfileSink;
+}
+
+export interface BatchProfileSink {
+  /** `performance.now()` elapsed between `queue.submit()` and `queue.onSubmittedWorkDone()` resolving — the GPU-side wait `batch()` would otherwise fold silently into the readback `mapAsync` call below. `null` until `batch()` writes it. */
+  submitToDoneMs: number | null;
+  /** `performance.now()` elapsed across every `readback` entry's `mapAsync`+copy, timed *after* `onSubmittedWorkDone` above has already resolved — so this is the readback round trip on its own, not padded with GPU completion wait. `null` until `batch()` writes it. */
+  readbackMs: number | null;
+  /**
+   * One entry per non-null `labels` entry whose pass produced a nonzero
+   * timestamp delta (a zero delta means the driver declined to serve that
+   * query — `wgsl.ts#dispatch`'s own doc on why zero is not reported as a
+   * duration). Empty — not absent — when `labels` was given but this device
+   * did not negotiate `timestamp-query` (`ResidentDevice.timestampsSupported`
+   * is `false`): the caller can tell "no GPU breakdown" from "GPU breakdown
+   * requested but every entry was exactly zero" by checking that flag
+   * itself, not by inspecting this array's length alone.
+   */
+  gpuEntries: { label: string; seconds: number }[];
+}
+
 export interface ResidentDevice {
   /**
    * Counters a test can snapshot before and after a decode loop to prove the
@@ -56,6 +104,8 @@ export interface ResidentDevice {
    * failures do not show up in coverage).
    */
   readonly stats: { buffersCreated: number; pipelinesCreated: number; submits: number };
+  /** Whether this device negotiated the `timestamp-query` feature — issue #131's `BatchProfile.sink.gpuEntries` is only ever populated when this is `true`; a caller on a device where it is `false` still gets `submitToDoneMs`/`readbackMs` (those need no GPU feature), just no per-dispatch GPU breakdown, and should say so rather than reporting an empty breakdown as "GPU took 0ms" (rule 9). */
+  readonly timestampsSupported: boolean;
   createStorageBuffer(bytes: number, usage?: number): GPUBuffer;
   createUniformBuffer(bytes: number): GPUBuffer;
   /** `queue.writeBuffer`, not a submit — safe to call before `batch()`, never inside a decode loop's steady state except where the op's own doc says so (embedding upload, position counters). */
@@ -90,7 +140,7 @@ export interface ResidentDevice {
    * then maps and reads back only `readback` — everything else recorded
    * (intermediate activations, the KV-cache copies) stays device-side.
    */
-  batch(ops: ResidentOp[], readback: ResidentReadback[]): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
+  batch(ops: ResidentOp[], readback: ResidentReadback[], profile?: BatchProfile): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
   destroy(): void;
 }
 
@@ -105,7 +155,12 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   // ceiling rather than the spec's low defaults. A resident engine's weight
   // buffers (`lmHead` alone is ~175 MiB packed for Sarashina2.2-1B) need it.
   const wanted = 2 * 1024 * 1024 * 1024;
+  // Issue #131: same feature-detection `wgsl.ts#createRunner` already does —
+  // requested only when the adapter offers it, since asking for a feature an
+  // adapter lacks fails `requestDevice` outright rather than degrading.
+  const timestampsSupported = adapter.features.has("timestamp-query");
   const device = await adapter.requestDevice({
+    requiredFeatures: timestampsSupported ? ["timestamp-query"] : [],
     requiredLimits: {
       maxStorageBufferBindingSize: Math.min(wanted, adapter.limits.maxStorageBufferBindingSize),
       maxBufferSize: Math.min(wanted, adapter.limits.maxBufferSize),
@@ -173,7 +228,28 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     return group;
   }
 
-  async function batch(ops: ResidentOp[], readback: ResidentReadback[]): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
+  async function batch(
+    ops: ResidentOp[],
+    readback: ResidentReadback[],
+    profile?: BatchProfile,
+  ): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
+    // Issue #131: which ops get their own timed pass, decided once up front
+    // so the query set can be sized exactly (`GPUQuerySetDescriptor.count`
+    // is fixed at creation) rather than grown as the loop below discovers
+    // labels. `labels[i]` only matters for `ops[i].kind === "dispatch"` —
+    // a label on a `"copy"` op is meaningless (copies never run inside a
+    // pass) and silently ignored, not an error, since `BatchProfile.labels`
+    // is positional against `ops` as a whole for the caller's convenience.
+    const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
+    const labeledSlots: string[] = [];
+    if (wantsGpuTiming) {
+      profile!.labels!.forEach((label, index) => {
+        if (label != null && ops[index]?.kind === "dispatch") labeledSlots.push(label);
+      });
+    }
+    const queryCount = labeledSlots.length * 2;
+    const querySet = queryCount > 0 ? device.createQuerySet({ type: "timestamp", count: queryCount }) : null;
+
     const encoder = device.createCommandEncoder();
     let pass: GPUComputePassEncoder | null = null;
     const endPass = () => {
@@ -182,9 +258,24 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
         pass = null;
       }
     };
-    for (const op of ops) {
+    let queryCursor = 0;
+    for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
-        if (!pass) pass = encoder.beginComputePass();
+        const label = profile?.labels ? (profile.labels[i] ?? null) : null;
+        if (profile?.labels) {
+          // Profiling mode: every dispatch this batch records gets its own
+          // pass — even an unlabeled one — so a labeled dispatch's own
+          // timestamps never span work outside it. See `BatchProfile`'s own
+          // doc for why this is real overhead confined to opt-in calls.
+          endPass();
+          const timeThis = querySet && label != null;
+          pass = encoder.beginComputePass(
+            timeThis ? { timestampWrites: { querySet, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
+          );
+          if (timeThis) queryCursor += 2;
+        } else if (!pass) {
+          pass = encoder.beginComputePass();
+        }
         pass.setPipeline(op.pipeline);
         pass.setBindGroup(0, op.bindGroup);
         pass.dispatchWorkgroups(...(op.workgroups as [number, number?, number?]));
@@ -200,9 +291,31 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     for (const r of readback) {
       encoder.copyBufferToBuffer(r.source, r.sourceOffset, r.staging, 0, r.length * 4);
     }
+    let queryResolved: GPUBuffer | null = null;
+    let queryReadable: GPUBuffer | null = null;
+    if (querySet) {
+      queryResolved = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+      queryReadable = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      encoder.resolveQuerySet(querySet, 0, queryCount, queryResolved, 0);
+      encoder.copyBufferToBuffer(queryResolved, 0, queryReadable, 0, queryCount * 8);
+    }
+
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;
 
+    // Issue #131 item 4's CPU half: how long the GPU took to actually finish
+    // this submission, timed separately from the readback `mapAsync` calls
+    // below (`onSubmittedWorkDone` resolves once the GPU is done, before any
+    // buffer is mapped) — without this, `batch()`'s only prior signal that
+    // work had finished was the first `mapAsync` resolving, which folds GPU
+    // completion wait and the readback round trip into one number.
+    if (profile) {
+      const t0 = performance.now();
+      await device.queue.onSubmittedWorkDone();
+      profile.sink.submitToDoneMs = performance.now() - t0;
+    }
+
+    const readbackT0 = profile ? performance.now() : 0;
     const results: (Float32Array | Int32Array | Uint32Array)[] = [];
     for (const r of readback) {
       await r.staging.mapAsync(GPUMapMode.READ);
@@ -210,11 +323,39 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
       r.staging.unmap();
       results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
     }
+    if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
+
+    if (querySet && queryReadable) {
+      await queryReadable.mapAsync(GPUMapMode.READ);
+      const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
+      queryReadable.unmap();
+      const entries: { label: string; seconds: number }[] = [];
+      for (const [k, label] of labeledSlots.entries()) {
+        // Timestamps are nanoseconds; a zero delta means the driver declined
+        // to serve that particular query (`wgsl.ts#dispatch`'s own doc) —
+        // not a real zero-duration dispatch, so it is left out rather than
+        // reported as one.
+        const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
+        if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+      }
+      profile!.sink.gpuEntries = entries;
+      querySet.destroy();
+      queryResolved!.destroy();
+      queryReadable.destroy();
+    } else if (profile?.labels) {
+      // Labels were requested but this device never negotiated
+      // `timestamp-query` — `sink.gpuEntries` stays `[]`, distinguishable
+      // from "measured, all zero" only via `timestampsSupported` (see that
+      // field's own doc); nothing here claims a GPU number it does not have.
+      profile.sink.gpuEntries = [];
+    }
+
     return results;
   }
 
   return {
     stats,
+    timestampsSupported,
     createStorageBuffer,
     createUniformBuffer,
     upload,

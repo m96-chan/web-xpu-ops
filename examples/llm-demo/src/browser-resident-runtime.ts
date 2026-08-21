@@ -31,9 +31,9 @@
  * instead of restating them makes that class of drift impossible rather
  * than merely checked.
  */
-import type { ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
+import type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
 
-export type { ResidentDevice, ResidentOp, ResidentReadback };
+export type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback };
 
 /** `harness/resident.ts#createResidentDevice`'s `navigator.gpu` counterpart — see that file's doc for what every piece below is for; this is a direct port, not a redesign. */
 export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
@@ -45,7 +45,11 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   // Same reasoning as `browser-runtime.ts#createBrowserRunner`: request the
   // adapter's own ceiling. A resident engine's weight buffers (`lmHead`
   // alone is ~175 MiB packed for Sarashina2.2-1B) need it.
+  // Issue #131: same feature-detection `harness/resident.ts` (this file's
+  // Node counterpart) does — requested only when the adapter offers it.
+  const timestampsSupported = adapter.features.has("timestamp-query");
   const device = await adapter.requestDevice({
+    requiredFeatures: timestampsSupported ? ["timestamp-query"] : [],
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -114,7 +118,20 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   async function batch(
     ops: ResidentOp[],
     readback: ResidentReadback[],
+    profile?: BatchProfile,
   ): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
+    // Issue #131 — see `harness/resident.ts#batch`'s own doc for the full
+    // reasoning; this is a direct port, unchanged in structure.
+    const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
+    const labeledSlots: string[] = [];
+    if (wantsGpuTiming) {
+      profile!.labels!.forEach((label, index) => {
+        if (label != null && ops[index]?.kind === "dispatch") labeledSlots.push(label);
+      });
+    }
+    const queryCount = labeledSlots.length * 2;
+    const querySet = queryCount > 0 ? device.createQuerySet({ type: "timestamp", count: queryCount }) : null;
+
     const encoder = device.createCommandEncoder();
     let pass: GPUComputePassEncoder | null = null;
     const endPass = () => {
@@ -123,9 +140,20 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
         pass = null;
       }
     };
-    for (const op of ops) {
+    let queryCursor = 0;
+    for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
-        if (!pass) pass = encoder.beginComputePass();
+        const label = profile?.labels ? (profile.labels[i] ?? null) : null;
+        if (profile?.labels) {
+          endPass();
+          const timeThis = querySet && label != null;
+          pass = encoder.beginComputePass(
+            timeThis ? { timestampWrites: { querySet, beginningOfPassWriteIndex: queryCursor, endOfPassWriteIndex: queryCursor + 1 } } : undefined,
+          );
+          if (timeThis) queryCursor += 2;
+        } else if (!pass) {
+          pass = encoder.beginComputePass();
+        }
         pass.setPipeline(op.pipeline);
         pass.setBindGroup(0, op.bindGroup);
         pass.dispatchWorkgroups(...(op.workgroups as [number, number?, number?]));
@@ -136,9 +164,25 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     }
     endPass();
     for (const r of readback) encoder.copyBufferToBuffer(r.source, r.sourceOffset, r.staging, 0, r.length * 4);
+    let queryResolved: GPUBuffer | null = null;
+    let queryReadable: GPUBuffer | null = null;
+    if (querySet) {
+      queryResolved = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+      queryReadable = device.createBuffer({ size: queryCount * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      encoder.resolveQuerySet(querySet, 0, queryCount, queryResolved, 0);
+      encoder.copyBufferToBuffer(queryResolved, 0, queryReadable, 0, queryCount * 8);
+    }
+
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;
 
+    if (profile) {
+      const t0 = performance.now();
+      await device.queue.onSubmittedWorkDone();
+      profile.sink.submitToDoneMs = performance.now() - t0;
+    }
+
+    const readbackT0 = profile ? performance.now() : 0;
     const results: (Float32Array | Int32Array | Uint32Array)[] = [];
     for (const r of readback) {
       // eslint-disable-next-line no-await-in-loop
@@ -147,11 +191,32 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       r.staging.unmap();
       results.push(r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes));
     }
+    if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
+
+    if (querySet && queryReadable) {
+      // eslint-disable-next-line no-await-in-loop
+      await queryReadable.mapAsync(GPUMapMode.READ);
+      const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
+      queryReadable.unmap();
+      const entries: { label: string; seconds: number }[] = [];
+      for (const [k, label] of labeledSlots.entries()) {
+        const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
+        if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+      }
+      profile!.sink.gpuEntries = entries;
+      querySet.destroy();
+      queryResolved!.destroy();
+      queryReadable.destroy();
+    } else if (profile?.labels) {
+      profile.sink.gpuEntries = [];
+    }
+
     return results;
   }
 
   return {
     stats,
+    timestampsSupported,
     createStorageBuffer,
     createUniformBuffer,
     upload,

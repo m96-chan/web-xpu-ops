@@ -1,7 +1,7 @@
-import { describe, expect } from "vitest";
-import { runnerFromResident } from "./resident.js";
+import { describe, expect, it } from "vitest";
+import { runnerFromResident, type BatchProfileSink } from "./resident.js";
 import { params } from "./wgsl.js";
-import { kernel, residentTest, useResidentGpu } from "./suite.js";
+import { kernel, residentTest, skipUnlessPresent, useResidentGpu } from "./suite.js";
 
 const elementwiseKernel = kernel(new URL("../ops/elementwise/index.ts", import.meta.url));
 
@@ -212,5 +212,123 @@ describe("resident device", () => {
     });
     expect(Array.from(sum2 as Float32Array)).toEqual([11, 12, 13, 14]);
     expect(device.stats.buffersCreated).toBeGreaterThan(buffersAfterFirst);
+  });
+});
+
+/**
+ * Issue #131: `batch()`'s optional third argument. These exercise the real
+ * contract `llm/engine-q8-resident.ts` will drive it through — `submitToDoneMs`/
+ * `readbackMs` filled in on every profiled call, `gpuEntries` populated only
+ * for dispatches the caller actually labeled, and only when this device
+ * negotiated `timestamp-query` (checked via `device.timestampsSupported`
+ * rather than assumed, since a CI machine without it must still pass this
+ * file — the assertions below are structured so they hold either way,
+ * per this repository's own "対応しない環境ではCPU側計時にフォールバック" scope).
+ */
+describe("resident device / BatchProfile (issue #131)", () => {
+  const getDevice = useResidentGpu();
+
+  function twoDispatchOps(device: NonNullable<ReturnType<typeof getDevice>>) {
+    const a = device.createStorageBuffer(16);
+    const b = device.createStorageBuffer(16);
+    const sum = device.createStorageBuffer(16);
+    const product = device.createStorageBuffer(16);
+    const addParams = device.createUniformBuffer(16);
+    const mulParams = device.createUniformBuffer(16);
+    device.upload(a, 0, new Float32Array([1, 2, 3, 4]));
+    device.upload(b, 0, new Float32Array([10, 10, 10, 10]));
+    device.upload(addParams, 0, new Uint8Array(params([["u32", 4], ["u32", 0]])));
+    device.upload(mulParams, 0, new Uint8Array(params([["u32", 4], ["u32", 1]])));
+    return { a, b, sum, product, addParams, mulParams };
+  }
+
+  residentTest("submitToDoneMs and readbackMs are both real numbers once a profiled batch resolves", async (device) => {
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const { a, b, sum, product, addParams, mulParams } = twoDispatchOps(device);
+    const addGroup = await device.bindGroup(pipeline, [a, b, sum, addParams]);
+    const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
+    const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+
+    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const [result] = await device.batch(
+      [
+        { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
+        { kind: "dispatch", pipeline, bindGroup: mulGroup, workgroups: [1] },
+      ],
+      [{ staging, source: product, sourceOffset: 0, length: 4, type: "f32" }],
+      { sink },
+    );
+
+    // Correctness is unaffected by asking for a profile — same result the
+    // unprofiled version of this exact dispatch pair produces above.
+    expect(Array.from(result as Float32Array)).toEqual([11, 24, 39, 56]);
+    expect(typeof sink.submitToDoneMs).toBe("number");
+    expect(sink.submitToDoneMs).toBeGreaterThanOrEqual(0);
+    expect(typeof sink.readbackMs).toBe("number");
+    expect(sink.readbackMs).toBeGreaterThanOrEqual(0);
+    // No `labels` were passed — nothing here asked for a GPU breakdown, so
+    // none should appear (an empty array reads as "not requested", not
+    // "requested and measured zero" — the `timestampsSupported`-gated test
+    // below is what exercises the populated case).
+    expect(sink.gpuEntries).toEqual([]);
+  });
+
+  it("labeled dispatches produce one gpuEntries row each, by label, when timestamp-query is supported", async (ctx) => {
+    const device = getDevice();
+    if (!skipUnlessPresent(ctx, device)) return;
+    if (!device.timestampsSupported) {
+      // Documented fallback (issue #131's own scope: "timestamp-query非対応
+      // 環境ではCPU側計時にフォールバック") — this repository's own dev/CI
+      // machines negotiate it (confirmed via `adapter.features` directly),
+      // so this branch is not expected to run here, but a future
+      // environment without it must not fail this file.
+      ctx.skip();
+      return;
+    }
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const { a, b, sum, product, addParams, mulParams } = twoDispatchOps(device);
+    const addGroup = await device.bindGroup(pipeline, [a, b, sum, addParams]);
+    const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
+    const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+
+    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    await device.batch(
+      [
+        { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
+        { kind: "dispatch", pipeline, bindGroup: mulGroup, workgroups: [1] },
+      ],
+      [{ staging, source: product, sourceOffset: 0, length: 4, type: "f32" }],
+      { labels: ["add", "mul"], sink },
+    );
+
+    const labels = sink.gpuEntries.map((e) => e.label).sort();
+    expect(labels).toEqual(["add", "mul"]);
+    for (const entry of sink.gpuEntries) expect(entry.seconds).toBeGreaterThan(0);
+  });
+
+  it("a null label leaves that dispatch out of gpuEntries", async (ctx) => {
+    const device = getDevice();
+    if (!skipUnlessPresent(ctx, device)) return;
+    if (!device.timestampsSupported) {
+      ctx.skip();
+      return;
+    }
+    const pipeline = await device.pipelineFor(elementwiseKernel);
+    const { a, b, sum, product, addParams, mulParams } = twoDispatchOps(device);
+    const addGroup = await device.bindGroup(pipeline, [a, b, sum, addParams]);
+    const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
+    const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+
+    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    await device.batch(
+      [
+        { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
+        { kind: "dispatch", pipeline, bindGroup: mulGroup, workgroups: [1] },
+      ],
+      [{ staging, source: product, sourceOffset: 0, length: 4, type: "f32" }],
+      { labels: ["add", null], sink },
+    );
+
+    expect(sink.gpuEntries.map((e) => e.label)).toEqual(["add"]);
   });
 });
