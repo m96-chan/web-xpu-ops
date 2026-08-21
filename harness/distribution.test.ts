@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -90,6 +90,25 @@ describe("published surface", () => {
     // `exports` pointing into `dist/` is only meaningful if `files` carries it
     // — npm would otherwise publish a tarball with none of it.
     expect(pkg.files).toContain("dist");
+  });
+
+  it("states the op count the tree actually has", () => {
+    // Third time this line has gone stale: 0.1.0 shipped it saying
+    // twenty-four when the tree held twenty-seven, that release's own
+    // CHANGELOG entry called the drift structural rather than careless —
+    // op PRs land in parallel and each is told to leave the shared count
+    // alone, so it is correct when written and wrong once the next batch
+    // merges — and proposed exactly this assertion. It said twenty-seven
+    // again at 0.2.0, against twenty-nine on disk (#119 added `permute`
+    // and `dequant_transpose`). The README is what npm renders, so the
+    // number is read by people who cannot check it.
+    const ops = readdirSync(fileURLToPath(new URL("ops", root)), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory()).length;
+    const readme = readFileSync(fileURLToPath(new URL("README.md", root)), "utf8");
+    const claimed = /^\| WGSL \| (\d+) ops \|/m.exec(readme);
+
+    expect(claimed, "the backends table lost its `| WGSL | N ops |` row").not.toBeNull();
+    expect(Number(claimed![1])).toBe(ops);
   });
 
   it("keeps a subpath for the kernels", () => {

@@ -486,9 +486,10 @@ already ships, and issue [#98](https://github.com/m96-chan/web-xpu-ops/issues/98
 tracks that specific composition, not a new op.
 
 ```ts
-// llm/ is source-only for now — not part of this package's published
-// `exports` (real-model use needs #96's weight converter and tokenizer,
-// both later issues), so this is a within-repo import, not a package one.
+// The engine itself is source-only — `llm/tokenizer`, `llm/sampler`,
+// `llm/kv-cache` and `llm/reshape` are published (0.2.0), but `LlamaEngine`
+// and everything under it is not, so this is a within-repo import rather
+// than a package one.
 import { LlamaEngine, TINY_FIXTURE_CONFIG } from "./llm/index.js";
 
 const engine = new LlamaEngine(config, weights, runner.run);
@@ -1339,10 +1340,11 @@ in practice: 17-33s per independent turn, dominated by `create()`'s own
 from the ~1.4 GiB checkpoint — for a workload (a chat: many short,
 independent generations against a model that never changes between turns)
 where none of that needed to happen again. This is a **within-repo (source-only)
-API** — same status as the rest of `llm/` ("`llm/`: an inference engine
-built from these ops" above, following issue #98's own precedent): nothing
-here is reachable through this package's published npm `exports`, so a
-consumer needs a source/`llm/` import, not a package one. Not a blocker for
+API** — the same status the engine layer has had since issue #98: the leaf
+modules `llm/tokenizer`, `llm/sampler`, `llm/kv-cache` and `llm/reshape` are
+published (0.2.0, issue #138), but the engines and the storage layer around
+them are not, so a consumer of `reset()` needs a source/`llm/` import rather
+than a package one. Not a blocker for
 this repository's own real consumer: `alibi-ai` already imports `llm/`
 straight from source and bundles it with esbuild, not through `npm install`,
 so this status quo is unchanged by issue #120 and no `exports` work is
@@ -1606,7 +1608,7 @@ text).
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 27 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
+| WGSL | 29 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 
