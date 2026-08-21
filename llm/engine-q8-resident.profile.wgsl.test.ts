@@ -63,7 +63,42 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     expect(Array.from(profiledLogits[0]!)).toEqual(Array.from(unprofiledLogits[0]!));
   });
 
-  residentTest("prefill's profile reports one packEntries row per layer per matmulQ8 projection", async () => {
+  /**
+   * Issue #142: `runPrefillResident`'s seven per-layer projections
+   * (`wq`/`wk`/`wv`/`wo`/gate/up/`wDown`) no longer go through
+   * `matmulQ8IntoShape` — `bindMatmulQ8` binds `this.layers[l]`'s own
+   * resident `ResidentWeight` (built once in `create()`) directly, with no
+   * `packInt8Rows` call and no `device.upload` for the weight/scale bytes.
+   * `profile.packEntries` (issue #131's own per-`packInt8Rows`-call log)
+   * must therefore be **empty** for a plain (non-debug) prefill call —
+   * `lm_head`'s debug-only `matmulQ8IntoShape` call
+   * (`debugAllPositionLogits`, `runPrefillResident`'s own
+   * `debugAllPositions` branch) is the only remaining caller, and this test
+   * never reaches it (it calls `forward()`, not `debugAllPositionLogits`).
+   *
+   * This test used to assert the *opposite* — `numLayers * 7` pack
+   * entries, one per projection per layer — because it predates issue #142
+   * (PR #141/issue #131 landed first, measuring `matmulQ8IntoShape`'s own
+   * per-call repack cost before #142 removed it). Left un-updated, that
+   * old assertion is not a false negative here: it started failing exactly
+   * because #142 does what it claims (`expected [] to have a length of 14
+   * but got +0` — the pre-#142 assertion, reproduced during this PR's own
+   * review before this rewrite). Renamed and rewritten to assert the
+   * post-#142 invariant directly, so a regression that reintroduces
+   * per-call packing (reverting `bindMatmulQ8` back to `matmulQ8IntoShape`
+   * for these seven) fails *this* test again — the same "observation point
+   * must break when the behavior it names breaks" property
+   * `engine-q8-resident.residentweight.wgsl.test.ts`'s own
+   * `buffersCreated` assertion already holds for buffer allocation; this is
+   * the same property for CPU pack time and transfer bytes. Confirmed by
+   * mutation: temporarily reverting the seven `bindMatmulQ8` calls back to
+   * `matmulQ8IntoShape` during this rewrite measured `packEntries.length
+   * === 14` and `uploadBytes === 81544` (matching the pre-#142 shape
+   * exactly — `2 layers × 7 projections`, and the packed weight+scale byte
+   * total for this fixture's tiny shapes); reverting the mutation restored
+   * `packEntries: []` and `uploadBytes: 3720`.
+   */
+  residentTest("prefill's profile reports zero packEntries — issue #142's resident weight buffers, not a per-call repack", async () => {
     // Issue #131 review: the previous test already ran this shared `engine`
     // through one prefill (`forward(fixture.promptTokens, ...)`), so without
     // `reset()` (issue #120) this call would route into `runDecodeStep`
@@ -76,27 +111,28 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     await engine!.forward(fixture.promptTokens, profile);
 
     const { numLayers } = fixture.config;
-    // wq, wk, wv, wo, wGate, wUp, wDown — `runPrefillResident`'s own seven
-    // `matmulQ8IntoShape` calls per layer (production path; `lm_head` only
-    // packs through `matmulQ8IntoShape` in the debug-only `debugAllPositionLogits`
-    // path, not here).
-    expect(profile.packEntries).toHaveLength(numLayers * 7);
-    const projByLayer = new Map<number, Set<string>>();
-    for (const entry of profile.packEntries) {
-      expect(entry.ms).toBeGreaterThanOrEqual(0);
-      expect(entry.bytes).toBeGreaterThan(0);
-      if (!projByLayer.has(entry.layer)) projByLayer.set(entry.layer, new Set());
-      projByLayer.get(entry.layer)!.add(entry.proj);
-    }
-    expect([...projByLayer.keys()].sort((a, b) => a - b)).toEqual(Array.from({ length: numLayers }, (_, i) => i));
-    for (const projs of projByLayer.values()) {
-      expect([...projs].sort()).toEqual(["wDown", "wGate", "wUp", "wk", "wo", "wq", "wv"]);
-    }
+    // See this test's own doc above — issue #142's own claim, asserted
+    // directly rather than merely narrated.
+    expect(profile.packEntries).toEqual([]);
 
+    // `uploadBytes` still counts the small per-layer norm-gain buffers
+    // (`attnNormBuf`/`ffnNormBuf`, `hiddenSize` floats each) and the
+    // embedding-row/final-norm uploads `runPrefillResident` always does —
+    // so `> 0` alone would not distinguish "no weight upload" from "weight
+    // upload still happening, plus these". `UPLOAD_BYTES_WEIGHT_FREE_CEILING`
+    // is the mutation-tested bound instead: measured 3720 bytes with
+    // `bindMatmulQ8` (this fixture, `numLayers: 2`), 81544 bytes with the
+    // pre-#142 `matmulQ8IntoShape` mutation (see this test's own doc) — the
+    // ceiling sits strictly between the two, with headroom on the resident
+    // side for unrelated future norm-buffer additions and a wide margin
+    // below the weight-upload side (~22x the resident measurement).
+    const UPLOAD_BYTES_WEIGHT_FREE_CEILING = 20_000;
     expect(profile.uploadBytes).toBeGreaterThan(0);
+    expect(profile.uploadBytes).toBeLessThan(UPLOAD_BYTES_WEIGHT_FREE_CEILING);
     expect(profile.uploadMs).toBeGreaterThanOrEqual(0);
     // Nine bind groups per layer (`attnNormGroup`, `ffnNormGroup`, plus the
-    // seven `matmulQ8IntoShape` calls' own internal `device.bindGroup`) —
+    // seven `bindMatmulQ8` calls' own internal `device.bindGroup` — no
+    // pack/upload ahead of them any more, issue #142) —
     // issue #131 item 3's own "24 rounds" description at Sarashina2.2-1B's
     // 24-layer scale, `numLayers` here instead of 24 for the tiny fixture —
     // plus a fixed number of once-per-call groups built outside the loop
@@ -157,7 +193,7 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     for (const entry of profile.gpuEntries) expect(entry.seconds).toBeGreaterThan(0);
   });
 
-  residentTest("decode's profile shows near-zero CPU pack/bindGroup cost, unlike prefill's own", async () => {
+  residentTest("decode's profile shows zero bind-group cost, unlike prefill's own — packEntries is empty for both, as of issue #142", async () => {
     // Self-contained, not relying on a preceding test's own side effect
     // (issue #131 review) — `reset()` (issue #120) then an *unprofiled*
     // prefill to reach a real decode-eligible position (`tokensSoFar > 0`);
@@ -180,17 +216,31 @@ describe("llm/engine-q8-resident / ForwardProfile (issue #131)", () => {
     // not per `forward()` call (this file's class doc, "Prefill is resident
     // too" section, and this issue's own review comment: the same bytes
     // `buildProjection` already uploaded for decode are what issue #131
-    // itself is asking whether prefill could reuse).
+    // itself is asking whether prefill could reuse). As of issue #142,
+    // prefill's own production path reached the identical conclusion for
+    // its seven per-layer projections (`bindMatmulQ8` reuses those same
+    // resident buffers instead of calling `matmulQ8IntoShape`) — so this
+    // assertion is no longer decode-specific; the sibling test above
+    // ("prefill's profile reports zero packEntries") checks the same thing
+    // for prefill. `ForwardProfile.packEntries`'s own doc has the one
+    // remaining exception (`debugAllPositionLogits`'s debug-only path).
     expect(profile.packEntries).toEqual([]);
     // Steady-state decode binds no new bind groups either (`LayerResident`'s
-    // own doc) — every group used below was built once in `create()`.
+    // own doc) — every group used below was built once in `create()`. This
+    // *is* still a real contrast with prefill (`bindGroupCalls` stays at
+    // `numLayers * 9`+ there, issue #142 does not change that — only
+    // whether those bind groups sit behind a fresh pack/upload or a
+    // resident buffer).
     expect(profile.bindGroupCalls).toBe(0);
     expect(profile.bindGroupMs).toBe(0);
     expect(profile.layerSetupMs).toBe(0);
     // Decode still uploads a handful of small uniforms/the embedding row
     // every step (`s.hiddenA`, both rope position uniforms, both `sEff`
-    // uniforms) — non-zero, but tiny next to prefill's per-layer weight
-    // re-upload.
+    // uniforms) — non-zero, but tiny. Pre-#142 this was also tiny next to
+    // prefill's own per-layer weight re-upload (~1 GiB at real-model scale);
+    // post-#142, prefill's own `uploadBytes` is tiny too (issue #142's own
+    // point), so this is no longer a decode-vs-prefill contrast, just a
+    // sanity check that decode still uploads *something* every step.
     expect(profile.uploadBytes).toBeGreaterThan(0);
     expect(profile.submitToDoneMs).not.toBeNull();
     expect(profile.readbackMs).not.toBeNull();

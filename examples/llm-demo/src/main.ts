@@ -746,7 +746,15 @@ interface PrefillProfileResult {
   /** Same idea as `controlPrefillMs`, for the one decode step below. */
   controlDecodeMs: number;
   prefill: ForwardProfile;
-  /** One `forward([token])` call immediately after this prompt length's prefill — issue #131's own scope asks for "1トークンdecode" alongside prefill, as a contrast case (`ForwardProfile`'s own doc: decode's `packEntries`/`bindGroupCalls` should be near-zero, unlike prefill's). */
+  /**
+   * One `forward([token])` call immediately after this prompt length's
+   * prefill — issue #131's own scope asks for "1トークンdecode" alongside
+   * prefill, as a contrast case. `bindGroupCalls` is the field that still
+   * contrasts them (near-zero for decode, `numLayers * 9`+ for prefill —
+   * `ForwardProfile.bindGroupCalls`'s own doc). `packEntries` no longer
+   * does, as of issue #142: both decode's and (production) prefill's are
+   * empty now — see `ForwardProfile.packEntries`'s own doc for why.
+   */
   decodeStep: ForwardProfile;
 }
 

@@ -103,6 +103,70 @@ Entries record **why** a change was needed. What changed is in the diff.
   rounding noise this fixture's tolerance was already sized for, not a new
   source of error.
 
+### Changed
+
+- `LlamaEngineQ8Resident.runPrefillResident` no longer re-packs and
+  re-uploads every projection's int8 weight on every `forward()` call —
+  issue #142, following up directly on #131/#141's own profiling of the
+  ~1.2–2.2s prefill fixed cost the entry above left unexplained.
+  `packInt8Rows` (CPU) turned out to be **77–79% of prefill's own fixed
+  cost** (#131/#141's own measured breakdown; the GPU kernel itself was only
+  2–6%) — and the packed bytes it produced every call were already sitting
+  on the GPU: `buildProjection`/`buildFfnProjection`/`buildResidualProjection`
+  (`llm/engine-q8-resident.ts`) upload the exact same `packInt8Rows` output,
+  for the exact same `weights.layers[l]` object, once in `create()`, to
+  build decode's own `matvecQ8`/`matvecQ8Ffn`/`matvecQ8Residual` bind
+  groups. Those three builders now keep the resulting `GPUBuffer` handles
+  (`ResidentWeight`, stored per layer) instead of discarding them once the
+  decode bind group is built, and prefill's `matmulQ8` bind group
+  (`bindMatmulQ8`, replacing `matmulQ8IntoShape` for every production
+  projection) binds those same resident buffers directly — no
+  `packInt8Rows`, no `queue.writeBuffer`, no new `GPUBuffer`, on the second
+  and every later prefill call in a generation (`reset()`, issue #120), and
+  on the very first one too.
+
+  **VRAM residency is unchanged.** These bytes were already resident for
+  decode; prefill now reads the same allocation instead of paying for a
+  second, transient ~1 GiB one that lived only until that call's own
+  `batch()` resolved. Nothing new is kept alive for longer than before.
+
+  **Measured** (RTX 5090, NVIDIA driver 610.57.04, Linux (Arch, kernel
+  7.1.5-arch1-2), Chrome 151.0.7922.71 non-headless via CDP on a dedicated
+  `--user-data-dir`/`--remote-debugging-port`, real Sarashina2.2-1B-alibi-v1
+  int8 checkpoint (24 layers, hiddenSize=1792, vocabSize=102400),
+  `examples/llm-demo`'s `__decodeFixedCostBenchmark`, one
+  `LlamaEngineQ8Resident` instance, `reset()` between prompt lengths, 8
+  samples per prompt length, same session, machine shared with other
+  concurrent sessions — `uptime` read `load average: 0.6–1.3` throughout):
+
+  | prompt length | before (`matmulQ8IntoShape`, per-call repack) | after (`bindMatmulQ8`, resident) | speedup |
+  | --- | --- | --- | --- |
+  | 76 tok | 1266.4ms median (1256.9–1277.0ms, n=8) | 42.7ms median (38.3–45.0ms, n=8; one 233.6ms outlier under concurrent GPU load) | ~29.7x |
+  | 365 tok | 1344.4ms median (1326.9–1378.9ms, n=8) | 120.6ms median (119.0–121.6ms, n=8; one 317.0ms outlier under concurrent GPU load) | ~11.1x |
+
+  Correctness: prefill and decode logits are **bit-for-bit identical**
+  whether `matmulQ8`'s weight comes from `bindMatmulQ8` (resident) or the
+  pre-#142 `matmulQ8IntoShape` (packed) — `llm/engine-q8-resident.ts` keeps
+  the latter as a test/debug-only method, `debugPrefillWithPackedWeights`,
+  precisely so `llm/engine-q8-resident.residentweight.wgsl.test.ts` can run
+  both paths on the **same engine, same session, same device** and diff
+  their output directly, rather than pinning literal floats from one
+  GPU/driver into a fixture file — `rmsnorm`'s `rsqrt`, `rope`'s `sin`/`cos`
+  and `gqa`'s softmax `exp` are all vendor/driver-dependent at the ULP level
+  (rule 2), so only an in-session comparison is portable; a golden-fixture
+  version of this test was caught in review for exactly that reason and
+  replaced before merge. Exact equality (`toEqual`, no tolerance), per
+  #130's own established criterion ("1ビットでも動いたら丸めではなく設計の
+  違い"): both paths read the identical packed bytes through the identical
+  `matmulQ8` kernel, so any difference would mean a design bug, not
+  rounding. `resident.stats.buffersCreated`'s own per-prefill-call delta
+  drops from a measured 75 to a measured 47 for the fixture in that same
+  test (28 fewer buffers = `2 × 7 projections × 2 layers`, exactly the
+  weight+scale pair this change stops re-allocating) — asserted with a
+  margin threshold, mutation-confirmed by temporarily reverting
+  `bindMatmulQ8` back to `matmulQ8IntoShape` and watching the assertion
+  fail at the measured pre-#142 value.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
