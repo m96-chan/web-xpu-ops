@@ -112,7 +112,7 @@ describe("llm/kernels.ts + llm/engine-q8-resident.ts CODE <-> examples/llm-demo 
   const nodeSide = unionTables(kernelsSide, engineResidentSide);
   const browserSide = opsFromBrowserRuntime(browserSource);
 
-  it("parsed at least the twelve known kernels.ts entry points, and engine-q8-resident.ts's own ten plus two fused ones (sanity check on the regexes themselves)", () => {
+  it("parsed at least the twelve known kernels.ts entry points, and engine-q8-resident.ts's own eleven (sanity check on the regexes themselves)", () => {
     // kernels.ts: 10 at issue #106; 11 then 12 since issue #117 added
     // `permute` (`ops/permute`) and `dequantTranspose` (`ops/dequant_transpose`).
     const kernelsTotal = Object.values(kernelsSide).reduce((sum, set) => sum + set.size, 0);

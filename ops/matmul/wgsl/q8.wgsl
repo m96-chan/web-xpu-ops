@@ -87,19 +87,26 @@ fn main(
     //
     // Neither half of this guard is load-bearing for the *output* — checked
     // by mutation, the same way plain matmul's own `row < M` tile_a guard is
-    // labelled hygiene rather than assumed to be. `ly < k_len` only gates
-    // whether an out-of-range `tile_b[ly][lx]` gets written; the reduction
-    // loop below reads `tile_b[k][lx]` only for `k < k_len`, so a value
-    // written at `ly >= k_len` is never read regardless. `col < params.M`
-    // only gates whether an invocation past the last output feature computes
-    // a value at all; that invocation's own `acc` is discarded by the store
-    // guard at the bottom, and no other lane ever reads `tile_b[*][lx]` at a
-    // different `lx`. Both stay, for the same reason plain matmul keeps its
-    // hygiene guard: WGSL does not promise an out-of-bounds storage read is a
-    // no-op, only that it will not reach another resource, and `col *
-    // words_per_row + (k >> 2u)` without the `col < M` half can walk past
-    // this row into the next one, or past the whole `weight` buffer once
-    // `col` runs far enough ahead of `M`.
+    // labelled hygiene rather than assumed to be: removing either half alone
+    // leaves every test green, because what each one guards is a *write* into
+    // `tile_b`, and that write's value never reaches `acc` regardless — the
+    // reduction loop below reads `tile_b[k][lx]` only for `k < k_len` (so a
+    // slot written at `ly >= k_len` is never read), and an invocation with
+    // `col >= params.M` has its own `acc` discarded by the store guard at the
+    // bottom (no *other* lane ever reads `tile_b[*][lx]` at a different `lx`).
+    //
+    // Both halves are still real guards on the `weight` *read* just above
+    // this comment, though, not just on the `tile_b` write — the read and the
+    // write share one `if`, so losing either half changes what gets read, not
+    // only what gets written. `ly < k_len`'s absence lets `k = k_base + ly`
+    // run to `K` or past it in the tile covering the ragged end of `K`, so
+    // `k >> 2u` can reach `words_per_row` or beyond — reading the *next*
+    // weight row's first word or two (or past the whole buffer, for the last
+    // row). `col < params.M`'s absence lets `col * words_per_row` itself walk
+    // past the last row entirely. WGSL does not promise an out-of-bounds
+    // storage read is a no-op, only that it will not reach another resource,
+    // so both stay — the same reason plain matmul keeps its own hygiene guard
+    // — even though neither read's result ever surfaces in `output`.
     if (col < params.M && ly < k_len) {
       let k = k_base + ly;
       let word = weight[col * words_per_row + (k >> 2u)];

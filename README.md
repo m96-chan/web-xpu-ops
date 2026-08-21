@@ -49,6 +49,7 @@ rather than being left blank.
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
+| `matmulQ8` | W8A32 GEMM: `matmul` with the right-hand operand held as an int8 weight instead of f32, `matvecQ8`'s own `[M, ceil(K/4)]` `u32` packed wire format read in-kernel — no separate dequant/transpose pass. Scale is `[M]`, `quantize`'s per-row absmax convention, applied once per output element. Speed unmeasured |
 | `transpose` | turned through workgroup memory so both read and write stay consecutive |
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
@@ -1161,18 +1162,21 @@ encodes every prompt token's pass through every layer into the same flat op
 list `runDecodeStep` builds — one `queue.submit` for the whole prompt, one
 readback (the **final** position's logits only — `forward()`'s prefill
 return shape changed to `[finalPositionLogits]`, matching what every real
-caller already read). It keeps the `matmul` path, not `matvecQ8` per
-token — that would multiply prefill's weight traffic by the prompt length,
-the opposite of the goal. Two new ops exist for this:
+caller already read). It kept a `matmul`-shaped path rather than `matvecQ8`
+per token — that would multiply prefill's weight traffic by the prompt
+length, the opposite of the goal (still true today: see "int8 prefill
+matmul (matmulQ8)" below, which changed *which* `matmul`-shaped kernel runs,
+not this decision). Two new ops existed for this at the time:
 
 - `ops/permute` — the `[tokens, heads, dim]` token-major <-> `[heads,
   tokens, dim]` head-major reshape `ops/gqa` needs, `LlamaEngineQ8`'s own
   CPU-side `llm/reshape.ts` functions ported to one GPU dispatch (reading
   Q/K/V back to the CPU to reshape, then re-uploading, would put a round
-  trip exactly where going resident removes one).
-- `ops/dequant_transpose` — dequantizes a packed int8 weight and transposes
+  trip exactly where going resident removes one). Still part of prefill's
+  own kernel set today.
+- `ops/dequant_transpose` — dequantized a packed int8 weight and transposed
   it to `matmul`'s `[K, N]` operand shape in one GPU dispatch. Measured
-  necessary, not merely nicer: the equivalent three CPU passes
+  necessary, not merely nicer, at the time: the equivalent three CPU passes
   (`packInt8Rows` → `dequantizePackedQ8` → `transposeRowMajor`, the detour
   `LlamaEngineQ8#project`'s own prefill branch takes from *already-packed*
   resident weight) cost ~100ms/layer on Sarashina2.2-1B's shape — **~2.5s
@@ -1185,6 +1189,15 @@ the opposite of the goal. Two new ops exist for this:
   layered on top of (which itself took 76-token prefill from 8.0s to 2.96s
   by removing the CPU pack+dequant+transpose *three-pass* detour's earlier,
   even slower form — see the PR for the intermediate numbers).
+
+  **No longer part of prefill's own kernel set** — issue #128 (below)
+  replaced this dispatch and plain `matmul` together with `matmulQ8`, which
+  reads the packed int8 weight in-kernel and needs neither. `ops/dequant_transpose`
+  itself still exists and is still exercised elsewhere (`llm/kernels.ts#runDequantTranspose`'s
+  own Node-side integration test, and `examples/llm-demo`'s WGSL parity
+  table), so this bullet is left as issue #117's own historical record
+  rather than rewritten — the "int8 prefill matmul (matmulQ8)" section is
+  where prefill's *current* weight-read path is described.
 
 KV writes go straight into the persistent, `maxSeqLen`-strided cache
 `runDecodeStep` reads: one contiguous `copyBufferToBuffer` per head (each
