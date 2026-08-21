@@ -1724,6 +1724,29 @@ one, `llm/engine-q8-resident.profile.wgsl.test.ts`). When given, it records:
   `readbackMs` (no GPU feature needed) but an empty, explicitly-flagged
   `gpuEntries` rather than a fabricated zero.
 
+**A real bug turned up before this measurement could be trusted.** An
+earlier version of `batch()` split every dispatch into its own compute pass
+whenever `BatchProfile.labels` was present *at all* — not gated on whether
+the caller actually wanted the GPU breakdown (`wantGpuBreakdown` below did
+not exist yet). That earlier version's own first measurement round reported
+`packInt8Rows` alone (1689.9ms) as *larger* than prefill's entire total from
+this same README's own #128 section (1175.0ms) — impossible for a sub-phase
+of that same call, and review caught it before merge. `ForwardProfile` now
+takes a second, separate opt-in, `wantGpuBreakdown` (default `false`): only
+when a caller explicitly sets it does `runPrefillResident`/`runDecodeStep`
+build a per-dispatch `labels` array at all, so a caller who only wants the
+CPU-side fields below (`packEntries`, `uploadMs`, `layerSetupMs`,
+`submitToDoneMs`) never pays the pass-splitting cost, and `batch()`'s own
+pass-splitting branch is gated on `wantsGpuTiming` (device support **and**
+caller intent), not merely a `labels` array being present.
+`__prefillProfileBenchmark` was also extended to run a **genuinely
+unprofiled control `forward()` call, in the same session, immediately
+before every profiled one** — the fix this bug actually needed: the
+original comparison was against a *different* PR's *differently-conditioned*
+measurement, not against this run's own unprofiled baseline, so there was
+no way to tell instrumentation overhead from ordinary session-to-session
+variance. Re-measured below against that control.
+
 **Measured (rule 9 — RTX 5090, NVIDIA driver 610.57.04, Linux/Arch kernel
 7.1.5-arch1-2, Chrome 151.0.7922.71 non-headless via CDP on a dedicated
 `--user-data-dir`/`--remote-debugging-port`, adapter `vendor: nvidia,
@@ -1731,65 +1754,76 @@ architecture: blackwell`, backend Dawn/Vulkan; real Sarashina2.2-1B-alibi-v1
 int8 checkpoint, 24 layers, `hiddenSize=1792`, `vocabSize=102400`;
 `examples/llm-demo/src/main.ts#__prefillProfileBenchmark`, synthetic-but-
 in-range token ids so prompt length is exact; one `LlamaEngineQ8Resident`,
-`reset()` between prompt lengths; 8 samples per prompt length across one
-CDP-driven run). This machine was **not idle**: other sessions' Chrome and
-`examples/llm-demo/server.mjs` processes were running concurrently
-throughout (`ps aux` during this run showed multiple unrelated Chrome
-renderer/server processes; `nvidia-smi` spot-checks read 3-4% utilization
-and ~7.4 GiB already resident from other processes) — the same
-"GPU共有デスクトップ" caveat issue #120's own measurement section already
-gives, reported rather than smoothed over):
+`reset()` between every generation, including between each prompt length's
+own control and profiled call). Machine load at measurement time: `load
+average 0.59, 0.77, 0.75`, top CPU consumers 4-5% each (confirmed with the
+reviewer independently, after an earlier round's contention claim turned
+out to be stale idle processes rather than real load — corrected here
+rather than left in). 5 samples per prompt length with `wantGpuBreakdown:
+false` (the cost figures below), 3 more with `wantGpuBreakdown: true` (the
+GPU row below, plus an independent overhead check) — all percentages are
+against **this run's own control**, not a number from a different PR:
 
-| | N=76 (mean, range, n=8) | N=365 (mean, range, n=8) |
+| | N=76 (mean, range) | N=365 (mean, range) |
 | --- | --- | --- |
-| **prefill `totalMs`** | **2138.7ms** (2114.0–2172.5) | **2197.9ms** (2184.3–2214.9) |
-| `packInt8Rows` CPU sum (item 1) | 1689.9ms (**79.0%** of total) | 1688.4ms (**76.8%**) |
-| layer-setup wall-clock — pack+upload+bindGroup, one `Promise.all` per layer × 24 (items 1-3 combined, additive) | 2086.8ms (**97.6%**) | 2056.5ms (**93.6%**) |
-| `queue.writeBuffer` CPU enqueue (item 2) | 39.8ms | 39.1ms |
-| `queue.writeBuffer` bytes | ~1.043 GiB | ~1.045 GiB |
-| GPU kernel time, timestamp-query, 168 `matmulQ8` dispatches + smaller kernels (item 4) | 39.55ms (**1.85%**) | 131.51ms (**5.98%**) |
-| submit→GPU-done wait (item 4, CPU-visible half) | 45.1ms (2.1%) | 136.1ms (6.2%) |
-| readback (`mapAsync`) | 0.3ms | 0.4ms |
-| **decode, 1 token, same call** `totalMs` | 25.6ms (14.2–40.8) | 18.5ms (13.8–42.4) |
-| decode `packEntries` / `bindGroupCalls` | **0 / 0** | **0 / 0** |
-| decode submit→GPU-done wait | 24.9ms (**97%** of decode total) | 17.4ms (**94%**) |
+| **control `forward()`, unprofiled** (n=5) | **2097.7ms** (2071.9–2155.7) | **2178.5ms** (2152.1–2216.7) |
+| profiled `totalMs`, `wantGpuBreakdown: false` (n=5) | 2089.2ms — **overhead −0.4%** (range −1.0% to +0.7%) | 2199.6ms — **overhead +1.0%** (range −0.6% to +2.2%) |
+| `packInt8Rows` CPU sum (item 1), % **of control** | 1686.7ms (**80.4%**) | 1700.1ms (**78.0%**) |
+| `queue.writeBuffer` CPU enqueue (item 2) | ~38ms | ~38ms |
+| `queue.writeBuffer` bytes | ~1.04 GiB | ~1.04 GiB |
+| submit→GPU-done wait (item 4, CPU-visible half) | 41.6ms | 117.0ms |
+| profiled `totalMs`, `wantGpuBreakdown: true` (n=3) | 2084.7ms — overhead −0.8% | 2179.4ms — overhead +0.5% |
+| GPU kernel time, timestamp-query (item 4, n=3) | 35.17ms (**1.67% of control**) | 114.19ms (**5.27% of control**) |
+| decode control / profiled `totalMs` | 27.1ms / 27.3ms | 13.0ms / 13.9ms |
+| decode `packEntries` / `bindGroupCalls` (every sample) | 0 / 0 | 0 / 0 |
 
-**`packInt8Rows` alone accounts for ~77-79% of prefill's own wall time, and
-the whole per-layer setup block it sits inside (pack + upload + bind-group
-validation, one `Promise.all` per layer) accounts for ~94-98% — GPU kernel
-time is 2-6% and scales with `N` as expected for a GEMM's row count, while
-the CPU-side setup cost does not (2086.8ms at N=76 vs. 2056.5ms at N=365,
-same fixed-cost-independent-of-prompt-length shape issue #128/#130 already
-established, now attributed to a specific phase rather than left as
-"something in `runPrefillResident`").** This confirms the reviewer's own
-comment on this issue: the same ~1 GiB of packed weight bytes
-`buildProjection` already uploaded once, for decode, in `create()`, is
-re-packed and re-uploaded by `matmulQ8IntoShape` on every single `forward()`
-call. Decode's own profile is the direct contrast: `packEntries`/
-`bindGroupCalls` are exactly zero every run (`runDecodeStep` never calls
+**`packInt8Rows` alone accounts for ~78-80% of prefill's own wall time,
+measured against this run's own unprofiled control — instrumentation
+overhead is noise-level (−1.0% to +2.2%) in both profiling modes, so this
+is not an artifact of the earlier pass-splitting bug.** GPU kernel time is
+1.7-5.3% and scales with `N` as expected for a GEMM's row count (35ms at
+N=76 → 114ms at N=365), while control `totalMs` itself barely moves
+(2097.7ms → 2178.5ms, 3.9% for 4.8x the tokens) — the same fixed-cost-
+independent-of-prompt-length shape issue #128/#130 already established,
+now attributed to a specific phase with a same-session control behind it.
+Decode's own profile is the direct contrast: `packEntries`/`bindGroupCalls`
+are exactly zero on every single sample (`runDecodeStep` never calls
 `matmulQ8IntoShape` — its bind groups were all built once, in `create()`),
-and its ~15-40ms total is almost entirely the GPU submit-to-completion wait,
-not CPU setup — the same work, done once instead of once per call, costs
-nothing per-token.
+and its ~13-27ms total tracks its own control closely.
+
+**This transfer buys nothing, and the fix is already known (tracked as
+#142, not attempted here — see Scope below).** `buildProjection`
+(`create()`, line ~269, decode's resident weight) and `matmulQ8IntoShape`
+(`runPrefillResident`, line ~431, prefill's per-call weight) both call
+`packInt8Rows(linear.codes, ...)` on the **same underlying `linear.codes`
+array** — identical bytes, identical function, only the argument names
+differ. `buildProjection`'s own upload already sits on the GPU, resident,
+for the whole engine's lifetime; `matmulQ8IntoShape` re-derives and
+re-uploads that same ~1 GiB from scratch on every `forward()` call and then
+discards the buffer once `batch()` resolves. The two call sites differ only
+in bind-group order (`[weight, scale, vector, out, uniform]` for decode's
+`matvecQ8` vs. `[a, weight, scale, out, uniform]` for prefill's `matmulQ8`)
+— binding the same resident `GPUBuffer` at the position `matmulQ8` expects
+removes the CPU pack and the GPU upload both, with no new kernel and no
+precision change.
 
 `bindGroupMs` (the sum of each individual `device.bindGroup()` call's own
 await, not wall-clock) is reported in the code but **not** in the table
-above deliberately — it reached ~11.5-12.1s on these same runs, larger than
-`totalMs` itself, because prefill's nine per-layer calls run concurrently
-under `Promise.all` and their individual await windows overlap; summing
-them is not a wall-clock quantity and would misstate this section's own
-conclusion if read as one. `layerSetupMs` (wall-clock around the whole
-`Promise.all` block) is the number this section actually uses, and is
-additive against `totalMs` by construction — see `ForwardProfile`'s own doc
-for the full reasoning, kept here only as a pointer so a future reader does
-not rediscover the same trap by eyeballing the raw JSON.
+above deliberately — under the *pre-fix* code it reached ~11.5-12.1s on a
+76-token prefill whose own `totalMs` was ~2.1s, because prefill's nine
+per-layer calls run concurrently under `Promise.all` and their individual
+await windows overlap; summing them is not a wall-clock quantity and would
+misstate this section's own conclusion if read as one. `layerSetupMs`
+(wall-clock around the whole `Promise.all` block, tracked closely with
+`packInt8Rows` above in every sample of this run) is the field to use
+instead — see `ForwardProfile`'s own doc for the full reasoning.
 
 **Scope.** No optimization is included here — per this issue's own
-completion condition, only the breakdown. The likely fix (keep the decode-
-side resident weight/scale buffers alive and bind them into `matmulQ8`
-instead of re-packing per call) is named, not attempted; it is tracked as
-its own follow-up issue so a correctness-first, one-change-at-a-time PR can
-review it against this measurement rather than against a hypothesis.
+completion condition, only the breakdown. The fix named above (keep
+decode's resident weight/scale buffers alive and bind them into `matmulQ8`
+instead of re-packing per call) is tracked as its own follow-up issue (#142)
+so a correctness-first, one-change-at-a-time PR can review it against this
+measurement as its own baseline.
 
 ### Scope
 

@@ -15,22 +15,35 @@ Entries record **why** a change was needed. What changed is in the diff.
   `packInt8Rows` CPU cost, `queue.writeBuffer` bytes/time, bind-group
   creation (both a raw per-call sum and the wall-clock time of prefill's own
   per-layer `Promise.all` block), GPU submit-to-completion wait, readback,
-  and — when the device negotiated `timestamp-query` — one GPU duration per
-  labeled dispatch. `undefined` by default (every existing caller), so this
-  changes no dispatch, no bind group and no arithmetic for anyone not asking
-  for it; proved directly by a bit-for-bit logits comparison between a
-  profiled and an unprofiled prefill call
-  (`llm/engine-q8-resident.profile.wgsl.test.ts`). Exists to answer #131's
-  own question — a reviewer comment on PR #130 named
-  `matmulQ8IntoShape`'s per-`forward()` re-pack-and-reupload of the same
-  ~1 GiB of weight bytes decode already keeps resident as prefill's likely
-  fixed cost, and this measures it directly instead of guessing again.
-  README's new "Where prefill's ~1.2s fixed cost actually goes" section has
-  the measured numbers: `packInt8Rows` alone is ~77-79% of prefill's own
-  wall time, ~94-98% once the whole per-layer setup block it sits inside is
-  counted, against 2-6% for actual GPU kernel time. **No optimization is
-  included in this change** — per this issue's own scope, only the
-  measurement.
+  and — only when the caller also opts into `ForwardProfile.wantGpuBreakdown`
+  and the device negotiated `timestamp-query` — one GPU duration per labeled
+  dispatch. `undefined` by default (every existing caller), so this changes
+  no dispatch, no bind group and no arithmetic for anyone not asking for it;
+  proved directly by a bit-for-bit logits comparison between a profiled and
+  an unprofiled prefill call (`llm/engine-q8-resident.profile.wgsl.test.ts`).
+  `wantGpuBreakdown` exists as a second, separate opt-in (PR #141 review)
+  because the GPU-side breakdown costs a dedicated compute pass per labeled
+  dispatch (~500 extra pass boundaries at Sarashina2.2-1B's 24-layer scale)
+  — real overhead that must not land on a caller who only wants the cheap
+  CPU-side fields, and did in an earlier version of this change before
+  review caught it (that version's own first measurement had `packInt8Rows`
+  alone reading larger than an unrelated PR's entire unprofiled prefill
+  total, which cannot be right for a sub-phase of the same call).
+
+  Exists to answer #131's own question — a reviewer comment on PR #130
+  named `matmulQ8IntoShape`'s per-`forward()` re-pack-and-reupload of the
+  same ~1 GiB of weight bytes decode already keeps resident as prefill's
+  likely fixed cost, and this measures it directly instead of guessing
+  again. README's new "Where prefill's ~1.2s fixed cost actually goes"
+  section has the measured numbers, checked against a genuinely unprofiled
+  control run in the same session: `packInt8Rows` alone is ~78-80% of
+  prefill's own control wall time, against 1.7-5.3% for actual GPU kernel
+  time — instrumentation overhead itself measured at noise level (roughly
+  ±2%) once `wantGpuBreakdown` correctly gates the pass-splitting cost.
+  **No optimization is included in this change** — per this issue's own
+  scope, only the measurement; the fix itself (bind decode's already-
+  resident weight buffers into prefill's `matmulQ8` instead of re-packing)
+  is tracked separately as issue #142.
 
 - `ops/matmul` gets a `matmulQ8` entry point (issue #128): the same tiled
   GEMM as plain `matmul`, but the right-hand operand is read as a packed
