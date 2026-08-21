@@ -260,10 +260,29 @@ function instrumentDevice(device: ResidentDevice, sink: ForwardProfile): Residen
  * same ~1.2s). `matmulQ8` (`ops/matmul/reference.ts`'s own doc) removes that
  * pass: the kernel dequantizes in-kernel from the same packed int8 layout
  * `matvecQ8` already reads, so there is no intermediate f32 buffer to write
- * or read at all — only the packed weight and its per-row scale, uploaded
- * once per layer per `forward()` call (`matmulQ8IntoShape` below), the same
- * "once per generation, not per token" cost `LlamaEngineQ8#project`'s doc
- * already accepted, just without the transpose in between.
+ * or read at all — only the packed weight and its per-row scale, which
+ * issue #128 itself still uploaded fresh once per layer per `forward()`
+ * call (`matmulQ8IntoShape`, at the time), the same "once per generation,
+ * not per token" cost `LlamaEngineQ8#project`'s doc already accepted, just
+ * without the transpose in between.
+ *
+ * Issue #142 removed that upload too: #131/#141's own profiling found it —
+ * not the GPU kernel itself (2-6% of prefill's own fixed cost) — was where
+ * the time actually went (`packInt8Rows`'s CPU cost alone, 77-79%). The
+ * bytes `matmulQ8IntoShape` packed and uploaded on every `forward()` call
+ * were always the *same* bytes `buildProjection`'s decode-side bind groups
+ * had already uploaded once in `create()` — same function
+ * (`packInt8Rows`), same `linear` object (`weights.layers[l]`'s own field,
+ * read by both `create()`'s `layer` loop variable and
+ * `runPrefillResident`'s `lw`), same wire format `matvecQ8` and `matmulQ8`
+ * both read. `buildProjection`/`buildFfnProjection`/`buildResidualProjection`
+ * now keep those `GPUBuffer` handles (`ResidentWeight`, `LayerResident`'s own
+ * fields) instead of discarding them once the decode bind group is built,
+ * and `bindMatmulQ8` (below `MatmulQ8ProjectionShape`) binds them directly —
+ * no `packInt8Rows`, no `device.upload`, no new `GPUBuffer` at all, for
+ * every prefill call after the first (`create()`'s own). VRAM residency is
+ * unchanged: these bytes were already resident for decode; prefill now
+ * reads the same allocation instead of paying for a second, transient one.
  *
  * ## Reshape: a GPU permute kernel, not a CPU round trip
  *
@@ -387,14 +406,20 @@ function instrumentDevice(device: ResidentDevice, sink: ForwardProfile): Residen
  * `+Infinity`-poisoned proof.
  *
  * Not free, still: `runPrefillResident`'s own transient, `N`-sized buffer
- * allocation and its per-layer packed-weight pack-and-upload
- * (`matmulQ8IntoShape`, issue #128) both re-run on every generation,
- * `reset()`-triggered or not — that was already true
- * before issue #120 (every generation pays it exactly once, on its own
- * first `forward()` call), and `reset()` does not change it. What `reset()`
- * removes is strictly the `create()` call itself and the weight re-upload
- * inside it, which is the term alibi-ai's own measurement named as
- * dominant.
+ * allocation re-runs on every generation, `reset()`-triggered or not — that
+ * was already true before issue #120 (every generation pays it exactly
+ * once, on its own first `forward()` call), and `reset()` does not change
+ * it. What `reset()` removes is strictly the `create()` call itself and the
+ * weight re-upload inside it, which is the term alibi-ai's own measurement
+ * named as dominant.
+ *
+ * Issue #142 removed the *other* per-generation weight cost this paragraph
+ * used to name here — `runPrefillResident`'s own per-layer packed-weight
+ * pack-and-upload (`matmulQ8IntoShape`, issue #128) no longer re-runs at
+ * all, `reset()`-triggered or not: `bindMatmulQ8` binds `this.layers[l]`'s
+ * resident `ResidentWeight`s, built once in `create()`, on every prefill
+ * call including the very first one. See `MatmulQ8ProjectionShape`'s own
+ * doc for the full explanation.
  */
 
 const CODE = {
@@ -448,7 +473,20 @@ function sliceLinear(linear: QuantizedLinear, rowStart: number, rowCount: number
   };
 }
 
-/** Packs, uploads and binds one `matvecQ8` projection: weight, scale, the shared vector/output buffers it reads and writes, and the uniform (`M`, `K`) it shares with every layer's same projection. */
+/**
+ * One projection's resident, packed-int8 weight — the `GPUBuffer` pair
+ * `buildProjection`/`buildFfnProjection`/`buildResidualProjection` upload
+ * once in `create()`. Issue #142: kept (not discarded once the decode bind
+ * group is built) so `runPrefillResident` can bind these same buffers
+ * directly instead of re-running `packInt8Rows` + `device.upload` for the
+ * identical bytes on every `forward()` call — see `bindMatmulQ8`'s own doc.
+ */
+interface ResidentWeight {
+  weightBuf: GPUBuffer;
+  scaleBuf: GPUBuffer;
+}
+
+/** Packs, uploads and binds one `matvecQ8` projection: weight, scale, the shared vector/output buffers it reads and writes, and the uniform (`M`, `K`) it shares with every layer's same projection. Issue #142: also returns the packed `weightBuf`/`scaleBuf` handles (not just the bind group) so a caller — `runPrefillResident`, via `LayerResident`'s own fields — can reuse the exact same resident bytes later instead of re-packing them. */
 async function buildProjection(
   device: ResidentDevice,
   pipeline: GPUComputePipeline,
@@ -458,13 +496,14 @@ async function buildProjection(
   uniform: GPUBuffer,
   vectorBuf: GPUBuffer,
   outBuf: GPUBuffer,
-): Promise<GPUBindGroup> {
+): Promise<{ bindGroup: GPUBindGroup; weight: ResidentWeight }> {
   const packed = packInt8Rows(linear.codes, N, K);
   const weightBuf = device.createStorageBuffer(packed.byteLength);
   device.upload(weightBuf, 0, packed);
   const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
   device.upload(scaleBuf, 0, linear.scale);
-  return device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, outBuf, uniform]);
+  const bindGroup = await device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, outBuf, uniform]);
+  return { bindGroup, weight: { weightBuf, scaleBuf } };
 }
 
 /**
@@ -479,6 +518,9 @@ async function buildProjection(
  * *existing* `{N: ffnHidden, K: hiddenSize}` uniform `create()` already
  * builds for the old `gateGroup` (`gateUniform`) — this op's `Params` shape
  * is identical to `q8`'s, so no new uniform buffer is needed.
+ *
+ * Issue #142: also returns the two packed `ResidentWeight`s (gate, up), not
+ * just the bind group — see `buildProjection`'s own doc for why.
  */
 async function buildFfnProjection(
   device: ResidentDevice,
@@ -490,7 +532,7 @@ async function buildFfnProjection(
   uniform: GPUBuffer,
   vectorBuf: GPUBuffer,
   outBuf: GPUBuffer,
-): Promise<GPUBindGroup> {
+): Promise<{ bindGroup: GPUBindGroup; gate: ResidentWeight; up: ResidentWeight }> {
   const packedGate = packInt8Rows(gate.codes, N, K);
   const weightGateBuf = device.createStorageBuffer(packedGate.byteLength);
   device.upload(weightGateBuf, 0, packedGate);
@@ -501,7 +543,12 @@ async function buildFfnProjection(
   device.upload(weightUpBuf, 0, packedUp);
   const scaleUpBuf = device.createStorageBuffer(up.scale.byteLength);
   device.upload(scaleUpBuf, 0, up.scale);
-  return device.bindGroup(pipeline, [weightGateBuf, scaleGateBuf, weightUpBuf, scaleUpBuf, vectorBuf, outBuf, uniform]);
+  const bindGroup = await device.bindGroup(pipeline, [weightGateBuf, scaleGateBuf, weightUpBuf, scaleUpBuf, vectorBuf, outBuf, uniform]);
+  return {
+    bindGroup,
+    gate: { weightBuf: weightGateBuf, scaleBuf: scaleGateBuf },
+    up: { weightBuf: weightUpBuf, scaleBuf: scaleUpBuf },
+  };
 }
 
 /**
@@ -511,6 +558,9 @@ async function buildFfnProjection(
  * order. `uniform` is, again, an existing `{N, K}` uniform (`oUniform` for
  * `wo`, `downUniform` for `wDown`) — `q8_residual`'s `Params` struct is
  * identical to `q8`'s.
+ *
+ * Issue #142: also returns the packed `ResidentWeight`, not just the bind
+ * group — see `buildProjection`'s own doc for why.
  */
 async function buildResidualProjection(
   device: ResidentDevice,
@@ -522,13 +572,14 @@ async function buildResidualProjection(
   vectorBuf: GPUBuffer,
   residualBuf: GPUBuffer,
   outBuf: GPUBuffer,
-): Promise<GPUBindGroup> {
+): Promise<{ bindGroup: GPUBindGroup; weight: ResidentWeight }> {
   const packed = packInt8Rows(linear.codes, N, K);
   const weightBuf = device.createStorageBuffer(packed.byteLength);
   device.upload(weightBuf, 0, packed);
   const scaleBuf = device.createStorageBuffer(linear.scale.byteLength);
   device.upload(scaleBuf, 0, linear.scale);
-  return device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, residualBuf, outBuf, uniform]);
+  const bindGroup = await device.bindGroup(pipeline, [weightBuf, scaleBuf, vectorBuf, residualBuf, outBuf, uniform]);
+  return { bindGroup, weight: { weightBuf, scaleBuf } };
 }
 
 /** Must match `TILE` in `ops/matmul/wgsl/q8.wgsl` — copied per rule 2, same as `llm/kernels.ts#MATMUL_TILE`. */
@@ -556,22 +607,25 @@ const DEFAULT_MAX_STORAGE_BINDING_BYTES = 128 * 1024 * 1024;
  * `aBuf`/`outBuf`/`uniform` are the activation buffers and the `(N, M, K)`
  * uniform, none of which depend on which layer's weight is about to flow
  * through the dispatch. `outFeatures`/`inFeatures` are kept alongside for
- * `matmulQ8IntoShape` below to size and pack that layer's own weight.
+ * `matmulQ8IntoShape` below (the debug-only lmHead path — see its own doc)
+ * to size and pack that one weight.
  *
  * Issue #128: this replaces `MatmulProjectionShape`'s pre-#128 `weightTBuf` —
  * a shared `[inFeatures, outFeatures]` f32 buffer that `ops/dequant_transpose`
  * dequantized-and-transposed a layer's packed weight *into*, once per layer,
  * for plain `matmul` to then read back out in full. `matmulQ8` (`ops/matmul/reference.ts`'s
  * own doc) reads the packed int8 weight directly — same wire format
- * `matvecQ8`'s decode-side `buildProjection` already uploads — so there is no
- * shared GPU-side scratch buffer left to reuse across layers at all: a
- * layer's weight now goes straight from `packInt8Rows` (CPU) to its own
- * transient `weightBuf`/`scaleBuf` (`matmulQ8IntoShape` below), the same
- * shape `dequantIntoShape` used for its *own* per-layer transient
- * weight/scale before dequantizing them — except now nothing dequantizes
- * them, `matmulQ8`'s dispatch just reads them, so the GPU write-then-read of
- * `inFeatures * outFeatures` f32 values that pass paid on every `forward()`
- * call is gone.
+ * `matvecQ8`'s decode-side `buildProjection` already uploads.
+ *
+ * Issue #142: for every *production* projection (`wq`/`wk`/`wv`/`wo`/gate/
+ * up/`wDown`), there is no per-call packing left at all — `bindMatmulQ8`
+ * below binds `shape`'s own `aBuf`/`outBuf`/`uniform` straight against the
+ * layer's already-resident `ResidentWeight` (`buildProjection`/
+ * `buildFfnProjection`/`buildResidualProjection`'s own return, built once in
+ * `create()` for decode). `outFeatures`/`inFeatures` still describe the
+ * shape (`matmulWg`'s workgroup count needs them), but nothing here sizes or
+ * packs a weight for that path any more — only `matmulQ8IntoShape`'s
+ * debug-only lmHead caller still does.
  */
 interface MatmulQ8ProjectionShape {
   aBuf: GPUBuffer;
@@ -592,28 +646,57 @@ function matmulQ8ProjectionShape(
 }
 
 /**
- * One layer's `matmulQ8` bind group, built fresh every call (unlike
- * `runDecodeStep`'s `buildProjection`, built once in `create()`): a fresh
- * `weightBuf`/`scaleBuf` per layer per projection, packed the same way
- * `buildProjection` packs its own resident decode-side weight
- * (`packInt8Rows`, `matvecQ8`'s wire format — a plain per-row byte copy, no
- * arithmetic, `ops/dequant_transpose/reference.ts`'s own doc measured this
- * step at ~170ms total across Sarashina2.2-1B's 24 layers), bound straight
- * into `matmulQ8` alongside `shape`'s own constant `aBuf`/`outBuf`/`uniform`.
+ * Issue #142: one layer's `matmulQ8` bind group, built fresh every call (the
+ * per-call `aBuf`/`outBuf`/`uniform` in `shape` are sized by this call's own
+ * `N`, unknown until `forward()` runs — see `MatmulQ8ProjectionShape`'s own
+ * doc) — but binding `weight`'s `weightBuf`/`scaleBuf` **as-is**, not a fresh
+ * pack of the same bytes. `weight` is the exact `ResidentWeight`
+ * `buildProjection`/`buildFfnProjection`/`buildResidualProjection` built once
+ * in `create()` for decode's own `matvecQ8`/`matvecQ8Ffn`/`matvecQ8Residual`
+ * bind groups: `packInt8Rows(linear.codes, N, K)` applied to the exact same
+ * `linear` (`weights.layers[l]`'s own field — `create()`'s `layer` loop
+ * variable and `runPrefillResident`'s `lw` are both `weights.layers[l]`,
+ * never a copy), so the byte layout `matmulQ8` reads here is *identical* to
+ * what `matmulQ8IntoShape`'s pre-#142 per-call `packInt8Rows` call used to
+ * produce fresh on every `forward()` — issue #142's own background, and the
+ * `packInt8Rows`-output-equality this repository's own review already
+ * confirmed before this change was made. Only the position in the bind
+ * group differs (`buildProjection`: `[weight, scale, vector, out, uniform]`;
+ * `matmulQ8`: `[a, weight, scale, out, uniform]`), which has nothing to do
+ * with the bytes underneath.
  *
- * A fresh buffer and a fresh bind group per layer, not a shared per-shape
- * buffer reused via `device.upload` the way a resident weight might suggest
- * — `ResidentDevice.upload`'s own doc says why that would be wrong here:
- * `queue.writeBuffer` runs immediately, not in `ops`' own push order, so
- * uploading layer `l + 1`'s bytes into a buffer layer `l`'s own (not yet
- * submitted) `matmulQ8` dispatch still reads would read the wrong layer's
- * weight the moment the whole batch actually submits. `dequantIntoShape`
- * (pre-#128) avoided this by writing through a GPU *dispatch* recorded into
- * `ops`, which executes in push order; a plain upload has no such op to
- * record. `weightBuf`/`scaleBuf` are collected into the caller's
- * `transientBuffers` and `destroy()`ed once `batch()` resolves, the same
- * lifetime `dequantIntoShape`'s own transient pair had (minus the third,
- * `dequantUniform`, which no longer exists).
+ * No `transient` buffers returned any more, unlike pre-#142's
+ * `matmulQ8IntoShape` (below): `weightBuf`/`scaleBuf` are owned by
+ * `this.layers` for the whole engine's lifetime, not by this call, so
+ * `runPrefillResident`'s own `transientBuffers.push/destroy()` loop no
+ * longer touches them at all — see that method's own doc for what is still
+ * transient there (the small per-layer norm-gain buffers only).
+ */
+async function bindMatmulQ8(
+  device: ResidentDevice,
+  matmulQ8Pipeline: GPUComputePipeline,
+  shape: MatmulQ8ProjectionShape,
+  weight: ResidentWeight,
+): Promise<GPUBindGroup> {
+  return device.bindGroup(matmulQ8Pipeline, [shape.aBuf, weight.weightBuf, weight.scaleBuf, shape.outBuf, shape.uniform]);
+}
+
+/**
+ * Packs, uploads and binds one **transient** `matmulQ8` projection —
+ * `bindMatmulQ8`'s pre-#142 shape, kept only for `debugAllPositionLogits`'s
+ * own full-`N`-position lmHead pass (`runPrefillResident`'s
+ * `debugAllPositions` branch). Every *production* projection went through
+ * this function before issue #142 and now goes through `bindMatmulQ8`
+ * instead (see that function's own doc) — `weights.lmHead` alone still
+ * calls this one, because `lmHead`'s only resident weight buffers
+ * (`this.lmHeadChunks`) are chunked by `MAX_WORKGROUPS_PER_DISPATCH`-sized
+ * row ranges for `matvecQ8`'s decode-shaped dispatch, not by `matmulQ8`'s
+ * own `[M, K]` tile shape — reusing them here would need re-deriving which
+ * chunk(s) a `matmulQ8` tile spans, for a debug/test-only path
+ * (`debugAllPositionLogits`'s own doc: "never called by `forward()`... this
+ * class's own production path") that real generation never runs. Not worth
+ * it for a path whose own sibling comment already accepts recomputing
+ * `lm_head` for every prompt position as a deliberate, debug-only cost.
  */
 async function matmulQ8IntoShape(
   device: ResidentDevice,
@@ -650,7 +733,7 @@ interface SharedResident {
   elementwisePipeline: GPUComputePipeline;
   /** Prefill only — see `runPrefillResident`. */
   permutePipeline: GPUComputePipeline;
-  /** Prefill only — see `runPrefillResident`/`matmulQ8IntoShape`. */
+  /** Prefill only — see `runPrefillResident`/`bindMatmulQ8`. */
   matmulQ8Pipeline: GPUComputePipeline;
 
   hiddenA: GPUBuffer;
@@ -700,6 +783,23 @@ interface LayerResident {
   ffnGroup: GPUBindGroup;
   /** Issue #111: `matvecQ8Residual` — `hiddenA = hiddenB + wDown · gatedBuf`, fusing the old `downGroup` matvec and the old `add2Group` elementwise add into one dispatch. */
   downGroup: GPUBindGroup;
+
+  /**
+   * Issue #142: this layer's seven projections' resident, packed-int8
+   * weight/scale buffer pairs — the exact `ResidentWeight`s
+   * `buildProjection`/`buildFfnProjection`/`buildResidualProjection`
+   * uploaded above to build `wqGroup`/`wkGroup`/.../`downGroup`, kept here
+   * too so `runPrefillResident`'s `bindMatmulQ8` calls can bind these same
+   * buffers into `matmulQ8`'s bind group instead of re-packing the
+   * identical bytes every `forward()` call.
+   */
+  wqWeight: ResidentWeight;
+  wkWeight: ResidentWeight;
+  wvWeight: ResidentWeight;
+  woWeight: ResidentWeight;
+  gateWeight: ResidentWeight;
+  upWeight: ResidentWeight;
+  downWeight: ResidentWeight;
 }
 
 interface LmHeadChunk {
@@ -747,12 +847,18 @@ export class LlamaEngineQ8Resident {
      * Held for this instance's whole lifetime, not dropped after the first
      * `forward()` call the way a pre-#120 version of this field
      * (`prefillWeights: LlamaWeightsQ8 | null`) did. `runPrefillResident`
-     * needs these CPU-side packed weights (`codes`/`scale` per layer) every
-     * time it runs — to pack and upload each layer's projection for
-     * `matmulQ8` (issue #128), since prefill's own transient weight buffers
-     * are not the persistent `matvecQ8` ones `create()` already built into
-     * `this.layers` — and
-     * issue #120 asks for exactly that: `reset()` followed by a *second*
+     * still needs these CPU-side weights every time it runs — the small
+     * per-layer `attnNorm`/`ffnNorm` gain vectors it re-uploads fresh each
+     * call (`create()`'s own `attnNormBuf`/`ffnNormBuf` are bound at `N = 1`
+     * shapes prefill cannot reuse), `finalNorm`, and — debug-only —
+     * `lmHead`'s codes/scale for `debugAllPositionLogits`'s full-position
+     * pass. Issue #142: it no longer reads `codes`/`scale` here for
+     * `wq`/`wk`/`wv`/`wo`/gate/up/`wDown` at all — `bindMatmulQ8` binds
+     * `this.layers[l]`'s own resident `ResidentWeight`s (built once in
+     * `create()` from these same fields) instead of re-packing them from
+     * `this.weights` on every call, which is what made the "held for the
+     * whole lifetime, not dropped" property below matter in the first place
+     * — issue #120 asks for exactly that: `reset()` followed by a *second*
      * prefill, not a one-shot.
      *
      * Costs nothing extra to keep: `weights` is a reference to the exact
@@ -784,13 +890,15 @@ export class LlamaEngineQ8Resident {
    * (`this.shared`, `this.layers`, `this.lmHeadChunks`) stays exactly as it
    * was; `runPrefillResident`'s transient, `N`-sized buffers for the new
    * prompt are still allocated fresh (they always were, once per prefill —
-   * see that method's own doc), and its per-layer packed-weight
-   * pack-and-upload still re-runs (needs `this.weights`, kept resident for exactly
-   * this — see that field's own doc) — neither of those is the ~1.4 GiB
-   * weight re-upload issue #120 exists to remove, which was **`create()`
-   * itself**: a whole new `ResidentDevice`, a whole new set of persistent
-   * `matvecQ8` weight buffers built via `device.upload()`. `reset()` means
-   * that call never happens again for a second, independent generation.
+   * see that method's own doc). Issue #142: its per-layer packed weight
+   * binding no longer re-packs or re-uploads anything on a second (third,
+   * ...) prefill — `bindMatmulQ8` reads straight from `this.layers[l]`'s own
+   * resident `ResidentWeight`s, built once back in `create()` — this is not
+   * the ~1.4 GiB weight re-upload issue #120 exists to remove, which was
+   * **`create()` itself**: a whole new `ResidentDevice`, a whole new set of
+   * persistent `matvecQ8` weight buffers built via `device.upload()`.
+   * `reset()` means that call never happens again for a second, independent
+   * generation.
    *
    * Old KV cache contents are **not** cleared here, deliberately — nothing
    * clears them. The next generation's own prefill only ever *writes* into
@@ -1006,22 +1114,22 @@ export class LlamaEngineQ8Resident {
 
       const attnNormGroup = await device.bindGroup(rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]);
       const ffnNormGroup = await device.bindGroup(rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]);
-      const wqGroup = await buildProjection(device, matvecPipeline, layer.wq, qDim, hiddenSize, qUniform, normedBuf, qOutBuf);
-      const wkGroup = await buildProjection(device, matvecPipeline, layer.wk, kvDim, hiddenSize, kUniform, normedBuf, kOutBuf);
-      const wvGroup = await buildProjection(device, matvecPipeline, layer.wv, kvDim, hiddenSize, vUniform, normedBuf, vOutBuf);
+      const { bindGroup: wqGroup, weight: wqWeight } = await buildProjection(device, matvecPipeline, layer.wq, qDim, hiddenSize, qUniform, normedBuf, qOutBuf);
+      const { bindGroup: wkGroup, weight: wkWeight } = await buildProjection(device, matvecPipeline, layer.wk, kvDim, hiddenSize, kUniform, normedBuf, kOutBuf);
+      const { bindGroup: wvGroup, weight: wvWeight } = await buildProjection(device, matvecPipeline, layer.wv, kvDim, hiddenSize, vUniform, normedBuf, vOutBuf);
       // Issue #111: `hiddenB = hiddenA + wo · attnOutBuf` — fused
       // matvecQ8+residual, replacing the old `woGroup` (plain matvecQ8 into
       // `projOutBuf`) plus a separate `add1Group` elementwise dispatch.
-      const woGroup = await buildResidualProjection(device, matvecResidualPipeline, layer.wo, hiddenSize, qDim, oUniform, attnOutBuf, hiddenA, hiddenB);
+      const { bindGroup: woGroup, weight: woWeight } = await buildResidualProjection(device, matvecResidualPipeline, layer.wo, hiddenSize, qDim, oUniform, attnOutBuf, hiddenA, hiddenB);
       // Issue #111: `gatedBuf = silu(wGate · normed2Buf) * (wUp · normed2Buf)`
       // — fused gate+up+silu+multiply, replacing the old `gateGroup`/
       // `upGroup` (two plain matvecQ8 dispatches) plus the old
       // `siluGroup`/`mulGroup` (activation, then elementwise multiply).
-      const ffnGroup = await buildFfnProjection(device, matvecFfnPipeline, layer.wGate, layer.wUp, ffnHidden, hiddenSize, gateUniform, normed2Buf, gatedBuf);
+      const { bindGroup: ffnGroup, gate: gateWeight, up: upWeight } = await buildFfnProjection(device, matvecFfnPipeline, layer.wGate, layer.wUp, ffnHidden, hiddenSize, gateUniform, normed2Buf, gatedBuf);
       // Issue #111: `hiddenA = hiddenB + wDown · gatedBuf` — fused
       // matvecQ8+residual, same shape as `woGroup` above, replacing the old
       // `downGroup` (plain matvecQ8 into `downOutBuf`) plus `add2Group`.
-      const downGroup = await buildResidualProjection(device, matvecResidualPipeline, layer.wDown, hiddenSize, ffnHidden, downUniform, gatedBuf, hiddenB, hiddenA);
+      const { bindGroup: downGroup, weight: downWeight } = await buildResidualProjection(device, matvecResidualPipeline, layer.wDown, hiddenSize, ffnHidden, downUniform, gatedBuf, hiddenB, hiddenA);
 
       const kCacheBuf = device.createStorageBuffer(numKvHeads * maxSeqLen * headDim * 4);
       const vCacheBuf = device.createStorageBuffer(numKvHeads * maxSeqLen * headDim * 4);
@@ -1030,6 +1138,8 @@ export class LlamaEngineQ8Resident {
 
       layers.push({
         kCacheBuf, vCacheBuf, attnNormGroup, ffnNormGroup, wqGroup, wkGroup, wvGroup, scoresGroup, contextGroup, woGroup, ffnGroup, downGroup,
+        // Issue #142 — see `LayerResident.wqWeight`'s own doc.
+        wqWeight, wkWeight, wvWeight, woWeight, gateWeight, upWeight, downWeight,
       });
     }
 
@@ -1049,7 +1159,7 @@ export class LlamaEngineQ8Resident {
       const chunkUniform = uniformOf(device, [["u32", rowCount], ["u32", hiddenSize]]);
       const outBuf = device.createStorageBuffer(rowCount * 4);
       const staging = device.createStorageBuffer(rowCount * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
-      const group = await buildProjection(
+      const { bindGroup: group } = await buildProjection(
         device, matvecPipeline, sliceLinear(weights.lmHead, rowStart, rowCount, hiddenSize), rowCount, hiddenSize, chunkUniform, finalNormedBuf, outBuf,
       );
       lmHeadChunks.push({ rowCount, group, outBuf, staging });
@@ -1114,19 +1224,28 @@ export class LlamaEngineQ8Resident {
    * resident too" / "Reshape" / "Prefill's own KV" sections for the design;
    * this method is their assembly.
    *
-   * Every buffer here is transient — allocated once at the top of this call
-   * (sized by `N`, which `create()` cannot know) and left for GC once this
-   * `await` resolves. That is unlike `runDecodeStep`'s buffers (built once in
-   * `create()`, reused every step): prefill runs exactly once per generation
-   * (this class's own decode contract, enforced in `forward`), so there is
-   * no repeated call to amortize allocation across — the "resident" property
-   * that matters here is *within* this one call (one submit for the whole
-   * prompt), not across calls. Issue #120's `reset()` means "once per
-   * generation" no longer means "once per this class instance's lifetime" —
-   * this method's own transient allocation and per-layer packed-weight
-   * pack-and-upload both re-run, unchanged, on every generation after a `reset()`; see
+   * Every `N`-sized buffer here is transient — allocated once at the top of
+   * this call (sized by `N`, which `create()` cannot know) and left for GC
+   * once this `await` resolves. That is unlike `runDecodeStep`'s buffers
+   * (built once in `create()`, reused every step): prefill runs exactly once
+   * per generation (this class's own decode contract, enforced in
+   * `forward`), so there is no repeated call to amortize allocation across —
+   * the "resident" property that matters here is *within* this one call (one
+   * submit for the whole prompt), not across calls. Issue #120's `reset()`
+   * means "once per generation" no longer means "once per this class
+   * instance's lifetime" — this method's own `N`-sized transient allocation
+   * still re-runs, unchanged, on every generation after a `reset()`; see
    * that method's own doc for which cost `reset()` actually removes (it is
    * not this one).
+   *
+   * Issue #142: the per-layer *weight* buffers `matmulQ8` reads here are
+   * the one exception to "every buffer here is transient" — `bindMatmulQ8`
+   * binds `this.layers[l]`'s resident `ResidentWeight`s (`create()`-owned,
+   * outliving this call and every other call) rather than packing a fresh
+   * transient pair, which is exactly what removes the CPU repack this
+   * method used to pay on every one of those "on every generation after a
+   * `reset()`" re-runs the paragraph above still describes for the `N`-sized
+   * scratch.
    */
   private async runPrefillResident(tokens: number[], debugAllPositions = false, profile?: ForwardProfile): Promise<Float32Array[]> {
     // Issue #131: whole-call wall time, stopped at this method's very last
@@ -1300,11 +1419,13 @@ export class LlamaEngineQ8Resident {
     const gateShape = matmulQ8ProjectionShape(ffnHidden, hiddenSize, gateMmUniform, normed2Buf, gateOutBuf);
     const upShape = matmulQ8ProjectionShape(ffnHidden, hiddenSize, upMmUniform, normed2Buf, upOutBuf);
     const downShape = matmulQ8ProjectionShape(hiddenSize, ffnHidden, downMmUniform, gatedBuf, downOutBuf);
-    // Every layer's own transient buffers (packed weight/scale per
-    // projection, plus the small norm-gain buffers) — `destroy()`ed once
-    // `batch()` below has resolved, not left for GC (PR #119 review, item 7,
-    // carried over unchanged by issue #128 — the transient-buffer lifetime
-    // discipline did not depend on which kernel reads them).
+    // Every layer's own transient buffers — `destroy()`ed once `batch()`
+    // below has resolved, not left for GC (PR #119 review, item 7). Issue
+    // #142: the seven per-projection packed weight/scale buffers pre-#142's
+    // `matmulQ8IntoShape` used to push here on every call are gone — `bindMatmulQ8`
+    // below binds `this.layers[l]`'s own resident `ResidentWeight`s instead
+    // of packing fresh ones, so only the small per-layer norm-gain buffers
+    // remain transient.
     const transientBuffers: GPUBuffer[] = [];
 
     for (let l = 0; l < numLayers; l += 1) {
@@ -1328,34 +1449,39 @@ export class LlamaEngineQ8Resident {
       // Sarashina2.2-1B's scale (~24 layers x 9 groups = 216 sequential
       // awaits otherwise). `Promise.all` still issues them in order and
       // still balances every push/pop correctly: each of the nine calls
-      // below is synchronous (pack, upload, `pushErrorScope`,
-      // `createBindGroup`, the `popErrorScope()` *call*) right up to its own
-      // `await`, so by the time control reaches the next array element the
-      // previous one has already pushed and popped its own scope — nesting
-      // never overlaps, only the *wait* for each validation result does.
-      // Issue #131: wall-clock around the whole concurrent block, not each
-      // call inside it — see `ForwardProfile.layerSetupMs`'s own doc for why
-      // this is the additive number and `bindGroupMs` (summed per-call) is
-      // not.
+      // below is synchronous (`pushErrorScope`, `createBindGroup`, the
+      // `popErrorScope()` *call*) right up to its own `await`, so by the
+      // time control reaches the next array element the previous one has
+      // already pushed and popped its own scope — nesting never overlaps,
+      // only the *wait* for each validation result does. Issue #142: the
+      // seven `matmulQ8IntoShape` calls this used to run (each its own
+      // `packInt8Rows` + two `device.upload`s ahead of its own `bindGroup`)
+      // are now `bindMatmulQ8` calls — no pack, no upload, just a bind
+      // group against `layer`'s already-resident weight buffers, so
+      // `profile.packEntries` (issue #131) has no entries for these seven
+      // projections any more (`bindMatmulQ8` takes no `packProfile` — there
+      // is nothing left to time). Issue #131: wall-clock around the whole
+      // concurrent block, not each call inside it — see
+      // `ForwardProfile.layerSetupMs`'s own doc for why this is the additive
+      // number and `bindGroupMs` (summed per-call) is not.
       const layerSetupStart = profile ? performance.now() : 0;
       const [attnNormGroup, ffnNormGroup, wq, wk, wv, wo, gate, up, down] = await Promise.all([
         device.bindGroup(s.rmsnormPipeline, [hiddenA, attnNormBuf, normedBuf, rmsUniform]),
         device.bindGroup(s.rmsnormPipeline, [hiddenB, ffnNormBuf, normed2Buf, rmsUniform]),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wqShape, lw.wq, profile && { sink: profile, layer: l, proj: "wq" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wkShape, lw.wk, profile && { sink: profile, layer: l, proj: "wk" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, wvShape, lw.wv, profile && { sink: profile, layer: l, proj: "wv" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, woShape, lw.wo, profile && { sink: profile, layer: l, proj: "wo" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, gateShape, lw.wGate, profile && { sink: profile, layer: l, proj: "wGate" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, upShape, lw.wUp, profile && { sink: profile, layer: l, proj: "wUp" }),
-        matmulQ8IntoShape(device, s.matmulQ8Pipeline, downShape, lw.wDown, profile && { sink: profile, layer: l, proj: "wDown" }),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, wqShape, layer.wqWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, wkShape, layer.wkWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, wvShape, layer.wvWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, woShape, layer.woWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, gateShape, layer.gateWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, upShape, layer.upWeight),
+        bindMatmulQ8(device, s.matmulQ8Pipeline, downShape, layer.downWeight),
       ]);
       if (profile) profile.layerSetupMs += performance.now() - layerSetupStart;
-      transientBuffers.push(...wq.transient, ...wk.transient, ...wv.transient, ...wo.transient, ...gate.transient, ...up.transient, ...down.transient);
 
       dispatch(s.rmsnormPipeline, attnNormGroup, [N], profile && `L${l}:rmsnorm_attn`);
-      dispatch(s.matmulQ8Pipeline, wq.bindGroup, matmulWg(qDim), profile && `L${l}:matmulQ8_wq`);
-      dispatch(s.matmulQ8Pipeline, wk.bindGroup, matmulWg(kvDim), profile && `L${l}:matmulQ8_wk`);
-      dispatch(s.matmulQ8Pipeline, wv.bindGroup, matmulWg(kvDim), profile && `L${l}:matmulQ8_wv`);
+      dispatch(s.matmulQ8Pipeline, wq, matmulWg(qDim), profile && `L${l}:matmulQ8_wq`);
+      dispatch(s.matmulQ8Pipeline, wk, matmulWg(kvDim), profile && `L${l}:matmulQ8_wk`);
+      dispatch(s.matmulQ8Pipeline, wv, matmulWg(kvDim), profile && `L${l}:matmulQ8_wv`);
       dispatch(s.ropePipeline, ropeQGroup, [wg256((N * qDim) / 2)], profile && `L${l}:rope_q`);
       dispatch(s.ropePipeline, ropeKGroup, [wg256((N * kvDim) / 2)], profile && `L${l}:rope_k`);
       dispatch(s.permutePipeline, splitQGroup, [wg256(N * qDim)], profile && `L${l}:permute_split_q`);
@@ -1364,14 +1490,14 @@ export class LlamaEngineQ8Resident {
       dispatch(s.gqaScoresPipeline, gqaScoresGroup, [N, numHeads, 1], profile && `L${l}:gqa_scores`);
       dispatch(s.gqaContextPipeline, gqaContextGroup, [N, numHeads, 1], profile && `L${l}:gqa_context`);
       dispatch(s.permutePipeline, mergeGroup, [wg256(N * qDim)], profile && `L${l}:permute_merge`);
-      dispatch(s.matmulQ8Pipeline, wo.bindGroup, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_wo`);
+      dispatch(s.matmulQ8Pipeline, wo, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_wo`);
       dispatch(s.elementwisePipeline, add1Group, [wg256(N * hiddenSize)], profile && `L${l}:elementwise_add1`);
       dispatch(s.rmsnormPipeline, ffnNormGroup, [N], profile && `L${l}:rmsnorm_ffn`);
-      dispatch(s.matmulQ8Pipeline, gate.bindGroup, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_gate`);
-      dispatch(s.matmulQ8Pipeline, up.bindGroup, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_up`);
+      dispatch(s.matmulQ8Pipeline, gate, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_gate`);
+      dispatch(s.matmulQ8Pipeline, up, matmulWg(ffnHidden), profile && `L${l}:matmulQ8_up`);
       dispatch(s.activationPipeline, siluGroup, [wg256(N * ffnHidden)], profile && `L${l}:activation_silu`);
       dispatch(s.elementwisePipeline, mulGroup, [wg256(N * ffnHidden)], profile && `L${l}:elementwise_mul`);
-      dispatch(s.matmulQ8Pipeline, down.bindGroup, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_down`);
+      dispatch(s.matmulQ8Pipeline, down, matmulWg(hiddenSize), profile && `L${l}:matmulQ8_down`);
       dispatch(s.elementwisePipeline, add2Group, [wg256(N * hiddenSize)], profile && `L${l}:elementwise_add2`);
 
       // Into the persistent, maxSeqLen-strided cache `runDecodeStep` reads —
@@ -1440,15 +1566,19 @@ export class LlamaEngineQ8Resident {
       logits = [finalLogits];
     }
 
-    // PR #119 review, item 7 (carried over by issue #128): every layer's
-    // transient packed-weight/scale/norm buffer — `batch()` above has
+    // PR #119 review, item 7 (carried over by issue #128, narrowed by issue
+    // #142): every layer's transient norm-gain buffer, plus — only on the
+    // debug-only `debugAllPositions` path — `weights.lmHead`'s own transient
+    // packed-weight/scale from `matmulQ8IntoShape` (see that function's own
+    // doc for why lmHead alone still packs fresh here). `batch()` above has
     // resolved, so the GPU has finished reading all of them; nothing here is
     // referenced by anything this call still needs (the persistent KV cache
     // and `s.finalNormedBuf`/`lmHeadChunks` writes are copies, already
-    // landed in buffers this class owns for the long term, not these). No
-    // separate `weightTBuf`-style shared buffer to destroy any more — issue
-    // #128 removed it; `MatmulQ8ProjectionShape` holds only buffers this
-    // class already owned before this call started.
+    // landed in buffers this class owns for the long term, not these). Every
+    // *production* projection's own weight/scale buffer is no longer in this
+    // list at all — issue #142's `bindMatmulQ8` binds `this.layers[l]`'s
+    // resident `ResidentWeight`s directly, which `create()` owns for the
+    // engine's whole lifetime, not this call.
     for (const buf of transientBuffers) buf.destroy();
 
     this.assertSameEpoch(epoch, debugAllPositions ? "debugAllPositionLogits" : "forward");

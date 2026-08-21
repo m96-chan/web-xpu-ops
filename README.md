@@ -1618,8 +1618,10 @@ full read of the same, on every prefill regardless of prompt length.
 `matmulQ8` (`ops/matmul/reference.ts`) removes that pass: the tiled GEMM
 kernel reads the packed int8 weight directly, in-kernel, using `matvecQ8`'s
 own `[M, ceil(K/4)]` wire format — no transpose, no intermediate buffer.
-`runPrefillResident` packs and uploads each layer's weight straight into
-`matmulQ8`'s bind group instead.
+`runPrefillResident` packed and uploaded each layer's weight straight into
+`matmulQ8`'s bind group at this issue's own landing (issue #142, below,
+removed that per-call pack/upload too — it turned out to be the actual
+dominant cost, not the GPU kernel this section measures).
 
 **Measured, and the result is smaller than this issue's own hypothesis —
 reported as measured, not as hoped for (rule 9).** `examples/llm-demo`'s
@@ -1862,6 +1864,96 @@ decode's resident weight/scale buffers alive and bind them into `matmulQ8`
 instead of re-packing per call) is tracked as its own follow-up issue (#142)
 so a correctness-first, one-change-at-a-time PR can review it against this
 measurement as its own baseline.
+
+### Resident weight buffers in prefill, not a re-pack per call (issue #142)
+
+The previous section's own "most likely remaining source, unmeasured here"
+guess (`runPrefillResident`'s per-layer `Promise.all` of nine
+`device.bindGroup()` calls) turned out not to be it. Issue #131/#141
+actually measured where prefill's ~1.2–2.2s fixed cost went, instead of
+guessing further: `packInt8Rows` (CPU, inside `matmulQ8IntoShape`) alone was
+**77–79%** of it; the GPU kernel `matmulQ8` itself was only 2–6%.
+
+The decisive fact issue #142 acts on: the bytes `packInt8Rows` produced
+fresh on every `forward()` call were **already sitting on the GPU**.
+`buildProjection`/`buildFfnProjection`/`buildResidualProjection`
+(`llm/engine-q8-resident.ts`) call the exact same `packInt8Rows` on the
+exact same `weights.layers[l]` object once in `create()`, to build decode's
+own `matvecQ8`/`matvecQ8Ffn`/`matvecQ8Residual` bind groups — the output is
+byte-identical by construction (same function, same input), and only the
+*position* in the bind group differs between decode's layout
+(`[weight, scale, vector, out, uniform]`) and `matmulQ8`'s
+(`[a, weight, scale, out, uniform]`), which has nothing to do with the
+bytes underneath.
+
+Those three builders now keep the resulting `GPUBuffer` handles
+(`ResidentWeight`, one pair per projection per layer) instead of discarding
+them once the decode bind group is built. `runPrefillResident`'s
+`matmulQ8` bind group (`bindMatmulQ8`, replacing `matmulQ8IntoShape` for
+every production projection — `wq`/`wk`/`wv`/`wo`/gate/up/`wDown`) binds
+those same resident buffers directly: no `packInt8Rows`, no
+`queue.writeBuffer`, no new `GPUBuffer`, on any prefill call, including the
+very first one. (`matmulQ8IntoShape` itself is not deleted — `lmHead`'s
+own debug-only, full-`N`-position path, `debugAllPositionLogits`, still
+uses it: `lmHead`'s only resident buffers are chunked by
+`matvecQ8`'s decode-shaped row limit, not by `matmulQ8`'s `[M, K]` tile
+shape, and re-deriving that mapping for a path real generation never runs
+was not worth it — see `matmulQ8IntoShape`'s own doc.)
+
+**VRAM residency does not change.** These bytes were already resident for
+decode; prefill now reads the same allocation instead of paying for a
+second, transient ~1 GiB one that lived only until that call's own
+`batch()` resolved and was then `destroy()`ed. Nothing is kept alive for
+longer than before — this is reuse, not new residency.
+
+**Measured** (RTX 5090, NVIDIA driver 610.57.04, Linux (Arch, kernel
+7.1.5-arch1-2), Chrome 151.0.7922.71 non-headless via CDP on a dedicated
+`--user-data-dir`/`--remote-debugging-port`, real Sarashina2.2-1B-alibi-v1
+int8 checkpoint (24 layers, hiddenSize=1792, vocabSize=102400),
+`examples/llm-demo`'s `__decodeFixedCostBenchmark`, one
+`LlamaEngineQ8Resident` instance, `reset()` between prompt lengths, 8
+samples per prompt length, control and fixed measured in the same session
+via `git stash`/rebuild between them — machine shared with other concurrent
+sessions throughout, `uptime` read `load average: 0.6–1.3`, not idle):
+
+| prompt length | before (`matmulQ8IntoShape`, per-call repack) | after (`bindMatmulQ8`, resident) | speedup |
+| --- | --- | --- | --- |
+| 76 tok | 1266.4ms median (1256.9–1277.0ms, n=8) | 42.7ms median (38.3–45.0ms, n=8; one 233.6ms outlier under concurrent GPU load) | ~29.7x |
+| 365 tok | 1344.4ms median (1326.9–1378.9ms, n=8) | 120.6ms median (119.0–121.6ms, n=8; one 317.0ms outlier under concurrent GPU load) | ~11.1x |
+
+This is the "prefill's ~1.2s fixed cost" this file's own prefill sections
+have been chasing since issue #117 — not shaved at the margin, but removed
+down to roughly the same order of magnitude as decode's own per-step cost.
+Development on this change started from the commit immediately before #141
+merged `ForwardProfile` (same base SHA as the previous section's own
+measurement, before it landed on `main`), so this table is
+`performance.now()`-timed `prefillMs` — the same metric
+`__decodeFixedCostBenchmark`'s own earlier tables in this file already use —
+not the `packMs`/`layerSetupMs` breakdown the previous section's own numbers
+give; it was not re-derived here. This section's own control (1266.4ms/
+1344.4ms median) sits below the previous section's own control (2097.7ms/
+2178.5ms mean) for the same N=76/365 — a different session, different
+concurrent load (see the previous section's own "unexplained... reported as
+measured" note for an earlier instance of this exact same class of
+session-to-session gap on this shared machine); both are real numbers for
+the code they measured, and the ~29.7x/~11.1x speedup below is against
+*this* section's own control, measured in the same session as the "after"
+column.
+
+Correctness: prefill and decode logits are **bit-for-bit identical**
+(`llm/engine-q8-resident.residentweight.wgsl.test.ts`) to a capture taken
+from the pre-#142 `matmulQ8IntoShape` code on this same tiny fixture — not
+within tolerance, exact equality, per issue #130's own established
+criterion ("1ビットでも動いたら丸めではなく設計の違い"): both paths read the
+identical packed bytes through the identical `matmulQ8` kernel, so any
+difference would mean a design bug, not floating-point rounding.
+`resident.stats.buffersCreated`'s own per-prefill-call delta drops from a
+measured 75 to a measured 47 for that fixture (`numLayers: 2`) — 28 fewer
+buffers, exactly `2 (weight + scale) × 7 (projections) × 2 (layers)`, the
+weight/scale pair this change stops re-allocating — asserted with a margin
+threshold in the same test file, mutation-confirmed by temporarily
+reverting `bindMatmulQ8` back to `matmulQ8IntoShape` during development and
+watching the assertion fail at the measured pre-#142 value (75).
 
 ### Scope
 
