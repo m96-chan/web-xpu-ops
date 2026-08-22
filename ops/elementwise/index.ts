@@ -1,1 +1,7 @@
-export { elementwise, ELEMENTWISE, type ElementwiseKind } from "./reference.js";
+export {
+  elementwise,
+  elementwiseRows,
+  ELEMENTWISE,
+  type ElementwiseKind,
+  type ElementwiseRowsArgs,
+} from "./reference.js";
