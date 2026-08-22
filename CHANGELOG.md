@@ -9,6 +9,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/matvec` gains the **q4 weight format** and a `matvecQ4G128` entry point
+  (issue #137): 4-bit codes packed eight to a `u32` (least-significant nibble
+  first — `packQ8`'s byte order at half the width), with one absmax scale per
+  **group of 128 contiguous columns** rather than one per row. `quantizeQ4G128`
+  produces the codes and scales, `packQ4` puts them on the wire, and
+  `matvecQ4G128` (reference + WGSL kernel) reads them without a dequant pass.
+
+  Exists because q8 is the only quantization this library had, and 8 bits is
+  the wrong size for the models it is being pointed at next: a 0.6B model fits
+  a browser at q8, a 3B or 4B one does not. Four bits without a group axis is
+  not a usable substitute — issue #137's measurements (voxshot's, on
+  MioTTS-0.6B, not this repository's) put per-row q4 at 4.5e-1 peak-relative
+  logit error against q8's 4.8e-2, with greedy agreement collapsing from 6
+  tokens to 1; group-128 recovers about 3x of that for 0.24 extra bits per
+  weight. This repository's own synthetic measurement shows the mechanism
+  directly (README, "The q4 format"): on columns two orders of magnitude
+  smaller than their row's peak, per-row q4 has RMS-relative error of exactly
+  **1.0** — every code rounds to zero — where group-128 is unaffected.
+
+  Three conventions are stated rather than picked quietly (rule 7), because
+  each has a live alternative that produces different numbers: the range is
+  symmetric **`[-7, 7]`** and not Q4_0's `[-8, 7]` (which measured *best* of
+  every configuration tried on weight RMS error and still flipped the argmax
+  in 4 of 4 cases, because clipping one tail biases the error instead of
+  randomising it); the scale's reciprocal is formed as `7/absmax` in f64, not
+  as `1/f32(scale)` as llama.cpp does; and rounding is `Math.round`'s
+  ties-toward-`+Infinity`, matching `ops/quantize` and
+  `llm/tools/quant_common.py`. The format is **not** called Q4_0-compatible —
+  block size, range and scale dtype all differ.
+
+  Speed is unmeasured, and so is the effect on any real model's output.
+
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
   per-call breakdown of where one `forward()` call's own wall time goes —
