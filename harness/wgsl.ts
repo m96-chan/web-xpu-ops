@@ -73,11 +73,57 @@ export function compilationFailure(
   return `shader failed to compile\n${errors.map(where).join("\n")}`;
 }
 
+/**
+ * Instances and adapters this process has created, kept reachable on purpose.
+ *
+ * The Dawn Node binding does not keep the `GPU` instance alive from a
+ * `GPUDevice`. Nothing in the returned object graph refers back to it, so once
+ * the instance goes out of scope the collector is free to take it — and a
+ * device whose instance has been collected starts failing dispatches. The
+ * failure is not a clean error: the process aborts with a glibc/futex
+ * `std::system_error`, segfaults, or hangs, and which one it does varies run to
+ * run. That is the signature of a race, and it is why this looked like flake.
+ *
+ * Measured, A-B-A, on `ops/gqa/wgsl.test.ts` (46 GPU cases, RTX 5090, driver
+ * 610.57.04, `webgpu` 0.4.0, Node v25.6.1, otherwise-idle GPU):
+ *
+ *   - without this array: **0/5 runs completed** (four produced no test result
+ *     at all, one hung)
+ *   - with it:            **5/5 runs green**, 46/46 each
+ *   - reverted again:     **0/4**
+ *
+ * The only difference between those conditions is this reference. No dispatch,
+ * allocation or ordering changed.
+ *
+ * This is why issues #38, #49, #68 and #107 all resisted diagnosis: they are
+ * the same bug seen from different angles. #49 ("a test that takes more than a
+ * few milliseconds before its first dispatch kills the worker") and #107
+ * ("real-model-scale CPU work before a dispatch crashes the binding") both
+ * describe *more time and more allocation for the collector to run in*. #68 ("a
+ * file dies once it holds too many dispatches") describes the same pressure
+ * from allocation volume. And the four vitest pool configurations that were
+ * tried and did not help could not have helped: vitest calls a test body as a
+ * function, so an instance created inside one is unreachable the moment that
+ * body returns, whatever the pool does.
+ *
+ * Credit: the hypothesis and the minimal repro came from the voxshot session,
+ * which isolated it to `nested` vs `nested-keep` in 35 lines with no model and
+ * no weights.
+ *
+ * Held as an array rather than a single binding because `createRunner` can be
+ * called more than once in a run (`harness/timing.test.ts` calls it directly),
+ * and every instance has to outlive its device. Nothing reads this array;
+ * being reachable is its whole job — `harness/instance-retention.test.ts`
+ * exists to stop it being deleted as dead code.
+ */
+const retainedInstances: unknown[] = [];
+
 /** Resolves to null when no adapter is available, so suites can skip. */
 export async function createRunner(): Promise<Runner | null> {
   Object.assign(globalThis, globals);
   const gpu = create([]) as GPU;
   const adapter = await gpu.requestAdapter();
+  retainedInstances.push(gpu, adapter);
   if (!adapter) return null;
   // Asked for explicitly, because the defaults are far below what the hardware
   // offers: this adapter allows a 2 GB storage binding but a device requested

@@ -7,6 +7,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The GPU tests stop dying for no stated reason. `harness/wgsl.ts` and
+  `harness/resident.ts` now keep the `GPU` instance and its adapter reachable
+  for as long as the device they produced, because the Dawn Node binding does
+  not: nothing in a `GPUDevice`'s object graph refers back to the instance, so
+  once the factory returned, the collector was free to take it — and a device
+  whose instance has been collected starts failing dispatches by aborting the
+  process on a glibc futex assertion, segfaulting, or hanging, differently on
+  each run.
+
+  That is one bug, and it is the one behind issues #38, #49, #68 and #107. Each
+  of those recorded a different face of it: "a test that takes more than a few
+  milliseconds before its first dispatch kills the worker" (#49) and
+  "real-model-scale CPU work before a dispatch crashes the binding" (#107) are
+  both descriptions of *more time for the collector to run in*; "a file dies
+  once it holds too many dispatches" (#68) is the same pressure from allocation
+  volume. The four vitest pool configurations tried against #38 could not have
+  helped — vitest calls a test body as a function, so an instance created inside
+  one is unreachable the moment that body returns, whichever pool is in use.
+
+  Measured A-B-A on `ops/gqa/wgsl.test.ts` (46 GPU cases, RTX 5090, driver
+  610.57.04, `webgpu` 0.4.0, Node v25.6.1, otherwise-idle GPU): **0/5 runs
+  completed** without the retention, **5/5 green** with it, **0/4** after
+  reverting. Nothing but that reference changed.
+
+  Diagnosis and the 35-line minimal repro came from the voxshot session, which
+  isolated it to `nested` vs `nested-keep` with no model and no weights. What
+  this repository had accumulated instead was three weeks of symptom
+  descriptions and workarounds — splitting test files (#68), retrying, and
+  treating the whole class as "Dawn flake".
+
 ### Added
 
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
