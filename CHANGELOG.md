@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `conv2d` / `conv2dOutputSize` in `ops/conv`, with a WGSL kernel at
+  `ops/conv/wgsl/conv2d.wgsl` (issue #145). `ops/conv` shipped 1D only, so
+  anything with a spatial input — the image decoders #148 is about — had no
+  convolution at all. It lives beside `conv1d` rather than in an op of its own
+  because every convention it needs is one `conv1d` already settled against
+  torch 2.10.0+cu128 (cross-correlation, zeros on both ends of each axis, bias
+  once per output element, `groups` splitting both channel axes, throwing where
+  torch raises); two files could drift, and a 2D op that flipped its kernel or
+  padded its edges differently from the 1D one beside it would be a wrong
+  answer of the right shape. The conventions were re-measured in 2D rather
+  than assumed, because two of them can only be checked there — a flip
+  reverses *both* axes, and a pad has four edges.
+
+  `stride` / `padding` / `dilation` take `number | [H, W]`, PyTorch's own
+  `int | tuple[int, int]`, with the pair order measured rather than read off
+  the docs (`stride=(2,3)` and `stride=(3,2)` on a `[1,1,4,6]` input return
+  `[1,1,2,2]` and `[1,1,2,3]`, so the first member is H). `padding` stays an
+  integer count: `'same'` / `'valid'` are refused for the reason `conv1d`
+  gives, now with the measurement behind it — torch splits `'same'`'s odd
+  total pad asymmetrically for an even kernel, which one integer per axis
+  cannot express, and torch itself rejects `'same'` with stride > 1.
+  Deliberately absent: `conv_transpose2d`, `padding_mode`, 3D.
+
+  **Speed unmeasured.** One thread per output element, no tiling, workgroup
+  256 along the contiguous (W) axis — the same shape `conv1d` uses, kept so
+  that whatever #134 measures lands on one shape rather than two.
+
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
   per-call breakdown of where one `forward()` call's own wall time goes —
