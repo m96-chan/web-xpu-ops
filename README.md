@@ -25,12 +25,15 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Twenty-seven ops, WGSL only, verified against their references on a real GPU.
+Twenty-eight ops, WGSL only, verified against their references on a real GPU.
 
-**Speed is unmeasured for every one of them.** The roofline each would be
+**Speed is unmeasured for all but one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
 statement about this GPU rather than about the kernel — so the column says so
-rather than being left blank.
+rather than being left blank. The exception is `axpy`, whose whole reason to
+exist is replacing two dispatches with one, so it had to be measured against
+the pair it replaces (#152); its row carries both the figure and the conditions
+it was taken under.
 
 | op | notes |
 | --- | --- |
@@ -43,6 +46,7 @@ rather than being left blank.
 | `activation` | `relu2`, `silu`, `elu`, `tanh`, `gelu`, `gelu_tanh`. `elu`'s `alpha` is a scalar hyperparameter defaulting to 1.0, as `torch.nn.ELU`. GELU is two functions, not one: the default `gelu` is the exact `erf` form (`torch.nn.functional.gelu`'s own default, `approximate="none"`) and `gelu_tanh` is `approximate="tanh"` — they differ by up to **4.73e-4, at x = 2.699**, so neither is a silent stand-in for the other. Speed unmeasured |
 | `snake` | Two entry points, because the name covers two functions. `kernel`: `x + sin²(α·x)/α` with a **learned per-channel** α (arXiv:2006.08195), as `Snake1d` in DACVAE. `beta`: `x + sin²(α·x)/β` with **both** learned per channel, as BigVGAN's `SnakeBeta` and MioCodec's decoder — β = α recovers the first. A checkpoint's `alpha` tensor does not say which it belongs to, and the BigVGAN family stores **logarithms** while DACVAE stores values; neither kernel exponentiates, because doing so would be wrong for the other. The epsilon is upstream's, inside the reciprocal and at upstream's value, guarding the **divisor** — α in the first, β in the second. `sin²` is the square of the sine. Its own op rather than an `activation` kind, because α is a buffer and a channel stride rather than a scalar — the reason is written out in `ops/snake/reference.ts`. Speed unmeasured |
 | `elementwise` | `add`, `multiply` |
+| `axpy` | `out[i] = y[i] + a * x[i]` with a **scalar** `a` — `torch.add(input, other, alpha=)`, BLAS's `saxpy` by name. Exists because `ops/elementwise` is same-shape only, so a rectified-flow sampler's `latent += dt * velocity` otherwise costs a full-length buffer of copies of `dt` plus multiply-then-add. Two entry points: `kernel` writes a third buffer, `inplace` updates `y` through a single `read_write` binding (aliasing `y` into `kernel`'s two bindings instead is **not** an error you get told about — the command buffer is invalidated at `finish()` and the readback is all zeros). It also **rounds once**: this device's compiler contracts `y + a*x` into an FMA, which is what `torch.add` does on CPU and CUDA, where multiply-then-add rounds the product first — at `a = f32(0.1), x = 3, y = -f32(0.3)` the two-dispatch path cancels to exactly 0 and this one gives -2^-27. Measured (RTX 5090, driver 610.57.04, Dawn via `webgpu@0.4`, f32, N = 262,144 = one 16×128×128 latent, median of 5, three sessions): **6.1-6.5 µs against 12.3-13.2 µs** for `elementwise(multiply)` + `elementwise(add)` — **1.9-2.1x**, at 484-512 GB/s or **28-30% of this machine's measured 1.719 TB/s ceiling**, so neither path is bandwidth-bound at this size and the win is doing half the work rather than doing it faster. Larger N is **unmeasured**: N = 1,048,576 reproduced #38/#68 (`std::system_error`, then a hang) three times in a row |
 | `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included. An optional precomputed angle table (`ropeCache`); past its end the angle is recomputed rather than wrapped. `headOffset` / `headCount` rotate a subset of the **heads** and copy the rest through — the axis Irodori-TTS's `_apply_rotary_half` uses (`chunk(2, dim=-2)`), not channel-wise partial rotary (`rotaryDim`), which is the other thing "half-RoPE" is used to mean and is not implemented. Speed unmeasured |
 | `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's — and `attention`'s `mask` is an additive bias of exactly this shape (`maskShape: [1, H, L]`), so the two compose by addition. Speed unmeasured |
 | `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
@@ -435,7 +439,7 @@ target-specific tuning pays off most.
 ### `kernel/` — one fused, named operation
 
 `rope` ✅ · `rmsnorm` ✅ · `layernorm` ✅ · `group_norm` ✅ · `softmax` ✅ ·
-`activation` ✅ · `snake` ✅ · `elementwise` ✅ · `quantize` ✅ · `dequantize` ✅ ·
+`activation` ✅ · `snake` ✅ · `elementwise` ✅ · `axpy` ✅ · `quantize` ✅ · `dequantize` ✅ ·
 `attention` ✅ · `flash_attention` ✅ · `ctc_decode` ✅ (greedy) · `mel` ✅ ·
 `stft` / `istft` ✅
 

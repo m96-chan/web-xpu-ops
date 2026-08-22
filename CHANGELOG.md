@@ -9,6 +9,53 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/axpy` (issue #152): `out[i] = y[i] + a * x[i]` with a **scalar** `a`,
+  in two entry points — `kernel` (out-of-place) and `inplace` (`y[i] += a *
+  x[i]`, BLAS `saxpy`'s own signature). A rectified-flow sampler's entire
+  scheduler step is `latent += dt * velocity`, once per diffusion step, and
+  `ops/elementwise` cannot express it: it takes two **equally sized** arrays,
+  so the scalar had to be materialised as a full-length buffer of copies of
+  `dt` and pushed through multiply-then-add. That is two dispatches, twice the
+  memory traffic, and — because `dt` changes every step — a latent-sized
+  upload per step to carry one number.
+
+  It is also a **different answer**, which is the part worth knowing before
+  swapping one for the other. Rounding the product to f32 before the add is
+  not the same as rounding once: at `a = f32(0.1)`, `x = 3`, `y = -f32(0.3)`
+  multiply-then-add cancels to exactly **0** while a single rounding gives
+  **-2^-27**. Which is correct is not this library's call (rule 7) — measured,
+  `torch.add(y, x, alpha=a)` returns the single-rounded value on CPU and on
+  CUDA alike, and so does this op on this device, whose WGSL compiler
+  contracts `y + a*x` into an FMA. Over 4,096 elements at `a = 0.37` the fused
+  kernel matched the reference on all 4,096 where the two-dispatch path
+  matched on 3,214, and no element was ever further from it — the test asserts
+  that ordering, not just agreement.
+
+  In-place is a separate entry point rather than a way of calling the
+  out-of-place one, because the obvious shortcut fails **silently**: binding
+  one buffer to `kernel`'s read-only `y` and its read_write `output` passes
+  `createBindGroup`, then invalidates the command buffer at `finish()`
+  (`usage (Storage(read-write)|Storage(read-only)) includes writable usage and
+  another usage in the same synchronization scope`), so the submit is dropped
+  and the readback is all zeros with nothing thrown — #46's failure mode
+  again. One `read_write` binding read and written by the same invocation is
+  well defined and measured working across a four-step resident loop.
+
+  `a` rides in the 16-byte uniform next to `N`, so the per-step cost of a
+  changing coefficient is one 16-byte `queue.writeBuffer` — the shape
+  `harness/resident.ts` already sanctions for position counters — and nothing
+  else is re-uploaded, buffers, pipeline and bind group all built once
+  (asserted against `ResidentDevice.stats`). That is deliberately not #144's
+  trap of re-sending unchanged bytes every call: here the only bytes that move
+  are the ones that changed.
+
+  Measured (rule 9; RTX 5090, driver 610.57.04, Dawn via `webgpu@0.4`, f32,
+  N = 262,144, median of 5, three sessions): **6.1-6.5 µs against 12.3-13.2 µs**
+  for `elementwise(multiply)` + `elementwise(add)`, i.e. **1.9-2.1x**, at
+  484-512 GB/s = **28-30% of this machine's measured 1.719 TB/s ceiling**.
+  Larger sizes are **unmeasured** — N = 1,048,576 reproduced #38/#68 three
+  times running.
+
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
   per-call breakdown of where one `forward()` call's own wall time goes —
