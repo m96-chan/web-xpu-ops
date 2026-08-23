@@ -95,9 +95,13 @@ export function conv1dOutputLength({
  * the input, and it has an `output_padding` this signature has nowhere to put.
  * Also absent: `'same'` / `'valid'` string
  * padding (sugar over the integer form, and `'same'` with an even effective
- * kernel needs asymmetric padding this signature cannot express), and 2D. 2D is
- * out of scope by ISSUE #14: speech front-ends need 1D, and 2D waits until
- * something asks for it.
+ * kernel needs asymmetric padding this signature cannot express).
+ *
+ * 2D was out of scope by ISSUE #14 — speech front-ends need 1D, and 2D waited
+ * until something asked for it. Something did (#145), so `conv2d` is below, in
+ * this file rather than in an op of its own: every convention this doc settles
+ * is the same one 2D uses, and the two disagreeing is the failure worth
+ * designing against.
  */
 export function conv1d({
   input,
@@ -149,6 +153,250 @@ export function conv1d({
           }
         }
         output[(n * Cout + oc) * Lout + ol] = acc;
+      }
+    }
+  }
+  return output;
+}
+
+/**
+ * A spatial argument: one number meaning both axes, or `[H, W]`.
+ *
+ * This is PyTorch's `int | tuple[int, int]`, and the order is the one torch
+ * 2.10.0+cu128 actually uses rather than the one the docs imply. Measured on a
+ * `[1, 1, 4, 6]` input with a `1x1` kernel: `stride=(2, 3)` returns
+ * `[1, 1, 2, 2]` and `stride=(3, 2)` returns `[1, 1, 2, 3]`, so the first
+ * member is the **H** (row) axis.
+ *
+ * Why a union rather than `strideH` / `strideW` fields, which would need no
+ * normalising and no runtime check: rule 7 breaks the tie. Everything a caller
+ * of this library reads about convolution — PyTorch, ONNX, every checkpoint's
+ * config — writes the pair as one argument, so `stride: [2, 1]` ports across by
+ * eye while `strideH: 2, strideW: 1` is a second spelling of the same idea that
+ * only this library uses. The lone number is not a convenience either: the
+ * shapes this op exists for (3x3, stride 1, padding 1) are square on every
+ * axis, and forcing `[1, 1]` on all three arguments would put the interesting
+ * case and the boring one at the same visual weight.
+ */
+export type Conv2dSpatial = number | readonly [number, number];
+
+/**
+ * Reads a spatial argument into `[H, W]`.
+ *
+ * Throws rather than coercing, and names the argument. The values this refuses
+ * are what a JavaScript caller reaches for when porting: `'same'` (see
+ * `conv2d`'s doc for why it is not accepted), `[1, 1, 1]` from a 3D config, a
+ * lone `[2]`. Every one of them has a silent reading — `padding = 0` for the
+ * string, "use the first" for the wrong-length array — and a wrong pad is a
+ * wrong answer of the right shape.
+ */
+function spatialPair(value: Conv2dSpatial, name: string): [number, number] {
+  if (typeof value === "number") return [value, value];
+  if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== "number" || typeof value[1] !== "number") {
+    throw new Error(`conv2d(): ${name} must be a number or [H, W], got ${JSON.stringify(value)}`);
+  }
+  return [value[0]!, value[1]!];
+}
+
+export interface Conv2dArgs {
+  /** `[N, Cin, H, W]`, row-major — NCHW, the layout `conv1d`'s `[N, Cin, L]` extends to. */
+  input: Float32Array;
+  /** `[Cout, Cin / groups, KH, KW]`, row-major. */
+  weight: Float32Array;
+  /** `[Cout]`. Omitted is PyTorch's `bias=None`: nothing is added. */
+  bias?: Float32Array;
+  /** Batch. */
+  N: number;
+  /** Input channels. */
+  Cin: number;
+  /** Output channels. */
+  Cout: number;
+  /** Input height (rows). */
+  H: number;
+  /** Input width (columns) — the contiguous axis. */
+  W: number;
+  /** Kernel height. */
+  KH: number;
+  /** Kernel width. */
+  KW: number;
+  /** Default 1. */
+  stride?: Conv2dSpatial;
+  /** Zeros added to *both* ends of each axis. Default 0. */
+  padding?: Conv2dSpatial;
+  /** Spacing between kernel taps. Default 1. */
+  dilation?: Conv2dSpatial;
+  /** Default 1. */
+  groups?: number;
+}
+
+/**
+ * `conv1dOutputLength` on each axis independently — the `[H, W]`
+ * `torch.nn.functional.conv2d` returns.
+ *
+ * Literally the 1D function called twice, not the same arithmetic written out
+ * again. The formula is a convention, and rule 7 says a convention gets chosen
+ * once: two copies can drift, and the drift would be a shape that is right on
+ * one axis and wrong on the other, which reads as a transposed image rather
+ * than as a crash.
+ *
+ * Measured against torch 2.10.0+cu128: `H=10, W=13, KH=3, KW=2,
+ * stride=(2,3), padding=(1,0), dilation=(2,4)` returns shape `(1, 1, 4, 3)`,
+ * which is what this gives.
+ */
+export function conv2dOutputSize({
+  H,
+  W,
+  KH,
+  KW,
+  stride = 1,
+  padding = 0,
+  dilation = 1,
+}: {
+  H: number;
+  W: number;
+  KH: number;
+  KW: number;
+  stride?: Conv2dSpatial;
+  padding?: Conv2dSpatial;
+  dilation?: Conv2dSpatial;
+}): { Hout: number; Wout: number } {
+  const [strideH, strideW] = spatialPair(stride, "stride");
+  const [padH, padW] = spatialPair(padding, "padding");
+  const [dilationH, dilationW] = spatialPair(dilation, "dilation");
+  return {
+    Hout: conv1dOutputLength({ L: H, K: KH, stride: strideH, padding: padH, dilation: dilationH }),
+    Wout: conv1dOutputLength({ L: W, K: KW, stride: strideW, padding: padW, dilation: dilationW }),
+  };
+}
+
+/**
+ * 2D convolution over `[N, Cin, H, W]`, matching
+ * `torch.nn.functional.conv2d(input, weight, bias, stride, padding, dilation, groups)`.
+ *
+ * The definition of correct for this op, on the same terms as `conv1d` above:
+ * the slowest, plainest expression of the maths, six nested loops, no attempt
+ * at anything else.
+ *
+ * ## What it inherits, and what it had to decide
+ *
+ * Every convention `conv1d`'s doc settles is settled the same way here, and
+ * that is why the two live in one file: **no kernel flip** (this is a
+ * cross-correlation), **zero padding on both ends of each axis**, **bias added
+ * once per output element**, **`groups` splitting both channel axes**, and
+ * **throwing** where PyTorch raises. They are re-measured in 2D rather than
+ * assumed, because two of them can only be checked in 2D — a flip reverses
+ * *both* axes, and a pad has four edges. `reference.test.ts` pins each.
+ *
+ * Two things 1D never had to answer:
+ *
+ * - **`stride` / `padding` / `dilation` take `number | [H, W]`** — see
+ *   `Conv2dSpatial` for the measurement that fixes the order and the reason a
+ *   union beats two fields.
+ * - **`padding` is an integer count, never `'same'` or `'valid'`.** `conv1d`
+ *   refuses the strings for reasons that get stronger in 2D, and they were
+ *   re-measured rather than inherited. `'valid'` is `0` — plain sugar. `'same'`
+ *   is **not** an integer count at all: torch 2.10.0+cu128 pads
+ *   `floor(dilation*(K-1)/2)` before the data and the rest after, so whenever
+ *   the effective kernel `dilation*(K-1)+1` is even the total pad is odd and
+ *   the two ends **differ**, which a single integer per axis — it pads both
+ *   ends equally — cannot express. Measured on `x = [[[[1..6]]]]` with a
+ *   corner-tap `1×K` kernel (`w[0,0,0,0] = 1`, rest zero), so each output
+ *   element names the input column the window started on:
+ *
+ *   | K (dilation 1) | `padding='same'`      | `padding=0`     | pad before/after |
+ *   | -------------- | --------------------- | --------------- | ---------------- |
+ *   | 2              | `[1,2,3,4,5,6]`       | `[1,2,3,4,5]`   | 0 / 1            |
+ *   | 4              | `[0,1,2,3,4,5]`       | `[1,2,3]`       | 1 / 2            |
+ *
+ *   The `K=2` row is the *only* even-kernel case whose front pad is zero, over
+ *   every `K` and `dilation`: `floor(dilation*(K-1)/2)` vanishes only when
+ *   `dilation*(K-1) <= 1`, and among even effective kernels that is exactly
+ *   `dilation*(K-1) == 1`. Everything else pads in front too — `K=2,
+ *   dilation=3` (effective 4) returns `[0,1,2,3,4,5]` just as `K=4` does — and
+ *   `'same'` and `0` do not even agree on the output length. So `'same'` is a
+ *   distinct mode, not a spelling of some integer, and the difference is
+ *   silent: a well-formed tensor of a different shape and a different
+ *   alignment, not an error. torch also raises
+ *   `padding='same' is not supported for strided convolutions`, which means the
+ *   string is not even a total function of the arguments beside it. Where a
+ *   string *is* worth taking, this library takes it: `istft`'s
+ *   `padding: "same"` (#92) exists because those samples are reachable from no
+ *   torch mode at all. That is the test — sugar over an integer stays in the
+ *   caller, a genuinely different result becomes an argument.
+ *
+ * Deliberately absent, all for reasons `conv1d` already gives: `padding_mode`
+ * (a pad op, not a conv op), `conv_transpose2d` (a different op — and the 1D
+ * pair is already split across two directories), and 3D.
+ */
+export function conv2d({
+  input,
+  weight,
+  bias,
+  N,
+  Cin,
+  Cout,
+  H,
+  W,
+  KH,
+  KW,
+  stride = 1,
+  padding = 0,
+  dilation = 1,
+  groups = 1,
+}: Conv2dArgs): Float32Array {
+  const [strideH, strideW] = spatialPair(stride, "stride");
+  const [padH, padW] = spatialPair(padding, "padding");
+  const [dilationH, dilationW] = spatialPair(dilation, "dilation");
+
+  if (Cin % groups !== 0 || Cout % groups !== 0) {
+    // PyTorch: "expected weight to be divisible by groups at dimension 0".
+    throw new Error(`conv2d(): Cin=${Cin} and Cout=${Cout} must both be divisible by groups=${groups}`);
+  }
+  const { Hout, Wout } = conv2dOutputSize({ H, W, KH, KW, stride, padding, dilation });
+  if (Hout <= 0 || Wout <= 0) {
+    // PyTorch: "Calculated padded input size per channel: (4 x 5). Kernel size:
+    // (5 x 2). Kernel size can't be greater than actual input size" — one axis
+    // failing is enough, which is why this is an `||`.
+    throw new Error(
+      `conv2d(): kernel size ${KH}x${KW} (dilated ${dilationH * (KH - 1) + 1}x${dilationW * (KW - 1) + 1}) ` +
+        `exceeds padded input size ${H + 2 * padH}x${W + 2 * padW}`,
+    );
+  }
+  if (input.length !== N * Cin * H * W) {
+    throw new Error(`conv2d(): expected ${N * Cin * H * W} input elements, got ${input.length}`);
+  }
+  if (weight.length !== Cout * (Cin / groups) * KH * KW) {
+    throw new Error(`conv2d(): expected ${Cout * (Cin / groups) * KH * KW} weight elements, got ${weight.length}`);
+  }
+
+  const inPerGroup = Cin / groups;
+  const outPerGroup = Cout / groups;
+  const output = new Float32Array(N * Cout * Hout * Wout);
+
+  for (let n = 0; n < N; n += 1) {
+    for (let oc = 0; oc < Cout; oc += 1) {
+      const group = Math.floor(oc / outPerGroup);
+      for (let oh = 0; oh < Hout; oh += 1) {
+        for (let ow = 0; ow < Wout; ow += 1) {
+          let acc = bias ? bias[oc]! : 0;
+          for (let icLocal = 0; icLocal < inPerGroup; icLocal += 1) {
+            const ic = group * inPerGroup + icLocal;
+            for (let kh = 0; kh < KH; kh += 1) {
+              // No flip, on either axis: tap (kh, kw) reads down and right from
+              // the window's top-left corner.
+              const ih = oh * strideH + kh * dilationH - padH;
+              if (ih < 0 || ih >= H) continue; // the zero pad, top and bottom
+              for (let kw = 0; kw < KW; kw += 1) {
+                const iw = ow * strideW + kw * dilationW - padW;
+                if (iw < 0 || iw >= W) continue; // the zero pad, left and right
+                acc +=
+                  input[((n * Cin + ic) * H + ih) * W + iw]! *
+                  weight[((oc * inPerGroup + icLocal) * KH + kh) * KW + kw]!;
+              }
+            }
+          }
+          output[((n * Cout + oc) * Hout + oh) * Wout + ow] = acc;
+        }
       }
     }
   }

@@ -1,5 +1,12 @@
 import { params, type Dispatch } from "../../harness/index.js";
-import { rope, ropeCache, ropeFrequencyParams, type RoPEArgs } from "./reference.js";
+import {
+  rope,
+  ropeAxes,
+  ropeCache,
+  ropeFrequencyParams,
+  type RoPEArgs,
+  type RoPEAxesArgs,
+} from "./reference.js";
 
 /**
  * Shared by `wgsl.test.ts` and `wgsl-cache.test.ts`.
@@ -176,3 +183,71 @@ export const YARN_64 = { kind: "yarn", factor: 8, originalContextLength: 64 } as
  * hardware rather than the shader.
  */
 export const TRANSCENDENTAL = { abs: 1e-3 };
+
+/**
+ * The same job `scenario` does, for the `axes` entry point.
+ *
+ * Separate rather than a flag on `scenario`: the two kernels take different
+ * bindings — an axis table and a position per axis here, a cache and five
+ * scaling scalars there — so one builder would be two builders sharing a name.
+ *
+ * The padding argument is `scenario`'s and is not repeated: input padded with a
+ * live value, output sized for the whole dispatch, so the kernel's
+ * `pair_idx >= total_pairs` guard is observable rather than hidden by a buffer
+ * that ends exactly where the data does.
+ */
+export function axesScenario(
+  code: string,
+  { N, numHeads, axisDims, positions, thetaBase }: Omit<RoPEAxesArgs, "input">,
+  /**
+   * Defaults to the wave the other cases use. Cases that assert a *copy* pass
+   * one that is nowhere zero, since an output nobody wrote reads back as zero
+   * and the wave is zero at index 0.
+   */
+  input: Float32Array = wave(N * numHeads * axisDims.reduce((sum, dim) => sum + dim, 0), 0.29),
+  /**
+   * Overrides the reference. One case checks the axes kernel against `rope`
+   * itself rather than against `ropeAxes`, which is the GPU half of "one axis
+   * is the op this generalises".
+   */
+  expectation: Float32Array = ropeAxes({ input, N, numHeads, axisDims, positions, thetaBase }),
+): { dispatch: Dispatch; expected: Float32Array } {
+  const headDim = axisDims.reduce((sum, dim) => sum + dim, 0);
+  const length = N * numHeads * headDim;
+  const workgroups = Math.ceil(length / 2 / 256);
+  const slots = workgroups * 256 * 2;
+
+  const padded = new Float32Array(slots).fill(SENTINEL);
+  padded.set(input);
+
+  // Four tokens of slack past the positions, filled with something visible: a
+  // thread whose `token` ran past `N` reads here, and if it read zeros instead
+  // it would apply the identity rotation — which against a zeroed output is
+  // indistinguishable from the guard having worked.
+  const positionSlack = new Int32Array(positions.length + axisDims.length * 4).fill(9999);
+  positionSlack.set(positions);
+
+  const expected = new Float32Array(slots);
+  expected.set(expectation);
+
+  return {
+    dispatch: {
+      code,
+      bindings: [
+        { kind: "storage", data: padded },
+        { kind: "storage", data: Uint32Array.from(axisDims) },
+        { kind: "storage", data: positionSlack },
+        { kind: "out", type: "f32", length: slots },
+        {
+          kind: "uniform",
+          data: params([
+            ["u32", N], ["u32", numHeads], ["u32", headDim], ["u32", axisDims.length],
+            ["f32", thetaBase],
+          ]),
+        },
+      ],
+      workgroups: [workgroups],
+    },
+    expected,
+  };
+}

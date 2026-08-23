@@ -43,8 +43,9 @@ rather than being left blank.
 | `softmax` | max-subtracted, so real logits do not overflow `exp` |
 | `activation` | `relu2`, `silu`, `elu`, `tanh`, `gelu`, `gelu_tanh`. `elu`'s `alpha` is a scalar hyperparameter defaulting to 1.0, as `torch.nn.ELU`. GELU is two functions, not one: the default `gelu` is the exact `erf` form (`torch.nn.functional.gelu`'s own default, `approximate="none"`) and `gelu_tanh` is `approximate="tanh"` — they differ by up to **4.73e-4, at x = 2.699**, so neither is a silent stand-in for the other. Speed unmeasured |
 | `snake` | Two entry points, because the name covers two functions. `kernel`: `x + sin²(α·x)/α` with a **learned per-channel** α (arXiv:2006.08195), as `Snake1d` in DACVAE. `beta`: `x + sin²(α·x)/β` with **both** learned per channel, as BigVGAN's `SnakeBeta` and MioCodec's decoder — β = α recovers the first. A checkpoint's `alpha` tensor does not say which it belongs to, and the BigVGAN family stores **logarithms** while DACVAE stores values; neither kernel exponentiates, because doing so would be wrong for the other. The epsilon is upstream's, inside the reciprocal and at upstream's value, guarding the **divisor** — α in the first, β in the second. `sin²` is the square of the sine. Its own op rather than an `activation` kind, because α is a buffer and a channel stride rather than a scalar — the reason is written out in `ops/snake/reference.ts`. Speed unmeasured |
-| `elementwise` | `add`, `multiply` |
+| `elementwise` | `add`, `multiply`, over two equally sized arrays. `elementwiseRows` (entry point `rows`) is the same two operations with the right-hand side broadcast **along the last dimension** — `[S, D] ⊕ [D]`, which is a `Linear`'s bias for `add` and AdaLN's per-channel scale for `multiply`. It is a separate function, and takes `S` and `D` explicitly, rather than `elementwise` inferring a broadcast from the lengths: a `[3,3]` and a `[3]` admit two different broadcasts (torch 2.10: `+ c` is `[[1,3,5],…]`, `+ c.unsqueeze(1)` is `[[1,2,3],…]`) and nothing in the lengths says which. Alignment is from the right as in NumPy/PyTorch, so `b.length === a.length` is a mistake and throws — torch refuses `[2,3] + [6]` for the same reason. Speed unmeasured |
 | `rope` | rotary position embedding, with KV-cache offset and NTK / YaRN context scaling. Follows `jquesnelle/yarn` and `transformers`, which agree; YaRN's attention temperature is included. An optional precomputed angle table (`ropeCache`); past its end the angle is recomputed rather than wrapped. `headOffset` / `headCount` rotate a subset of the **heads** and copy the rest through — the axis Irodori-TTS's `_apply_rotary_half` uses (`chunk(2, dim=-2)`), not channel-wise partial rotary (`rotaryDim`), which is the other thing "half-RoPE" is used to mean and is not implemented. Speed unmeasured |
+| `ropeAxes` | multi-axis RoPE, in `ops/rope` beside the 1-D one: the head dim split into contiguous per-axis blocks (Z-Image's `[32, 48, 48]`), each rotated by that token's own position on that axis. Follows Z-Image's `RopeEmbedder` / `apply_rotary_emb` (Tongyi-MAI/Z-Image @ `26f23ed`), which is what decides all three of its conventions: positions arrive as an explicit `[N, axes]` `Int32Array` (upstream's `ids`) rather than being derived from a patch grid; one shared `thetaBase` (256 there), with the exponent normalised by **the axis's own channel count**, not by the head dim; and pairing is **adjacent** channels `2i`/`2i+1` — the same convention `rope` uses, `torch.view_as_complex` upstream, and *not* HF Llama's `rotate_half`, so a Z-Image checkpoint needs no `permuteRopeChannels` and a Llama-style one needs the same permutation as for `rope`. Angles are computed rather than tabulated, so upstream's `axes_lens` is not a parameter and a negative position turns backwards instead of wrapping to the end of a table. An odd axis dim throws (upstream cannot express one either). No scaling, no head range, no cache — none of the three is what Z-Image asks for, and `ropeCacheAxes` waits on a measurement. Speed unmeasured |
 | `alibi` | linear attention-score bias (arXiv:2108.12409); slopes follow the paper's own `get_slopes`, including the **non-monotonic** appended tail for head counts that are not a power of two. Bias is the paper's relative form `m * (j - i)`, not BLOOM's `m * j`; masking is the caller's — and `attention`'s `mask` is an additive bias of exactly this shape (`maskShape: [1, H, L]`), so the two compose by addition. Speed unmeasured |
 | `pope` | Legendre polynomial position table (arXiv:2405.04585, Eq. 14); order is the position, argument sweeps `[-1, 1)`. `posOffset` is required because the paper does not say whether positions start at 0 or 1. Speed unmeasured |
 | `quantize` | per-row absmax to int8, symmetric `[-127, 127]` |
@@ -57,7 +58,7 @@ rather than being left blank.
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. `istft` also takes `padding: "same"`, the Vocos / X-Codec-2 / MioCodec vocoder convention that crops `(nFft - hop) / 2` per end so `T` frames give `T * hop` samples — **not a torch mode**, and not composable from one, because the samples `center: false` would return fail NOLA. Speed unmeasured |
-| `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
+| `conv` | `conv1d` and `conv2d`, as `torch.nn.functional.conv1d` / `conv2d` — a **cross-correlation**, so the kernel is *not* flipped (in 2D, on neither axis); `stride` / `padding` / `dilation` / `groups` / optional `bias`. 2D is NCHW (`[N, Cin, H, W]`, weight `[Cout, Cin/groups, KH, KW]`) and its three spatial arguments take **`number | [H, W]`**, PyTorch's `int | tuple[int, int]` with the pair order measured rather than assumed. `padding` is an integer count on both: `'same'` / `'valid'` are **not** accepted, because `'same'` with an even effective kernel pads asymmetrically in torch and one integer per axis cannot say that — unlike `istft`'s `"same"`, which is a genuinely different result rather than sugar. Speed unmeasured, and 2D is one thread per output element with no tiling |
 | `conv_transpose` | 1D only, as `torch.nn.functional.conv_transpose1d` — the decoder half of `conv`, and what a DAC-style codec upsamples with. Weight is **`[Cin, Cout/groups, K]`**, the transpose of `conv`'s layout; `padding` **crops** the output rather than extending the input; `output_padding` lengthens the trailing end only and takes no part in the sum. The kernel is *not* flipped, for the same reason `conv`'s is not. `weight_norm` is an offline conversion, not a flag here. Speed unmeasured |
 | `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). `mask` is torch's **float** `attn_mask`, **added** to the scores (`-Infinity` masks), not the boolean one — the additive form is what composes with `alibi`; `keyPaddingBias` converts a boolean mask, whose polarity is torch's `attn_mask` (`true` = attend) and therefore the **reverse** of `nn.MultiheadAttention`'s `key_padding_mask`. Broadcast over batch, heads and query rows via `maskShape`, so `[B,1,1,S]` and `[B,H,L,S]` are both legal. `causal` with `mask` **throws**, as torch does. A fully masked row returns **zeros**, as `aten::_safe_softmax` does and plain `torch.softmax` does not. Speed unmeasured |
 | `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
@@ -508,7 +509,7 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
-`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D) · `conv_transpose` ✅ (1D) ·
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D, 2D) · `conv_transpose` ✅ (1D) ·
 `add` · `mul` · `gather` ✅ · `scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
 Small, total, boring. Everything else is built from these, and they are where
@@ -533,7 +534,7 @@ unable to carry complex tensors.
 
 ### `attention/` — the variants that are their own problem
 
-Position: `RoPE` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache` ✅ · `half-RoPE (head range)` ✅
+Position: `RoPE` ✅ · `multi-axis RoPE (ropeAxes)` ✅ · `ALiBi` ✅ · `PoPE` ✅ · `YaRN` ✅ · `NTK scaling` ✅ · `rotary cache` ✅ · `half-RoPE (head range)` ✅
 
 Sharing: `GQA` ✅ · `MQA` ✅ (one op — `gqa`, parameterised by `kvHeads`)
 
@@ -630,7 +631,10 @@ relabels a checkpoint's Q/K projection rows accordingly (exact, not
 approximate — the derivation and a numeric proof are in
 `llm/weights.ts` and `llm/rope-permutation.test.ts`), and
 `llm/tools/gen_fixture.py` applies the same permutation before writing
-`tiny.weights.bin`.
+`tiny.weights.bin`. `ropeAxes` pairs adjacent channels too — Z-Image's
+`torch.view_as_complex(x.reshape(*, -1, 2))` is the same convention — so the
+rule is per checkpoint, not per op: `rotate_half` weights need the permutation
+whichever of the two rotates them.
 
 **Scope.** f32 weights (this section) and int8 weights (next section) both
 exist now; the tokenizer and sampler are exported from `llm/index.ts` and
