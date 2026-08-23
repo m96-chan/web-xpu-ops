@@ -158,11 +158,33 @@ export class FetchedDitWeights {
   }
 
   #remember<T>(map: Map<string, T>, name: string, value: T): T {
+    // Delete first, so re-setting an existing key moves it to the newest end.
+    // `Map.set` alone keeps the original position, which is what let eviction
+    // pick the wrong entries.
+    map.delete(name);
     map.set(name, value);
     while (map.size > this.#limit) {
       const oldest = map.keys().next().value as string;
       map.delete(oldest);
     }
+    return value;
+  }
+
+  /**
+   * Counts a cache hit as a use.
+   *
+   * Skipping this was a real bug. `preload` fetches a prefix's tensors
+   * together; one of them already being resident meant an early return that
+   * left it at its old position — old enough that the other three, inserted in
+   * the same call, evicted it. The preload then reported success for a tensor
+   * it had just discarded, and the failure surfaced as "read before it was
+   * preloaded" somewhere else entirely.
+   *
+   * An LRU whose reads do not count as use is not an LRU.
+   */
+  #touch<T>(map: Map<string, T>, name: string, value: T): T {
+    map.delete(name);
+    map.set(name, value);
     return value;
   }
 
@@ -175,7 +197,26 @@ export class FetchedDitWeights {
    */
   async preload(prefix: string): Promise<void> {
     const wanted = [...this.#byName.keys()].filter((name) => name.startsWith(prefix));
-    await Promise.all(wanted.map((name) => (this.#byName.get(name)!.kind === "q8" ? this.#fetchPacked(name) : this.#fetchDense(name))));
+    if (wanted.length === 0) {
+      throw new Error(`fetch-weights: preload(${JSON.stringify(prefix)}) matched no tensor in the manifest.`);
+    }
+    await Promise.all(
+      wanted.map((name) => (this.#byName.get(name)!.kind === "q8" ? this.#fetchPacked(name) : this.#fetchDense(name))),
+    );
+
+    // Checked here rather than discovered later. A tensor that is not resident
+    // after its own preload becomes "read before it was preloaded" several
+    // frames downstream, which names the symptom and not the cause — and the
+    // cause has been a different thing each time: the hook placed below its own
+    // use, then a bound too small to hold what one call asks for.
+    const missing = wanted.filter((name) => !this.#cache.has(name) && !this.#packedCache.has(name));
+    if (missing.length > 0) {
+      throw new Error(
+        `fetch-weights: preload(${JSON.stringify(prefix)}) fetched ${wanted.length} tensors but ` +
+          `${missing.length} are not resident (${missing.slice(0, 3).join(", ")}). ` +
+          `Cache limit is ${this.#limit}; dense ${this.#cache.size}, packed ${this.#packedCache.size}.`,
+      );
+    }
   }
 
   /**
@@ -212,7 +253,7 @@ export class FetchedDitWeights {
   /** Cached only. Throws rather than returning a stale or empty tensor. */
   get(name: string): Float32Array {
     const cached = this.#cache.get(name);
-    if (cached) return cached;
+    if (cached) return this.#touch(this.#cache, name, cached);
     const packed = this.#packedCache.get(name);
     if (packed) {
       return this.#remember(
@@ -232,7 +273,7 @@ export class FetchedDitWeights {
     const tensor = this.#byName.get(name);
     if (!tensor || tensor.kind !== "q8") return null;
     const cached = this.#packedCache.get(name);
-    if (cached) return cached;
+    if (cached) return this.#touch(this.#packedCache, name, cached);
     const [N, K] = tensor.shape as [number, number];
     const words = N * Math.ceil(K / 4);
     const [codes, scale] = await Promise.all([
@@ -250,7 +291,7 @@ export class FetchedDitWeights {
 
   async #fetchDense(name: string): Promise<Float32Array> {
     const cached = this.#cache.get(name);
-    if (cached) return cached;
+    if (cached) return this.#touch(this.#cache, name, cached);
     const tensor = this.#byName.get(name);
     if (!tensor) throw new Error(`fetch-weights: no tensor named ${JSON.stringify(name)} in the manifest.`);
 
