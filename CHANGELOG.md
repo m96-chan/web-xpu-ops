@@ -41,6 +41,83 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/matmul` gains a `matmulQ4G128` entry point (issue #149): the tiled GEMM
+  of `matmulQ8`, reading the q4 format `ops/matvec` defines — `[M, ceil(K/8)]`
+  packed nibbles plus `[M, ceil(K/128)]` per-group scales — with in-kernel
+  dequant and no transpose pass. Prefill is the half of inference that runs
+  through GEMM, so a quantization format that only has a GEMV covers only
+  decode; this is what lets a 4B-parameter text encoder be read at all, at
+  4.25 bits per weight (≈1.98 GiB for 4e9 parameters, arithmetic from the
+  measured bits-per-weight — no checkpoint of that size has been converted
+  here).
+
+  The format is **not re-decided** here (rule 7 — issue #149 says so in as many
+  words): `ops/matmul/q4.reference.test.ts` checks that by running this GEMM
+  against `matvecQ4G128` row by row, so the two ops cannot drift into two
+  spellings of "the q4 format" while each agrees with its own kernel.
+
+  **No bias**, despite issue #149 asking for one. `matmul` and `matmulQ8` have
+  none, `biasAdd` (issue #150) composes by addition, and rule 8 wants the plain
+  arithmetic agreeing with the reference before anything is fused into it.
+  Speed is unmeasured.
+
+- `ops/matvec` gains the **q4 weight format** and a `matvecQ4G128` entry point
+  (issue #137): 4-bit codes packed eight to a `u32` (least-significant nibble
+  first — `packQ8`'s byte order at half the width), with one absmax scale per
+  **group of 128 contiguous columns** rather than one per row. `quantizeQ4G128`
+  produces the codes and scales, `packQ4` puts them on the wire, and
+  `matvecQ4G128` (reference + WGSL kernel) reads them without a dequant pass.
+
+  Exists because q8 is the only quantization this library had, and 8 bits is
+  the wrong size for the models it is being pointed at next: a 0.6B model fits
+  a browser at q8, a 3B or 4B one does not. Four bits without a group axis is
+  not a usable substitute — issue #137's measurements (voxshot's, on
+  MioTTS-0.6B, not this repository's) put per-row q4 at 4.5e-1 peak-relative
+  logit error against q8's 4.8e-2, with greedy agreement collapsing from 6
+  tokens to 1; group-128 recovers about 3x of that for 0.24 extra bits per
+  weight. This repository's own synthetic measurement shows the mechanism
+  directly (README, "The q4 format"): on columns two orders of magnitude
+  smaller than their row's peak, per-row q4 has RMS-relative error of exactly
+  **1.0** — every code rounds to zero — where group-128 is unaffected.
+
+  Three conventions are stated rather than picked quietly (rule 7), because
+  each has a live alternative that produces different numbers: the range is
+  symmetric **`[-7, 7]`** and not Q4_0's `[-8, 7]` (which measured *best* of
+  every configuration tried on weight RMS error and still flipped the argmax
+  in 4 of 4 cases, because clipping one tail biases the error instead of
+  randomising it); the scale's reciprocal is formed as `7/absmax` in f64, not
+  as `1/f32(scale)` as llama.cpp does; and rounding is `Math.round`'s
+  ties-toward-`+Infinity`, matching `ops/quantize` and
+  `llm/tools/quant_common.py`. The format is **not** called Q4_0-compatible —
+  block size, range and scale dtype all differ.
+
+  Speed is unmeasured, and so is the effect on any real model's output.
+- `conv2d` / `conv2dOutputSize` in `ops/conv`, with a WGSL kernel at
+  `ops/conv/wgsl/conv2d.wgsl` (issue #145). `ops/conv` shipped 1D only, so
+  anything with a spatial input — the image decoders #148 is about — had no
+  convolution at all. It lives beside `conv1d` rather than in an op of its own
+  because every convention it needs is one `conv1d` already settled against
+  torch 2.10.0+cu128 (cross-correlation, zeros on both ends of each axis, bias
+  once per output element, `groups` splitting both channel axes, throwing where
+  torch raises); two files could drift, and a 2D op that flipped its kernel or
+  padded its edges differently from the 1D one beside it would be a wrong
+  answer of the right shape. The conventions were re-measured in 2D rather
+  than assumed, because two of them can only be checked there — a flip
+  reverses *both* axes, and a pad has four edges.
+
+  `stride` / `padding` / `dilation` take `number | [H, W]`, PyTorch's own
+  `int | tuple[int, int]`, with the pair order measured rather than read off
+  the docs (`stride=(2,3)` and `stride=(3,2)` on a `[1,1,4,6]` input return
+  `[1,1,2,2]` and `[1,1,2,3]`, so the first member is H). `padding` stays an
+  integer count: `'same'` / `'valid'` are refused for the reason `conv1d`
+  gives, now with the measurement behind it — torch splits `'same'`'s odd
+  total pad asymmetrically for an even kernel, which one integer per axis
+  cannot express, and torch itself rejects `'same'` with stride > 1.
+  Deliberately absent: `conv_transpose2d`, `padding_mode`, 3D.
+
+  **Speed unmeasured.** One thread per output element, no tiling, workgroup
+  256 along the contiguous (W) axis — the same shape `conv1d` uses, kept so
+  that whatever #134 measures lands on one shape rather than two.
 - `ropeAxes` (issue #151), exported from `ops/rope` beside the 1-D op, with a
   second WGSL entry point `ops/rope/wgsl/axes.wgsl`. Z-Image's DiT gives every
   token a `(t, y, x)` triple and splits the head dim `[32, 48, 48]` so each
