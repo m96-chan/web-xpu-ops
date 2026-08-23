@@ -72,6 +72,32 @@ Entries record **why** a change was needed. What changed is in the diff.
   block size, range and scale dtype all differ.
 
   Speed is unmeasured, and so is the effect on any real model's output.
+- `conv2d` / `conv2dOutputSize` in `ops/conv`, with a WGSL kernel at
+  `ops/conv/wgsl/conv2d.wgsl` (issue #145). `ops/conv` shipped 1D only, so
+  anything with a spatial input — the image decoders #148 is about — had no
+  convolution at all. It lives beside `conv1d` rather than in an op of its own
+  because every convention it needs is one `conv1d` already settled against
+  torch 2.10.0+cu128 (cross-correlation, zeros on both ends of each axis, bias
+  once per output element, `groups` splitting both channel axes, throwing where
+  torch raises); two files could drift, and a 2D op that flipped its kernel or
+  padded its edges differently from the 1D one beside it would be a wrong
+  answer of the right shape. The conventions were re-measured in 2D rather
+  than assumed, because two of them can only be checked there — a flip
+  reverses *both* axes, and a pad has four edges.
+
+  `stride` / `padding` / `dilation` take `number | [H, W]`, PyTorch's own
+  `int | tuple[int, int]`, with the pair order measured rather than read off
+  the docs (`stride=(2,3)` and `stride=(3,2)` on a `[1,1,4,6]` input return
+  `[1,1,2,2]` and `[1,1,2,3]`, so the first member is H). `padding` stays an
+  integer count: `'same'` / `'valid'` are refused for the reason `conv1d`
+  gives, now with the measurement behind it — torch splits `'same'`'s odd
+  total pad asymmetrically for an even kernel, which one integer per axis
+  cannot express, and torch itself rejects `'same'` with stride > 1.
+  Deliberately absent: `conv_transpose2d`, `padding_mode`, 3D.
+
+  **Speed unmeasured.** One thread per output element, no tiling, workgroup
+  256 along the contiguous (W) axis — the same shape `conv1d` uses, kept so
+  that whatever #134 measures lands on one shape rather than two.
 - `ropeAxes` (issue #151), exported from `ops/rope` beside the 1-D op, with a
   second WGSL entry point `ops/rope/wgsl/axes.wgsl`. Z-Image's DiT gives every
   token a `(t, y, x)` triple and splits the head dim `[32, 48, 48]` so each
