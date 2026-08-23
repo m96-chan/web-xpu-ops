@@ -28,13 +28,15 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import sys
 from pathlib import Path
 
 import torch
 from diffusers import AutoencoderKL
 from PIL import Image
 
-REPO = "Tongyi-MAI/Z-Image"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from models import REPO, add_argument, resolve  # noqa: E402
 
 
 
@@ -72,10 +74,11 @@ def main() -> None:
                          "hard edges and fine texture are where a VAE visibly loses information)")
     ap.add_argument("--size", type=int, default=256, help="square crop fed to the encoder")
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent.parent / "fixtures")
+    add_argument(ap)
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
-    vae = AutoencoderKL.from_pretrained(REPO, subfolder="vae", torch_dtype=torch.float32).eval()
+    vae = AutoencoderKL.from_pretrained(resolve("vae", args.model_dir), torch_dtype=torch.float32).eval()
 
     if args.image is not None:
         img = Image.open(args.image).convert("RGB")

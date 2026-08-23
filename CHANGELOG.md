@@ -7,6 +7,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Added
+
+- `llm/tokenizer-bpe.ts`: a byte-level BPE tokenizer, which is what Qwen uses
+  and therefore what Z-Image's text encoder needs (issue #153). A separate
+  module from `llm/tokenizer.ts` rather than an option on it: that one is
+  SentencePiece **unigram**, where the vocabulary carries a score per piece and
+  encoding is a Viterbi search for the likeliest segmentation. BPE has no
+  scores and replays an ordered merge list instead. The two share a signature
+  and nothing else.
+
+  Four stages in a fixed order, because each one's output is the next one's
+  input: NFC (declared by the checkpoint, and without it text arriving
+  decomposed from a macOS filesystem tokenises differently), the checkpoint's
+  own pre-tokenisation regex, the GPT-2 byte alphabet (which is why there is no
+  unknown token — every byte is representable), then the merges.
+
+  Correctness is 32 cases run through the real `tokenizers` library
+  (`llm/tools/gen_bpe_fixtures.py`), covering Japanese, Chinese, Korean,
+  Cyrillic, RTL Arabic, ZWJ/skin-tone/flag emoji, code, URLs, whitespace runs,
+  the pre-tokeniser's contraction list, and an NFC/NFD pair that must encode
+  alike — the same case list the SentencePiece side (#104) found to matter,
+  plus the ones specific to BPE. `decode` skips special tokens by default
+  because the reference does (measured: `[151644, 872]` gives `"user"` there,
+  `"<|im_start|>user"` with the flag off), and takes `{ skipSpecial: false }`
+  for the times a caller wants the chat scaffolding visible.
+
+  A normalizer other than NFC is refused rather than ignored, since ignoring
+  one silently changes every id and no test written against this module alone
+  would notice.
+
 ### Fixed
 
 - The GPU tests stop dying for no stated reason. `harness/wgsl.ts` and

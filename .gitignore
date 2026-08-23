@@ -12,3 +12,7 @@ examples/zimage-vae/fixtures-small/decoder.bin
 examples/zimage-vae/fixtures-small/decoded.png
 examples/zimage-vae/fixtures-tiny/decoder.bin
 examples/zimage-vae/fixtures-tiny/decoded.png
+
+
+# Workflow subagents get their own worktrees here; they are throwaway.
+.claude/worktrees/

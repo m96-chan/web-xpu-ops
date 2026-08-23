@@ -53,6 +53,7 @@
   "include": [
     "ops/*/index.ts",
     "llm/tokenizer.ts",
+    "llm/tokenizer-bpe.ts",
     "llm/kv-cache.ts",
     "llm/reshape.ts",
     "llm/sampler.ts"
