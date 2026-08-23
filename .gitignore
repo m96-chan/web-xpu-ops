@@ -13,9 +13,6 @@ examples/zimage-vae/fixtures-small/decoded.png
 examples/zimage-vae/fixtures-tiny/decoder.bin
 examples/zimage-vae/fixtures-tiny/decoded.png
 
-# Qwen BPE vocabulary: 5.7 MB, exported by llm/tools/gen_bpe_fixtures.py
-# from the checkpoint. The fixtures beside it are committed; this is not.
-llm/data/*.bpe-vocab.json
 
 # Workflow subagents get their own worktrees here; they are throwaway.
 .claude/worktrees/
