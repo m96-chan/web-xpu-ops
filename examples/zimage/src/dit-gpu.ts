@@ -35,8 +35,6 @@
  * attention and matmul dispatches are two-dimensional and stay far below it at
  * any resolution this can run.
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import type { Runner } from "../../../harness/wgsl.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
@@ -51,25 +49,41 @@ import { captionPositionIds, imagePositionIds, patchify, timestepEmbedding, unpa
 
 type Run = Runner["run"];
 
-const opsRoot = new URL("../../../ops/", import.meta.url);
-
-/** As `decoder-gpu.ts` does it: read the WGSL directly, so this runs under plain node. */
-function wgsl(op: string, entry = "kernel"): string {
-  return readFileSync(fileURLToPath(new URL(`${op}/wgsl/${entry}.wgsl`, opsRoot)), "utf8");
+/**
+ * The kernels this forward dispatches, by name.
+ *
+ * Passed in rather than read from disk, because the browser has no `fs` and
+ * this file is the same code in both places. `kernels-node.ts` reads them off
+ * the filesystem for Node; the browser build fetches them. Making it a
+ * parameter is what stops the browser version from being a second, drifting
+ * copy of this file.
+ */
+export interface DitKernels {
+  rmsnorm: string;
+  layernorm: string;
+  matmul: string;
+  activation: string;
+  elementwise: string;
+  rows: string;
+  ropeAxes: string;
+  dequantTranspose: string;
+  scores: string;
+  context: string;
 }
 
-const CODE = {
-  rmsnorm: wgsl("rmsnorm"),
-  layernorm: wgsl("layernorm"),
-  matmul: wgsl("matmul"),
-  activation: wgsl("activation"),
-  elementwise: wgsl("elementwise"),
-  rows: wgsl("elementwise", "rows"),
-  ropeAxes: wgsl("rope", "axes"),
-  dequantTranspose: wgsl("dequant_transpose"),
-  scores: wgsl("attention", "scores"),
-  context: wgsl("attention", "context"),
-};
+/** The kernel names, so both loaders fetch the same set. */
+export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: string }[] = [
+  { key: "rmsnorm", op: "rmsnorm", entry: "kernel" },
+  { key: "layernorm", op: "layernorm", entry: "kernel" },
+  { key: "matmul", op: "matmul", entry: "kernel" },
+  { key: "activation", op: "activation", entry: "kernel" },
+  { key: "elementwise", op: "elementwise", entry: "kernel" },
+  { key: "rows", op: "elementwise", entry: "rows" },
+  { key: "ropeAxes", op: "rope", entry: "axes" },
+  { key: "dequantTranspose", op: "dequant_transpose", entry: "kernel" },
+  { key: "scores", op: "attention", entry: "scores" },
+  { key: "context", op: "attention", entry: "context" },
+];
 
 const WG = 256;
 const TILE = 16;
@@ -98,6 +112,7 @@ async function chunked(
  */
 async function linearPacked(
   run: Run,
+  K: DitKernels,
   x: Float32Array,
   packed: { codes: Uint32Array; scale: Float32Array; N: number; K: number },
   rows: number,
@@ -122,7 +137,7 @@ async function linearPacked(
   for (let o0 = 0; o0 < outDim; o0 += maxOut) {
     const chunk = Math.min(maxOut, outDim - o0);
     const [wT] = await run({
-      code: CODE.dequantTranspose,
+      code: K.dequantTranspose,
       bindings: [
         { kind: "storage", data: codes.subarray(o0 * wordsPerRow, (o0 + chunk) * wordsPerRow) },
         { kind: "storage", data: scale.subarray(o0, o0 + chunk) },
@@ -132,7 +147,7 @@ async function linearPacked(
       workgroups: [Math.ceil((chunk * inDim) / WG)],
     });
     const [y] = await run({
-      code: CODE.matmul,
+      code: K.matmul,
       bindings: [
         { kind: "storage", data: x },
         { kind: "storage", data: wT as Float32Array },
@@ -158,6 +173,7 @@ async function linearPacked(
 /** `y = x @ W^T (+ b)`; `W` is `[out, in]` and the transpose stays on the CPU. */
 async function linear(
   run: Run,
+  K: DitKernels,
   x: Float32Array,
   weight: Float32Array,
   rows: number,
@@ -170,7 +186,7 @@ async function linear(
     for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = weight[o * inDim + i]!;
   }
   const [y] = await run({
-    code: CODE.matmul,
+    code: K.matmul,
     bindings: [
       { kind: "storage", data: x },
       { kind: "storage", data: wT },
@@ -190,6 +206,7 @@ async function linear(
 
 async function rmsnorm(
   run: Run,
+  K: DitKernels,
   input: Float32Array,
   weight: Float32Array,
   N: number,
@@ -197,7 +214,7 @@ async function rmsnorm(
   eps: number,
 ): Promise<Float32Array> {
   const [out] = await run({
-    code: CODE.rmsnorm,
+    code: K.rmsnorm,
     bindings: [
       { kind: "storage", data: input },
       { kind: "storage", data: weight },
@@ -209,10 +226,10 @@ async function rmsnorm(
   return out as Float32Array;
 }
 
-async function elementwise(run: Run, a: Float32Array, b: Float32Array, kind: number): Promise<Float32Array> {
+async function elementwise(run: Run, K: DitKernels, a: Float32Array, b: Float32Array, kind: number): Promise<Float32Array> {
   return chunked(a.length, async (offset, n) => {
     const [part] = await run({
-      code: CODE.elementwise,
+      code: K.elementwise,
       bindings: [
         { kind: "storage", data: a.subarray(offset, offset + n) },
         { kind: "storage", data: b.subarray(offset, offset + n) },
@@ -228,6 +245,7 @@ async function elementwise(run: Run, a: Float32Array, b: Float32Array, kind: num
 /** `a` is `[S, D]`, `b` is `[D]` and is broadcast down the rows. */
 async function elementwiseRows(
   run: Run,
+  K: DitKernels,
   a: Float32Array,
   b: Float32Array,
   S: number,
@@ -235,7 +253,7 @@ async function elementwiseRows(
   kind: number,
 ): Promise<Float32Array> {
   const [out] = await run({
-    code: CODE.rows,
+    code: K.rows,
     bindings: [
       { kind: "storage", data: a },
       { kind: "storage", data: b },
@@ -247,10 +265,10 @@ async function elementwiseRows(
   return out as Float32Array;
 }
 
-async function activation(run: Run, input: Float32Array, kind: number): Promise<Float32Array> {
+async function activation(run: Run, K: DitKernels, input: Float32Array, kind: number): Promise<Float32Array> {
   return chunked(input.length, async (offset, n) => {
     const [part] = await run({
-      code: CODE.activation,
+      code: K.activation,
       bindings: [
         { kind: "storage", data: input.subarray(offset, offset + n) },
         { kind: "out", type: "f32", length: n },
@@ -274,6 +292,7 @@ async function activation(run: Run, input: Float32Array, kind: number): Promise<
  */
 async function ropeAxes(
   run: Run,
+  K: DitKernels,
   input: Float32Array,
   N: number,
   numHeads: number,
@@ -292,7 +311,7 @@ async function ropeAxes(
   positionSlack.set(positions);
 
   const [out] = await run({
-    code: CODE.ropeAxes,
+    code: K.ropeAxes,
     bindings: [
       { kind: "storage", data: padded },
       { kind: "storage", data: Uint32Array.from(axisDims) },
@@ -342,6 +361,7 @@ function mergeHeads(x: Float32Array, seq: number, heads: number, dim: number): F
  */
 async function attention(
   run: Run,
+  K: DitKernels,
   q: Float32Array,
   k: Float32Array,
   v: Float32Array,
@@ -358,7 +378,7 @@ async function attention(
     const kh = k.subarray(h * S * D, (h + 1) * S * D);
     const vh = v.subarray(h * S * D, (h + 1) * S * D);
     const [probs] = await run({
-      code: CODE.scores,
+      code: K.scores,
       bindings: [
         { kind: "storage", data: qh },
         { kind: "storage", data: kh },
@@ -377,7 +397,7 @@ async function attention(
       workgroups: [L, 1, 1],
     });
     const [context] = await run({
-      code: CODE.context,
+      code: K.context,
       bindings: [
         { kind: "storage", data: probs as Float32Array },
         { kind: "storage", data: vh },
@@ -400,6 +420,7 @@ async function attention(
  */
 async function project(
   run: Run,
+  K: DitKernels,
   src: PackedWeightSource,
   name: string,
   x: Float32Array,
@@ -409,13 +430,14 @@ async function project(
   bias?: Float32Array,
 ): Promise<Float32Array> {
   const packed = src.packedQ8(name);
-  if (packed) return linearPacked(run, x, packed, rows, bias);
-  return linear(run, x, src.get(name), rows, inDim, outDim, bias);
+  if (packed) return linearPacked(run, K, x, packed, rows, bias);
+  return linear(run, K, x, src.get(name), rows, inDim, outDim, bias);
 }
 
 /** One block. Mirrors `zimageBlock`, including `validSeq`'s trim-not-mask. */
 async function block(
   run: Run,
+  K: DitKernels,
   cfg: { dim: number; nHeads: number; headDim: number; ffnHidden: number; normEps: number; ropeAxesDims: number[]; ropeTheta: number },
   src: PackedWeightSource,
   prefix: string,
@@ -444,35 +466,35 @@ async function block(
     gateMlp = ones();
   } else {
     const mod = await project(
-      run, src, p("adaLN_modulation.0.weight"), adalnInput, 1, adalnInput.length, 4 * dim,
+      run, K, src, p("adaLN_modulation.0.weight"), adalnInput, 1, adalnInput.length, 4 * dim,
       w("adaLN_modulation.0.bias"),
     );
     const chunk = (i: number) => mod.slice(i * dim, (i + 1) * dim);
     scaleMsa = chunk(0);
-    gateMsa = await activation(run, chunk(1), ACTIVATION.tanh);
+    gateMsa = await activation(run, K, chunk(1), ACTIVATION.tanh);
     scaleMlp = chunk(2);
-    gateMlp = await activation(run, chunk(3), ACTIVATION.tanh);
+    gateMlp = await activation(run, K, chunk(3), ACTIVATION.tanh);
     for (let i = 0; i < dim; i += 1) {
       scaleMsa[i] = 1 + scaleMsa[i]!;
       scaleMlp[i] = 1 + scaleMlp[i]!;
     }
   }
 
-  const normed1 = await rmsnorm(run, x, w("attention_norm1.weight"), seq, dim, normEps);
-  const scaled1 = await elementwiseRows(run, normed1, scaleMsa, seq, dim, ELEMENTWISE.multiply);
+  const normed1 = await rmsnorm(run, K, x, w("attention_norm1.weight"), seq, dim, normEps);
+  const scaled1 = await elementwiseRows(run, K, normed1, scaleMsa, seq, dim, ELEMENTWISE.multiply);
 
-  let q = await project(run, src, p("attention.to_q.weight"), scaled1, seq, dim, width);
-  let k = await project(run, src, p("attention.to_k.weight"), scaled1, seq, dim, width);
-  const v = await project(run, src, p("attention.to_v.weight"), scaled1, seq, dim, width);
+  let q = await project(run, K, src, p("attention.to_q.weight"), scaled1, seq, dim, width);
+  let k = await project(run, K, src, p("attention.to_k.weight"), scaled1, seq, dim, width);
+  const v = await project(run, K, src, p("attention.to_v.weight"), scaled1, seq, dim, width);
 
-  q = await rmsnorm(run, q, w("attention.norm_q.weight"), seq * nHeads, headDim, normEps);
-  k = await rmsnorm(run, k, w("attention.norm_k.weight"), seq * nHeads, headDim, normEps);
-  q = await ropeAxes(run, q, seq, nHeads, ropeAxesDims, positions, ropeTheta);
-  k = await ropeAxes(run, k, seq, nHeads, ropeAxesDims, positions, ropeTheta);
+  q = await rmsnorm(run, K, q, w("attention.norm_q.weight"), seq * nHeads, headDim, normEps);
+  k = await rmsnorm(run, K, k, w("attention.norm_k.weight"), seq * nHeads, headDim, normEps);
+  q = await ropeAxes(run, K, q, seq, nHeads, ropeAxesDims, positions, ropeTheta);
+  k = await ropeAxes(run, K, k, seq, nHeads, ropeAxesDims, positions, ropeTheta);
 
   const live = validSeq;
   const attended = await attention(
-    run,
+    run, K,
     splitHeads(q.subarray(0, live * width), live, nHeads, headDim),
     splitHeads(k.subarray(0, live * width), live, nHeads, headDim),
     splitHeads(v.subarray(0, live * width), live, nHeads, headDim),
@@ -481,24 +503,24 @@ async function block(
   const merged = new Float32Array(seq * width);
   merged.set(mergeHeads(attended, live, nHeads, headDim), 0);
 
-  const projected = await project(run, src, p("attention.to_out.0.weight"), merged, seq, width, dim);
-  const normed2 = await rmsnorm(run, projected, w("attention_norm2.weight"), seq, dim, normEps);
-  const gated1 = await elementwiseRows(run, normed2, gateMsa, seq, dim, ELEMENTWISE.multiply);
-  let h = await elementwise(run, x, gated1, ELEMENTWISE.add);
+  const projected = await project(run, K, src, p("attention.to_out.0.weight"), merged, seq, width, dim);
+  const normed2 = await rmsnorm(run, K, projected, w("attention_norm2.weight"), seq, dim, normEps);
+  const gated1 = await elementwiseRows(run, K, normed2, gateMsa, seq, dim, ELEMENTWISE.multiply);
+  let h = await elementwise(run, K, x, gated1, ELEMENTWISE.add);
 
-  const normed3 = await rmsnorm(run, h, w("ffn_norm1.weight"), seq, dim, normEps);
-  const scaled2 = await elementwiseRows(run, normed3, scaleMlp, seq, dim, ELEMENTWISE.multiply);
+  const normed3 = await rmsnorm(run, K, h, w("ffn_norm1.weight"), seq, dim, normEps);
+  const scaled2 = await elementwiseRows(run, K, normed3, scaleMlp, seq, dim, ELEMENTWISE.multiply);
   const gate = await activation(
-    run, await project(run, src, p("feed_forward.w1.weight"), scaled2, seq, dim, ffnHidden), ACTIVATION.silu,
+    run, K, await project(run, K, src, p("feed_forward.w1.weight"), scaled2, seq, dim, ffnHidden), ACTIVATION.silu,
   );
-  const up = await project(run, src, p("feed_forward.w3.weight"), scaled2, seq, dim, ffnHidden);
+  const up = await project(run, K, src, p("feed_forward.w3.weight"), scaled2, seq, dim, ffnHidden);
   const ffn = await project(
-    run, src, p("feed_forward.w2.weight"),
-    await elementwise(run, gate, up, ELEMENTWISE.multiply), seq, ffnHidden, dim,
+    run, K, src, p("feed_forward.w2.weight"),
+    await elementwise(run, K, gate, up, ELEMENTWISE.multiply), seq, ffnHidden, dim,
   );
-  const normed4 = await rmsnorm(run, ffn, w("ffn_norm2.weight"), seq, dim, normEps);
-  const gated2 = await elementwiseRows(run, normed4, gateMlp, seq, dim, ELEMENTWISE.multiply);
-  h = await elementwise(run, h, gated2, ELEMENTWISE.add);
+  const normed4 = await rmsnorm(run, K, ffn, w("ffn_norm2.weight"), seq, dim, normEps);
+  const gated2 = await elementwiseRows(run, K, normed4, gateMlp, seq, dim, ELEMENTWISE.multiply);
+  h = await elementwise(run, K, h, gated2, ELEMENTWISE.add);
   return h;
 }
 
@@ -506,6 +528,7 @@ async function block(
 /** `ditForward`, dispatch for dispatch. */
 export async function ditForwardGpu(
   run: Run,
+  K: DitKernels,
   cfg: DitConfig,
   weights: PackedWeightSource,
   input: DitInput,
@@ -522,18 +545,18 @@ export async function ditForwardGpu(
 
   const tFreq = timestepEmbedding(input.t * cfg.tScale, cfg.frequencyEmbeddingSize, cfg.maxPeriod);
   const tMid = await project(
-    run, weights, "t_embedder.mlp.0.weight", tFreq, 1, cfg.frequencyEmbeddingSize,
+    run, K, weights, "t_embedder.mlp.0.weight", tFreq, 1, cfg.frequencyEmbeddingSize,
     weights.get("t_embedder.mlp.0.bias").length, weights.get("t_embedder.mlp.0.bias"),
   );
   const adalnInput = await project(
-    run, weights, "t_embedder.mlp.2.weight", await activation(run, tMid, ACTIVATION.silu),
+    run, K, weights, "t_embedder.mlp.2.weight", await activation(run, K, tMid, ACTIVATION.silu),
     1, tMid.length, cfg.adalnEmbedDim, weights.get("t_embedder.mlp.2.bias"),
   );
   if (trace) trace.adalnInput = adalnInput;
 
   const key = `${patchSize}-1`;
   let x = await project(
-    run, weights, `all_x_embedder.${key}.weight`,
+    run, K, weights, `all_x_embedder.${key}.weight`,
     patchify(input.latent, inChannels, F, H, W, patchSize, 1), xSeq, patchDim, dim,
     weights.get(`all_x_embedder.${key}.bias`),
   );
@@ -543,15 +566,15 @@ export async function ditForwardGpu(
   const blockCfg = { dim, nHeads, headDim, ffnHidden, normEps, ropeAxesDims: cfg.ropeAxesDims, ropeTheta: cfg.ropeTheta };
 
   for (let i = 0; i < cfg.nRefinerLayers; i += 1) {
-    x = await block(run, blockCfg, weights, `noise_refiner.${i}.`, true, x, adalnInput, xPositions, xSeq, xSeq);
+    x = await block(run, K, blockCfg, weights, `noise_refiner.${i}.`, true, x, adalnInput, xPositions, xSeq, xSeq);
   }
   if (trace) trace.afterNoiseRefiner = x.slice();
 
   const capNormed = await rmsnorm(
-    run, input.capFeats, weights.get("cap_embedder.0.weight"), capSeq, cfg.capFeatDim, normEps,
+    run, K, input.capFeats, weights.get("cap_embedder.0.weight"), capSeq, cfg.capFeatDim, normEps,
   );
   let cap = await project(
-    run, weights, "cap_embedder.1.weight", capNormed, capSeq, cfg.capFeatDim, dim,
+    run, K, weights, "cap_embedder.1.weight", capNormed, capSeq, cfg.capFeatDim, dim,
     weights.get("cap_embedder.1.bias"),
   );
 
@@ -568,7 +591,7 @@ export async function ditForwardGpu(
   const capPositions = captionPositionIds(capSeq);
   for (let i = 0; i < cfg.nRefinerLayers; i += 1) {
     cap = await block(
-      run, blockCfg, weights, `context_refiner.${i}.`, false, cap, null, capPositions, capSeq, capValid,
+      run, K, blockCfg, weights, `context_refiner.${i}.`, false, cap, null, capPositions, capSeq, capValid,
     );
   }
   if (trace) trace.afterContextRefiner = cap.slice();
@@ -584,21 +607,21 @@ export async function ditForwardGpu(
 
   for (let i = 0; i < cfg.nLayers; i += 1) {
     unified = await block(
-      run, blockCfg, weights, `layers.${i}.`, true, unified, adalnInput, positions, unifiedSeq, unifiedValid,
+      run, K, blockCfg, weights, `layers.${i}.`, true, unified, adalnInput, positions, unifiedSeq, unifiedValid,
     );
     if (trace && i === 0) trace.afterLayer0 = unified.slice();
   }
   if (trace) trace.afterLayers = unified.slice();
 
   const scale = await project(
-    run, weights, `all_final_layer.${key}.adaLN_modulation.1.weight`,
-    await activation(run, adalnInput, ACTIVATION.silu), 1, cfg.adalnEmbedDim, dim,
+    run, K, weights, `all_final_layer.${key}.adaLN_modulation.1.weight`,
+    await activation(run, K, adalnInput, ACTIVATION.silu), 1, cfg.adalnEmbedDim, dim,
     weights.get(`all_final_layer.${key}.adaLN_modulation.1.bias`),
   );
   for (let d = 0; d < dim; d += 1) scale[d] = 1 + scale[d]!;
 
   const [normed] = await run({
-    code: CODE.layernorm,
+    code: K.layernorm,
     bindings: [
       { kind: "storage", data: unified },
       { kind: "storage", data: new Float32Array(dim).fill(1) },
@@ -608,10 +631,10 @@ export async function ditForwardGpu(
     ],
     workgroups: [unifiedSeq],
   });
-  const scaled = await elementwiseRows(run, normed as Float32Array, scale, unifiedSeq, dim, ELEMENTWISE.multiply);
+  const scaled = await elementwiseRows(run, K, normed as Float32Array, scale, unifiedSeq, dim, ELEMENTWISE.multiply);
 
   const projected = await project(
-    run, weights, `all_final_layer.${key}.linear.weight`, scaled, unifiedSeq, dim, patchDim,
+    run, K, weights, `all_final_layer.${key}.linear.weight`, scaled, unifiedSeq, dim, patchDim,
     weights.get(`all_final_layer.${key}.linear.bias`),
   );
   return unpatchify(projected.slice(0, xSeq * patchDim), inChannels, F, H, W, patchSize, 1);

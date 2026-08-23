@@ -32,6 +32,7 @@ import { decodeGpu } from "../../zimage-vae/src/decoder-gpu.js";
 import { encodePng } from "../../zimage-vae/src/render.js";
 import { type DitConfig } from "./dit.js";
 import { ditForwardGpu } from "./dit-gpu.js";
+import { ditKernels } from "./kernels-node.js";
 import {
   DEFAULT_FLOW_SHIFT,
   DEFAULT_STEPS,
@@ -111,6 +112,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   const run = runner.run;
+  const K = ditKernels();
   const started = Date.now();
   const mark = (label: string, from: number): number => {
     console.log(`  ${label.padEnd(18)} ${((Date.now() - from) / 1000).toFixed(1)}s`);
@@ -230,7 +232,7 @@ async function main(): Promise<void> {
   );
   for (let step = 0; step < steps; step += 1) {
     const stepStart = Date.now();
-    const velocity = await ditForwardGpu(run, ditCfg, weights, {
+    const velocity = await ditForwardGpu(run, K, ditCfg, weights, {
       latent: latents,
       F: 1,
       H: latentSide,

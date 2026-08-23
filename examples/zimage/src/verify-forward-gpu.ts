@@ -29,6 +29,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { type DitConfig, type DitTrace } from "./dit.js";
 import { ditForwardGpu } from "./dit-gpu.js";
+import { ditKernels } from "./kernels-node.js";
 import { createRunner } from "../../../harness/wgsl.js";
 import { LazyDitWeights } from "./weights-node.js";
 
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
   const ran = Date.now();
   const out = await ditForwardGpu(
     runner.run,
+    ditKernels(),
     cfg,
     weights,
     {
