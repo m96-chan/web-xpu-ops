@@ -16,9 +16,12 @@
 //   output: [N, C, outH, outW]  f32
 //
 // N and C never appear apart — the resample is per (n, c) plane — so they are
-// one flat plane index here, exactly as in the reference. That also keeps this
-// off the 65535 limit on dispatch dimensions y and z for a batch times channel
-// count that a decoder can reach.
+// one flat plane index here, exactly as in the reference. This is forced by the
+// dispatch, not a way around its limits: x is spent on outW and y on outH, so
+// N and C have only z left and must share it. Flattening therefore makes the
+// 65535 limit on y and z arrive *sooner*, at N * C rather than at each alone —
+// a real ceiling for a decoder with many channels, and the reason a batched
+// caller that reaches it has to split the dispatch rather than reshape.
 //
 // Dispatch: x over outW in 256-wide workgroups, y = outH, z = N * C.
 

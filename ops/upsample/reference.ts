@@ -88,8 +88,12 @@ export function nearestUpsampleScale(inSize: number, outSize: number): number {
  *   matching OpenCV INTER_NEAREST which is buggy and kept for BC". The f32 is
  *   load-bearing, not an implementation detail: at `H = 14, outH = 46`,
  *   destination row 23 has exact source `23 * 14 / 46 = 7` exactly, but
- *   `float32(14/46) = 0.30434784` is below `14/46`, so `23 * 0.30434784`
- *   floors to **6**. torch returns row 6 there. Doing the same index in exact
+ *   `float32(14/46) = 0.30434781` (0.304347813129425048828125) is below
+ *   `14/46`, so `23 * 0.30434781` floors to **6**. torch returns row 6 there.
+ *   The digits matter: the *next* f32 up, `0.30434784`, is above `14/46`, and
+ *   `23 * 0.30434784 = 7.0000005` floors to 7 — so a reader checking this
+ *   paragraph against a rounded-off constant gets the opposite answer to the
+ *   one the code and torch agree on. Doing the same index in exact
  *   integer arithmetic (`(dst * inSize) / outSize | 0`) returns row 7 — a
  *   whole row different, silently. So this reference multiplies in f32 too,
  *   and the tests pin `[…, 6, 6, 6, 6, 7, …]` at that shape. Every destination
@@ -112,7 +116,7 @@ export function nearestUpsampleScale(inSize: number, outSize: number): number {
  *   off by a row with no error, so the two are named apart rather than hidden
  *   behind a default.
  * - **Non-integer ratios are allowed.** `outH` and `outW` are independent
- *   positive integers, so 3 → 5 and 4 → 5 in one call is legal and matches
+ *   positive integers, so 3 → 5 and 4 → 7 in one call is legal and matches
  *   torch. Nothing rounds: there is no scale factor to round, which is the
  *   point of taking the size.
  * - **Downsampling throws.** `outH < H` or `outW < W` is refused rather than

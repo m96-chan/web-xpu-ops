@@ -25,7 +25,13 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Twenty-eight ops, WGSL only, verified against their references on a real GPU.
+Thirty ops, WGSL only, verified against their references on a real GPU. That is
+the count of directories under `ops/` — the number the backends table states and
+the number `harness/distribution.test.ts` asserts against the tree, so it is the
+one that cannot go stale silently. Counting the rows of the table below gives
+something else and always will: a few ops take a row per entry point
+(`matvecQ8`, `matmulQ8`, `ropeAxes`), and `permute` and `dequant_transpose` are
+described in the LLM-engine sections that produced them rather than here.
 
 **Speed is unmeasured for every one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
@@ -1985,7 +1991,7 @@ text).
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 29 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
+| WGSL | 30 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 
