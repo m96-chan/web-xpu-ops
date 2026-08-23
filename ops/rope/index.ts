@@ -1,8 +1,10 @@
 export {
   rope,
+  ropeAxes,
   ropeCache,
   ropeFrequencyParams,
   type RoPEArgs,
+  type RoPEAxesArgs,
   type RoPECache,
   type RoPECacheArgs,
   type RoPEFrequencyParams,
