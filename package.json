@@ -44,6 +44,10 @@
       "types": "./dist/llm/tokenizer.d.ts",
       "default": "./dist/llm/tokenizer.js"
     },
+    "./llm/tokenizer-bpe": {
+      "types": "./dist/llm/tokenizer-bpe.d.ts",
+      "default": "./dist/llm/tokenizer-bpe.js"
+    },
     "./llm/kv-cache": {
       "types": "./dist/llm/kv-cache.d.ts",
       "default": "./dist/llm/kv-cache.js"
