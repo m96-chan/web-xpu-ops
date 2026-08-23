@@ -10,3 +10,5 @@ __pycache__/
 examples/zimage-vae/fixtures/
 examples/zimage-vae/fixtures-small/decoder.bin
 examples/zimage-vae/fixtures-small/decoded.png
+examples/zimage-vae/fixtures-tiny/decoder.bin
+examples/zimage-vae/fixtures-tiny/decoded.png

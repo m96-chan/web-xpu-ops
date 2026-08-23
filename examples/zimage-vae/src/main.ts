@@ -11,7 +11,9 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createRunner } from "../../../harness/wgsl.js";
 import { type DecoderConfig, decode } from "./decoder.js";
+import { decodeGpu } from "./decoder-gpu.js";
 import { encodePng } from "./render.js";
 
 interface Entry {
@@ -81,9 +83,18 @@ const latentEntry = manifest.latent.find((e) => e.name === "latent")!;
 const [, , lh, lw] = latentEntry.shape;
 
 console.log(`latent ${latentEntry.shape.join("x")} -> image ${lh! * 8}x${lw! * 8}`);
+const cpuOnly = process.argv.includes("--cpu");
+const runner = cpuOnly ? null : await createRunner();
+if (!cpuOnly && !runner) console.warn("no GPU adapter — falling back to the CPU reference path");
+
+const w = (n: string) => pick(weightBlob, manifest.decoder, n);
+const lat = pick(latentBlob, manifest.latent, "latent");
 const started = performance.now();
-const out = decode(cfg, (n) => pick(weightBlob, manifest.decoder, n), pick(latentBlob, manifest.latent, "latent"), lh!, lw!);
+const out = runner
+  ? await decodeGpu(runner.run, cfg, w, lat, lh!, lw!)
+  : decode(cfg, w, lat, lh!, lw!);
 const elapsed = performance.now() - started;
+runner?.destroy();
 
 const png = encodePng(out.data, out.H, out.W);
 const target = fileURLToPath(new URL("decoded.png", base));
@@ -93,6 +104,6 @@ const want = pick(latentBlob, manifest.latent, "reference");
 let worst = 0;
 for (let i = 0; i < want.length; i += 1) worst = Math.max(worst, Math.abs(out.data[i]! - want[i]!));
 
-console.log(`decoded in ${(elapsed / 1000).toFixed(1)}s on the CPU reference path`);
+console.log(`decoded in ${(elapsed / 1000).toFixed(2)}s on the ${runner ? "GPU" : "CPU reference"} path`);
 console.log(`worst |ours - model| = ${worst.toExponential(3)} on pixels in [-1, 1]`);
 console.log(`wrote ${target}`);

@@ -14,12 +14,13 @@ import { type DecoderConfig, decode } from "./decoder.js";
  * early return).
  */
 
-// The 64px golden, not the 256px one: the CPU reference is six nested loops by
-// design (the reference is meant to be the slowest, plainest expression of the
-// maths), and at 256px that is minutes per run rather than a test. The GPU path
-// takes the full size — see the demo. Correctness does not depend on the size:
-// every block, channel count and group is identical, only H and W shrink.
-const fixtures = new URL("../fixtures-small/", import.meta.url);
+// The 32px golden. The CPU reference is six nested loops by design — the
+// reference is meant to be the slowest, plainest statement of the maths — and
+// it costs 64.9s at 64px, over this runner's 60s per-file budget. The GPU test
+// beside this one uses 64px, and the demo does 256px; correctness does not
+// depend on the size, since every block, channel count and group is identical
+// between them and only H and W shrink.
+const fixtures = new URL("../fixtures-tiny/", import.meta.url);
 const weightsPath = fileURLToPath(new URL("decoder.bin", fixtures));
 const present = existsSync(weightsPath);
 
