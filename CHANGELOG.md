@@ -9,6 +9,35 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `examples/zimage-web`: **Z-Image runs in a browser.** A prompt goes in a text
+  box and a picture appears on a canvas — tokenizer, Qwen3-4B text encoder, DiT
+  and VAE decoder, all on WebGPU, all composed from this repository's kernels
+  (issue #166). It calls the same functions the Node verifiers hold to the
+  model rather than carrying a browser copy of them, because the copy is what
+  would drift away from the numbers those verifiers earned.
+
+- `examples/zimage`: the whole pipeline, each part measured against Z-Image's
+  own implementation before being wired to the next — one block at the shipped
+  width (8.72e-8), the full DiT forward (4.386e-6), the text encoder
+  (7.993e-7), the sampler's schedule (exact), and generation end to end.
+
+### Changed
+
+- The DiT's GPU path reads packed q8 weights through `ops/matmul`'s `q8` entry
+  instead of `ops/dequant_transpose` followed by `matmul`. The dequantised
+  operand is four times the packed weight and was crossing the bus twice; one
+  forward went from 26.9s to 6.2s, 160x the CPU reference, with agreement
+  unchanged at 4.386e-6.
+
+  Worth recording alongside it: batching attention across its 30 heads removed
+  57% of a forward's dispatches and changed the wall clock by **nothing**. The
+  count was never the constraint; the bytes were.
+
+- `npm run lint` now type-checks `examples/zimage-web`. It was the one
+  directory nothing checked, and esbuild does not read types — which hid a call
+  missing an argument until it threw in a browser, and a second bug that had
+  not been reached yet.
+
 - `examples/zimage`: the block from #163 now runs on the **shipped weights at
   the shipped width** (issue #166, stage 1), not on a scaled-down golden with a
   random seed. `tools/convert_dit.py` turns the 12.31 GB checkpoint into 3.34 GB
