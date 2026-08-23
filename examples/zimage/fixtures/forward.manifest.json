@@ -51,7 +51,7 @@
     "ropeTheta": 256.0
   },
   "quantizationCost": {
-    "relativeRms": 0.21130740642547607
+    "relativeRms": 0.027796948328614235
   },
   "tensors": [
     {
