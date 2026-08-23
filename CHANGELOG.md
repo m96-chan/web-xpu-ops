@@ -9,6 +9,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `examples/zimage`: the block from #163 now runs on the **shipped weights at
+  the shipped width** (issue #166, stage 1), not on a scaled-down golden with a
+  random seed. `tools/convert_dit.py` turns the 12.31 GB checkpoint into 3.34 GB
+  of q4-g128, `src/weights.ts` reads it back, and `src/verify-real-block.ts`
+  puts `layers.0` through `block.ts` at `dim=3840` / `head_dim=128` / axes
+  `[32, 48, 48]`.
+
+  The port matches the model to **8.72e-8 relative RMS** on identical quantized
+  weights. Against the full-precision model the gap is 1.778e-2 — which is, to
+  four figures, exactly what quantization costs when measured independently in
+  torch. Two goldens rather than one, so a porting mistake and the format's cost
+  cannot be attributed to each other.
+
+  This also answers what #137 reopened. On `layers.0`, quantizing every Linear
+  to q4 costs 0.0519 relative RMS, and `adaLN_modulation` alone accounts for
+  0.0478 of it — it produces the scales and gates that multiply the whole
+  residual stream, so its error is multiplicative across all 3840 channels. The
+  converter therefore keeps adaLN at q8 and the rest at q4: +2.6% bytes per
+  layer, and 0.0519 down to 0.0178. `q4-g32` was measured too and is worse on
+  both counts (0.0398, and 0.25 more bits everywhere).
+
 - `llm/tokenizer-bpe.ts`: a byte-level BPE tokenizer, which is what Qwen uses
   and therefore what Z-Image's text encoder needs (issue #153). A separate
   module from `llm/tokenizer.ts` rather than an option on it: that one is
