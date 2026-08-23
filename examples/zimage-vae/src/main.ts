@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { createRunner } from "../../../harness/wgsl.js";
 import { type DecoderConfig, decode } from "./decoder.js";
 import { decodeGpu } from "./decoder-gpu.js";
+import { decoderKernels } from "./decoder-kernels-node.js";
 import { encodePng } from "./render.js";
 
 interface Entry {
@@ -91,7 +92,7 @@ const w = (n: string) => pick(weightBlob, manifest.decoder, n);
 const lat = pick(latentBlob, manifest.latent, "latent");
 const started = performance.now();
 const out = runner
-  ? await decodeGpu(runner.run, cfg, w, lat, lh!, lw!)
+  ? await decodeGpu(runner.run, decoderKernels(), cfg, w, lat, lh!, lw!)
   : decode(cfg, w, lat, lh!, lw!);
 const elapsed = performance.now() - started;
 runner?.destroy();

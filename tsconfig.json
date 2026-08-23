@@ -10,5 +10,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["ops", "harness", "llm", "examples/zimage/src"]
+  "include": ["ops", "harness", "llm", "examples/zimage/src",
+    "examples/zimage-vae/src"]
 }

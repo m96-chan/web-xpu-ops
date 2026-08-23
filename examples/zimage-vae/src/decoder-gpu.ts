@@ -16,8 +16,6 @@
  * get one wrong.
  */
 import type { Runner } from "../../../harness/wgsl.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { conv2dOutputSize } from "../../../ops/conv/index.js";
@@ -25,28 +23,37 @@ import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { nearestUpsampleScale } from "../../../ops/upsample/index.js";
 import type { DecoderConfig, Map4, Weights } from "./decoder.js";
 
-const opsRoot = new URL("../../../ops/", import.meta.url);
-
 /**
- * Reads a kernel the same way `harness/suite.ts#kernel` does, but without
- * importing it: that module pulls in vitest, which makes anything touching it
- * unusable from a plain `node` process — and this decoder's whole point is to
- * be runnable outside a test.
+ * The kernels this decoder dispatches, by name.
+ *
+ * Passed in rather than read from disk, because the browser has no `fs` and
+ * this file is the same code in both places — `decoder-kernels-node.ts` reads
+ * them off the filesystem, the browser build inlines them at bundle time. The
+ * alternative, a second copy of the decoder for the browser, is the copy that
+ * drifts.
  */
-function wgsl(op: string, entry = "kernel"): string {
-  return readFileSync(fileURLToPath(new URL(`${op}/wgsl/${entry}.wgsl`, opsRoot)), "utf8");
+export interface DecoderKernels {
+  conv2d: string;
+  upsample: string;
+  groupNorm: string;
+  activation: string;
+  elementwise: string;
+  matmul: string;
+  scores: string;
+  context: string;
 }
 
-const CODE = {
-  conv2d: wgsl("conv", "conv2d"),
-  upsample: wgsl("upsample"),
-  groupNorm: wgsl("group_norm"),
-  activation: wgsl("activation"),
-  elementwise: wgsl("elementwise"),
-  matmul: wgsl("matmul"),
-  scores: wgsl("attention", "scores"),
-  context: wgsl("attention", "context"),
-};
+/** The kernel names, so both loaders fetch the same set. */
+export const DECODER_KERNEL_SOURCES: { key: keyof DecoderKernels; op: string; entry: string }[] = [
+  { key: "conv2d", op: "conv", entry: "conv2d" },
+  { key: "upsample", op: "upsample", entry: "kernel" },
+  { key: "groupNorm", op: "group_norm", entry: "kernel" },
+  { key: "activation", op: "activation", entry: "kernel" },
+  { key: "elementwise", op: "elementwise", entry: "kernel" },
+  { key: "matmul", op: "matmul", entry: "kernel" },
+  { key: "scores", op: "attention", entry: "scores" },
+  { key: "context", op: "attention", entry: "context" },
+];
 
 const WG = 256;
 
@@ -75,14 +82,14 @@ async function chunked(len: number, out: Float32Array, one: (offset: number, n: 
 }
 type Run = Runner["run"];
 
-async function conv(run: Run, x: Map4, w: Weights, prefix: string, outC: number, k: number, pad: number): Promise<Map4> {
+async function conv(run: Run, K: DecoderKernels, x: Map4, w: Weights, prefix: string, outC: number, k: number, pad: number): Promise<Map4> {
   const { Hout, Wout } = conv2dOutputSize({ H: x.H, W: x.W, KH: k, KW: k, padding: pad });
   // The kernel writes one lane per output column and rounds the dispatch up to
   // a whole workgroup, so the buffer carries that slack — same shape as the
   // op's own test.
   const width = Math.ceil(Wout / WG) * WG;
   const [out] = await run({
-    code: CODE.conv2d,
+    code: K.conv2d,
     bindings: [
       { kind: "storage", data: x.data },
       { kind: "storage", data: w(`${prefix}.weight`) },
@@ -102,10 +109,10 @@ async function conv(run: Run, x: Map4, w: Weights, prefix: string, outC: number,
   return { data: (out as Float32Array).subarray(0, outC * Hout * Wout), C: outC, H: Hout, W: Wout };
 }
 
-async function groupNormSilu(run: Run, x: Map4, w: Weights, prefix: string, G: number): Promise<Map4> {
+async function groupNormSilu(run: Run, K: DecoderKernels, x: Map4, w: Weights, prefix: string, G: number): Promise<Map4> {
   const len = x.C * x.H * x.W;
   const [normed] = await run({
-    code: CODE.groupNorm,
+    code: K.groupNorm,
     bindings: [
       { kind: "storage", data: x.data },
       { kind: "storage", data: w(`${prefix}.weight`) },
@@ -118,7 +125,7 @@ async function groupNormSilu(run: Run, x: Map4, w: Weights, prefix: string, G: n
   const src = normed as Float32Array;
   const activated = await chunked(len, new Float32Array(len), async (offset, n) => {
     const [part] = await run({
-      code: CODE.activation,
+      code: K.activation,
       bindings: [
         { kind: "storage", data: src.subarray(offset, offset + n) },
         { kind: "out", type: "f32", length: n },
@@ -131,10 +138,10 @@ async function groupNormSilu(run: Run, x: Map4, w: Weights, prefix: string, G: n
   return { data: activated, C: x.C, H: x.H, W: x.W };
 }
 
-async function add(run: Run, a: Float32Array, b: Float32Array): Promise<Float32Array> {
+async function add(run: Run, K: DecoderKernels, a: Float32Array, b: Float32Array): Promise<Float32Array> {
   return chunked(a.length, new Float32Array(a.length), async (offset, n) => {
     const [part] = await run({
-      code: CODE.elementwise,
+      code: K.elementwise,
       bindings: [
         { kind: "storage", data: a.subarray(offset, offset + n) },
         { kind: "storage", data: b.subarray(offset, offset + n) },
@@ -147,13 +154,13 @@ async function add(run: Run, a: Float32Array, b: Float32Array): Promise<Float32A
   });
 }
 
-async function resnet(run: Run, x: Map4, w: Weights, prefix: string, outC: number, G: number, hasShortcut: boolean): Promise<Map4> {
-  let h = await groupNormSilu(run, x, w, `${prefix}.norm1`, G);
-  h = await conv(run, h, w, `${prefix}.conv1`, outC, 3, 1);
-  h = await groupNormSilu(run, h, w, `${prefix}.norm2`, G);
-  h = await conv(run, h, w, `${prefix}.conv2`, outC, 3, 1);
-  const skip = hasShortcut ? await conv(run, x, w, `${prefix}.conv_shortcut`, outC, 1, 0) : x;
-  return { data: await add(run, skip.data, h.data), C: outC, H: h.H, W: h.W };
+async function resnet(run: Run, K: DecoderKernels, x: Map4, w: Weights, prefix: string, outC: number, G: number, hasShortcut: boolean): Promise<Map4> {
+  let h = await groupNormSilu(run, K, x, w, `${prefix}.norm1`, G);
+  h = await conv(run, K, h, w, `${prefix}.conv1`, outC, 3, 1);
+  h = await groupNormSilu(run, K, h, w, `${prefix}.norm2`, G);
+  h = await conv(run, K, h, w, `${prefix}.conv2`, outC, 3, 1);
+  const skip = hasShortcut ? await conv(run, K, x, w, `${prefix}.conv_shortcut`, outC, 1, 0) : x;
+  return { data: await add(run, K, skip.data, h.data), C: outC, H: h.H, W: h.W };
 }
 
 /** `[C, H*W]` to `[H*W, C]`; the transpose stays on the CPU (see the README). */
@@ -170,13 +177,13 @@ function toMap(tokens: Float32Array, C: number, hw: number): Float32Array {
   return out;
 }
 
-async function linear(run: Run, x: Float32Array, w: Weights, prefix: string, rows: number, inC: number, outC: number): Promise<Float32Array> {
+async function linear(run: Run, K: DecoderKernels, x: Float32Array, w: Weights, prefix: string, rows: number, inC: number, outC: number): Promise<Float32Array> {
   const weight = w(`${prefix}.weight`);
   const bias = w(`${prefix}.bias`);
   const wT = new Float32Array(inC * outC);
   for (let o = 0; o < outC; o += 1) for (let i = 0; i < inC; i += 1) wT[i * outC + o] = weight[o * inC + i]!;
   const [y] = await run({
-    code: CODE.matmul,
+    code: K.matmul,
     bindings: [
       { kind: "storage", data: x },
       { kind: "storage", data: wT },
@@ -191,10 +198,10 @@ async function linear(run: Run, x: Float32Array, w: Weights, prefix: string, row
   return out;
 }
 
-async function midAttention(run: Run, x: Map4, w: Weights, prefix: string, G: number): Promise<Map4> {
+async function midAttention(run: Run, K: DecoderKernels, x: Map4, w: Weights, prefix: string, G: number): Promise<Map4> {
   const hw = x.H * x.W;
   const [normed] = await run({
-    code: CODE.groupNorm,
+    code: K.groupNorm,
     bindings: [
       { kind: "storage", data: x.data },
       { kind: "storage", data: w(`${prefix}.group_norm.weight`) },
@@ -206,12 +213,12 @@ async function midAttention(run: Run, x: Map4, w: Weights, prefix: string, G: nu
   });
   const tokens = toTokens({ data: normed as Float32Array, C: x.C, H: x.H, W: x.W });
 
-  const q = await linear(run, tokens, w, `${prefix}.to_q`, hw, x.C, x.C);
-  const k = await linear(run, tokens, w, `${prefix}.to_k`, hw, x.C, x.C);
-  const v = await linear(run, tokens, w, `${prefix}.to_v`, hw, x.C, x.C);
+  const q = await linear(run, K, tokens, w, `${prefix}.to_q`, hw, x.C, x.C);
+  const k = await linear(run, K, tokens, w, `${prefix}.to_k`, hw, x.C, x.C);
+  const v = await linear(run, K, tokens, w, `${prefix}.to_v`, hw, x.C, x.C);
 
   const [probs] = await run({
-    code: CODE.scores,
+    code: K.scores,
     bindings: [
       { kind: "storage", data: q },
       { kind: "storage", data: k },
@@ -232,7 +239,7 @@ async function midAttention(run: Run, x: Map4, w: Weights, prefix: string, G: nu
     workgroups: [hw, 1, 1],
   });
   const [attended] = await run({
-    code: CODE.context,
+    code: K.context,
     bindings: [
       { kind: "storage", data: probs as Float32Array },
       { kind: "storage", data: v },
@@ -242,35 +249,35 @@ async function midAttention(run: Run, x: Map4, w: Weights, prefix: string, G: nu
     workgroups: [hw, 1, 1],
   });
 
-  const projected = await linear(run, attended as Float32Array, w, `${prefix}.to_out.0`, hw, x.C, x.C);
-  return { data: await add(run, x.data, toMap(projected, x.C, hw)), C: x.C, H: x.H, W: x.W };
+  const projected = await linear(run, K, attended as Float32Array, w, `${prefix}.to_out.0`, hw, x.C, x.C);
+  return { data: await add(run, K, x.data, toMap(projected, x.C, hw)), C: x.C, H: x.H, W: x.W };
 }
 
-export async function decodeGpu(run: Run, cfg: DecoderConfig, w: Weights, latent: Float32Array, latentH: number, latentW: number): Promise<Map4> {
+export async function decodeGpu(run: Run, K: DecoderKernels, cfg: DecoderConfig, w: Weights, latent: Float32Array, latentH: number, latentW: number): Promise<Map4> {
   const G = cfg.normNumGroups;
   const unscaled = new Float32Array(latent.length);
   for (let i = 0; i < latent.length; i += 1) unscaled[i] = latent[i]! / cfg.scalingFactor + cfg.shiftFactor;
 
   let x: Map4 = { data: unscaled, C: cfg.latentChannels, H: latentH, W: latentW };
   const top = cfg.blockOutChannels[cfg.blockOutChannels.length - 1]!;
-  x = await conv(run, x, w, "conv_in", top, 3, 1);
+  x = await conv(run, K, x, w, "conv_in", top, 3, 1);
 
-  x = await resnet(run, x, w, "mid_block.resnets.0", top, G, false);
-  x = await midAttention(run, x, w, "mid_block.attentions.0", G);
-  x = await resnet(run, x, w, "mid_block.resnets.1", top, G, false);
+  x = await resnet(run, K, x, w, "mid_block.resnets.0", top, G, false);
+  x = await midAttention(run, K, x, w, "mid_block.attentions.0", G);
+  x = await resnet(run, K, x, w, "mid_block.resnets.1", top, G, false);
 
   const reversed = [...cfg.blockOutChannels].reverse();
   for (const [i, outC] of reversed.entries()) {
     for (let r = 0; r < cfg.layersPerBlock + 1; r += 1) {
       const inC = r === 0 ? x.C : outC;
-      x = await resnet(run, x, w, `up_blocks.${i}.resnets.${r}`, outC, G, inC !== outC);
+      x = await resnet(run, K, x, w, `up_blocks.${i}.resnets.${r}`, outC, G, inC !== outC);
     }
     if (i !== cfg.blockOutChannels.length - 1) {
       const outH = x.H * 2;
       const outW = x.W * 2;
       const width = Math.ceil(outW / WG) * WG;
       const [up] = await run({
-        code: CODE.upsample,
+        code: K.upsample,
         bindings: [
           { kind: "storage", data: x.data },
           { kind: "out", type: "f32", length: x.C * outH * outW },
@@ -286,10 +293,10 @@ export async function decodeGpu(run: Run, cfg: DecoderConfig, w: Weights, latent
         workgroups: [width / WG, outH, x.C],
       });
       x = { data: up as Float32Array, C: x.C, H: outH, W: outW };
-      x = await conv(run, x, w, `up_blocks.${i}.upsamplers.0.conv`, outC, 3, 1);
+      x = await conv(run, K, x, w, `up_blocks.${i}.upsamplers.0.conv`, outC, 3, 1);
     }
   }
 
-  x = await groupNormSilu(run, x, w, "conv_norm_out", G);
-  return conv(run, x, w, "conv_out", cfg.outChannels, 3, 1);
+  x = await groupNormSilu(run, K, x, w, "conv_norm_out", G);
+  return conv(run, K, x, w, "conv_out", cfg.outChannels, 3, 1);
 }

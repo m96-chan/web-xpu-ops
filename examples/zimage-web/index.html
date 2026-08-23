@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Z-Image in the browser — web-xpu-ops</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fbfbfa;
+        --fg: #16150f;
+        --muted: #6b6a61;
+        --line: #dedcd3;
+        --accent: #b03a2e;
+        --panel: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16150f;
+          --fg: #f2f0e8;
+          --muted: #9a988c;
+          --line: #33322a;
+          --accent: #e2705f;
+          --panel: #1e1d16;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 2rem 1.25rem 4rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main { max-width: 62rem; margin: 0 auto; }
+      h1 { font-size: 1.5rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+      .sub { color: var(--muted); margin: 0 0 2rem; }
+      .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 22rem); gap: 1.5rem; align-items: start; }
+      @media (max-width: 52rem) { .grid { grid-template-columns: minmax(0, 1fr); } }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; }
+      label { display: block; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 .35rem; }
+      input, select, button {
+        font: inherit; color: inherit; background: var(--bg);
+        border: 1px solid var(--line); border-radius: 6px; padding: .5rem .6rem; width: 100%;
+      }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-top: .9rem; }
+      button {
+        margin-top: 1.1rem; background: var(--accent); color: #fff; border-color: transparent;
+        font-weight: 600; cursor: pointer;
+      }
+      button:disabled { opacity: .55; cursor: progress; }
+      figure { margin: 0; }
+      canvas {
+        width: 100%; max-width: 512px; aspect-ratio: 1; image-rendering: pixelated;
+        background: repeating-conic-gradient(var(--line) 0 25%, transparent 0 50%) 0 0 / 16px 16px;
+        border: 1px solid var(--line); border-radius: 8px; display: block;
+      }
+      #status { margin-top: 1rem; font-variant-numeric: tabular-nums; color: var(--muted); font-size: .9rem; min-height: 1.6em; }
+      #bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: .6rem; }
+      #bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+      #log {
+        margin-top: 1rem; max-height: 15rem; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--muted); white-space: pre-wrap; word-break: break-word;
+      }
+      .note { font-size: .85rem; color: var(--muted); border-left: 2px solid var(--line); padding-left: .8rem; margin-top: 1.5rem; }
+      .note strong { color: var(--fg); }
+      code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); padding: .1em .35em; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Z-Image, in this browser</h1>
+      <p class="sub">
+        Prompt to picture on WebGPU — tokenizer, Qwen3-4B text encoder, the DiT and the VAE decoder,
+        all composed from <code>web-xpu-ops</code>' kernels. Nothing is sent anywhere.
+        <br /><span id="build" style="font-size:.8rem;opacity:.7">build …</span>
+      </p>
+
+      <div class="grid">
+        <figure class="panel">
+          <canvas id="canvas" width="256" height="256"></canvas>
+          <div id="bar"><i></i></div>
+          <div id="status">Waiting for WebGPU…</div>
+          <div id="log"></div>
+        </figure>
+
+        <form class="panel" id="form">
+          <label for="prompt">Prompt</label>
+          <input id="prompt" name="prompt" value="a red apple on a wooden table" autocomplete="off" />
+
+          <div class="row">
+            <div>
+              <label for="size">Size</label>
+              <select id="size" name="size">
+                <option value="256" selected>256 × 256</option>
+                <option value="384">384 × 384</option>
+                <option value="512">512 × 512</option>
+              </select>
+            </div>
+            <div>
+              <label for="steps">Steps</label>
+              <input id="steps" name="steps" type="number" min="1" max="32" value="8" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="seed">Seed</label>
+              <input id="seed" name="seed" type="number" value="0" />
+            </div>
+            <div>
+              <label for="shift">Flow shift</label>
+              <input id="shift" name="shift" type="number" step="0.1" value="3" />
+            </div>
+          </div>
+
+          <button id="go" type="submit" disabled>Generate</button>
+
+          <p class="note">
+            <strong>The model downloads once.</strong> 6.17&nbsp;GB of the DiT is fetched into the
+            browser's disk cache before the first generation; after that nothing is downloaded, on
+            this visit or the next. It is deliberately not kept in memory — that left too little
+            heap for the activations, and 512&nbsp;×&nbsp;512 failed to allocate.
+            <br /><br />
+            It is still not fast: weights are uploaded to the GPU per dispatch rather than kept
+            resident, and attention grows quadratically with size — 30&nbsp;heads at 512&nbsp;×&nbsp;512
+            are 129&nbsp;MB of scores per layer, on a heap that is already holding the model.
+            Measured numbers are in the example's README.
+          </p>
+        </form>
+      </div>
+    </main>
+    <script type="module" src="./dist/bundle.js"></script>
+  </body>
+</html>

@@ -56,7 +56,15 @@ export interface BlockConfig {
   ropeTheta: number;
 }
 
-/** Every parameter of one block, in the model's own naming. */
+/**
+ * Every parameter of one block, in the model's own naming.
+ *
+ * The adaLN pair is optional because `context_refiner`'s blocks are built with
+ * `modulation=False` and genuinely do not have those tensors — 13 per layer in
+ * the checkpoint against the main stack's 15. Declaring them optional is how
+ * the type says so; a caller that forgets `adalnInput` for a modulated block
+ * gets an error naming it rather than a silent identity.
+ */
 export interface BlockWeights {
   attention_to_q_weight: Float32Array;
   attention_to_k_weight: Float32Array;
@@ -71,8 +79,8 @@ export interface BlockWeights {
   ffn_norm1_weight: Float32Array;
   attention_norm2_weight: Float32Array;
   ffn_norm2_weight: Float32Array;
-  adaLN_modulation_0_weight: Float32Array;
-  adaLN_modulation_0_bias: Float32Array;
+  adaLN_modulation_0_weight?: Float32Array;
+  adaLN_modulation_0_bias?: Float32Array;
 }
 
 /**
@@ -126,22 +134,76 @@ function qkNorm(x: Float32Array, rows: number, headDim: number, weight: Float32A
   return rmsnorm({ input: x, weight, N: rows, D: headDim, eps });
 }
 
-export function zimageBlock(cfg: BlockConfig, w: BlockWeights, x: Float32Array, adalnInput: Float32Array, positions: Int32Array): Float32Array {
+/**
+ * One block.
+ *
+ * `adalnInput` is `null` for a `modulation=False` block — `context_refiner`'s
+ * two layers. The model writes that as a separate branch without the scales or
+ * the gates; here it is the same arithmetic with all four set to exactly 1.0,
+ * which multiplies without rounding in f32 and keeps one path instead of two.
+ * A second branch would be a second place for the residuals to be wrong.
+ */
+export function zimageBlock(
+  cfg: BlockConfig,
+  w: BlockWeights,
+  x: Float32Array,
+  adalnInput: Float32Array | null,
+  positions: Int32Array,
+  /**
+   * How many leading tokens are real. Padding is the rest, and there is no
+   * `validSeq` for a block whose tokens are all real.
+   *
+   * **This trims, it does not mask**, and the difference is the whole reason
+   * the parameter is a count rather than a mask. `modules/attention.py:130`
+   * takes the single-batch path: when a mask is present and every sequence in
+   * the batch is the same length, it slices `q`, `k` and `v` to that length,
+   * **drops the mask**, runs attention, and pads the result back with **zeros**
+   * (`:295`). So a padded row's attention output is not "the attention it would
+   * have had, minus the padded keys" — it is exactly zero, and the residual
+   * `x + norm2(attn_out)` leaves that row untouched by the attention half.
+   *
+   * An additive `-Infinity` key mask was tried first and measured 6.6e-1
+   * relative RMS at `afterContextRefiner`: right about the keys, wrong about
+   * the query rows. Both are needed to notice, which is why it is written down.
+   *
+   * The trim assumes the real tokens are a **prefix**. They are — padding sits
+   * at the end of the caption, and the unified stack puts all image tokens
+   * first — and it is checked rather than assumed, because the model would
+   * silently attend to the wrong tokens too.
+   */
+  validSeq?: number,
+): Float32Array {
   const { dim, nHeads, headDim, seq, ffnHidden, normEps, ropeAxesDims, ropeTheta } = cfg;
 
-  // adaLN: one Linear with bias, then four chunks along the last axis.
-  const mod = linear(adalnInput, w.adaLN_modulation_0_weight, 1, adalnInput.length, 4 * dim);
-  for (let i = 0; i < mod.length; i += 1) mod[i] = mod[i]! + w.adaLN_modulation_0_bias[i % (4 * dim)]!;
+  const ones = (): Float32Array => new Float32Array(dim).fill(1);
+  let scaleMsa: Float32Array;
+  let gateMsa: Float32Array;
+  let scaleMlp: Float32Array;
+  let gateMlp: Float32Array;
 
-  const chunk = (k: number): Float32Array => mod.subarray(k * dim, (k + 1) * dim);
-  const scaleMsa = chunk(0).slice();
-  const gateMsa = activation({ input: chunk(1).slice(), kind: ACTIVATION.tanh });
-  const scaleMlp = chunk(2).slice();
-  const gateMlp = activation({ input: chunk(3).slice(), kind: ACTIVATION.tanh });
-  // `1.0 + scale`, which is what makes an all-zero modulation the identity.
-  for (let i = 0; i < dim; i += 1) {
-    scaleMsa[i] = 1 + scaleMsa[i]!;
-    scaleMlp[i] = 1 + scaleMlp[i]!;
+  if (adalnInput === null) {
+    scaleMsa = ones();
+    gateMsa = ones();
+    scaleMlp = ones();
+    gateMlp = ones();
+  } else {
+    if (!w.adaLN_modulation_0_weight || !w.adaLN_modulation_0_bias) {
+      throw new Error("zimageBlock: adalnInput was given but the block carries no adaLN_modulation weights.");
+    }
+    // adaLN: one Linear with bias, then four chunks along the last axis.
+    const mod = linear(adalnInput, w.adaLN_modulation_0_weight, 1, adalnInput.length, 4 * dim);
+    for (let i = 0; i < mod.length; i += 1) mod[i] = mod[i]! + w.adaLN_modulation_0_bias[i % (4 * dim)]!;
+
+    const chunk = (k: number): Float32Array => mod.subarray(k * dim, (k + 1) * dim);
+    scaleMsa = chunk(0).slice();
+    gateMsa = activation({ input: chunk(1).slice(), kind: ACTIVATION.tanh });
+    scaleMlp = chunk(2).slice();
+    gateMlp = activation({ input: chunk(3).slice(), kind: ACTIVATION.tanh });
+    // `1.0 + scale`, which is what makes an all-zero modulation the identity.
+    for (let i = 0; i < dim; i += 1) {
+      scaleMsa[i] = 1 + scaleMsa[i]!;
+      scaleMlp[i] = 1 + scaleMlp[i]!;
+    }
   }
 
   // --- attention half ---
@@ -160,14 +222,24 @@ export function zimageBlock(cfg: BlockConfig, w: BlockWeights, x: Float32Array, 
   q = ropeAxes({ input: q, N: seq, numHeads: nHeads, axisDims: ropeAxesDims, positions, thetaBase: ropeTheta });
   k = ropeAxes({ input: k, N: seq, numHeads: nHeads, axisDims: ropeAxesDims, positions, thetaBase: ropeTheta });
 
+  // The trim happens *after* QK-Norm and RoPE, matching the model: those run on
+  // the full sequence and only `attention()` sees the shortened one.
+  const live = validSeq ?? seq;
+  if (live < 0 || live > seq) throw new Error(`zimageBlock: validSeq ${live} is outside [0, ${seq}].`);
+  const width = nHeads * headDim;
+
   const attnOut = attention({
-    q: splitHeads(q, seq, nHeads, headDim),
-    k: splitHeads(k, seq, nHeads, headDim),
-    v: splitHeads(v, seq, nHeads, headDim),
-    B: 1, H: nHeads, L: seq, S: seq, D: headDim, Dv: headDim,
+    q: splitHeads(q.subarray(0, live * width), live, nHeads, headDim),
+    k: splitHeads(k.subarray(0, live * width), live, nHeads, headDim),
+    v: splitHeads(v.subarray(0, live * width), live, nHeads, headDim),
+    B: 1, H: nHeads, L: live, S: live, D: headDim, Dv: headDim,
     causal: false,
   });
-  const projected = linear(mergeHeads(attnOut.output, seq, nHeads, headDim), w.attention_to_out_0_weight, seq, nHeads * headDim, dim);
+  // Padded back with zeros, which is what makes those rows skip the attention
+  // residual entirely rather than receive a masked version of it.
+  const merged = new Float32Array(seq * width);
+  merged.set(mergeHeads(attnOut.output, live, nHeads, headDim), 0);
+  const projected = linear(merged, w.attention_to_out_0_weight, seq, width, dim);
 
   const normed2 = rmsnorm({ input: projected, weight: w.attention_norm2_weight, N: seq, D: dim, eps: normEps });
   const gated1 = elementwiseRows({ a: normed2, b: gateMsa, S: seq, D: dim, kind: ELEMENTWISE.multiply });

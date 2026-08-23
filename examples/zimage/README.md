@@ -1,15 +1,24 @@
-# `examples/zimage` — does the op set reach Z-Image?
+# `examples/zimage` — Z-Image, composed from this repository's ops
 
-One `ZImageTransformerBlock`, composed from this repository's ops and checked
-against the model's own implementation.
+**Nothing here generates an image yet, and nothing here runs on a GPU.** What
+it establishes is narrower and comes first: that the ops compose into Z-Image's
+actual computation, checked against the model's own implementation at every
+step. Issue #166 tracks the rest.
 
-**This is not a demo.** Nothing here generates an image, and nothing here runs
-on a GPU. It answers a narrower question, asked by issue #163: after #145,
-#146 and #149–#152 landed, do those ops actually compose into a real model's
-block, or do they only satisfy each op's own reference? Those are different
-claims, and only the second one had been shown.
+| stage | what it establishes | against the model |
+| --- | --- | --- |
+| one block, 64 wide, random weights (#163) | the algebra | **5.96e-8** |
+| one block, shipped width and weights (#166) | the composition, at `dim=3840` | **8.72e-8** |
+| the whole DiT forward (#166) | patchify, timesteps, refiners, 30 layers, final layer | **1.93e-6** |
+| the text encoder (#166) | Qwen3-4B to `hidden_states[-2]` | **6.20e-7** |
 
-## What it establishes
+Still to come: the sampler and wiring (stage 4) and a browser demo (stage 5).
+
+Every row above is measured against a golden produced by running the model
+itself, never against this code's own reasoning. Where a number below has not
+been measured, it says so.
+
+## One block, against the model's algebra
 
 `src/block.ts` is a composition — every line is an existing op, and nothing new
 is introduced. It matches Z-Image's own block to within one f32 ulp:
@@ -121,6 +130,95 @@ npx tsx examples/zimage/src/verify-real-block.ts --dit ~/zimage-q4
 
 Not part of `npm test`: it needs the 3.34 GB blob, which CI does not have and
 should not fetch. `block.test.ts` is the part that runs everywhere.
+
+## The whole DiT forward
+
+`src/dit.ts` is everything around the blocks, and that is where a port goes
+wrong — a stack of correct blocks says nothing about any of it.
+`src/verify-forward.ts` runs it against the model's own forward, hooked at six
+points and compared **in order**, stopping at the first disagreement: a
+34-layer stack that reports only its last tensor tells you that something is
+wrong and nothing about where.
+
+| checkpoint | vs the model, same quantized weights | vs the model at full precision |
+| --- | --- | --- |
+| `adalnInput` | 1.436e-6 | 1.436e-6 |
+| `afterNoiseRefiner` | 2.228e-6 | 3.796e-3 |
+| `afterContextRefiner` | 2.552e-7 | 3.574e-2 |
+| `afterLayer0` | 1.777e-6 | 2.031e-2 |
+| `afterLayers` (30 layers) | 1.852e-6 | 8.203e-2 |
+| **`output`** | **1.931e-6** | 2.113e-1 |
+
+The right-hand column is the format's cost compounding, not the port drifting;
+torch measures the same 2.113e-1 for the quantization alone. (Those two columns
+are the q4-with-adaLN-at-q8 layout, which was the default when they were taken.
+The q8 default's own end-to-end figure is being remeasured.)
+
+### Six conventions that were read, not guessed
+
+Each of these produces a plausible wrong answer, and none is visible in the
+shape of the output.
+
+- **The timestep embedding puts `cos` first.** `cat([cos, sin])`, the opposite
+  of what diffusers and most DiT code do. Getting it backwards denoises for the
+  wrong amount of time.
+- **`t` is scaled by 1000** before it is embedded.
+- **Image positions start after the caption**, `(cap_seq_len + 1 + f, h, w)`,
+  while caption positions are `(i + 1, 0, 0)`.
+- **The final layer is a LayerNorm**, `eps=1e-6` and no affine, scaled by
+  `1 + adaLN(SiLU(c))` — not the RMSNorm used everywhere else.
+- **`context_refiner`'s blocks have no modulation**, and genuinely lack the
+  adaLN tensors: 13 per layer against the main stack's 15.
+- **The caption's padding is handled twice.** The row is zeroed and
+  `cap_pad_token` written into it, *and* it is dropped from attention.
+
+That last one cost two attempts and is worth the detail. Ignoring the padding
+entirely measured **1.21** relative RMS — the learned pad vector is exactly
+what the softmax spends weight on if nothing stops it. Adding an additive
+`-Infinity` key mask measured **6.6e-1**, which is right about the keys and
+wrong about the query rows: `modules/attention.py` does not mask at all when
+every sequence in the batch is the same length, which for one image is always.
+It **slices** `q`, `k` and `v` to the valid length, discards the mask, and pads
+the output back with **zeros**. A padded row's attention output is therefore
+exactly zero and the residual leaves that row untouched. Only trying both
+separated the two mistakes.
+
+## The text encoder
+
+`src/text-encoder.ts` is Qwen3-4B, run to where Z-Image stops it.
+
+`hidden_states[-2]` is **the output of layer 34** of 0..35, taken before
+`model.norm` — measured by hooking every decoder layer and matching, because
+this version of `transformers` does not collect the hidden states in the loop
+where it could be read. Layer 35, the final norm and the LM head are never
+reached. Off by one gives embeddings of the right shape and the wrong content.
+
+Verified at **6.197e-7** relative RMS on the shipped weights, at full precision:
+no quantization is in the picture yet, deliberately, so that a porting mistake
+cannot be confused with a format's cost. Quantizing the encoder is a separate
+step with its own number.
+
+**QK-Norm's weight is permuted with the projection it follows.** HF pairs RoPE
+channels half a head apart where `ops/rope` pairs them adjacently, and
+`llm/weights.ts`'s `permuteRopeChannels` already handles `q_proj`/`k_proj`. The
+part that is easy to miss: `q_norm`/`k_norm` are `[headDim]` and multiply
+channel by channel *inside* a head, exactly where the permutation reorders
+things. RMSNorm's normalisation is permutation-invariant; its scale is not.
+Dropping that permutation measures **1.002e-1** against 6.197e-7.
+
+**The 512-token padding is not reproduced.** Attention is causal and the
+padding is on the right, so no real token attends to one. That is an argument
+rather than a measurement, so the golden is generated *padded* and compared
+against an *unpadded* run — the rows agree, which is what makes skipping it
+safe rather than merely plausible.
+
+### Why not `llm/`'s engines
+
+Qwen3's decoder layer is Llama's plus QK-Norm, and **none of the three engines
+has it** (`q_norm`/`k_norm` appear nowhere in `llm/`). Closing that gap has to
+happen in the CPU engine and both GPU ones together, which is its own piece of
+work; stage 3 needs a correct encoder before it needs a fast one. This golden
+is what that work can be checked against.
 
 ## Regenerating the golden
 
