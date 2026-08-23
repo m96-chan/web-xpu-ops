@@ -29,6 +29,7 @@ import { createRunner } from "../../../harness/wgsl.js";
 import { type BpeVocab, ByteLevelBpeTokenizer } from "../../../llm/tokenizer-bpe.js";
 import { type DecoderConfig } from "../../zimage-vae/src/decoder.js";
 import { decodeGpu } from "../../zimage-vae/src/decoder-gpu.js";
+import { decoderKernels } from "../../zimage-vae/src/decoder-kernels-node.js";
 import { encodePng } from "../../zimage-vae/src/render.js";
 import { type DitConfig } from "./dit.js";
 import { ditForwardGpu } from "./dit-gpu.js";
@@ -283,7 +284,7 @@ async function main(): Promise<void> {
   // `shift_scale_latents_for_decode` — so the latent goes in as the sampler
   // left it, not pre-scaled. Doing both would double the shift and give an
   // image with the right structure and the wrong colours.
-  const image = await decodeGpu(run, decoderCfg, vaeWeight, latents, latentSide, latentSide);
+  const image = await decodeGpu(run, decoderKernels(), decoderCfg, vaeWeight, latents, latentSide, latentSide);
   at = mark("vae decode", at);
 
   writeFileSync(outPath, encodePng(image.data, image.H, image.W));

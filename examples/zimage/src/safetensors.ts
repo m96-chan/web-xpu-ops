@@ -14,30 +14,15 @@
  * tensor right and every later one wrong, which is the most convincing way to
  * be broken.
  */
+/** Re-exported so callers that already import this module keep working. */
+export { bf16ToF32 } from "./bf16.js";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { bf16ToF32 } from "./bf16.js";
 
 interface Entry {
   dtype: string;
   shape: number[];
   data_offsets: [number, number];
-}
-
-/**
- * bf16 to f32.
- *
- * bf16 **is** f32's top 16 bits — same exponent width, mantissa truncated — so
- * this is a shift, not a conversion, and every bf16 value is exactly
- * representable in f32. Reading the same bits as f16 would give numbers of an
- * entirely different magnitude while still looking like numbers.
- */
-export function bf16ToF32(values: Uint16Array): Float32Array {
-  const out = new Float32Array(values.length);
-  const view = new DataView(new ArrayBuffer(4));
-  for (let i = 0; i < values.length; i += 1) {
-    view.setUint32(0, values[i]! << 16, true);
-    out[i] = view.getFloat32(0, true);
-  }
-  return out;
 }
 
 export class SafetensorsFile {

@@ -9,12 +9,21 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DIT_KERNEL_SOURCES, type DitKernels } from "./dit-gpu.js";
+import { ENCODER_KERNEL_SOURCES, type EncoderKernels } from "./text-encoder-gpu.js";
 
 const opsRoot = new URL("../../../ops/", import.meta.url);
 
 export function ditKernels(): DitKernels {
   const out = {} as DitKernels;
   for (const { key, op, entry } of DIT_KERNEL_SOURCES) {
+    out[key] = readFileSync(fileURLToPath(new URL(`${op}/wgsl/${entry}.wgsl`, opsRoot)), "utf8");
+  }
+  return out;
+}
+
+export function encoderKernels(): EncoderKernels {
+  const out = {} as EncoderKernels;
+  for (const { key, op, entry } of ENCODER_KERNEL_SOURCES) {
     out[key] = readFileSync(fileURLToPath(new URL(`${op}/wgsl/${entry}.wgsl`, opsRoot)), "utf8");
   }
   return out;

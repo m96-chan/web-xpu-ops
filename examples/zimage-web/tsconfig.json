@@ -1,0 +1,20 @@
+{
+  // A separate program from the root `tsconfig.json`, for the reason
+  // `examples/llm-demo/tsconfig.json` gives: this demo needs the `DOM` lib and
+  // `@webgpu/types`' `navigator.gpu`, and the root config deliberately carries
+  // neither, so that a browser API can never leak into an op's reference
+  // implementation by accident.
+  //
+  // It exists at all because for a while it did not, and the demo was the one
+  // directory in the repository nothing type-checked. What that hid was a
+  // `decodeGpu` call missing an argument — a `TypeError` in the browser, from
+  // code the bundler was happy to build.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types"],
+    "noEmit": true
+  },
+  // `build.mjs` / `server.mjs` are plain Node scripts, not TypeScript.
+  "include": ["src"]
+}

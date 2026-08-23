@@ -4,6 +4,7 @@ import { beforeAll, describe, expect } from "vitest";
 import { gpuTest, useGpu } from "../../../harness/index.js";
 import { type DecoderConfig } from "./decoder.js";
 import { decodeGpu } from "./decoder-gpu.js";
+import { decoderKernels } from "./decoder-kernels-node.js";
 
 /**
  * The GPU decoder against the model's own decode of the same latent.
@@ -70,7 +71,7 @@ describe.skipIf(!present)("Z-Image VAE decoder on the GPU", () => {
 
   gpuTest("reproduces the model's own decode", async (run) => {
     const started = performance.now();
-    const got = await decodeGpu(run, cfg, weights, latent, latentH, latentW);
+    const got = await decodeGpu(run, decoderKernels(), cfg, weights, latent, latentH, latentW);
     const elapsed = performance.now() - started;
 
     expect(got.data.length).toBe(reference.length);

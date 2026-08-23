@@ -195,6 +195,11 @@ export class LazyDitWeights implements WeightSource {
     };
   }
 
+  /** A tensor's shape without reading it — see `PackedWeightSource.shapeOf`. */
+  shapeOf(name: string): number[] | undefined {
+    return this.#byName.get(name)?.shape;
+  }
+
   get(name: string): Float32Array {
     const cached = this.#cache.get(name);
     if (cached) {

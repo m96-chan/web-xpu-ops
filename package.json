@@ -64,12 +64,14 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/assets.mjs",
-    "lint": "tsc --noEmit && tsc -p examples/llm-demo/tsconfig.json --noEmit",
+    "lint": "tsc --noEmit && tsc -p examples/llm-demo/tsconfig.json --noEmit && tsc -p examples/zimage-web/tsconfig.json --noEmit",
     "test": "node scripts/test.mjs",
     "test:file": "vitest run",
     "prepublishOnly": "npm run build",
     "demo:build": "node examples/llm-demo/build.mjs",
-    "demo:serve": "node examples/llm-demo/server.mjs"
+    "demo:serve": "node examples/llm-demo/server.mjs",
+    "zimage:build": "node examples/zimage-web/build.mjs",
+    "zimage:serve": "node examples/zimage-web/server.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

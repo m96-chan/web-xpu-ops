@@ -2,7 +2,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { bf16ToF32, SafetensorsFile } from "./safetensors.js";
+import { bf16ToF32 } from "./bf16.js";
+import { SafetensorsFile } from "./safetensors.js";
 
 /**
  * The reader, against files this test writes.
