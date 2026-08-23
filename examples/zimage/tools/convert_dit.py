@@ -1,36 +1,45 @@
 #!/usr/bin/env python3
-"""Converts Z-Image's DiT to the q4-g128 format this library reads.
+"""Converts Z-Image's DiT to the quantized formats this library reads.
 
-12.31 GB of bf16 does not fit anywhere useful. In the format issue #137 settled
-on — group size 128, symmetric [-7, 7], 4 bits per weight plus one f32 scale per
-group — this run measured **26.7%** of the bf16 size, so the DiT lands around
-3.3 GB. Not 4/16 = 25%, because the per-group scales cost a further 0.25 bits
-per weight and the tensors listed below stay f32 entirely.
+12.31 GB of bf16 does not fit anywhere useful. Two formats were measured over
+the **whole** forward, on identical inputs, against the full-precision model
+(`tools/measure_quant_forward.py`):
 
-What gets quantized and what does not, and why:
+    dense          24.62 GB   (reference)
+    all-q4          3.28 GB   rel-RMS 0.3490   cos 0.956070
+    adaLN-q8        3.34 GB   rel-RMS 0.2113   cos 0.977780
+    adaLN+qk-q8     3.81 GB   rel-RMS 0.2022   cos 0.979668
+    all-q8          6.16 GB   rel-RMS 0.0278   cos 0.999634
 
-  - **Linear weights** (`to_q/k/v`, `to_out`, `feed_forward.w1/w2/w3`,
-    `cap_embedder`, the final `linear`) go to q4. They are the 12 GB.
-  - **`adaLN_modulation` goes to q8 instead**, and this is measured, not a
-    hunch. Quantizing one weight of `layers.0` at a time and running the real
-    block (`tools/gen_real_block_golden.py`) puts adaLN at 4.78% relative RMS
-    on the block's output, against 1.2% for the next worst and 0.4% for the
-    best — it alone accounts for nearly all of the 5.19% that quantizing
-    everything costs. It is the weight that produces the scales and gates
-    multiplying the whole residual stream, so its error is not additive but
-    multiplicative across all 3840 channels. Moving just it to q8 costs 2.5 MB
-    per layer (96.1 -> 98.6, +2.6%) and takes the block from 5.19% to 1.78%.
-    Small groups do not fix it: q4-g32 costs 0.25 more bits everywhere for
-    5.19% -> 3.98%, which is worse on both counts.
+**The default is q8, and the reason is the gap between the first measurement
+and this one.** On a single layer, q4-g128 with adaLN at q8 costs 1.78e-2, which
+reads as acceptable. Thirty-four layers do not add that error, they compound it:
+the same configuration costs 0.21 on the velocity prediction. q8 costs 0.028 —
+seven times less, for 1.8x the bytes — and no arrangement of q4 gets close.
+Moving QK to q8 as well buys 0.2113 -> 0.2022 for another 0.47 GB, which is the
+shape of a dead end rather than a knob worth having.
+
+`--format mixed` restores the q4 layout for anyone who wants 3.34 GB and has
+read the row above that says what it costs.
+
+What stays out of both formats, and why:
+
+  - **Linear weights** are quantized. They are the 12 GB.
   - **Norm weights, biases, embedders, pad tokens** stay f32. Together they are
-    a rounding error in size, and they are the tensors where a per-group scale
-    has nothing to average over — a `[3840]` norm weight quantized in groups of
-    128 would carry 30 scales for 30 groups of nearly identical numbers.
-  - `x_embedder` is a `Conv2d`-shaped patch embedder and stays f32 for the same
-    reason: it is one tensor, and `matmulQ4G128` is not what reads it.
+    a rounding error in size, and a per-group scale has nothing to average over
+    on a `[3840]` norm weight — it would carry 30 scales for 30 groups of
+    nearly identical numbers.
+  - `x_embedder` is the patch embedder and stays f32 for the same reason: one
+    tensor, and the quantized GEMV is not what reads it.
 
-The split is written into the manifest rather than inferred at load time, so a
-loader never has to guess which of the two a tensor is.
+Within `mixed`, `adaLN_modulation` is the one weight kept at q8, and that too
+was measured rather than guessed: quantizing one weight of `layers.0` at a time
+puts adaLN at 4.78% relative RMS on the block's output against 1.2% for the
+next worst. It produces the scales and gates multiplying the whole residual
+stream, so its error is multiplicative across all 3840 channels.
+
+The format of each tensor is written into the manifest rather than inferred at
+load time, so a loader never has to guess.
 
 Run with musubi-tuner's interpreter (it has torch and safetensors):
 
@@ -80,7 +89,16 @@ def should_quantize(name: str, shape: tuple[int, ...]) -> bool:
     return any(name.endswith(suffix) for suffix in QUANTIZED_SUFFIXES)
 
 
-def is_q8(name: str) -> bool:
+def is_q8(name: str, fmt: str = "q8") -> bool:
+    """Which of the two formats this tensor takes.
+
+    Defaults to q8 for everything, because that is what the whole-forward
+    measurement chose; `fmt="mixed"` restores the q4-with-adaLN-at-q8 layout the
+    per-layer measurement suggested, for anyone who wants the smaller download
+    and has seen what it costs.
+    """
+    if fmt == "q8":
+        return True
     return any(name.endswith(suffix) for suffix in Q8_SUFFIXES)
 
 
@@ -149,6 +167,9 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers, for a fixture small enough to commit")
+    ap.add_argument("--format", choices=("q8", "mixed"), default="q8",
+                    help="q8 everywhere (default), or q4 with adaLN at q8 — see the module docstring "
+                         "for what the second one costs")
     add_argument(ap)
     args = ap.parse_args()
 
@@ -181,7 +202,7 @@ def main() -> None:
                 arr = t.numpy()
                 original_bytes += arr.size * 2  # bf16 on disk
 
-                if should_quantize(name, arr.shape) and is_q8(name):
+                if should_quantize(name, arr.shape) and is_q8(name, args.format):
                     codes, scale = quantize_q8(arr)
                     packed = pack_q8(codes)
                     q8_out.write(packed.tobytes())
@@ -227,6 +248,7 @@ def main() -> None:
                                  "output, against 1.2% for the next worst weight"}},
         "config": config,
         "limitLayers": args.limit_layers,
+        "chosenFormat": args.format,
         "tensors": manifest,
     }, indent=1) + "\n")
 
