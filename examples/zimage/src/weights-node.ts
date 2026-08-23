@@ -171,6 +171,30 @@ export class LazyDitWeights implements WeightSource {
     for (const tensor of manifest.tensors) this.#byName.set(tensor.name, tensor);
   }
 
+  /**
+   * A q8 tensor as it sits on disk: packed codes and per-row scales.
+   *
+   * For the GPU path, which dispatches `ops/dequant_transpose` and gets back
+   * `matmul`'s `[K, N]` operand in one pass. Handing it dense f32 instead means
+   * dequantising on the CPU, transposing on the CPU, and uploading four times
+   * the bytes — measured as most of a GPU forward's wall time before this
+   * existed.
+   *
+   * `null` when the tensor is not q8, so a caller can fall back to `get`
+   * without catching.
+   */
+  packedQ8(name: string): { codes: Uint32Array; scale: Float32Array; N: number; K: number } | null {
+    const tensor = this.#byName.get(name);
+    if (!tensor || tensor.kind !== "q8") return null;
+    const [N, K] = tensor.shape as [number, number];
+    return {
+      codes: new Uint32Array(readRange(join(this.#dir, "dit.q8.bin"), tensor.codesOffset, N * Math.ceil(K / 4), 4)),
+      scale: new Float32Array(readRange(join(this.#dir, "dit.q8scales.bin"), tensor.scaleOffset, N, 4)),
+      N,
+      K,
+    };
+  }
+
   get(name: string): Float32Array {
     const cached = this.#cache.get(name);
     if (cached) {
