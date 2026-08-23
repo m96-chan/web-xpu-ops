@@ -217,39 +217,60 @@ async function midAttention(run: Run, K: DecoderKernels, x: Map4, w: Weights, pr
   const k = await linear(run, K, tokens, w, `${prefix}.to_k`, hw, x.C, x.C);
   const v = await linear(run, K, tokens, w, `${prefix}.to_v`, hw, x.C, x.C);
 
-  const [probs] = await run({
-    code: K.scores,
-    bindings: [
-      { kind: "storage", data: q },
-      { kind: "storage", data: k },
-      // A zero bias, [B=1, 1, 1] shaped: the smallest buffer that says nothing
-      // is masked. Layout copied from ops/attention/wgsl.test.ts, not re-derived.
-      { kind: "storage", data: new Float32Array(hw) },
-      { kind: "out", type: "f32", length: hw * hw },
-      {
-        kind: "uniform",
-        data: params([
-          ["u32", 1], ["u32", hw], ["u32", hw], ["u32", x.C],
-          ["f32", 1 / Math.sqrt(x.C)],
-          ["u32", 0], ["i32", 0],
-          ["u32", 1], ["u32", 1], ["u32", 1],
-        ]),
-      },
-    ],
-    workgroups: [hw, 1, 1],
-  });
-  const [attended] = await run({
-    code: K.context,
-    bindings: [
-      { kind: "storage", data: probs as Float32Array },
-      { kind: "storage", data: v },
-      { kind: "out", type: "f32", length: hw * x.C },
-      { kind: "uniform", data: params([["u32", 1], ["u32", hw], ["u32", hw], ["u32", x.C]]) },
-    ],
-    workgroups: [hw, 1, 1],
-  });
+  /**
+   * Attention over the whole feature map, split by **query rows**.
+   *
+   * The scores are `hw * hw` floats, and `hw` is the latent's area: at a 1024
+   * image that is 128x128 = 16,384 tokens and **1.07 GB** of scores, against a
+   * `maxStorageBufferBindingSize` of 512 MiB. The first version asked for it in
+   * one dispatch and failed to allocate — at 512 it is 0.07 GB and fits, which
+   * is the shape of bug that ships.
+   *
+   * A query row attends to every key and to nothing else, so splitting the rows
+   * is exact: each chunk computes its own softmax over the full key axis and
+   * writes its own slice of the output. Only the number of dispatches changes.
+   */
+  const ROW_BUDGET = 256 * 1024 * 1024;
+  const rowsPerChunk = Math.max(1, Math.min(hw, Math.floor(ROW_BUDGET / (hw * 4))));
+  const attended = new Float32Array(hw * x.C);
 
-  const projected = await linear(run, K, attended as Float32Array, w, `${prefix}.to_out.0`, hw, x.C, x.C);
+  for (let row0 = 0; row0 < hw; row0 += rowsPerChunk) {
+    const rows = Math.min(rowsPerChunk, hw - row0);
+    const [probs] = await run({
+      code: K.scores,
+      bindings: [
+        { kind: "storage", data: q.subarray(row0 * x.C, (row0 + rows) * x.C) },
+        { kind: "storage", data: k },
+        // A zero bias: the smallest buffer that says nothing is masked. Layout
+        // copied from ops/attention/wgsl.test.ts, not re-derived.
+        { kind: "storage", data: new Float32Array(hw) },
+        { kind: "out", type: "f32", length: rows * hw },
+        {
+          kind: "uniform",
+          data: params([
+            ["u32", 1], ["u32", rows], ["u32", hw], ["u32", x.C],
+            ["f32", 1 / Math.sqrt(x.C)],
+            ["u32", 0], ["i32", 0],
+            ["u32", 1], ["u32", 1], ["u32", 1],
+          ]),
+        },
+      ],
+      workgroups: [rows, 1, 1],
+    });
+    const [chunk] = await run({
+      code: K.context,
+      bindings: [
+        { kind: "storage", data: probs as Float32Array },
+        { kind: "storage", data: v },
+        { kind: "out", type: "f32", length: rows * x.C },
+        { kind: "uniform", data: params([["u32", 1], ["u32", rows], ["u32", hw], ["u32", x.C]]) },
+      ],
+      workgroups: [rows, 1, 1],
+    });
+    attended.set(chunk as Float32Array, row0 * x.C);
+  }
+
+  const projected = await linear(run, K, attended, w, `${prefix}.to_out.0`, hw, x.C, x.C);
   return { data: await add(run, K, x.data, toMap(projected, x.C, hw)), C: x.C, H: x.H, W: x.W };
 }
 
@@ -276,23 +297,41 @@ export async function decodeGpu(run: Run, K: DecoderKernels, cfg: DecoderConfig,
       const outH = x.H * 2;
       const outW = x.W * 2;
       const width = Math.ceil(outW / WG) * WG;
-      const [up] = await run({
-        code: K.upsample,
-        bindings: [
-          { kind: "storage", data: x.data },
-          { kind: "out", type: "f32", length: x.C * outH * outW },
-          {
-            kind: "uniform",
-            data: params([
-              ["u32", x.H], ["u32", x.W], ["u32", outH], ["u32", outW],
-              ["f32", nearestUpsampleScale(x.H, outH)], ["f32", nearestUpsampleScale(x.W, outW)],
-              ["u32", 0], ["u32", 0],
-            ]),
-          },
-        ],
-        workgroups: [width / WG, outH, x.C],
-      });
-      x = { data: up as Float32Array, C: x.C, H: outH, W: outW };
+      /**
+       * Upsample, split by **channel**.
+       *
+       * The last up block writes `128 * 1024 * 1024` floats for a 1024 image —
+       * **0.54 GB**, against a `maxStorageBufferBindingSize` of 512 MiB. At 512
+       * it is 0.13 GB and fits, which is why this only appeared at the size the
+       * model was trained for.
+       *
+       * Nearest-neighbour upsampling reads and writes one channel at a time
+       * with nothing shared between them, so a per-channel split is exact.
+       */
+      const CHANNEL_BUDGET = 256 * 1024 * 1024;
+      const perChunk = Math.max(1, Math.min(x.C, Math.floor(CHANNEL_BUDGET / (outH * outW * 4))));
+      const upsampled = new Float32Array(x.C * outH * outW);
+      for (let c0 = 0; c0 < x.C; c0 += perChunk) {
+        const channels = Math.min(perChunk, x.C - c0);
+        const [part] = await run({
+          code: K.upsample,
+          bindings: [
+            { kind: "storage", data: x.data.subarray(c0 * x.H * x.W, (c0 + channels) * x.H * x.W) },
+            { kind: "out", type: "f32", length: channels * outH * outW },
+            {
+              kind: "uniform",
+              data: params([
+                ["u32", x.H], ["u32", x.W], ["u32", outH], ["u32", outW],
+                ["f32", nearestUpsampleScale(x.H, outH)], ["f32", nearestUpsampleScale(x.W, outW)],
+                ["u32", 0], ["u32", 0],
+              ]),
+            },
+          ],
+          workgroups: [width / WG, outH, channels],
+        });
+        upsampled.set(part as Float32Array, c0 * outH * outW);
+      }
+      x = { data: upsampled, C: x.C, H: outH, W: outW };
       x = await conv(run, K, x, w, `up_blocks.${i}.upsamplers.0.conv`, outC, 3, 1);
     }
   }

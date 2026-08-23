@@ -134,13 +134,25 @@ export async function createRunner(): Promise<Runner | null> {
   // Capped at what the adapter reports rather than requested blindly, since
   // asking for more than a device supports fails outright, and the weakest
   // devices are the ones this library most needs to keep working on.
-  const wanted = 512 * 1024 * 1024;
+  // **The adapter's own ceiling, not a number chosen here.**
+  //
+  // This was 512 MiB, and that constant was the reason `examples/zimage-vae`
+  // could not decode at the resolution the model is trained for: a 1024 image's
+  // last up block needs a 512 MiB binding and a 1 GB buffer, and Dawn's own
+  // error said so — "this adapter supports a higher maxBufferSize of
+  // 1099511627776, which can be specified in requiredLimits". The device was
+  // refusing what the hardware offers because this line did not ask for it.
+  //
+  // Capped at what the adapter reports, since asking for more than a device
+  // supports fails `requestDevice` outright, and the weakest devices are the
+  // ones this library most needs to keep working on. `Math.min` below is what
+  // does the capping; there is nothing left for a constant to decide.
   const timestamps = adapter.features.has("timestamp-query");
   const device = await adapter.requestDevice({
     requiredFeatures: timestamps ? ["timestamp-query"] : [],
     requiredLimits: {
-      maxStorageBufferBindingSize: Math.min(wanted, adapter.limits.maxStorageBufferBindingSize),
-      maxBufferSize: Math.min(wanted, adapter.limits.maxBufferSize),
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
     },
   });
 

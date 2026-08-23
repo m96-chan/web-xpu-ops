@@ -25,30 +25,30 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRunner } from "../../../harness/wgsl.js";
 import { type BpeVocab, ByteLevelBpeTokenizer } from "../../../llm/tokenizer-bpe.js";
 import { type DecoderConfig } from "../../zimage-vae/src/decoder.js";
 import { decodeGpu } from "../../zimage-vae/src/decoder-gpu.js";
 import { decoderKernels } from "../../zimage-vae/src/decoder-kernels-node.js";
 import { encodePng } from "../../zimage-vae/src/render.js";
 import { type DitConfig } from "./dit.js";
-import { ditForwardGpu } from "./dit-gpu.js";
-import { ditKernels } from "./kernels-node.js";
+import { type PackedWeightSource } from "./dit-gpu.js";
+import { ditForwardResident, releaseDitWeights } from "./dit-resident.js";
+import { createResidentDevice, runnerFromResident } from "../../../harness/resident.js";
+import { ditKernels, encoderKernels } from "./kernels-node.js";
 import {
   DEFAULT_FLOW_SHIFT,
-  DEFAULT_STEPS,
   NUM_TRAIN_TIMESTEPS,
+  VARIANTS,
+  type Variant,
+  applyCfg,
+  cfgEnabled,
   eulerStep,
   flowSchedule,
   modelTimestep,
 } from "./sampler.js";
 import { ShardedSafetensors, SafetensorsFile } from "./safetensors.js";
-import {
-  type Qwen3Config,
-  type Qwen3LayerWeights,
-  permuteLayerForRope,
-  qwen3Encode,
-} from "./text-encoder.js";
+import { type Qwen3Config, type Qwen3LayerWeights, permuteLayerForRope } from "./text-encoder.js";
+import { type Qwen3GpuWeights, qwen3EncodeGpu } from "./text-encoder-gpu.js";
 import { LazyDitWeights } from "./weights-node.js";
 
 function arg(flag: string, fallback: string): string {
@@ -101,19 +101,49 @@ async function main(): Promise<void> {
   }
   const prompt = arg("--prompt", "a red apple on a wooden table");
   const size = Number(arg("--size", "256"));
-  const steps = Number(arg("--steps", String(DEFAULT_STEPS)));
+  /**
+   * Which published checkpoint this is, and therefore what to run it with.
+   *
+   * `Tongyi-MAI/Z-Image` is Base: undistilled, 28-50 steps, CFG 3.0-5.0.
+   * `Z-Image-Turbo` is distilled: 8 steps, no CFG. Running one on the other's
+   * numbers produces a picture that has not converged and barely follows the
+   * prompt — which is exactly what it did before this flag existed.
+   */
+  const variant = arg("--variant", "base") as Variant;
+  if (!(variant in VARIANTS)) {
+    console.error(`generate: --variant must be one of ${Object.keys(VARIANTS).join(", ")}.`);
+    process.exit(2);
+  }
+  const defaults = VARIANTS[variant];
+  const steps = Number(arg("--steps", String(defaults.steps)));
+  const guidance = Number(arg("--guidance", String(defaults.guidance)));
+  const negativePrompt = arg("--negative", "");
   const shift = Number(arg("--shift", String(DEFAULT_FLOW_SHIFT)));
   const seed = Number(arg("--seed", "0"));
   const outPath = arg("--out", "generated.png");
 
   const root = modelRoot();
-  const runner = await createRunner();
-  if (!runner) {
+  /**
+   * **One device**, for both the resident DiT and the per-dispatch encoder and
+   * VAE.
+   *
+   * Two devices was the first version and does not work: a `GPUBuffer` belongs
+   * to the device that made it, so the DiT's resident weights are not bindable
+   * from the other one — `WriteBuffer` on an invalid buffer, several frames
+   * from the cause.
+   *
+   * It is also wasteful in a way a peer session measured on this same binding:
+   * `requestDevice()` on `webgpu@0.4.0` spins a core for as long as the device
+   * is open, whether or not anything is dispatched. Two devices, two cores.
+   */
+  const resident = await createResidentDevice();
+  if (!resident) {
     console.error("generate: no WebGPU adapter available.");
     process.exit(2);
   }
-  const run = runner.run;
+  const run = runnerFromResident(resident);
   const K = ditKernels();
+  const held = new Map<string, GPUBuffer>();
   const started = Date.now();
   const mark = (label: string, from: number): number => {
     console.log(`  ${label.padEnd(18)} ${((Date.now() - from) / 1000).toFixed(1)}s`);
@@ -132,6 +162,7 @@ async function main(): Promise<void> {
   const formatted = `<|im_start|>user\n${prompt}<|im_end|>\n<|im_start|>assistant\n`;
   const ids = Int32Array.from(tokenizer.encode(formatted));
   console.log(`prompt: ${JSON.stringify(prompt)} -> ${ids.length} tokens`);
+  console.log(`variant ${variant}: ${steps} steps, guidance ${guidance}  (${defaults.note})`);
   at = mark("tokenize", at);
 
   // --- 2. text encoder ---
@@ -163,7 +194,8 @@ async function main(): Promise<void> {
     // `hidden_states[-2]`, measured — see `fixtures/text-encoder.manifest.json`.
     stopAfterLayer: encoderConfig.num_hidden_layers! - 2,
   };
-  const capFeats = qwen3Encode(qwenCfg, {
+  /** The encoder's weights, named so the unconditional branch can reuse them. */
+  const encoderWeights: Qwen3GpuWeights = {
     numLayers: qwenCfg.numLayers,
     embed: (wanted) => {
       const table = readEncoder("model.embed_tokens.weight");
@@ -193,9 +225,37 @@ async function main(): Promise<void> {
       };
       return permuteLayerForRope(raw, qwenCfg);
     },
-  }, ids);
+  };
+  const capFeats = await qwen3EncodeGpu(run, encoderKernels(), qwenCfg, encoderWeights, ids);
   closeEncoder();
   at = mark("text encoder", at);
+
+  /**
+   * The unconditional branch, when CFG is on.
+   *
+   * A negative prompt is encoded like any other; without one, upstream uses
+   * **zeros** of the same shape and says so in a warning
+   * (`zimage_generate_image.py:579`). Zeros are not "no text" in the sense of
+   * an empty string — they are a vector the model never saw in training, which
+   * is what makes them push away from everything rather than toward a neutral
+   * image.
+   */
+  let negativeFeats: Float32Array | null = null;
+  let negativeMask: Float32Array | null = null;
+  if (cfgEnabled(guidance)) {
+    if (negativePrompt) {
+      const negIds = Int32Array.from(
+        tokenizer.encode(`<|im_start|>user\n${negativePrompt}<|im_end|>\n<|im_start|>assistant\n`),
+      );
+      negativeFeats = await qwen3EncodeGpu(run, encoderKernels(), qwenCfg, encoderWeights, negIds);
+      negativeMask = new Float32Array(negIds.length).fill(1);
+      console.log(`  negative prompt -> ${negIds.length} tokens`);
+    } else {
+      negativeFeats = new Float32Array(capFeats.length);
+      negativeMask = new Float32Array(ids.length).fill(1);
+      console.log("  no negative prompt: using zeros, as upstream does");
+    }
+  }
 
   // --- 3. denoise ---
   const weights = new LazyDitWeights(ditDir);
@@ -233,15 +293,21 @@ async function main(): Promise<void> {
   );
   for (let step = 0; step < steps; step += 1) {
     const stepStart = Date.now();
-    const velocity = await ditForwardGpu(run, K, ditCfg, weights, {
-      latent: latents,
-      F: 1,
-      H: latentSide,
-      W: latentSide,
-      t: modelTimestep(timesteps[step]!, NUM_TRAIN_TIMESTEPS),
-      capFeats,
-      capMask,
-    });
+    const t = modelTimestep(timesteps[step]!, NUM_TRAIN_TIMESTEPS);
+    const forward = (feats: Float32Array, mask: Float32Array): Promise<Float32Array> =>
+      ditForwardResident(
+        resident, K, ditCfg, weights as PackedWeightSource,
+        { latent: latents, F: 1, H: latentSide, W: latentSide, t, capFeats: feats, capMask: mask },
+        undefined, undefined, held,
+      );
+
+    const conditional = await forward(capFeats, capMask);
+    // `cond + scale * (cond - uncond)`, upstream's own composition
+    // (`zimage_generate_image.py:600`). Two forwards a step, which is what CFG
+    // costs and why Turbo exists.
+    const velocity = negativeFeats
+      ? applyCfg(conditional, await forward(negativeFeats, negativeMask!), guidance)
+      : conditional;
     // Negated: Z-Image predicts negative noise (`zimage_generate_image.py:604`).
     const negated = new Float32Array(velocity.length);
     for (let i = 0; i < velocity.length; i += 1) negated[i] = -velocity[i]!;
@@ -284,9 +350,20 @@ async function main(): Promise<void> {
   // `shift_scale_latents_for_decode` — so the latent goes in as the sampler
   // left it, not pre-scaled. Doing both would double the shift and give an
   // image with the right structure and the wrong colours.
+  {
+    let mn = Infinity, mx = -Infinity, sum = 0, sq = 0;
+    for (let i = 0; i < latents.length; i += 1) { const v = latents[i]!; mn = Math.min(mn, v); mx = Math.max(mx, v); sum += v; sq += v * v; }
+    const mean = sum / latents.length;
+    console.log(`  final latent: min ${mn.toFixed(3)} max ${mx.toFixed(3)} mean ${mean.toFixed(3)} std ${Math.sqrt(sq / latents.length - mean * mean).toFixed(3)}`);
+  }
+  if (process.env.ZIMAGE_DUMP_LATENT) {
+    writeFileSync(process.env.ZIMAGE_DUMP_LATENT, Buffer.from(latents.buffer, latents.byteOffset, latents.byteLength));
+    console.log(`  wrote the final latent to ${process.env.ZIMAGE_DUMP_LATENT} (${latentSide}x${latentSide})`);
+  }
   const image = await decodeGpu(run, decoderKernels(), decoderCfg, vaeWeight, latents, latentSide, latentSide);
   at = mark("vae decode", at);
 
+  releaseDitWeights(held);
   writeFileSync(outPath, encodePng(image.data, image.H, image.W));
   console.log(`\nwrote ${outPath} (${image.W}x${image.H}) in ${((Date.now() - started) / 1000).toFixed(1)}s total`);
 }

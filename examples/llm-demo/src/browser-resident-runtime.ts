@@ -115,6 +115,29 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     return group;
   }
 
+  /**
+   * `bindGroup` over ranges.
+   *
+   * Added with `harness/resident.ts`'s own `bindGroupSliced` so this file still
+   * satisfies `ResidentDevice`. Nothing in this demo calls it — the caller that
+   * needs it is `examples/zimage`'s DiT, splitting a QK-Norm whose row count
+   * exceeds WebGPU's 65,535 workgroup limit — but leaving it off would make the
+   * type a lie about what a `ResidentDevice` provides.
+   */
+  async function bindGroupSliced(
+    pipeline: GPUComputePipeline,
+    slices: { buffer: GPUBuffer; offset: number; size: number }[],
+  ): Promise<GPUBindGroup> {
+    device.pushErrorScope("validation");
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: slices.map((slice, binding) => ({ binding, resource: slice })),
+    });
+    const invalid = await device.popErrorScope();
+    if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    return group;
+  }
+
   async function batch(
     ops: ResidentOp[],
     readback: ResidentReadback[],
@@ -230,6 +253,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     upload,
     pipelineFor,
     bindGroup,
+    bindGroupSliced,
     batch,
     destroy() {
       device.destroy();
