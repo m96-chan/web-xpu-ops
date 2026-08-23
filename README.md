@@ -36,6 +36,7 @@ rather than being left blank.
 | --- | --- |
 | `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
 | `matvecQ8` | W8A32 GEMV: `matvec` with the weight held as int8 instead of f32. Weight is `[N, ceil(K/4)]` `u32`, four codes packed per word least-significant byte first — the layout a little-endian host gets for free by viewing an `Int8Array`'s buffer as `Uint32Array`; scale is `[N]`, `quantize`'s per-row absmax convention, applied once per row after the dot product rather than per term. `packQ8` packs `quantize`'s `Int32Array` codes into this layout; the two compose (`packQ8(quantize(w).output, N, K)` + `quantize(w).scales`) rather than this op quantizing on its own. Speed unmeasured |
+| `matvecQ4G128` | W4A32 GEMV: `matvecQ8` at four bits, with one scale per **group of 128 columns** instead of one per row. Weight is `[N, ceil(K/8)]` `u32`, eight two's-complement nibbles per word least-significant nibble first — `packQ8`'s byte order at half the width; scale is `[N, ceil(K/128)]`, `quantizeQ4G128`'s per-group absmax. Range is symmetric **`[-7, 7]`**, `scale = absmax/7`, and the reciprocal is formed as `7/absmax` rather than `1/f32(scale)` — all three stated because the alternatives are live conventions and one of them (Q4_0's `[-8, 7]`) measured *better* on weight error while breaking argmax. **Not "Q4_0 compatible"**: block 128 vs 32, `[-7, 7]` vs `[-8, 7]`, f32 scale vs fp16. See "The q4 format" below. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row. An optional per-group `weight` of `[G, D]` for QK-norm — row `n` takes group `n % G`, so the grouped axis has to be the one just left of `D` (`[B, S, H, Dh]`, not `[B, H, S, Dh]`); `G = 1` is the single shared gamma. Reduction stays over `D` alone, matching `F.rms_norm(x, (D,)) * w` rather than `torch.nn.RMSNorm((H, Dh))`, which reduces over both. Speed unmeasured |
 | `layernorm` | two workgroup reductions; **biased** variance (`1/D`) and `eps` inside the `sqrt`, as `torch.nn.functional.layer_norm`. Speed unmeasured |
 | `group_norm` | `torch.nn.functional.group_norm`: statistics pooled over a **group of channels**, affine applied **per channel**. For `[N, C, L]` each of the `N × G` groups reduces `(C/G) × L` values, so this is not `layernorm` with a longer row — that gives one mean per channel, and the two disagree with no error and no change of shape. `G = 1` normalises the whole sample, `G = C` is InstanceNorm. Biased variance and `eps` inside the `sqrt`, both measured against torch 2.10 rather than inherited from `layernorm` (the unbiased form is out by 1.6e-1, `eps` outside the root by 4.3e-6). `C % G != 0` throws, as torch does. Speed unmeasured |
@@ -389,6 +390,74 @@ them worse.
 Autoregressive decoding is GEMV-shaped: batch of one, every step. Prefill is
 GEMM-shaped. A library that only does one of them well is only good at half of
 inference.
+
+---
+
+## The q4 format (W4A32, group-128) — issue #137
+
+The second quantized weight format in this library, beside `quantize`'s per-row
+int8. `matvecQ4G128` reads it.
+
+| | value | why not the alternative |
+| --- | --- | --- |
+| bits | 4, **8 codes per `u32`**, least-significant nibble first | `packQ8`'s byte order at half the width, so a converter that already emits q8 changes constants, not code |
+| range | **`[-7, 7]`**, symmetric | `[-8, 7]` (Q4_0) clips one tail only, which turns quantization error into a systematic bias — see below |
+| scale | `absmax / 7`, **f32**, one per **128 contiguous columns** of a row, `[N, ceil(K/128)]` | per-row loses too much at 4 bits; `g64` was not distinguishable from `g128` by anything but bpw |
+| reciprocal | `7 / absmax`, formed in f64 | `1 / f32(scale)` (llama.cpp) rounds differently at code boundaries |
+| rounding | `Math.round` — ties toward `+Infinity` | matches `ops/quantize` and `llm/tools/quant_common.py` exactly |
+
+**This is not Q4_0 and does not claim to be.** It is in the same family
+(per-block symmetric absmax, no zero point), and differs in three ways that
+change the numbers: block 128 rather than 32, `[-7, 7]` rather than `[-8, 7]`,
+f32 scale rather than fp16. The group axis is the one GPTQ/AWQ call
+`group_size`, but those carry a zero point and this does not. Q4_K / Q4_1 —
+asymmetric, with a per-block minimum — are not implemented.
+
+### What is measured here, and what is not
+
+**Measured in this repository** by `ops/matvec/q4.quality.test.ts` — CPU only,
+so it cannot pass vacuously for want of a GPU; `npm run test:file
+ops/matvec/q4.quality.test.ts` reprints the table. N=256, K=2560, deterministic
+LCG input, f64 reference arithmetic. These are **synthetic matrices, not model
+weights**:
+
+| matrix | weight RMS rel: q8-row / q4-row / q4-g128 | GEMV peak rel: q8-row / q4-row / q4-g128 |
+| --- | --- | --- |
+| iid gaussian | 7.97e-3 / 1.45e-1 / 1.14e-1 | 9.44e-3 / 2.08e-1 / 1.50e-1 |
+| + a 20x outlier column every 64 | 4.05e-2 / 3.83e-1 / 2.90e-1 | 3.22e-2 / 2.85e-1 / 2.33e-1 |
+| per-128-column magnitude bands (1x/10x/100x) | 1.32e-2 / 1.68e-1 / 1.14e-1 | 1.88e-2 / 2.25e-1 / 1.36e-1 |
+| …the same, **restricted to the 1x columns** | 7.13e-1 / **1.00e+0** / 1.15e-1 | — |
+
+The last row is the whole argument for the group axis, and it is the reason the
+three rows above it look unimpressive: a global RMS-relative figure is dominated
+by whichever columns are largest, so it barely moves. Restricted to the columns
+that are two orders of magnitude *smaller* than their row's peak, per-row q4
+scores exactly **1.0** — every code in those columns rounds to zero and the band
+is annihilated — while `g128` is unaffected at 1.15e-1. Note that q8's per-row
+scale loses those columns too (7.13e-1): the axis is doing the work here, not
+the bit width. An iid matrix cannot show any of this, because there is nothing
+for a per-group scale to adapt to, and neither can uniformly-spread outliers —
+both are in the table so that "group-wise is better" is not read as
+unconditional. Real weights are neither.
+
+Wire size, measured from the buffers `packQ4` actually produces (same test):
+**4.250 bpw** for q4-g128 at any `K` that is a multiple of 128 — 4 bits of code
+plus one f32 scale per 128 weights — against 4 + 32/K for per-row q4 and
+8 + 32/K for q8. The group axis costs **a quarter of a bit per weight**.
+A `[2560, 2560]` weight is 26,214,400 bytes as f32, 6,563,840 as q8, and
+3,481,600 as q4-g128.
+
+**Not measured here**: what this does to a real model. No logits comparison, no
+greedy-trajectory comparison, no audio. Issue #137's decisions rest on
+voxshot's measurements on MioTTS-0.6B (per-row q4 at 4.5e-1 peak-relative
+logit error against q8's 4.8e-2; `[-8, 7]` flipping the argmax in 4 of 4 cases
+despite the best weight RMS error of any configuration tried), and those are
+**voxshot's numbers, not this repository's**. The harness that produced them
+(`spike/miotts/measure_q4.ts`) does not use these kernels, so running it against
+weights quantized by `quantizeQ4G128` would isolate this implementation's own
+error — that comparison has not been run.
+
+**Speed is unmeasured**, for the kernel and for the format.
 
 ---
 
