@@ -98,6 +98,83 @@ Entries record **why** a change was needed. What changed is in the diff.
   three times running, and this entry said "unmeasured" — that was the collected
   `GPU` instance described above, not a size limit, and it reproduces no longer.
   Nothing in this op changed between the two measurements.
+- `ops/matmul` gains a `matmulQ4G128` entry point (issue #149): the tiled GEMM
+  of `matmulQ8`, reading the q4 format `ops/matvec` defines — `[M, ceil(K/8)]`
+  packed nibbles plus `[M, ceil(K/128)]` per-group scales — with in-kernel
+  dequant and no transpose pass. Prefill is the half of inference that runs
+  through GEMM, so a quantization format that only has a GEMV covers only
+  decode; this is what lets a 4B-parameter text encoder be read at all, at
+  4.25 bits per weight (≈1.98 GiB for 4e9 parameters, arithmetic from the
+  measured bits-per-weight — no checkpoint of that size has been converted
+  here).
+
+  The format is **not re-decided** here (rule 7 — issue #149 says so in as many
+  words): `ops/matmul/q4.reference.test.ts` checks that by running this GEMM
+  against `matvecQ4G128` row by row, so the two ops cannot drift into two
+  spellings of "the q4 format" while each agrees with its own kernel.
+
+  **No bias**, despite issue #149 asking for one. `matmul` and `matmulQ8` have
+  none, `biasAdd` (issue #150) composes by addition, and rule 8 wants the plain
+  arithmetic agreeing with the reference before anything is fused into it.
+  Speed is unmeasured.
+
+- `ops/matvec` gains the **q4 weight format** and a `matvecQ4G128` entry point
+  (issue #137): 4-bit codes packed eight to a `u32` (least-significant nibble
+  first — `packQ8`'s byte order at half the width), with one absmax scale per
+  **group of 128 contiguous columns** rather than one per row. `quantizeQ4G128`
+  produces the codes and scales, `packQ4` puts them on the wire, and
+  `matvecQ4G128` (reference + WGSL kernel) reads them without a dequant pass.
+
+  Exists because q8 is the only quantization this library had, and 8 bits is
+  the wrong size for the models it is being pointed at next: a 0.6B model fits
+  a browser at q8, a 3B or 4B one does not. Four bits without a group axis is
+  not a usable substitute — issue #137's measurements (voxshot's, on
+  MioTTS-0.6B, not this repository's) put per-row q4 at 4.5e-1 peak-relative
+  logit error against q8's 4.8e-2, with greedy agreement collapsing from 6
+  tokens to 1; group-128 recovers about 3x of that for 0.24 extra bits per
+  weight. This repository's own synthetic measurement shows the mechanism
+  directly (README, "The q4 format"): on columns two orders of magnitude
+  smaller than their row's peak, per-row q4 has RMS-relative error of exactly
+  **1.0** — every code rounds to zero — where group-128 is unaffected.
+
+  Three conventions are stated rather than picked quietly (rule 7), because
+  each has a live alternative that produces different numbers: the range is
+  symmetric **`[-7, 7]`** and not Q4_0's `[-8, 7]` (which measured *best* of
+  every configuration tried on weight RMS error and still flipped the argmax
+  in 4 of 4 cases, because clipping one tail biases the error instead of
+  randomising it); the scale's reciprocal is formed as `7/absmax` in f64, not
+  as `1/f32(scale)` as llama.cpp does; and rounding is `Math.round`'s
+  ties-toward-`+Infinity`, matching `ops/quantize` and
+  `llm/tools/quant_common.py`. The format is **not** called Q4_0-compatible —
+  block size, range and scale dtype all differ.
+
+  Speed is unmeasured, and so is the effect on any real model's output.
+- `conv2d` / `conv2dOutputSize` in `ops/conv`, with a WGSL kernel at
+  `ops/conv/wgsl/conv2d.wgsl` (issue #145). `ops/conv` shipped 1D only, so
+  anything with a spatial input — the image decoders #148 is about — had no
+  convolution at all. It lives beside `conv1d` rather than in an op of its own
+  because every convention it needs is one `conv1d` already settled against
+  torch 2.10.0+cu128 (cross-correlation, zeros on both ends of each axis, bias
+  once per output element, `groups` splitting both channel axes, throwing where
+  torch raises); two files could drift, and a 2D op that flipped its kernel or
+  padded its edges differently from the 1D one beside it would be a wrong
+  answer of the right shape. The conventions were re-measured in 2D rather
+  than assumed, because two of them can only be checked there — a flip
+  reverses *both* axes, and a pad has four edges.
+
+  `stride` / `padding` / `dilation` take `number | [H, W]`, PyTorch's own
+  `int | tuple[int, int]`, with the pair order measured rather than read off
+  the docs (`stride=(2,3)` and `stride=(3,2)` on a `[1,1,4,6]` input return
+  `[1,1,2,2]` and `[1,1,2,3]`, so the first member is H). `padding` stays an
+  integer count: `'same'` / `'valid'` are refused for the reason `conv1d`
+  gives, now with the measurement behind it — torch splits `'same'`'s odd
+  total pad asymmetrically for an even kernel, which one integer per axis
+  cannot express, and torch itself rejects `'same'` with stride > 1.
+  Deliberately absent: `conv_transpose2d`, `padding_mode`, 3D.
+
+  **Speed unmeasured.** One thread per output element, no tiling, workgroup
+  256 along the contiguous (W) axis — the same shape `conv1d` uses, kept so
+  that whatever #134 measures lands on one shape rather than two.
 - `ropeAxes` (issue #151), exported from `ops/rope` beside the 1-D op, with a
   second WGSL entry point `ops/rope/wgsl/axes.wgsl`. Z-Image's DiT gives every
   token a `(t, y, x)` triple and splits the head dim `[32, 48, 48]` so each
@@ -175,6 +252,45 @@ Entries record **why** a change was needed. What changed is in the diff.
   `Params` struct — every current binder of that kernel uploads a two-field
   struct, and a struct change would have made "unchanged" an argument instead
   of a diff that does not touch it. Speed unmeasured.
+
+- `ops/upsample`: `nearestUpsample2d`, nearest-neighbour 2D resampling over
+  `[N, C, H, W]` (issue #146). This library had **no resampling op at all** —
+  the nearest thing was `convTranspose1d`, which raises resolution with learned
+  weights. Image decoders that avoid checkerboard artefacts do it the other
+  way, "nearest upsample then conv", so they need both and neither one
+  substitutes for the other.
+
+  Matches `torch.nn.functional.interpolate(x, size=(outH, outW),
+  mode='nearest')` measured against torch 2.10.0+cu128, and the two conventions
+  that could have been chosen silently are written into the API instead:
+
+  - It takes the **output size**, not a scale factor, because torch's two
+    entry paths genuinely disagree. At `H = 3`, `scale_factor=1.6` maps the
+    four output rows to sources `0, 0, 1, 1` while `size=(4, ...)` maps them
+    to `0, 0, 1, 2`. Taking the size keeps the output shape a matter of
+    integers rather than of how a float scale rounds, and the two agree
+    wherever the ratio is a whole number — including the 2x every decoder
+    actually asks for.
+  - The source index is `floor(dst * f32(inSize / outSize))` with the multiply
+    **in f32**, which is torch's OpenCV `INTER_NEAREST` formula and not the
+    same function as exact integer arithmetic: at `H = 14 -> 46` destination
+    row 23 lands exactly on source row 7 in exact arithmetic and on row **6**
+    in f32, which is what torch returns. Getting this wrong shifts a whole row
+    of an image with no error and no shape change.
+  - `align_corners` is **not** a parameter and must not be added: torch raises
+    for it in this mode ("align_corners option can only be set with the
+    interpolating modes"), because it aligns a sample grid before interpolating
+    between neighbours and nearest interpolates between nothing.
+  - Downsampling throws rather than quietly evaluating the same formula, which
+    is out of scope for the issue and is measured against nothing.
+
+  The f32 ratio is divided **on the host** and passed to the shader, because
+  WGSL allows f32 `/` 2.5 ULP of error while requiring `*` to be correctly
+  rounded. That is not a precaution taken from the spec: dividing inside the
+  shader instead makes the `14 -> 46` case return source row 7 on an RTX 5090
+  (Dawn, f32), disagreeing with torch and with the reference.
+
+  Speed unmeasured.
 
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a

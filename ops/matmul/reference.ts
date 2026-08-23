@@ -135,3 +135,95 @@ export function matmulQ8({ a, weight, scale, N, M, K }: MatmulQ8Args): Float32Ar
   }
   return matmul({ a, b, M: N, N: M, K });
 }
+
+/**
+ * `matmulQ4G128`: `matmulQ8`'s GEMM at four bits, with one scale per **group
+ * of 128 contracted positions** instead of one per weight row (W4A32 —
+ * quantized weight, f32 activation).
+ *
+ * Issue #149's motivation is a size limit rather than a speed one: the models
+ * this is aimed at (a 4B text encoder, a DiT) do not fit a browser at eight
+ * bits, and prefill is the half of inference that runs through GEMM. Decode's
+ * side of the same format is `matvecQ4G128` (`ops/matvec`, issue #137).
+ *
+ * ## The format is #137's, not a second one
+ *
+ * `weight` is **exactly** `matvecQ4G128`'s wire format —
+ * `[M, ceil(K/8)]` `u32`, row-major, eight two's-complement 4-bit codes per
+ * word, least-significant nibble first — and `scale` is exactly its
+ * `[M, ceil(K/128)]` per-group absmax array (`ops/matvec/reference.ts` carries
+ * the whole story: why `[-7, 7]` and not `[-8, 7]`, why the reciprocal is
+ * `7/absmax` and not `1/f32(scale)`, why 128 and why not a parameter). None of
+ * that is re-decided here; rule 7 forbids picking the same convention twice,
+ * and `ops/matmul/q4.reference.test.ts` checks the claim by running this
+ * function against `matvecQ4G128` row by row rather than trusting this
+ * paragraph.
+ *
+ * `a` is `[N, K]` f32 row-major — `matmul`'s own `A`, unchanged — and `output`
+ * is `[N, M]`, one row per input row and one column per weight row, the same
+ * shape and the same argument naming as `matmulQ8`.
+ *
+ * ## No bias
+ *
+ * Issue #149 asks for one. It is not here, deliberately (rule 8): a fused bias
+ * cannot be measured against anything until the unfused arithmetic agrees with
+ * the reference, and `ops/matmul` has no bias in `matmul` or `matmulQ8` either
+ * — adding one only to the q4 path would make the three ops disagree about
+ * what a GEMM is. `biasAdd` (issue #150) is a separate op that composes by
+ * addition, and if fusing it here is worth a dispatch, that is a change with a
+ * measurement attached, not a parameter added on the way past.
+ *
+ * ## Why this composes rather than loops
+ *
+ * The definition rule 8 asks for: dequantize the packed weight into `matmul`'s
+ * own `[K, M]` `b` operand, then call `matmul`. Not a new algorithm — the old
+ * one, fed an operand built from the format. The tiled kernel that reads the
+ * packed words directly (`wgsl/q4_g128.wgsl`) is then measured against this,
+ * and the interesting question it has to answer (does hoisting the scale to
+ * one lookup per tile-row agree with applying it per element?) has somewhere
+ * to fail.
+ */
+export interface MatmulQ4G128Args {
+  /** `[N, K]` f32, row-major — `matmul`'s own `a`. */
+  a: Float32Array;
+  /** `[M, ceil(K/8)]` u32, row-major, 8 codes per word, least-significant nibble first — `matvecQ4G128`'s wire format. */
+  weight: Uint32Array;
+  /** `[M, ceil(K/128)]` f32, row-major — one absmax-derived scale per group of 128 contracted positions. */
+  scale: Float32Array;
+  /** Rows of `a`, and of `output`. */
+  N: number;
+  /** Rows of `weight`, and columns of `output`. */
+  M: number;
+  /** Columns of `a` before packing, and the contracted dimension. */
+  K: number;
+}
+
+/**
+ * Sign-extends a 4-bit field: `0xf` is `-1` and `0x9` is `-7`.
+ *
+ * Copied from `ops/matvec/reference.ts#unpackI4` rather than imported, for the
+ * reason `unpackI8` above is copied from that same file: this op's
+ * production-code dependency graph stays its own.
+ */
+function unpackI4(nibble: number): number {
+  return nibble >= 8 ? nibble - 16 : nibble;
+}
+
+/** Must match `ops/matvec/reference.ts#Q4_GROUP_SIZE` — copied, not re-derived (rule 2). */
+const Q4_GROUP_SIZE = 128;
+
+export function matmulQ4G128({ a, weight, scale, N, M, K }: MatmulQ4G128Args): Float32Array {
+  const wordsPerRow = Math.ceil(K / 8);
+  const groupsPerRow = Math.ceil(K / Q4_GROUP_SIZE);
+  const b = new Float32Array(K * M);
+  for (let row = 0; row < M; row += 1) {
+    const rowWordOffset = row * wordsPerRow;
+    const rowGroupOffset = row * groupsPerRow;
+    for (let k = 0; k < K; k += 1) {
+      const word = weight[rowWordOffset + (k >> 3)]!;
+      const nibble = (word >>> ((k & 7) * 4)) & 0xf;
+      b[k * M + row] = unpackI4(nibble) * scale[rowGroupOffset + Math.floor(k / Q4_GROUP_SIZE)]!;
+    }
+  }
+  return matmul({ a, b, M: N, N: M, K });
+}

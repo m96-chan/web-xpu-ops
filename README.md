@@ -25,7 +25,13 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Thirty ops, WGSL only, verified against their references on a real GPU.
+Thirty-one ops, WGSL only, verified against their references on a real GPU. That is
+the count of directories under `ops/` — the number the backends table states and
+the number `harness/distribution.test.ts` asserts against the tree, so it is the
+one that cannot go stale silently. Counting the rows of the table below gives
+something else and always will: a few ops take a row per entry point
+(`matvecQ8`, `matmulQ8`, `ropeAxes`), and `permute` and `dequant_transpose` are
+described in the LLM-engine sections that produced them rather than here.
 
 **Speed is unmeasured for all but one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
@@ -39,6 +45,7 @@ it was taken under.
 | --- | --- |
 | `matvec` | GEMV; `torch.mv` convention, streaming rather than tiled. Speed unmeasured |
 | `matvecQ8` | W8A32 GEMV: `matvec` with the weight held as int8 instead of f32. Weight is `[N, ceil(K/4)]` `u32`, four codes packed per word least-significant byte first — the layout a little-endian host gets for free by viewing an `Int8Array`'s buffer as `Uint32Array`; scale is `[N]`, `quantize`'s per-row absmax convention, applied once per row after the dot product rather than per term. `packQ8` packs `quantize`'s `Int32Array` codes into this layout; the two compose (`packQ8(quantize(w).output, N, K)` + `quantize(w).scales`) rather than this op quantizing on its own. Speed unmeasured |
+| `matvecQ4G128` | W4A32 GEMV: `matvecQ8` at four bits, with one scale per **group of 128 columns** instead of one per row. Weight is `[N, ceil(K/8)]` `u32`, eight two's-complement nibbles per word least-significant nibble first — `packQ8`'s byte order at half the width; scale is `[N, ceil(K/128)]`, `quantizeQ4G128`'s per-group absmax. Range is symmetric **`[-7, 7]`**, `scale = absmax/7`, and the reciprocal is formed as `7/absmax` rather than `1/f32(scale)` — all three stated because the alternatives are live conventions and one of them (Q4_0's `[-8, 7]`) measured *better* on weight error while breaking argmax. **Not "Q4_0 compatible"**: block 128 vs 32, `[-7, 7]` vs `[-8, 7]`, f32 scale vs fp16. See "The q4 format" below. Speed unmeasured |
 | `rmsnorm` | workgroup reduction; `eps` guards an all-zero row. An optional per-group `weight` of `[G, D]` for QK-norm — row `n` takes group `n % G`, so the grouped axis has to be the one just left of `D` (`[B, S, H, Dh]`, not `[B, H, S, Dh]`); `G = 1` is the single shared gamma. Reduction stays over `D` alone, matching `F.rms_norm(x, (D,)) * w` rather than `torch.nn.RMSNorm((H, Dh))`, which reduces over both. Speed unmeasured |
 | `layernorm` | two workgroup reductions; **biased** variance (`1/D`) and `eps` inside the `sqrt`, as `torch.nn.functional.layer_norm`. Speed unmeasured |
 | `group_norm` | `torch.nn.functional.group_norm`: statistics pooled over a **group of channels**, affine applied **per channel**. For `[N, C, L]` each of the `N × G` groups reduces `(C/G) × L` values, so this is not `layernorm` with a longer row — that gives one mean per channel, and the two disagree with no error and no change of shape. `G = 1` normalises the whole sample, `G = C` is InstanceNorm. Biased variance and `eps` inside the `sqrt`, both measured against torch 2.10 rather than inherited from `layernorm` (the unbiased form is out by 1.6e-1, `eps` outside the root by 4.3e-6). `C % G != 0` throws, as torch does. Speed unmeasured |
@@ -55,13 +62,15 @@ it was taken under.
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
 | `matmulQ8` | W8A32 GEMM: `matmul` with the right-hand operand held as an int8 weight instead of f32, `matvecQ8`'s own `[M, ceil(K/4)]` `u32` packed wire format read in-kernel — no separate dequant/transpose pass. Scale is `[M]`, `quantize`'s per-row absmax convention, applied once per output element. Speed unmeasured |
+| `matmulQ4G128` | W4A32 GEMM: `matmulQ8` at four bits, reading `matvecQ4G128`'s own `[M, ceil(K/8)]` `u32` packed wire format and its `[M, ceil(K/128)]` per-group scales in-kernel — the prefill half of the q4 format, same tiling (`TILE = 16`) and same argument names as `matmulQ8`. **No bias**, deliberately: `matmul` and `matmulQ8` have none either, and a fused one cannot be measured against anything until the plain form agrees with the reference. Speed unmeasured |
 | `transpose` | turned through workgroup memory so both read and write stay consecutive |
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
 | `scatter` | indexed writes; **colliding indices accumulate** — see below |
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. `istft` also takes `padding: "same"`, the Vocos / X-Codec-2 / MioCodec vocoder convention that crops `(nFft - hop) / 2` per end so `T` frames give `T * hop` samples — **not a torch mode**, and not composable from one, because the samples `center: false` would return fail NOLA. Speed unmeasured |
-| `conv` | 1D only, as `torch.nn.functional.conv1d` — a **cross-correlation**, so the kernel is *not* flipped; `stride` / `padding` / `dilation` / `groups` / optional `bias`. Speed unmeasured |
+| `conv` | `conv1d` and `conv2d`, as `torch.nn.functional.conv1d` / `conv2d` — a **cross-correlation**, so the kernel is *not* flipped (in 2D, on neither axis); `stride` / `padding` / `dilation` / `groups` / optional `bias`. 2D is NCHW (`[N, Cin, H, W]`, weight `[Cout, Cin/groups, KH, KW]`) and its three spatial arguments take **`number | [H, W]`**, PyTorch's `int | tuple[int, int]` with the pair order measured rather than assumed. `padding` is an integer count on both: `'same'` / `'valid'` are **not** accepted, because `'same'` with an even effective kernel pads asymmetrically in torch and one integer per axis cannot say that — unlike `istft`'s `"same"`, which is a genuinely different result rather than sugar. Speed unmeasured, and 2D is one thread per output element with no tiling |
 | `conv_transpose` | 1D only, as `torch.nn.functional.conv_transpose1d` — the decoder half of `conv`, and what a DAC-style codec upsamples with. Weight is **`[Cin, Cout/groups, K]`**, the transpose of `conv`'s layout; `padding` **crops** the output rather than extending the input; `output_padding` lengthens the trailing end only and takes no part in the sum. The kernel is *not* flipped, for the same reason `conv`'s is not. `weight_norm` is an offline conversion, not a flag here. Speed unmeasured |
+| `upsample` | `nearestUpsample2d`: nearest-neighbour 2D resample over `[N, C, H, W]`, as `F.interpolate(x, size=(outH, outW), mode='nearest')` — the **`size=` path**, not `scale_factor=`. The two are not two spellings of one thing: at `H = 3`, `scale_factor=1.6` maps the four output rows `0, 0, 1, 1` and `size=(4, ...)` maps them `0, 0, 1, 2` (both measured), and only the size path is decided by integers rather than by how a float scale rounds. Source index is `floor(dst * f32(inSize / outSize))` **computed in f32**, torch's OpenCV `INTER_NEAREST` formula — at `H = 14 -> 46`, destination row 23 copies source row **6**, where exact integer arithmetic says 7. `align_corners` is not a parameter, because torch *raises* for it in this mode rather than defaulting it; `mode='nearest-exact'` is a different function (`floor((dst + 0.5) * scale)`) and is not implemented. Downsampling **throws**. No weights and no arithmetic on the values — this is the `nearest upsample -> conv` half of a decoder that avoids `conv_transpose`'s checkerboard, so a decoder wants both ops and neither substitutes for the other. Speed unmeasured |
 | `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). `mask` is torch's **float** `attn_mask`, **added** to the scores (`-Infinity` masks), not the boolean one — the additive form is what composes with `alibi`; `keyPaddingBias` converts a boolean mask, whose polarity is torch's `attn_mask` (`true` = attend) and therefore the **reverse** of `nn.MultiheadAttention`'s `key_padding_mask`. Broadcast over batch, heads and query rows via `maskShape`, so `[B,1,1,S]` and `[B,H,L,S]` are both legal. `causal` with `mask` **throws**, as torch does. A fully masked row returns **zeros**, as `aten::_safe_softmax` does and plain `torch.softmax` does not. Speed unmeasured |
 | `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
 | `flash_attention` | the same function as `attention`, one dispatch, tiled online softmax; the `[B, H, L, S]` score matrix is never allocated, which is tested by counting bound bytes and not only by the answer. `132n + 44` bytes at `L = S = n, D = Dv = 8` against unfused `4n² + 68n + 40`. Takes the same additive `mask` as `attention`, on the same terms. Speed unmeasured |
@@ -396,6 +405,86 @@ inference.
 
 ---
 
+## The q4 format (W4A32, group-128) — issue #137
+
+The second quantized weight format in this library, beside `quantize`'s per-row
+int8. `matvecQ4G128` reads it.
+
+| | value | why not the alternative |
+| --- | --- | --- |
+| bits | 4, **8 codes per `u32`**, least-significant nibble first | `packQ8`'s byte order at half the width, so a converter that already emits q8 changes constants, not code |
+| range | **`[-7, 7]`**, symmetric | `[-8, 7]` (Q4_0) clips one tail only, which turns quantization error into a systematic bias — see below |
+| scale | `absmax / 7`, **f32**, one per **128 contiguous columns** of a row, `[N, ceil(K/128)]` | per-row loses too much at 4 bits; `g64` was not distinguishable from `g128` by anything but bpw |
+| reciprocal | `7 / absmax`, formed in f64 | `1 / f32(scale)` (llama.cpp) rounds differently at code boundaries |
+| rounding | `Math.round` — ties toward `+Infinity` | matches `ops/quantize` and `llm/tools/quant_common.py` exactly |
+
+**This is not Q4_0 and does not claim to be.** It is in the same family
+(per-block symmetric absmax, no zero point), and differs in three ways that
+change the numbers: block 128 rather than 32, `[-7, 7]` rather than `[-8, 7]`,
+f32 scale rather than fp16. The group axis is the one GPTQ/AWQ call
+`group_size`, but those carry a zero point and this does not. Q4_K / Q4_1 —
+asymmetric, with a per-block minimum — are not implemented.
+
+### What is measured here, and what is not
+
+**Measured in this repository** by `ops/matvec/q4.quality.test.ts` — CPU only,
+so it cannot pass vacuously for want of a GPU; `npm run test:file
+ops/matvec/q4.quality.test.ts` reprints the table. N=256, K=2560, deterministic
+LCG input, f64 reference arithmetic. These are **synthetic matrices, not model
+weights**:
+
+| matrix | weight RMS rel: q8-row / q4-row / q4-g128 | GEMV peak rel: q8-row / q4-row / q4-g128 |
+| --- | --- | --- |
+| iid gaussian | 7.97e-3 / 1.45e-1 / 1.14e-1 | 9.44e-3 / 2.08e-1 / 1.50e-1 |
+| + a 20x outlier column every 64 | 4.05e-2 / 3.83e-1 / 2.90e-1 | 3.22e-2 / 2.85e-1 / 2.33e-1 |
+| per-128-column magnitude bands (1x/10x/100x) | 1.32e-2 / 1.68e-1 / 1.14e-1 | 1.88e-2 / 2.25e-1 / 1.36e-1 |
+| …the same, **restricted to the 1x columns** | 7.13e-1 / **1.00e+0** / 1.15e-1 | — |
+
+The last row is the whole argument for the group axis, and it is the reason the
+three rows above it look unimpressive: a global RMS-relative figure is dominated
+by whichever columns are largest, so it barely moves. Restricted to the columns
+that are two orders of magnitude *smaller* than their row's peak, per-row q4
+scores exactly **1.0** — every code in those columns rounds to zero and the band
+is annihilated — while `g128` is unaffected at 1.15e-1. Note that q8's per-row
+scale loses those columns too (7.13e-1): the axis is doing the work here, not
+the bit width. An iid matrix cannot show any of this, because there is nothing
+for a per-group scale to adapt to, and neither can uniformly-spread outliers —
+both are in the table so that "group-wise is better" is not read as
+unconditional. Real weights are neither.
+
+Wire size, measured from the buffers `packQ4` actually produces (same test):
+**4.250 bpw** for q4-g128 at any `K` that is a multiple of 128 — 4 bits of code
+plus one f32 scale per 128 weights — against 4 + 32/K for per-row q4 and
+8 + 32/K for q8. The group axis costs **a quarter of a bit per weight**.
+A `[2560, 2560]` weight is 26,214,400 bytes as f32, 6,563,840 as q8, and
+3,481,600 as q4-g128.
+
+### Does a 4B model fit?
+
+Arithmetic, from the measured 4.250 bpw: 4e9 parameters at 4.25 bits is
+**2,125,000,000 bytes ≈ 1.98 GiB**, against 4.02 GiB at q8 (8.012 bpw) and
+16 GiB at f32. That is the number issue #149 exists for, and it is arithmetic
+rather than a measurement — this repository has no 4B checkpoint, has converted
+none, and therefore does not know what the non-Linear tensors (embeddings,
+norms, biases) add on top, nor whether any single tensor exceeds
+`maxStorageBufferBindingSize` on a given browser. Issue #112 records that
+exceeding a limit is answered with **zeros rather than an error**, so "it fits
+in total" is not the same claim as "it loads".
+
+**Not measured here**: what this does to a real model. No logits comparison, no
+greedy-trajectory comparison, no audio. Issue #137's decisions rest on
+voxshot's measurements on MioTTS-0.6B (per-row q4 at 4.5e-1 peak-relative
+logit error against q8's 4.8e-2; `[-8, 7]` flipping the argmax in 4 of 4 cases
+despite the best weight RMS error of any configuration tried), and those are
+**voxshot's numbers, not this repository's**. The harness that produced them
+(`spike/miotts/measure_q4.ts`) does not use these kernels, so running it against
+weights quantized by `quantizeQ4G128` would isolate this implementation's own
+error — that comparison has not been run.
+
+**Speed is unmeasured**, for the kernel and for the format.
+
+---
+
 ## Performance, measured against the machine's own ceiling
 
 Correctness tests answer *does it work*. At this layer the other half of the job
@@ -432,6 +521,9 @@ Three layers, by what they are rather than by what they compute.
 ### `primitive/` — the algebra
 
 `matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D) · `conv_transpose` ✅ (1D) ·
+`upsample` ✅ (nearest, 2D) · `add` · `mul` · `gather` ✅ · `scatter` ✅ ·
+`transpose` ✅ · `reduce` ✅
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D, 2D) · `conv_transpose` ✅ (1D) ·
 `add` · `mul` · `gather` ✅ · `scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
 Small, total, boring. Everything else is built from these, and they are where
@@ -1987,7 +2079,7 @@ text).
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 30 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
+| WGSL | 31 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 
