@@ -144,11 +144,17 @@ export interface ResidentDevice {
   destroy(): void;
 }
 
+/** Instances kept reachable — see `wgsl.ts#retainedInstances` (#107). */
+const retainedResidentInstances: unknown[] = [];
+
 /** Resolves to null when no adapter is available, mirroring `wgsl.ts#createRunner`. */
 export async function createResidentDevice(): Promise<ResidentDevice | null> {
   Object.assign(globalThis, globals);
   const gpu = create([]) as GPU;
   const adapter = await gpu.requestAdapter();
+  // Kept reachable for the device's whole life — see `wgsl.ts#retainedInstances`
+  // for the measurement and why this is not optional (#107).
+  retainedResidentInstances.push(gpu, adapter);
   if (!adapter) return null;
 
   // Same reasoning as `wgsl.ts#createRunner`: request the adapter's own
