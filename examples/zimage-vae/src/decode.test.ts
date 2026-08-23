@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { type DecoderConfig, decode } from "./decoder.js";
 
 /**
@@ -39,38 +39,49 @@ interface Manifest {
 }
 
 describe.skipIf(!present)("Z-Image VAE decoder, composed from ops", () => {
-  const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("manifest.json", fixtures)), "utf8")) as Manifest;
+  // Everything is read in `beforeAll`, not in the describe body. `skipIf` skips
+  // the *tests*; the body around them still runs, so an eager read here would
+  // throw ENOENT on any machine without the gitignored weights — which is every
+  // CI runner. It did, once.
+  let cfg: DecoderConfig;
+  let weights: (name: string) => Float32Array;
+  let latent: Float32Array;
+  let want: Float32Array;
+  let latentH = 0;
+  let latentW = 0;
 
-  const read = (file: string): Float32Array => {
-    const raw = readFileSync(fileURLToPath(new URL(file, fixtures)));
-    return new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
-  };
-  const latentBlob = read("latent.bin");
-  const weightBlob = read("decoder.bin");
-
-  const slice = (blob: Float32Array, table: Manifest["latent"], name: string): Float32Array => {
-    const t = table.find((e) => e.name === name);
-    if (!t) throw new Error(`fixture has no "${name}" — regenerate with tools/gen_latent.py`);
-    return blob.subarray(t.offset, t.offset + t.length);
-  };
-
-  const cfg: DecoderConfig = {
-    blockOutChannels: manifest.config.block_out_channels,
-    layersPerBlock: manifest.config.layers_per_block,
-    normNumGroups: manifest.config.norm_num_groups,
-    latentChannels: manifest.config.latent_channels,
-    outChannels: manifest.config.out_channels,
-    scalingFactor: manifest.config.scaling_factor,
-    shiftFactor: manifest.config.shift_factor,
-  };
-
-  const weights = (name: string): Float32Array => slice(weightBlob, manifest.decoder, name);
-  const latentEntry = manifest.latent.find((e) => e.name === "latent")!;
-  const [, , latentH, latentW] = latentEntry.shape;
+  beforeAll(() => {
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("manifest.json", fixtures)), "utf8")) as Manifest;
+    const read = (file: string): Float32Array => {
+      const raw = readFileSync(fileURLToPath(new URL(file, fixtures)));
+      return new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+    };
+    const latentBlob = read("latent.bin");
+    const weightBlob = read("decoder.bin");
+    const slice = (blob: Float32Array, table: Manifest["latent"], name: string): Float32Array => {
+      const t = table.find((e) => e.name === name);
+      if (!t) throw new Error(`fixture has no "${name}" — regenerate with tools/gen_latent.py`);
+      return blob.subarray(t.offset, t.offset + t.length);
+    };
+    cfg = {
+      blockOutChannels: manifest.config.block_out_channels,
+      layersPerBlock: manifest.config.layers_per_block,
+      normNumGroups: manifest.config.norm_num_groups,
+      latentChannels: manifest.config.latent_channels,
+      outChannels: manifest.config.out_channels,
+      scalingFactor: manifest.config.scaling_factor,
+      shiftFactor: manifest.config.shift_factor,
+    };
+    weights = (name) => slice(weightBlob, manifest.decoder, name);
+    latent = slice(latentBlob, manifest.latent, "latent");
+    want = slice(latentBlob, manifest.latent, "reference");
+    const shape = manifest.latent.find((e) => e.name === "latent")!.shape;
+    latentH = shape[2]!;
+    latentW = shape[3]!;
+  });
 
   it("reproduces the model's own decode", () => {
-    const got = decode(cfg, weights, slice(latentBlob, manifest.latent, "latent"), latentH!, latentW!);
-    const want = slice(latentBlob, manifest.latent, "reference");
+    const got = decode(cfg, weights, latent, latentH, latentW);
 
     expect(got.data.length).toBe(want.length);
 
