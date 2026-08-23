@@ -404,3 +404,181 @@ export function rope({
   }
   return output;
 }
+
+/**
+ * Multi-axis RoPE: the head split into blocks of channels, each turned by its
+ * own position.
+ *
+ * `rope` above gives a token one position. A patch in an image transformer has
+ * several — Z-Image's DiT gives every token a `(t, y, x)` triple and rotates
+ * channels `[0, 32)` by `t`, `[32, 80)` by `y` and `[80, 128)` by `x`. That is
+ * this op. It is not `rope` called three times: the three blocks live in one
+ * head and go into one attention dot product, so splitting them across calls
+ * would mean three passes over the same tensor to write disjoint thirds of it.
+ *
+ * ## What this follows
+ *
+ * `torch` has no RoPE at all, let alone a multi-axis one, so rule 7's fallback
+ * is the implementation this op exists to run:
+ *
+ *   Tongyi-MAI/Z-Image @ 26f23eda626ffadda020b04ff79488e1d72004cd
+ *   `src/zimage/transformer.py` — `RopeEmbedder`, `apply_rotary_emb`
+ *   `src/config/model.py` — `ROPE_THETA = 256.0`, `ROPE_AXES_DIMS = [32, 48, 48]`
+ *
+ * `ops/rope/axes-cases.ts` holds outputs produced by importing those two
+ * functions and running them; `ops/rope/tools/gen_axes_fixture.py` regenerates
+ * it. Three things had to be decided to write this op, and upstream decides all
+ * three — none of them is a guess:
+ *
+ * **1. Where the positions come from.** Upstream's `RopeEmbedder.__call__`
+ * takes `ids` of shape `[tokens, axes]` and asserts exactly that, so the
+ * positions are *given*, not derived from a patch grid. `positions` here is the
+ * same array flattened token-major, and this op stays a kernel rather than
+ * acquiring an opinion about how a caller lays out its patches.
+ *
+ * **2. One `thetaBase` or one per axis.** Upstream has a single `theta` and
+ * gives each axis its own **denominator**: `1 / theta ** (arange(0, d, 2) / d)`
+ * with `d` the *axis's* channel count, not the head's. So every axis sweeps the
+ * same frequency range — 1 down to about `1/theta` — however many channels it
+ * was given, and a 32-channel axis is a coarser sampling of that range than a
+ * 48-channel one rather than a truncation of it. Dividing by `headDim` instead
+ * is the plausible wrong answer and `axes-cases.ts`'s `uneven` case is there to
+ * catch it. A per-axis base is deliberately not a parameter: upstream has one
+ * base, and a parameter added on speculation is one every kernel variant has to
+ * honour ever after.
+ *
+ * **3. Which channels pair up.** `torch.view_as_complex(x.reshape(*, -1, 2))`
+ * pairs **adjacent** channels `2i`/`2i+1` — the same convention `rope` above
+ * uses, and *not* HF Llama's `rotate_half`, which pairs `i` with `i + D/2` and
+ * is why `llm/weights.ts#permuteRopeChannels` exists. A Z-Image checkpoint
+ * therefore needs no channel permutation on the way in, and a Llama-style one
+ * would need the same permutation as for `rope`. This is stated in the README
+ * too, because getting it wrong produces a tensor rather than an error.
+ *
+ * ## Positions are computed here, not looked up
+ *
+ * Upstream tabulates each axis to `axes_lens` (`[1536, 512, 512]`) and indexes
+ * the table, so a position past the end is an `IndexError` and a *negative* one
+ * silently wraps to the far end of the table, Python-style. This op computes
+ * the angle where it is used, so `axes_lens` is not a parameter of it:
+ *
+ *   - inside upstream's table the two agree to one f32 ulp — measured at
+ *     2.384e-7, and that is what the fixture checks
+ *   - past it this op returns the rotation that position actually implies,
+ *     where upstream raises
+ *   - a negative position turns the other way, which is the rotation `-p`
+ *     means, rather than becoming position `axes_lens[a] - p`
+ *
+ * The last one is a real divergence and is chosen rather than inherited: there
+ * is no table here for `-1` to be the last row *of*, and a numbering accident of
+ * `torch` indexing is not part of what RoPE is. `Int32Array` for the same
+ * reason `gather` uses it — a negative position stays negative instead of
+ * becoming a huge positive one that nothing can tell from a real one.
+ *
+ * ## Odd axis dims throw
+ *
+ * An axis of 3 channels has no third pair to rotate, and upstream cannot
+ * express one either: `arange(0, 3, 2)` gives it 2 frequencies for a block that
+ * holds 1.5 pairs, and with `axes_dims = [3, 3]` upstream fails with
+ * `The size of tensor a (3) must match the size of tensor b (4)` — measured,
+ * torch 2.10.0. So there is no convention to follow, only conventions to
+ * invent, and this throws instead of picking one.
+ *
+ * ## What is not here
+ *
+ * No `scaling`, no head range, no angle cache. Z-Image uses none of the three,
+ * and each is a parameter every future variant of this kernel would have to
+ * honour. The cache is the one most likely to be wanted (`ropeCacheAxes`, a
+ * `[axis, pos, pair, cos/sin]` table); nothing here blocks it, because the
+ * angle is a pure function of `(axis, position, pair)` exactly as `ropeCache`'s
+ * is of `(position, pair)` — but it is not written until a measurement asks
+ * for it (#148, rule 8).
+ */
+export interface RoPEAxesArgs {
+  /** `[N, numHeads, headDim]`, with `headDim` the sum of `axisDims`. */
+  input: Float32Array;
+  /** Tokens. */
+  N: number;
+  numHeads: number;
+  /**
+   * Channels each axis owns, in order. Axis `a` owns the contiguous block
+   * starting after every earlier axis's block, which is what upstream's
+   * `torch.cat(result, dim=-1)` builds.
+   *
+   * Every entry must be positive and **even**; the sum is the head dim, which
+   * is therefore not passed separately — two ways to say the same number is one
+   * way to say two different ones.
+   */
+  axisDims: readonly number[];
+  /**
+   * `[N, axisDims.length]`, token-major: `positions[token * axes + axis]`.
+   * Upstream's `ids`, flattened.
+   */
+  positions: Int32Array;
+  /** Shared by every axis. Z-Image uses 256; 1-D RoPE conventionally 10000. */
+  thetaBase: number;
+}
+
+export function ropeAxes({ input, N, numHeads, axisDims, positions, thetaBase }: RoPEAxesArgs): Float32Array {
+  const axes = axisDims.length;
+  if (axes === 0) {
+    throw new Error("ropeAxes: axisDims is empty; a head has to belong to at least one axis");
+  }
+  for (const [axis, dim] of axisDims.entries()) {
+    // Rejected rather than rounded down: half a pair is not a rotation, and
+    // upstream cannot express one either — see the note above.
+    if (!Number.isInteger(dim) || dim <= 0 || dim % 2 !== 0) {
+      throw new Error(`ropeAxes: axis ${axis} has ${dim} channels; every axis needs a positive even count`);
+    }
+  }
+
+  const headDim = axisDims.reduce((sum, dim) => sum + dim, 0);
+  // The head dim is derived, so this is the only place an `axisDims` that does
+  // not describe the tensor can be caught. Reading on regardless would rotate
+  // the wrong channels by the wrong angle and hand back a tensor rather than an
+  // error, which is the failure this whole file is written against.
+  if (input.length !== N * numHeads * headDim) {
+    throw new Error(
+      `ropeAxes: input holds ${input.length} values, but ${N} × ${numHeads} × ${headDim} is ${N * numHeads * headDim}`,
+    );
+  }
+  if (positions.length !== N * axes) {
+    throw new Error(
+      `ropeAxes: positions holds ${positions.length} values, but ${N} tokens on ${axes} axes need ${N * axes}`,
+    );
+  }
+
+  const output = new Float32Array(input.length);
+  for (let token = 0; token < N; token += 1) {
+    for (let head = 0; head < numHeads; head += 1) {
+      // Where this axis's channels start — every earlier axis's block, in
+      // order, which is what upstream's `torch.cat(..., dim=-1)` produces.
+      let from = 0;
+      for (let axis = 0; axis < axes; axis += 1) {
+        const dim = axisDims[axis]!;
+        const pos = positions[token * axes + axis]!;
+
+        for (let pair = 0; pair < dim / 2; pair += 1) {
+          // `dim`, not `headDim`: upstream's `theta ** (arange(0, d, 2) / d)`
+          // normalises by the axis's own channel count, so each axis sweeps the
+          // whole frequency range. Written as a negative exponent for the same
+          // reason `invFreq` above is — it is then the identical expression
+          // `rope` evaluates, which is what makes the one-axis case agree with
+          // it bit for bit rather than merely closely.
+          const theta = pos * Math.pow(thetaBase, (-2 * pair) / dim);
+          const base = (token * numHeads + head) * headDim + from + pair * 2;
+          const x0 = input[base]!;
+          const x1 = input[base + 1]!;
+          // Adjacent channels, `2i`/`2i+1`, as `torch.view_as_complex` pairs
+          // them upstream and as `rope` pairs them here — not `rotate_half`.
+          const cos = Math.cos(theta);
+          const sin = Math.sin(theta);
+          output[base] = x0 * cos - x1 * sin;
+          output[base + 1] = x0 * sin + x1 * cos;
+        }
+        from += dim;
+      }
+    }
+  }
+  return output;
+}
