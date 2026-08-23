@@ -17,6 +17,7 @@
 import * as esbuild from "esbuild";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { execSync } from "node:child_process";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const browserHarnessShim = path.join(here, "../llm-demo/src/browser-runtime.ts");
@@ -40,6 +41,14 @@ const options = {
   sourcemap: true,
   logLevel: "info",
   loader: { ".wgsl": "text" },
+  // So the page can say which build it is. A stale cached bundle throwing an
+  // error that was already fixed is otherwise indistinguishable from the fix
+  // not working.
+  define: {
+    BUILD_STAMP: JSON.stringify(
+      `${execSync("git rev-parse --short HEAD").toString().trim()} at ${new Date().toISOString().slice(11, 19)}`,
+    ),
+  },
   plugins: [harnessBrowserShim],
 };
 

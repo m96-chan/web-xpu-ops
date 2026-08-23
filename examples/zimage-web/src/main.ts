@@ -41,6 +41,11 @@ const logBox = $<HTMLDivElement>("log");
 const form = $<HTMLFormElement>("form");
 const go = $<HTMLButtonElement>("go");
 
+// On the page, not only in the log. Four rounds of this session were spent
+// telling a fixed build from a cached one by counting line numbers in a pasted
+// stack; the answer belongs somewhere it can be read at a glance.
+$<HTMLElement>("build").textContent = `build ${BUILD_STAMP}`;
+
 function log(message: string): void {
   logBox.textContent = `${logBox.textContent}${logBox.textContent ? "\n" : ""}${message}`;
   logBox.scrollTop = logBox.scrollHeight;
@@ -87,6 +92,9 @@ function draw(planes: Float32Array, H: number, W: number): void {
   ctx.putImageData(image, 0, 0);
 }
 
+/** Replaced at bundle time — see `build.mjs`. */
+declare const BUILD_STAMP: string;
+
 const DIT_BASE = "/weights/dit";
 const ENCODER_BASE = "/weights/text_encoder";
 const VAE_BASE = "/weights/vae";
@@ -104,6 +112,8 @@ async function main(): Promise<void> {
   const K = ditKernels;
   const EK = encoderKernels;
 
+  // Printed so that "which bundle is this page running" is a question with an
+  // answer. It cost an hour once.
   status("Reading manifests…");
   const [dit, encoderIndex, encoderConfig, vaeManifest, vocab] = await Promise.all([
     FetchedDitWeights.open(DIT_BASE, 48),
@@ -179,12 +189,25 @@ async function main(): Promise<void> {
   // The whole DiT, once, with a bar on it. Fetching per layer instead put 6.17
   // GB on the wire in every denoising step — the same bytes, eight times over.
   const gb = (bytes: number): string => `${(bytes / 1e9).toFixed(2)} GB`;
+  // Into the browser's disk cache, not the heap. The first run pays the
+  // download; every run after it — and every step within one — reads from disk
+  // and touches the network not at all.
   await dit.preloadAll((done, total, bytes) => {
-    status(`Loading the DiT — ${done}/${total} tensors, ${gb(bytes)}`, (done / total) * 0.98);
+    status(`Caching the DiT — ${done}/${total} tensors, ${gb(bytes)}`, (done / total) * 0.98);
   });
-  log(`DiT held in memory: ${gb(dit.bytesHeld)} across ${dit.tensorCount} tensors`);
 
-  status(`Ready — ${gb(dit.bytesHeld)} resident, nothing more to download.`, 1);
+  // What is left for everything else. Holding the model costs the heap it
+  // costs, and the next allocation to fail is an activation — at 512x512 the
+  // attention scores are 129 MB, and `Array buffer allocation failed` is what
+  // that looks like from inside a dispatch. Reported rather than left for the
+  // failure to explain, since it is the number that decides which sizes work.
+  const budget = (performance as Performance & { memory?: { jsHeapSizeLimit: number } }).memory;
+  if (budget) {
+    log(`heap limit ${gb(budget.jsHeapSizeLimit)}, model ${gb(dit.bytesHeld)}`);
+  }
+  log(`DiT cached on disk: ${gb(dit.bytesHeld)} across ${dit.tensorCount} tensors`);
+
+  status(`Ready — ${gb(dit.bytesHeld)} cached, nothing more to download.`, 1);
   go.disabled = false;
 
   form.addEventListener("submit", (event) => {
@@ -326,8 +349,12 @@ async function main(): Promise<void> {
       log(`total ${total.toFixed(1)}s`);
     } catch (error) {
       status("Failed — see the log.");
-      log(String(error));
-      console.error(error);
+      // The stamp goes on the error, not only in the log above it. A pasted
+      // stack is otherwise indistinguishable from the same stack out of a
+      // cached build that has already been fixed — which cost four rounds of
+      // "please reload" before anyone could tell the two apart.
+      log(`[build ${BUILD_STAMP}] ${String(error)}`);
+      console.error(`[build ${BUILD_STAMP}]`, error);
     } finally {
       go.disabled = false;
     }

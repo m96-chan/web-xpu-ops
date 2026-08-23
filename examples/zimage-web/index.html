@@ -73,6 +73,7 @@
       <p class="sub">
         Prompt to picture on WebGPU — tokenizer, Qwen3-4B text encoder, the DiT and the VAE decoder,
         all composed from <code>web-xpu-ops</code>' kernels. Nothing is sent anywhere.
+        <br /><span id="build" style="font-size:.8rem;opacity:.7">build …</span>
       </p>
 
       <div class="grid">
@@ -116,13 +117,15 @@
           <button id="go" type="submit" disabled>Generate</button>
 
           <p class="note">
-            <strong>The model loads once.</strong> 6.17&nbsp;GB of the DiT is fetched and held in
-            memory before the first generation; after that nothing is downloaded, and each denoising
-            step is pure compute. The text encoder is cached on its first prompt.
+            <strong>The model downloads once.</strong> 6.17&nbsp;GB of the DiT is fetched into the
+            browser's disk cache before the first generation; after that nothing is downloaded, on
+            this visit or the next. It is deliberately not kept in memory — that left too little
+            heap for the activations, and 512&nbsp;×&nbsp;512 failed to allocate.
             <br /><br />
             It is still not fast: weights are uploaded to the GPU per dispatch rather than kept
-            resident, and attention grows quadratically with size. Measured numbers are in the
-            example's README.
+            resident, and attention grows quadratically with size — 30&nbsp;heads at 512&nbsp;×&nbsp;512
+            are 129&nbsp;MB of scores per layer, on a heap that is already holding the model.
+            Measured numbers are in the example's README.
           </p>
         </form>
       </div>

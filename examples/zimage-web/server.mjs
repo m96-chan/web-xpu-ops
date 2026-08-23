@@ -20,7 +20,7 @@
  * Nothing here is meant for the public internet: it serves whatever the paths
  * below point at, to localhost, for a demo.
  */
-import { createReadStream, existsSync, readdirSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import http from "node:http";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -69,6 +69,25 @@ const mounts = [
   ["/", here],
 ];
 
+/**
+ * The demo's own files must not be cached; the weights should be.
+ *
+ * Without this the browser caches `bundle.js` heuristically — no
+ * `Cache-Control`, so it invents one — and a rebuilt demo silently keeps
+ * running the old code. That happened: a fixed `decodeGpu` call kept throwing
+ * the error it had already been fixed for, and the bundle on disk, the bundle
+ * the server returned and the bundle the page was executing were three
+ * different questions.
+ *
+ * The weights are the opposite case. They are gigabytes and they never change
+ * for a given conversion, so they are the one thing here worth caching hard.
+ */
+function cacheControl(file) {
+  return file.includes("/weights/") || /\.(bin|safetensors)$/.test(file)
+    ? "public, max-age=31536000, immutable"
+    : "no-store";
+}
+
 const types = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -94,11 +113,40 @@ function resolve(urlPath) {
   return null;
 }
 
+/**
+ * `index.html`, with the bundle's mtime appended to its `<script src>`.
+ *
+ * `Cache-Control: no-store` should already be enough, and was not: a tab that
+ * had loaded the page before the header existed kept executing the bundle it
+ * already had, and "reload" is advice rather than a mechanism. Changing the URL
+ * is a mechanism — no cache, at any layer, can serve a different resource for a
+ * name it has never seen.
+ *
+ * Done here rather than in the file so that `index.html` stays a plain document
+ * in the repository, and so the stamp cannot go stale relative to the build.
+ */
+function indexWithStamp(file) {
+  const bundle = path.join(here, "dist/bundle.js");
+  const stamp = existsSync(bundle) ? statSync(bundle).mtimeMs.toFixed(0) : "0";
+  return readFileSync(file, "utf8").replace("./dist/bundle.js", `./dist/bundle.js?v=${stamp}`);
+}
+
 const server = http.createServer((req, res) => {
   const file = resolve(req.url ?? "/");
   if (!file) {
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("not found\n");
+    return;
+  }
+
+  if (file.endsWith("index.html")) {
+    const body = Buffer.from(indexWithStamp(file), "utf8");
+    res.writeHead(200, {
+      "content-type": types[".html"],
+      "content-length": body.byteLength,
+      "cache-control": "no-store",
+    });
+    res.end(body);
     return;
   }
 
@@ -125,12 +173,18 @@ const server = http.createServer((req, res) => {
       "content-length": end - start + 1,
       "content-range": `bytes ${start}-${end}/${size}`,
       "accept-ranges": "bytes",
+      "cache-control": cacheControl(file),
     });
     createReadStream(file, { start, end }).pipe(res);
     return;
   }
 
-  res.writeHead(200, { "content-type": type, "content-length": size, "accept-ranges": "bytes" });
+  res.writeHead(200, {
+    "content-type": type,
+    "content-length": size,
+    "accept-ranges": "bytes",
+    "cache-control": cacheControl(file),
+  });
   createReadStream(file).pipe(res);
 });
 

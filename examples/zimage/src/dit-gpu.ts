@@ -383,10 +383,23 @@ async function attention(
 ): Promise<Float32Array> {
   const scale = 1 / Math.sqrt(D);
   const scoresBytes = heads * L * S * 4;
-  // The device's own ceiling is not visible from here, so this is the spec's
-  // guaranteed minimum rather than a guess at the adapter's — under it, every
-  // device works; over it, the per-head path is taken and is merely slower.
-  const CAP = 128 * 1024 * 1024;
+  /**
+   * How large one scores allocation may be.
+   *
+   * Not a storage-binding limit — that is 512 MiB and was never the binding
+   * constraint here. It is a **host memory** one: the harness reads every
+   * output back, so a batch costs its own buffer plus the copy `slice` makes,
+   * and the browser demo is already holding the model. At 512x512 (1,039
+   * tokens, 30 heads) one whole-batch scores buffer is 129.5 MB, which fitted
+   * under a 128 MiB cap by a hair, doubled on readback, and threw
+   * `Array buffer allocation failed` on a heap with 6.17 GB of weights in it.
+   *
+   * 32 MiB keeps the transient small enough to allocate on a loaded heap while
+   * still batching seven or eight heads at these shapes — the dispatch count
+   * was never the constraint (measured: halving it changed nothing), so
+   * batching less costs little and failing to allocate costs everything.
+   */
+  const CAP = 32 * 1024 * 1024;
 
   const dispatch = async (h0: number, count: number): Promise<Float32Array> => {
     const qh = q.subarray(h0 * L * D, (h0 + count) * L * D);

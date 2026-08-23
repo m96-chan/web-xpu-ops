@@ -20,6 +20,63 @@ import {
 } from "../../zimage/src/weights.js";
 import { bf16ToF32 } from "../../zimage/src/bf16.js";
 
+/**
+ * The browser's own on-disk cache, opened once.
+ *
+ * `null` when the page is not in a secure context (the Cache API is
+ * unavailable over plain `http://` on some origins) — in which case everything
+ * below still works and simply costs the network again.
+ */
+let store: Cache | null | undefined;
+async function cacheStore(): Promise<Cache | null> {
+  if (store !== undefined) return store;
+  try {
+    store = typeof caches === "undefined" ? null : await caches.open("zimage-weights-v2");
+  } catch {
+    store = null;
+  }
+  return store;
+}
+
+/**
+ * A byte range, from the browser's disk cache when it has been seen before.
+ *
+ * The first version of this held every tensor in JavaScript memory so that a
+ * generation did no network. That worked and moved the problem: 6.17 GB on the
+ * heap left too little for the activations, and 512x512's 129 MB of attention
+ * scores threw `Array buffer allocation failed` from inside a dispatch.
+ *
+ * The Cache API is the right place for bytes that are large, immutable, and
+ * wanted again — it is backed by disk rather than the heap, so the model can be
+ * fetched once and re-read every step without the heap ever holding more than
+ * the layer in flight.
+ */
+async function cachedRange(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
+  const cache = await cacheStore();
+  if (!cache) return readRange(url, byteOffset, byteLength);
+
+  // A **query**, not a fragment. `new Request(url)` strips the fragment, so
+  // `url#0+1024` and `url#4096+2048` are one cache entry — every range of a
+  // file collapsing onto whichever was stored first. That returns bytes rather
+  // than an error, of the right length for the wrong tensor, and the picture
+  // comes out black.
+  const key = `${url}?o=${byteOffset}&n=${byteLength}`;
+  const hit = await cache.match(key);
+  if (hit) {
+    const cached = await hit.arrayBuffer();
+    // The length is the one thing a wrong entry cannot fake, so it is checked
+    // rather than trusted — the failure above was silent precisely because
+    // nothing compared what came back against what was asked for.
+    if (cached.byteLength === byteLength) return cached;
+    await cache.delete(key);
+  }
+
+  const buffer = await readRange(url, byteOffset, byteLength);
+  // `put` reads the body, so the stored copy is separate from what is returned.
+  await cache.put(key, new Response(buffer.slice(0)));
+  return buffer;
+}
+
 async function readRange(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
   if (byteLength === 0) return new ArrayBuffer(0);
   const response = await fetch(url, {
@@ -39,20 +96,25 @@ async function readRange(url: string, byteOffset: number, byteLength: number): P
 }
 
 /**
- * The converted DiT, read over HTTP and then **kept**.
+ * The converted DiT: on disk after the first visit, a layer at a time in memory.
  *
- * The first version bounded the cache at a couple of dozen tensors, mirroring
- * the Node loader — which is right when the backing store is a file and the
- * page cache is doing the remembering, and badly wrong over HTTP. A forward
- * touches every tensor once, so a bound smaller than the model means every
- * layer is re-fetched on every step: 6.17 GB per step, 49 GB for an
- * eight-step generation, all of it the same bytes.
+ * Two wrong answers came before this one, and both are worth keeping written
+ * down because they are the same mistake pointed in opposite directions.
  *
- * So the default is to hold everything. That is 6.17 GB of packed codes in
- * JavaScript memory — real, and worth stating — but it makes every step after
- * the first fetch cost **nothing** on the wire. `maxCachedTensors` is still
- * there for a machine that cannot spare the memory, where the trade goes the
- * other way.
+ * The first mirrored the Node loader and held a couple of dozen tensors. That
+ * is right behind a file, where the OS page cache does the remembering, and
+ * wrong over HTTP where nothing does: a forward touches every tensor once, so
+ * any bound below the model size re-fetches all of it every step — 6.17 GB per
+ * step, 49 GB for eight.
+ *
+ * The second held everything, which quieted the network and put 6.17 GB on the
+ * heap. The next allocation to fail was an activation: 512x512's readbacks
+ * threw `Array buffer allocation failed` from inside a dispatch.
+ *
+ * The bytes are large, immutable and wanted again, which describes a disk
+ * cache rather than a heap. `cachedRange` puts them in the browser's, so a
+ * generation does no network **and** memory holds only the layer in flight.
+ * `maxCachedTensors` bounds that layer's worth.
  *
  * Only the packed form is held for a quantized weight. `matmulQ8` reads the
  * codes directly, so nothing dequantises to four times the size on the way in.
@@ -72,7 +134,7 @@ export class FetchedDitWeights {
     for (const tensor of manifest.tensors) this.#byName.set(tensor.name, tensor);
   }
 
-  static async open(base: string, maxCachedTensors = Infinity): Promise<FetchedDitWeights> {
+  static async open(base: string, maxCachedTensors = 48): Promise<FetchedDitWeights> {
     const response = await fetch(`${base}/dit.manifest.json`);
     if (!response.ok) {
       throw new Error(
@@ -87,7 +149,7 @@ export class FetchedDitWeights {
     return new FetchedDitWeights(base, manifest, maxCachedTensors);
   }
 
-  /** Total bytes held, for the progress read-out — the number the user is waiting on. */
+  /** Total bytes fetched, for the progress read-out — the number the user is waiting on. */
   bytesHeld = 0;
 
   /** Every tensor in the manifest, for `preloadAll`'s progress. */
@@ -174,8 +236,8 @@ export class FetchedDitWeights {
     const [N, K] = tensor.shape as [number, number];
     const words = N * Math.ceil(K / 4);
     const [codes, scale] = await Promise.all([
-      readRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
-      readRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N * 4),
+      cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
+      cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N * 4),
     ]);
     this.bytesHeld += codes.byteLength + scale.byteLength;
     return this.#remember(this.#packedCache, name, {
@@ -198,8 +260,8 @@ export class FetchedDitWeights {
       const words = N! * Math.ceil(K! / 8);
       const groups = N! * Math.ceil(K! / GROUP_SIZE);
       const [codes, scales] = await Promise.all([
-        readRange(`${this.#base}/dit.codes.bin`, tensor.codesOffset * 4, words * 4),
-        readRange(`${this.#base}/dit.scales.bin`, tensor.scaleOffset * 4, groups * 4),
+        cachedRange(`${this.#base}/dit.codes.bin`, tensor.codesOffset * 4, words * 4),
+        cachedRange(`${this.#base}/dit.scales.bin`, tensor.scaleOffset * 4, groups * 4),
       ]);
       out = dequantizeQ4G128({
         packed: new Uint32Array(codes),
@@ -210,12 +272,12 @@ export class FetchedDitWeights {
     } else if (tensor.kind === "q8") {
       const words = N! * Math.ceil(K! / 4);
       const [codes, scale] = await Promise.all([
-        readRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
-        readRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N! * 4),
+        cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
+        cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N! * 4),
       ]);
       out = dequantizeQ8({ packed: new Uint32Array(codes), scale: new Float32Array(scale), N: N!, K: K! });
     } else {
-      const buffer = await readRange(`${this.#base}/dit.f32.bin`, tensor.offset * 4, N! * K! * 4);
+      const buffer = await cachedRange(`${this.#base}/dit.f32.bin`, tensor.offset * 4, N! * K! * 4);
       out = new Float32Array(buffer);
     }
     this.bytesHeld += out.byteLength;
@@ -289,7 +351,7 @@ export class FetchedSafetensors {
     const out = new Float32Array(rows.length * rowLength);
     for (let i = 0; i < rows.length; i += 1) {
       const at = this.#dataStart + entry.data_offsets[0] + rows[i]! * rowLength * perElement;
-      const buffer = await readRange(this.#url, at, rowLength * perElement);
+      const buffer = await cachedRange(this.#url, at, rowLength * perElement);
       const row =
         entry.dtype === "F32" ? new Float32Array(buffer) : bf16ToF32(new Uint16Array(buffer));
       out.set(row, i * rowLength);
@@ -301,14 +363,18 @@ export class FetchedSafetensors {
 /**
  * A sharded checkpoint over HTTP, addressed as if it were one file — and cached.
  *
- * The encoder runs once per generation rather than once per step, so it is not
- * the 49 GB the DiT was; it is still 7 GB re-read on every prompt, which is 7 GB
- * more than the second prompt needs. Held for the same reason and with the same
- * trade.
+ * Nothing is held in memory here. An earlier version cached every tensor it
+ * read, which for 35 layers of bf16 expanded to f32 is **14 GB** — and that,
+ * not the activations, is what left no room for a 42 MB readback and threw
+ * `Array buffer allocation failed` from inside an elementwise dispatch.
+ *
+ * It does not need to be: `cachedRange` already puts the bytes in the browser's
+ * disk cache, so a second read costs a disk hit and a bf16 expansion rather
+ * than a download. The heap holds one layer at a time, which is the only amount
+ * that has to fit.
  */
 export class FetchedShards {
   readonly #files = new Map<string, FetchedSafetensors>();
-  readonly #cache = new Map<string, Float32Array>();
 
   constructor(
     readonly base: string,
@@ -325,13 +391,9 @@ export class FetchedShards {
   }
 
   async read(name: string): Promise<Float32Array> {
-    const cached = this.#cache.get(name);
-    if (cached) return cached;
     const shard = this.weightMap[name];
     if (!shard) throw new Error(`fetch-weights: no shard listed for ${JSON.stringify(name)}.`);
-    const out = await (await this.#file(shard)).read(name);
-    this.#cache.set(name, out);
-    return out;
+    return (await this.#file(shard)).read(name);
   }
 
   async readRows(name: string, rows: Int32Array, rowLength: number): Promise<Float32Array> {
