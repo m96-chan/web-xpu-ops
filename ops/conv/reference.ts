@@ -294,12 +294,29 @@ export function conv2dOutputSize({
  *   union beats two fields.
  * - **`padding` is an integer count, never `'same'` or `'valid'`.** `conv1d`
  *   refuses the strings for reasons that get stronger in 2D, and they were
- *   re-measured rather than inherited. `'valid'` is `0`. `'same'` is `0` too
- *   whenever the effective kernel is even: torch 2.10.0+cu128 splits the odd
- *   total pad **asymmetrically** — `F.conv2d([[[[1,2,3,4]]]], [[[[1,0]]]],
- *   padding='same')` returns `[1,2,3,4]`, i.e. nothing added before the data
- *   and one zero after — and a single integer per axis pads both ends equally,
- *   so this signature cannot express it. torch also raises
+ *   re-measured rather than inherited. `'valid'` is `0` — plain sugar. `'same'`
+ *   is **not** an integer count at all: torch 2.10.0+cu128 pads
+ *   `floor(dilation*(K-1)/2)` before the data and the rest after, so whenever
+ *   the effective kernel `dilation*(K-1)+1` is even the total pad is odd and
+ *   the two ends **differ**, which a single integer per axis — it pads both
+ *   ends equally — cannot express. Measured on `x = [[[[1..6]]]]` with a
+ *   corner-tap `1×K` kernel (`w[0,0,0,0] = 1`, rest zero), so each output
+ *   element names the input column the window started on:
+ *
+ *   | K (dilation 1) | `padding='same'`      | `padding=0`     | pad before/after |
+ *   | -------------- | --------------------- | --------------- | ---------------- |
+ *   | 2              | `[1,2,3,4,5,6]`       | `[1,2,3,4,5]`   | 0 / 1            |
+ *   | 4              | `[0,1,2,3,4,5]`       | `[1,2,3]`       | 1 / 2            |
+ *
+ *   The `K=2` row is the *only* even-kernel case whose front pad is zero, over
+ *   every `K` and `dilation`: `floor(dilation*(K-1)/2)` vanishes only when
+ *   `dilation*(K-1) <= 1`, and among even effective kernels that is exactly
+ *   `dilation*(K-1) == 1`. Everything else pads in front too — `K=2,
+ *   dilation=3` (effective 4) returns `[0,1,2,3,4,5]` just as `K=4` does — and
+ *   `'same'` and `0` do not even agree on the output length. So `'same'` is a
+ *   distinct mode, not a spelling of some integer, and the difference is
+ *   silent: a well-formed tensor of a different shape and a different
+ *   alignment, not an error. torch also raises
  *   `padding='same' is not supported for strided convolutions`, which means the
  *   string is not even a total function of the arguments beside it. Where a
  *   string *is* worth taking, this library takes it: `istft`'s
