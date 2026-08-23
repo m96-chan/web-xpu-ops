@@ -81,12 +81,23 @@ Entries record **why** a change was needed. What changed is in the diff.
   trap of re-sending unchanged bytes every call: here the only bytes that move
   are the ones that changed.
 
-  Measured (rule 9; RTX 5090, driver 610.57.04, Dawn via `webgpu@0.4`, f32,
-  N = 262,144, median of 5, three sessions): **6.1-6.5 µs against 12.3-13.2 µs**
-  for `elementwise(multiply)` + `elementwise(add)`, i.e. **1.9-2.1x**, at
-  484-512 GB/s = **28-30% of this machine's measured 1.719 TB/s ceiling**.
-  Larger sizes are **unmeasured** — N = 1,048,576 reproduced #38/#68 three
-  times running.
+  Measured (rule 9; RTX 5090, driver 610.57.04, Dawn via `webgpu@0.4`, Node
+  v25.6.1, f32, GPU timestamps, median of 5 per session, three sessions,
+  otherwise-idle GPU; ceiling measured by `harness/roofline.ts` in the same
+  sessions, 1.69-1.72 TB/s). At **N = 262,144** (one 16×128×128 latent):
+  **6.5 µs against 12.8-16.9 µs** for `elementwise(multiply)` +
+  `elementwise(add)`, i.e. **2.0-2.6x** — but at 480-487 GB/s, only **28% of
+  the ceiling**, so at that size neither path is bandwidth-bound and the win is
+  doing half the work rather than doing it faster. At **N = 1,048,576** it is
+  bandwidth-bound: **7.7-9.0 µs against 17.1-18.4 µs**, **2.0-2.4x**, at
+  1.40-1.63 TB/s = **83-95% of the ceiling**, which is what a kernel that moves
+  12 bytes per element and does one FMA with them should reach.
+
+  The larger size is in this entry only because #161 landed. While this op was
+  being written, N = 1,048,576 aborted with `std::system_error` and then hung,
+  three times running, and this entry said "unmeasured" — that was the collected
+  `GPU` instance described above, not a size limit, and it reproduces no longer.
+  Nothing in this op changed between the two measurements.
 - `ropeAxes` (issue #151), exported from `ops/rope` beside the 1-D op, with a
   second WGSL entry point `ops/rope/wgsl/axes.wgsl`. Z-Image's DiT gives every
   token a `(t, y, x)` triple and splits the head dim `[32, 48, 48]` so each
