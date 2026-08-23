@@ -7,6 +7,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- The GPU tests stop dying for no stated reason. `harness/wgsl.ts` and
+  `harness/resident.ts` now keep the `GPU` instance and its adapter reachable
+  for as long as the device they produced, because the Dawn Node binding does
+  not: nothing in a `GPUDevice`'s object graph refers back to the instance, so
+  once the factory returned, the collector was free to take it — and a device
+  whose instance has been collected starts failing dispatches by aborting the
+  process on a glibc futex assertion, segfaulting, or hanging, differently on
+  each run.
+
+  That is one bug, and it is the one behind issues #38, #49, #68 and #107. Each
+  of those recorded a different face of it: "a test that takes more than a few
+  milliseconds before its first dispatch kills the worker" (#49) and
+  "real-model-scale CPU work before a dispatch crashes the binding" (#107) are
+  both descriptions of *more time for the collector to run in*; "a file dies
+  once it holds too many dispatches" (#68) is the same pressure from allocation
+  volume. The four vitest pool configurations tried against #38 could not have
+  helped — vitest calls a test body as a function, so an instance created inside
+  one is unreachable the moment that body returns, whichever pool is in use.
+
+  Measured A-B-A on `ops/gqa/wgsl.test.ts` (46 GPU cases, RTX 5090, driver
+  610.57.04, `webgpu` 0.4.0, Node v25.6.1, otherwise-idle GPU): **0/5 runs
+  completed** without the retention, **5/5 green** with it, **0/4** after
+  reverting. Nothing but that reference changed.
+
+  Diagnosis and the 35-line minimal repro came from the voxshot session, which
+  isolated it to `nested` vs `nested-keep` with no model and no weights. What
+  this repository had accumulated instead was three weeks of symptom
+  descriptions and workarounds — splitting test files (#68), retrying, and
+  treating the whole class as "Dawn flake".
+
 ### Added
 
 - `ropeAxes` (issue #151), exported from `ops/rope` beside the 1-D op, with a
@@ -52,6 +84,40 @@ Entries record **why** a change was needed. What changed is in the diff.
   at the fixture's magnitude, which is the expected gap given that upstream
   rounds the angle to f32 before `cos`/`sin` and this reference does not. Speed
   unmeasured, like every other op here.
+- `ops/elementwise` gains `elementwiseRows` and a second WGSL entry point,
+  `rows` (issue #150): `add` and `multiply` with the right-hand side broadcast
+  along the last dimension — `out[s, d] = a[s, d] ⊕ b[d]` for `a` of `[S, D]`
+  and `b` of `[D]`. `add` is a `Linear`'s bias (**biasAdd**) and `multiply` is
+  AdaLN's per-channel scale (**rowwiseAffine**); Z-Image's DiT (#148) needs
+  both, and until now `elementwise` threw on any pair of unequal lengths, so
+  a bias had to be materialised as a full `[S, D]` copy on the host first.
+
+  It is a **separate function taking `S` and `D` explicitly**, not a length
+  check added to `elementwise`. Inferring the broadcast from the lengths was
+  rejected because the lengths do not carry the intent: a `[3, 3]` activation
+  and a `[3]` vector admit two different broadcasts — across the columns and
+  down the rows — and both return well-formed, finite, *different* answers
+  (torch 2.10: `torch.arange(9).reshape(3,3) + c` is `[[1,3,5],[4,6,8],[7,9,11]]`,
+  `+ c.unsqueeze(1)` is `[[1,2,3],[5,6,7],[9,10,11]]`). An inferring
+  `elementwise` would have to pick one silently, which is issue #143's
+  "returns a plausible value instead of throwing" class. Stating the shape
+  turns a caller's mistake into a contradiction the op can refuse: a `b` that
+  is not `D` long, an `a` that is not `S*D` long, or a missing/non-positive
+  dimension all throw, in `ops/gqa`'s message format.
+
+  Broadcasting aligns from the right, as NumPy and PyTorch do, and only the
+  last dimension is supported — so `b.length === a.length` is a mistake here
+  and not a same-shape fallback (torch refuses `[2,3] + [6]` for exactly that
+  reason, verified against 2.10 rather than recalled).
+
+  The existing same-shape path is **untouched**: `elementwise` and
+  `wgsl/kernel.wgsl` are byte-for-byte what they were, so the residual add and
+  SwiGLU multiply in `llm/engine.ts`, `llm/engine-q8.ts` and
+  `llm/engine-q8-resident.ts` cannot have changed behaviour. That is also why
+  the broadcast is a new `.wgsl` file rather than a third field on the shared
+  `Params` struct — every current binder of that kernel uploads a two-field
+  struct, and a struct change would have made "unchanged" an argument instead
+  of a diff that does not touch it. Speed unmeasured.
 
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
