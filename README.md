@@ -25,7 +25,13 @@ does anyone notice when it regresses?**
 
 ## What exists today
 
-Twenty-seven ops, WGSL only, verified against their references on a real GPU.
+Thirty ops, WGSL only, verified against their references on a real GPU. That is
+the count of directories under `ops/` — the number the backends table states and
+the number `harness/distribution.test.ts` asserts against the tree, so it is the
+one that cannot go stale silently. Counting the rows of the table below gives
+something else and always will: a few ops take a row per entry point
+(`matvecQ8`, `matmulQ8`, `ropeAxes`), and `permute` and `dequant_transpose` are
+described in the LLM-engine sections that produced them rather than here.
 
 **Speed is unmeasured for every one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
@@ -60,6 +66,7 @@ rather than being left blank.
 | `stft` / `istft` | `torch.stft` / `torch.istft` conventions: centred, reflect padding, one-sided, unnormalised, periodic Hann; `istft` divides by the `w²` envelope — see below. `istft` also takes `padding: "same"`, the Vocos / X-Codec-2 / MioCodec vocoder convention that crops `(nFft - hop) / 2` per end so `T` frames give `T * hop` samples — **not a torch mode**, and not composable from one, because the samples `center: false` would return fail NOLA. Speed unmeasured |
 | `conv` | `conv1d` and `conv2d`, as `torch.nn.functional.conv1d` / `conv2d` — a **cross-correlation**, so the kernel is *not* flipped (in 2D, on neither axis); `stride` / `padding` / `dilation` / `groups` / optional `bias`. 2D is NCHW (`[N, Cin, H, W]`, weight `[Cout, Cin/groups, KH, KW]`) and its three spatial arguments take **`number | [H, W]`**, PyTorch's `int | tuple[int, int]` with the pair order measured rather than assumed. `padding` is an integer count on both: `'same'` / `'valid'` are **not** accepted, because `'same'` with an even effective kernel pads asymmetrically in torch and one integer per axis cannot say that — unlike `istft`'s `"same"`, which is a genuinely different result rather than sugar. Speed unmeasured, and 2D is one thread per output element with no tiling |
 | `conv_transpose` | 1D only, as `torch.nn.functional.conv_transpose1d` — the decoder half of `conv`, and what a DAC-style codec upsamples with. Weight is **`[Cin, Cout/groups, K]`**, the transpose of `conv`'s layout; `padding` **crops** the output rather than extending the input; `output_padding` lengthens the trailing end only and takes no part in the sum. The kernel is *not* flipped, for the same reason `conv`'s is not. `weight_norm` is an offline conversion, not a flag here. Speed unmeasured |
+| `upsample` | `nearestUpsample2d`: nearest-neighbour 2D resample over `[N, C, H, W]`, as `F.interpolate(x, size=(outH, outW), mode='nearest')` — the **`size=` path**, not `scale_factor=`. The two are not two spellings of one thing: at `H = 3`, `scale_factor=1.6` maps the four output rows `0, 0, 1, 1` and `size=(4, ...)` maps them `0, 0, 1, 2` (both measured), and only the size path is decided by integers rather than by how a float scale rounds. Source index is `floor(dst * f32(inSize / outSize))` **computed in f32**, torch's OpenCV `INTER_NEAREST` formula — at `H = 14 -> 46`, destination row 23 copies source row **6**, where exact integer arithmetic says 7. `align_corners` is not a parameter, because torch *raises* for it in this mode rather than defaulting it; `mode='nearest-exact'` is a different function (`floor((dst + 0.5) * scale)`) and is not implemented. Downsampling **throws**. No weights and no arithmetic on the values — this is the `nearest upsample -> conv` half of a decoder that avoids `conv_transpose`'s checkerboard, so a decoder wants both ops and neither substitutes for the other. Speed unmeasured |
 | `attention` | unfused SDPA in two dispatches; `torch.nn.functional.scaled_dot_product_attention` convention — `scale` is `1/sqrt(D)` from the query's head dim, and `causal` is upper-left aligned (`queryOffset = S - L` gives `causal_lower_right`). `mask` is torch's **float** `attn_mask`, **added** to the scores (`-Infinity` masks), not the boolean one — the additive form is what composes with `alibi`; `keyPaddingBias` converts a boolean mask, whose polarity is torch's `attn_mask` (`true` = attend) and therefore the **reverse** of `nn.MultiheadAttention`'s `key_padding_mask`. Broadcast over batch, heads and query rows via `maskShape`, so `[B,1,1,S]` and `[B,H,L,S]` are both legal. `causal` with `mask` **throws**, as torch does. A fully masked row returns **zeros**, as `aten::_safe_softmax` does and plain `torch.softmax` does not. Speed unmeasured |
 | `ctc_decode` | greedy only. Collapse repeats **then** drop blanks, as `torch.unique_consecutive` + a blank filter does; `blank=0` as in `torch.nn.CTCLoss`. Lengths are written by the kernel, so nothing reads back |
 | `flash_attention` | the same function as `attention`, one dispatch, tiled online softmax; the `[B, H, L, S]` score matrix is never allocated, which is tested by counting bound bytes and not only by the answer. `132n + 44` bytes at `L = S = n, D = Dv = 8` against unfused `4n² + 68n + 40`. Takes the same additive `mask` as `attention`, on the same terms. Speed unmeasured |
@@ -509,6 +516,9 @@ Three layers, by what they are rather than by what they compute.
 
 ### `primitive/` — the algebra
 
+`matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D) · `conv_transpose` ✅ (1D) ·
+`upsample` ✅ (nearest, 2D) · `add` · `mul` · `gather` ✅ · `scatter` ✅ ·
+`transpose` ✅ · `reduce` ✅
 `matmul` (GEMM) ✅ · `matvec` (GEMV) ✅ · `conv` ✅ (1D, 2D) · `conv_transpose` ✅ (1D) ·
 `add` · `mul` · `gather` ✅ · `scatter` ✅ · `transpose` ✅ · `reduce` ✅
 
@@ -2065,7 +2075,7 @@ text).
 
 | backend | status | shape |
 | --- | --- | --- |
-| WGSL | 29 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
+| WGSL | 30 ops | a kernel per op, per target; resolution is `<entry>[.<target>][.<dtype>].wgsl` |
 | WASM | planned | a kernel per op, SIMD where available |
 | WebNN | planned | **not a kernel** — an `MLGraphBuilder` graph, so the entry is a mapping |
 

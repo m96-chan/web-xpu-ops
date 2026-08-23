@@ -196,6 +196,45 @@ Entries record **why** a change was needed. What changed is in the diff.
   struct, and a struct change would have made "unchanged" an argument instead
   of a diff that does not touch it. Speed unmeasured.
 
+- `ops/upsample`: `nearestUpsample2d`, nearest-neighbour 2D resampling over
+  `[N, C, H, W]` (issue #146). This library had **no resampling op at all** —
+  the nearest thing was `convTranspose1d`, which raises resolution with learned
+  weights. Image decoders that avoid checkerboard artefacts do it the other
+  way, "nearest upsample then conv", so they need both and neither one
+  substitutes for the other.
+
+  Matches `torch.nn.functional.interpolate(x, size=(outH, outW),
+  mode='nearest')` measured against torch 2.10.0+cu128, and the two conventions
+  that could have been chosen silently are written into the API instead:
+
+  - It takes the **output size**, not a scale factor, because torch's two
+    entry paths genuinely disagree. At `H = 3`, `scale_factor=1.6` maps the
+    four output rows to sources `0, 0, 1, 1` while `size=(4, ...)` maps them
+    to `0, 0, 1, 2`. Taking the size keeps the output shape a matter of
+    integers rather than of how a float scale rounds, and the two agree
+    wherever the ratio is a whole number — including the 2x every decoder
+    actually asks for.
+  - The source index is `floor(dst * f32(inSize / outSize))` with the multiply
+    **in f32**, which is torch's OpenCV `INTER_NEAREST` formula and not the
+    same function as exact integer arithmetic: at `H = 14 -> 46` destination
+    row 23 lands exactly on source row 7 in exact arithmetic and on row **6**
+    in f32, which is what torch returns. Getting this wrong shifts a whole row
+    of an image with no error and no shape change.
+  - `align_corners` is **not** a parameter and must not be added: torch raises
+    for it in this mode ("align_corners option can only be set with the
+    interpolating modes"), because it aligns a sample grid before interpolating
+    between neighbours and nearest interpolates between nothing.
+  - Downsampling throws rather than quietly evaluating the same formula, which
+    is out of scope for the issue and is measured against nothing.
+
+  The f32 ratio is divided **on the host** and passed to the shader, because
+  WGSL allows f32 `/` 2.5 ULP of error while requiring `*` to be correctly
+  rounded. That is not a precaution taken from the spec: dividing inside the
+  shader instead makes the `14 -> 46` case return source row 7 on an RTX 5090
+  (Dawn, f32), disagreeing with torch and with the reference.
+
+  Speed unmeasured.
+
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
   per-call breakdown of where one `forward()` call's own wall time goes —
