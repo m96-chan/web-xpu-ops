@@ -37,6 +37,11 @@ import { join } from "node:path";
 const OPS = "ops";
 const HARNESS = "harness";
 const LLM = "llm";
+// `examples/` is not published and mostly not tested, but `zimage` carries the
+// composition check for issue #163 — the one place that asserts the ops add up
+// to a real model rather than to their own references. Left out of the runner,
+// it would be green in an editor and absent from CI.
+const EXAMPLES_TESTED = ["examples/zimage/src"];
 
 /** Every `*.test.ts` under `dir`, recursing into subdirectories. */
 function testFilesRecursive(dir) {
@@ -74,6 +79,7 @@ function testFiles() {
   // being forced into either shape. None of these need a GPU, but per-file
   // processes are what makes a crash attributable to one file (see #38).
   found.push(...testFilesRecursive(LLM));
+  for (const dir of EXAMPLES_TESTED) found.push(...testFilesRecursive(dir));
   return found.sort();
 }
 
