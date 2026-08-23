@@ -41,6 +41,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/matmul` gains a `matmulQ4G128` entry point (issue #149): the tiled GEMM
+  of `matmulQ8`, reading the q4 format `ops/matvec` defines — `[M, ceil(K/8)]`
+  packed nibbles plus `[M, ceil(K/128)]` per-group scales — with in-kernel
+  dequant and no transpose pass. Prefill is the half of inference that runs
+  through GEMM, so a quantization format that only has a GEMV covers only
+  decode; this is what lets a 4B-parameter text encoder be read at all, at
+  4.25 bits per weight (≈1.98 GiB for 4e9 parameters, arithmetic from the
+  measured bits-per-weight — no checkpoint of that size has been converted
+  here).
+
+  The format is **not re-decided** here (rule 7 — issue #149 says so in as many
+  words): `ops/matmul/q4.reference.test.ts` checks that by running this GEMM
+  against `matvecQ4G128` row by row, so the two ops cannot drift into two
+  spellings of "the q4 format" while each agrees with its own kernel.
+
+  **No bias**, despite issue #149 asking for one. `matmul` and `matmulQ8` have
+  none, `biasAdd` (issue #150) composes by addition, and rule 8 wants the plain
+  arithmetic agreeing with the reference before anything is fused into it.
+  Speed is unmeasured.
+
 - `ops/matvec` gains the **q4 weight format** and a `matvecQ4G128` entry point
   (issue #137): 4-bit codes packed eight to a `u32` (least-significant nibble
   first — `packQ8`'s byte order at half the width), with one absmax scale per

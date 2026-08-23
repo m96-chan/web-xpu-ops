@@ -52,6 +52,7 @@ rather than being left blank.
 | `dequantize` | applies both the weight and the activation scale |
 | `matmul` | GEMM; `torch.mm` convention, shared-memory tiling. Speed unmeasured |
 | `matmulQ8` | W8A32 GEMM: `matmul` with the right-hand operand held as an int8 weight instead of f32, `matvecQ8`'s own `[M, ceil(K/4)]` `u32` packed wire format read in-kernel — no separate dequant/transpose pass. Scale is `[M]`, `quantize`'s per-row absmax convention, applied once per output element. Speed unmeasured |
+| `matmulQ4G128` | W4A32 GEMM: `matmulQ8` at four bits, reading `matvecQ4G128`'s own `[M, ceil(K/8)]` `u32` packed wire format and its `[M, ceil(K/128)]` per-group scales in-kernel — the prefill half of the q4 format, same tiling (`TILE = 16`) and same argument names as `matmulQ8`. **No bias**, deliberately: `matmul` and `matmulQ8` have none either, and a fused one cannot be measured against anything until the plain form agrees with the reference. Speed unmeasured |
 | `transpose` | turned through workgroup memory so both read and write stay consecutive |
 | `reduce` | `sum` / `max` / `min` / `mean` along an axis |
 | `gather` | row selection, as `torch.index_select(table, 0, indices)` — not `torch.gather`; an out-of-range index gathers zeros |
@@ -446,6 +447,18 @@ plus one f32 scale per 128 weights — against 4 + 32/K for per-row q4 and
 8 + 32/K for q8. The group axis costs **a quarter of a bit per weight**.
 A `[2560, 2560]` weight is 26,214,400 bytes as f32, 6,563,840 as q8, and
 3,481,600 as q4-g128.
+
+### Does a 4B model fit?
+
+Arithmetic, from the measured 4.250 bpw: 4e9 parameters at 4.25 bits is
+**2,125,000,000 bytes ≈ 1.98 GiB**, against 4.02 GiB at q8 (8.012 bpw) and
+16 GiB at f32. That is the number issue #149 exists for, and it is arithmetic
+rather than a measurement — this repository has no 4B checkpoint, has converted
+none, and therefore does not know what the non-Linear tensors (embeddings,
+norms, biases) add on top, nor whether any single tensor exceeds
+`maxStorageBufferBindingSize` on a given browser. Issue #112 records that
+exceeding a limit is answered with **zeros rather than an error**, so "it fits
+in total" is not the same claim as "it loads".
 
 **Not measured here**: what this does to a real model. No logits comparison, no
 greedy-trajectory comparison, no audio. Issue #137's decisions rest on
