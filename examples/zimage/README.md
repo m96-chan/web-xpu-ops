@@ -55,8 +55,72 @@ Two facts about the model were read from its source rather than assumed
 - **Not a GPU run, and not speed.** Both are #148's job. The composition here is
   CPU reference ops throughout, which is what makes it a statement about
   correctness only.
-- **Not the real weights.** Random, fixed seed. What it proves is that the
-  arithmetic lines up, not that any particular checkpoint loads.
+- **Not the real weights** — *no longer true, see below.* The 64-wide golden
+  above still uses a fixed random seed; the shipped weights are covered by a
+  second check.
+
+## The same block, at the shipped width, with the shipped weights
+
+Issue #166's first stage. `src/weights.ts` reads what `tools/convert_dit.py`
+writes, and `src/verify-real-block.ts` runs `layers.0` through `block.ts` at
+`dim=3840`, `head_dim=128`, axes `[32, 48, 48]` — the real thing, not a
+scaled-down stand-in — against a golden that stores only inputs and outputs so
+it stays at 374 KB.
+
+Measured, on this machine:
+
+| | |
+| --- | --- |
+| port vs the model, same quantized weights | **8.72e-8** relative RMS, cos 1.000000000 |
+| port vs the model at full precision | 1.778e-2 relative RMS, cos 0.999842 |
+| of which quantization alone, measured in torch | 1.778e-2 relative RMS, cos 0.999842 |
+
+The second and third lines agreeing to four figures is the point: the entire
+gap to the full-precision model is the format, and the port contributes 8.72e-8
+on top of it. Comparing against one number would have left those two
+indistinguishable.
+
+### What 4-bit costs, and where
+
+The DiT is 12.31 GB of bf16. In q4-g128 (#137's format) it is 3.34 GB, and the
+question #137 was reopened to answer is what that costs. On `layers.0`, with
+each weight quantized alone and the rest left dense:
+
+| weight | relative RMS on the block's output |
+| --- | --- |
+| `adaLN_modulation.0.weight` | **0.0478** |
+| `attention.to_q.weight` | 0.0121 |
+| `attention.to_k.weight` | 0.0090 |
+| `feed_forward.w2.weight` | 0.0062 |
+| `feed_forward.w1/w3.weight` | 0.0054 |
+| `attention.to_v.weight` | 0.0042 |
+| `attention.to_out.0.weight` | 0.0037 |
+
+adaLN dominates, and not by a little: quantizing everything costs 0.0519, of
+which it is 0.0478. It is the weight that produces the scales and gates
+multiplying the whole residual stream, so its error is multiplicative across
+all 3840 channels rather than additive.
+
+So the converter keeps **adaLN at q8 and everything else at q4**. That costs
+2.5 MB per layer — 96.1 to 98.6, +2.6% — and takes the block from 0.0519 to
+0.0178. Smaller groups do not substitute: `q4-g32` costs 0.25 more bits on
+every weight and only reaches 0.0398. Whole-model q8 would reach 0.0034 at
+203.5 MB per layer, which is 6.5 GB of browser.
+
+None of that is a claim about image quality — it is one layer, on random
+activations, and 30 layers compound. What it rules out is choosing the format
+by feel.
+
+### Running it
+
+```bash
+/home/m96-chan/project/therdparty/musubi-tuner/.venv/bin/python \
+    examples/zimage/tools/convert_dit.py --out ~/zimage-q4
+npx tsx examples/zimage/src/verify-real-block.ts --dit ~/zimage-q4
+```
+
+Not part of `npm test`: it needs the 3.34 GB blob, which CI does not have and
+should not fetch. `block.test.ts` is the part that runs everywhere.
 
 ## Regenerating the golden
 
