@@ -41,6 +41,41 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/elementwise` gains `elementwiseRows` and a second WGSL entry point,
+  `rows` (issue #150): `add` and `multiply` with the right-hand side broadcast
+  along the last dimension — `out[s, d] = a[s, d] ⊕ b[d]` for `a` of `[S, D]`
+  and `b` of `[D]`. `add` is a `Linear`'s bias (**biasAdd**) and `multiply` is
+  AdaLN's per-channel scale (**rowwiseAffine**); Z-Image's DiT (#148) needs
+  both, and until now `elementwise` threw on any pair of unequal lengths, so
+  a bias had to be materialised as a full `[S, D]` copy on the host first.
+
+  It is a **separate function taking `S` and `D` explicitly**, not a length
+  check added to `elementwise`. Inferring the broadcast from the lengths was
+  rejected because the lengths do not carry the intent: a `[3, 3]` activation
+  and a `[3]` vector admit two different broadcasts — across the columns and
+  down the rows — and both return well-formed, finite, *different* answers
+  (torch 2.10: `torch.arange(9).reshape(3,3) + c` is `[[1,3,5],[4,6,8],[7,9,11]]`,
+  `+ c.unsqueeze(1)` is `[[1,2,3],[5,6,7],[9,10,11]]`). An inferring
+  `elementwise` would have to pick one silently, which is issue #143's
+  "returns a plausible value instead of throwing" class. Stating the shape
+  turns a caller's mistake into a contradiction the op can refuse: a `b` that
+  is not `D` long, an `a` that is not `S*D` long, or a missing/non-positive
+  dimension all throw, in `ops/gqa`'s message format.
+
+  Broadcasting aligns from the right, as NumPy and PyTorch do, and only the
+  last dimension is supported — so `b.length === a.length` is a mistake here
+  and not a same-shape fallback (torch refuses `[2,3] + [6]` for exactly that
+  reason, verified against 2.10 rather than recalled).
+
+  The existing same-shape path is **untouched**: `elementwise` and
+  `wgsl/kernel.wgsl` are byte-for-byte what they were, so the residual add and
+  SwiGLU multiply in `llm/engine.ts`, `llm/engine-q8.ts` and
+  `llm/engine-q8-resident.ts` cannot have changed behaviour. That is also why
+  the broadcast is a new `.wgsl` file rather than a third field on the shared
+  `Params` struct — every current binder of that kernel uploads a two-field
+  struct, and a struct change would have made "unchanged" an argument instead
+  of a diff that does not touch it. Speed unmeasured.
+
 - `LlamaEngineQ8Resident.forward()` (and `harness/resident.ts#ResidentDevice.batch()`)
   gain an opt-in `ForwardProfile`/`BatchProfile` argument (issue #131): a
   per-call breakdown of where one `forward()` call's own wall time goes —
