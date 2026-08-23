@@ -41,6 +41,63 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- `ops/axpy` (issue #152): `out[i] = y[i] + a * x[i]` with a **scalar** `a`,
+  in two entry points — `kernel` (out-of-place) and `inplace` (`y[i] += a *
+  x[i]`, BLAS `saxpy`'s own signature). A rectified-flow sampler's entire
+  scheduler step is `latent += dt * velocity`, once per diffusion step, and
+  `ops/elementwise` cannot express it: it takes two **equally sized** arrays,
+  so the scalar had to be materialised as a full-length buffer of copies of
+  `dt` and pushed through multiply-then-add. That is two dispatches, twice the
+  memory traffic, and — because `dt` changes every step — a latent-sized
+  upload per step to carry one number.
+
+  It is also a **different answer**, which is the part worth knowing before
+  swapping one for the other. Rounding the product to f32 before the add is
+  not the same as rounding once: at `a = f32(0.1)`, `x = 3`, `y = -f32(0.3)`
+  multiply-then-add cancels to exactly **0** while a single rounding gives
+  **-2^-27**. Which is correct is not this library's call (rule 7) — measured,
+  `torch.add(y, x, alpha=a)` returns the single-rounded value on CPU and on
+  CUDA alike, and so does this op on this device, whose WGSL compiler
+  contracts `y + a*x` into an FMA. Over 4,096 elements at `a = 0.37` the fused
+  kernel matched the reference on all 4,096 where the two-dispatch path
+  matched on 3,214, and no element was ever further from it — the test asserts
+  that ordering, not just agreement.
+
+  In-place is a separate entry point rather than a way of calling the
+  out-of-place one, because the obvious shortcut fails **silently**: binding
+  one buffer to `kernel`'s read-only `y` and its read_write `output` passes
+  `createBindGroup`, then invalidates the command buffer at `finish()`
+  (`usage (Storage(read-write)|Storage(read-only)) includes writable usage and
+  another usage in the same synchronization scope`), so the submit is dropped
+  and the readback is all zeros with nothing thrown — #46's failure mode
+  again. One `read_write` binding read and written by the same invocation is
+  well defined and measured working across a four-step resident loop.
+
+  `a` rides in the 16-byte uniform next to `N`, so the per-step cost of a
+  changing coefficient is one 16-byte `queue.writeBuffer` — the shape
+  `harness/resident.ts` already sanctions for position counters — and nothing
+  else is re-uploaded, buffers, pipeline and bind group all built once
+  (asserted against `ResidentDevice.stats`). That is deliberately not #144's
+  trap of re-sending unchanged bytes every call: here the only bytes that move
+  are the ones that changed.
+
+  Measured (rule 9; RTX 5090, driver 610.57.04, Dawn via `webgpu@0.4`, Node
+  v25.6.1, f32, GPU timestamps, median of 5 per session, three sessions,
+  otherwise-idle GPU; ceiling measured by `harness/roofline.ts` in the same
+  sessions, 1.69-1.72 TB/s). At **N = 262,144** (one 16×128×128 latent):
+  **6.5 µs against 12.8-16.9 µs** for `elementwise(multiply)` +
+  `elementwise(add)`, i.e. **2.0-2.6x** — but at 480-487 GB/s, only **28% of
+  the ceiling**, so at that size neither path is bandwidth-bound and the win is
+  doing half the work rather than doing it faster. At **N = 1,048,576** it is
+  bandwidth-bound: **7.7-9.0 µs against 17.1-18.4 µs**, **2.0-2.4x**, at
+  1.40-1.63 TB/s = **83-95% of the ceiling**, which is what a kernel that moves
+  12 bytes per element and does one FMA with them should reach.
+
+  The larger size is in this entry only because #161 landed. While this op was
+  being written, N = 1,048,576 aborted with `std::system_error` and then hung,
+  three times running, and this entry said "unmeasured" — that was the collected
+  `GPU` instance described above, not a size limit, and it reproduces no longer.
+  Nothing in this op changed between the two measurements.
 - `ops/matmul` gains a `matmulQ4G128` entry point (issue #149): the tiled GEMM
   of `matmulQ8`, reading the q4 format `ops/matvec` defines — `[M, ceil(K/8)]`
   packed nibbles plus `[M, ceil(K/128)]` per-group scales — with in-kernel
