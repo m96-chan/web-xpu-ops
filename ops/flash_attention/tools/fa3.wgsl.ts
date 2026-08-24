@@ -40,7 +40,11 @@ export function fa3Flash(shape: FlashShape, maxD: number, maxDv = maxD): string 
   // Registers per thread for the prefetched tile, when it is prefetched into
   // registers. The staging loops stride by THREADS, so a thread touches at
   // most this many elements — `params.D` is bounded by `maxD` at dispatch.
-  const pk = Math.max(1, Math.ceil((shape.tileS * maxD) / shape.threads));
+  const vec = shape.scoreReads === "vec4";
+  // In vec4 mode a "unit" of k is four channels, so a thread touches a quarter
+  // as many of them.
+  const kUnits = vec ? Math.ceil(maxD / 4) : maxD;
+  const pk = Math.max(1, Math.ceil((shape.tileS * kUnits) / shape.threads));
   const pv = Math.max(1, Math.ceil((shape.tileS * maxDv) / shape.threads));
 
   // Straight into the idle half of the buffer, before the scores. The store
@@ -49,24 +53,47 @@ export function fa3Flash(shape: FlashShape, maxD: number, maxDv = maxD): string 
   // distinct workgroup variables and WGSL has no aliasing between them) but is
   // not obliged to.
   const DIRECT_ISSUE = `      if (t + 1u < tiles) {
-${stageTile("(t + 1u) * TILE_S", "1u - cur", "        ")}
+${stageTile(shape, "(t + 1u) * TILE_S", "1u - cur", "        ")}
       }`;
   const DIRECT_LAND = "";
 
   // Into registers first. The global loads are issued here, the scores and the
   // softmax happen, and only then does the thread wait on them to store — so
   // the arithmetic covers the latency whatever the compiler decides.
-  const REGISTER_ISSUE = `      var pk: array<f32, ${pk}>;
-      var pv: array<f32, ${pv}>;
-      if (t + 1u < tiles) {
-        let next = (t + 1u) * TILE_S;
-        var p = 0u;
-        for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
+  const KEY_INTO_REGISTERS = vec
+    ? `        for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
+          let j = next + e / d4n;
+          let c0 = (e % d4n) * 4u;
+          var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+          if (j < params.S) {
+            for (var c = 0u; c < 4u; c = c + 1u) {
+              let d = c0 + c;
+              if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
+            }
+          }
+          pk[p] = val;
+          p = p + 1u;
+        }`
+    : `        for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
           let j = next + e / params.D;
           let d = e % params.D;
           pk[p] = select(0.0, k[k_head + j * params.D + d], j < params.S);
           p = p + 1u;
-        }
+        }`;
+  // The same padded row stride the staging path uses; `e` walks the tile
+  // densely, the destination does not.
+  const unitsPerRow = vec ? "d4n" : "params.D";
+  const KEY_OUT_OF_REGISTERS = `        for (var e = tid; e < TILE_S * ${unitsPerRow}; e = e + THREADS) {
+          sk[(1u - cur) * K_STRIDE + (e / ${unitsPerRow}) * ROW + (e % ${unitsPerRow})] = pk[p];
+          p = p + 1u;
+        }`;
+
+  const REGISTER_ISSUE = `      var pk: array<${vec ? "vec4<f32>" : "f32"}, ${pk}>;
+      var pv: array<f32, ${pv}>;
+      if (t + 1u < tiles) {
+        let next = (t + 1u) * TILE_S;
+        var p = 0u;
+${KEY_INTO_REGISTERS}
         p = 0u;
         for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
           let j = next + e / params.Dv;
@@ -77,10 +104,7 @@ ${stageTile("(t + 1u) * TILE_S", "1u - cur", "        ")}
       }`;
   const REGISTER_LAND = `      if (t + 1u < tiles) {
         var p = 0u;
-        for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
-          sk[(1u - cur) * K_STRIDE + e] = pk[p];
-          p = p + 1u;
-        }
+${KEY_OUT_OF_REGISTERS}
         p = 0u;
         for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
           sv[(1u - cur) * V_STRIDE + e] = pv[p];
@@ -110,7 +134,7 @@ fn main(
 ${prologue(shape, shape.threads, maxDv)}
 
   // Prime the pipeline: tile 0 into half 0, before the loop.
-${stageTile("0u", "0u", "  ")}
+${stageTile(shape, "0u", "0u", "  ")}
 
   var cur = 0u;
   for (var t = 0u; t < tiles; t = t + 1u) {
@@ -122,7 +146,7 @@ ${stageTile("0u", "0u", "  ")}
 
 ${issue}
 
-${scores("base", "cur", "    ")}
+${scores(shape, "base", "cur", "    ")}
     workgroupBarrier();
 
 ${softmax("    ")}

@@ -28,6 +28,16 @@ export const MASKED = "-3.402823e+38";
 export function preamble(shape: FlashShape, maxD: number, maxDv: number, generation: Generation): string {
   const { bq, tileS, threads } = shape;
   const buffers = generation === "fa3" ? 2 : 1;
+  const vec = shape.scoreReads === "vec4";
+  // vec4 staging works in groups of four channels, so a row is rounded up. The
+  // tail is zero-filled by the staging guard, which makes the extra lanes
+  // contribute nothing to the dot rather than making it wrong.
+  const d4 = Math.ceil(maxD / 4);
+  // The stride from one staged row to the next, in whatever unit the score
+  // phase reads. Padding makes it coprime with the memory banks.
+  const row = (vec ? d4 : maxD) + (shape.padRows ? 1 : 0);
+  const qType = vec ? `array<vec4<f32>, ${bq * row}>` : `array<f32, ${bq * row}>`;
+  const kType = vec ? `array<vec4<f32>, ${buffers * tileS * row}>` : `array<f32, ${buffers * tileS * row}>`;
   return `
 struct Params {
   H: u32, L: u32, S: u32, D: u32, Dv: u32,
@@ -47,12 +57,13 @@ const TILE_S: u32 = ${tileS}u;
 const THREADS: u32 = ${threads}u;
 const MAX_D: u32 = ${maxD}u;
 const MAX_DV: u32 = ${maxDv}u;
-const K_STRIDE: u32 = ${tileS * maxD}u;
+const K_STRIDE: u32 = ${tileS * row}u;
+const ROW: u32 = ${row}u;
 const V_STRIDE: u32 = ${tileS * maxDv}u;
 const MASKED: f32 = ${MASKED};
 
-var<workgroup> sq: array<f32, ${bq * maxD}>;
-var<workgroup> sk: array<f32, ${buffers * tileS * maxD}>;
+var<workgroup> sq: ${qType};
+var<workgroup> sk: ${kType};
 var<workgroup> sv: array<f32, ${buffers * tileS * maxDv}>;
 var<workgroup> ss: array<f32, ${bq * tileS}>;
 // The softmax state, per row, **shared**.
@@ -70,6 +81,30 @@ var<workgroup> scorr: array<f32, ${bq}>;
 
 /** Head/batch addressing and the q tile, which is staged once and read every tile. */
 export function prologue(shape: FlashShape, threads: number, maxDv: number): string {
+  // How many vec4 a row of D channels takes. Runtime, because one program
+  // serves every D up to the one it was generated for.
+  const stageQ = shape.scoreReads === "vec4"
+    ? `  let d4n = (params.D + 3u) / 4u;
+  for (var t = tid; t < BQ * d4n; t = t + THREADS) {
+    let r = t / d4n;
+    let unit = t % d4n;
+    let c0 = unit * 4u;
+    let row = q0 + r;
+    var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (row < params.L) {
+      for (var c = 0u; c < 4u; c = c + 1u) {
+        let d = c0 + c;
+        if (d < params.D) { val[c] = q[(head * params.L + row) * params.D + d]; }
+      }
+    }
+    sq[r * ROW + unit] = val;
+  }`
+    : `  for (var t = tid; t < BQ * params.D; t = t + THREADS) {
+    let r = t / params.D;
+    let d = t % params.D;
+    let row = q0 + r;
+    sq[r * ROW + d] = select(0.0, q[(head * params.L + row) * params.D + d], row < params.L);
+  }`;
   return `  let q0 = wg.x * BQ;
   let batch = wg.z;
   let h = wg.y;
@@ -80,12 +115,7 @@ export function prologue(shape: FlashShape, threads: number, maxDv: number): str
   let mb = select(0u, batch, params.mask_batch > 1u);
   let mh = select(0u, h, params.mask_heads > 1u);
 
-  for (var t = tid; t < BQ * params.D; t = t + THREADS) {
-    let r = t / params.D;
-    let d = t % params.D;
-    let row = q0 + r;
-    sq[t] = select(0.0, q[(head * params.L + row) * params.D + d], row < params.L);
-  }
+${stageQ}
 
   // One running maximum, sum and accumulator per (row this thread owns,
   // channel this thread owns). A thread owns one channel per sweep, and sweeps
@@ -107,14 +137,31 @@ export function prologue(shape: FlashShape, threads: number, maxDv: number): str
  * `indent` only so the generated WGSL reads like something a person wrote; a
  * kernel nobody can read is a kernel nobody can check against the reference.
  */
-export function stageTile(baseExpr: string, bufExpr: string, indent: string): string {
-  return `${indent}// D and Dv can differ; k and v are staged with their own strides rather
-${indent}// than one shared constant.
-${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
+export function stageTile(shape: FlashShape, baseExpr: string, bufExpr: string, indent: string): string {
+  // `v` stays scalar whatever `k` does: the accumulate walks it by channel
+  // across threads, not by row, so there is no group of four to fold.
+  const stageK = shape.scoreReads === "vec4"
+    ? `${indent}for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
+${indent}  let j = (${baseExpr}) + e / d4n;
+${indent}  let unit = e % d4n;
+${indent}  let c0 = unit * 4u;
+${indent}  var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+${indent}  if (j < params.S) {
+${indent}    for (var c = 0u; c < 4u; c = c + 1u) {
+${indent}      let d = c0 + c;
+${indent}      if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
+${indent}    }
+${indent}  }
+${indent}  sk[(${bufExpr}) * K_STRIDE + (e / d4n) * ROW + unit] = val;
+${indent}}`
+    : `${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.D;
 ${indent}  let d = e % params.D;
-${indent}  sk[(${bufExpr}) * K_STRIDE + e] = select(0.0, k[k_head + j * params.D + d], j < params.S);
-${indent}}
+${indent}  sk[(${bufExpr}) * K_STRIDE + (e / params.D) * ROW + d] = select(0.0, k[k_head + j * params.D + d], j < params.S);
+${indent}}`;
+  return `${indent}// D and Dv can differ; k and v are staged with their own strides rather
+${indent}// than one shared constant.
+${stageK}
 ${indent}for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.Dv;
 ${indent}  let d = e % params.Dv;
@@ -123,7 +170,18 @@ ${indent}}`;
 }
 
 /** `BQ * TILE_S` scores, spread over every thread, both operands from workgroup memory. */
-export function scores(baseExpr: string, bufExpr: string, indent: string): string {
+export function scores(shape: FlashShape, baseExpr: string, bufExpr: string, indent: string): string {
+  // Two workgroup loads per multiply-add, or two per four.
+  const inner = shape.scoreReads === "vec4"
+    ? `${indent}    var acc4 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+${indent}    for (var dv = 0u; dv < d4n; dv = dv + 1u) {
+${indent}      acc4 = fma(sq[r * ROW + dv], sk[(${bufExpr}) * K_STRIDE + slot * ROW + dv], acc4);
+${indent}    }
+${indent}    let dot_ = acc4.x + acc4.y + acc4.z + acc4.w;`
+    : `${indent}    var dot_ = 0.0;
+${indent}    for (var d = 0u; d < params.D; d = d + 1u) {
+${indent}      dot_ = fma(sq[r * ROW + d], sk[(${bufExpr}) * K_STRIDE + slot * ROW + d], dot_);
+${indent}    }`;
   return `${indent}for (var e = tid; e < BQ * TILE_S; e = e + THREADS) {
 ${indent}  let r = e / TILE_S;
 ${indent}  let slot = e % TILE_S;
@@ -132,12 +190,9 @@ ${indent}  let row = q0 + r;
 ${indent}  var value = MASKED;
 ${indent}  if (j < params.S && row < params.L
 ${indent}      && (params.causal == 0u || i32(j) <= i32(row) + params.query_offset)) {
-${indent}    var dot = 0.0;
-${indent}    for (var d = 0u; d < params.D; d = d + 1u) {
-${indent}      dot = fma(sq[r * params.D + d], sk[(${bufExpr}) * K_STRIDE + slot * params.D + d], dot);
-${indent}    }
+${inner}
 ${indent}    let mr = select(0u, row, params.mask_rows > 1u);
-${indent}    value = dot * params.scale + mask[((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S + j];
+${indent}    value = dot_ * params.scale + mask[((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S + j];
 ${indent}  }
 ${indent}  ss[e] = value;
 ${indent}}`;

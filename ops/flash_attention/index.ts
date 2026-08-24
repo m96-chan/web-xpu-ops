@@ -16,55 +16,65 @@ export { keyPaddingBias, type MaskShape } from "../attention/reference.js";
  * `tools/fa2.wgsl.ts` for why that is the only thing that ever moved this op —
  * so the grid is not one workgroup per query.
  *
- * **Measured, on an RTX 5090 (Dawn, f32, D = Dv = 128), by
- * `tools/bench.ts`.** Against the previous shipped shape, taken as 1.00 in the
- * same rounds so a clock that moved moved both:
+ * **Measured, on an RTX 5090 (Dawn, f32, D = Dv = 128), by `tools/bench.ts`.**
+ * Ratios are to the previous shipped shape, timed in the same rounds so a clock
+ * that moved moved both:
  *
- *     BQ=32 TILE_S=8 256t key-outer   0.51 cross,  0.51 self   <- this
- *     BQ=16 TILE_S=8 128t key-outer   0.51 cross,  0.57 self
- *     BQ=32 TILE_S=4 128t key-outer   0.47 cross,  0.62 self
- *     BQ=32 TILE_S=16 256t key-outer  0.74 cross,  0.73 self
- *     BQ=64 TILE_S=8 256t key-outer   0.76 cross,   -    self
+ *     BQ=32 TILE_S=8 128t key vec4 +pad   0.35 cross,  0.35 self   <- this
+ *     BQ=16 TILE_S=8 128t key vec4 +pad   0.40 cross,  0.42 self
+ *     BQ=32 TILE_S=8 128t key vec4        0.78 cross,  0.81 self
+ *     BQ=32 TILE_S=8 256t key scalar +pad 0.79 cross,  0.78 self
+ *     BQ=32 TILE_S=8 256t key scalar      1.00 cross,  1.00 self
+ *     BQ=64 TILE_S=8 256t key scalar      1.49 cross
  *
- * `key-outer` is the accumulate nesting and is worth about 1.5x on its own:
- * walking keys outermost reads each staged value of `v` once into a register
- * and lets all `BQ` rows use it, where walking rows outermost re-read it `BQ`
- * times from workgroup memory.
+ * **Three generations of FlashAttention measured within a few percent of each
+ * other, and none of them was the problem.** `tools/where.ts` says why: it
+ * deletes each inner loop in turn and times what is left. On the self shape,
+ * full is 16.45 ms, deleting the accumulate leaves 15.23, deleting the score
+ * dot leaves 5.28, deleting both leaves 2.76. **The score dot product is 76% of
+ * this kernel.** FA1, FA2 and FA3 differ in how the tile loop is *scheduled*
+ * and all three run the same dot product, so none of them could move it.
  *
- * The two shapes disagree and `self` wins the argument — it is roughly four
- * times the cost of `cross` in an Anima block — which is why `TILE_S = 4` is
- * not taken despite being the faster of the two on `cross`.
+ * Two things moved it, and they compose better than they multiply (0.81 x 0.78
+ * would be 0.63; together they measure 0.35):
  *
- * **`BQ = 64` is slower, and that bounds the query tile.** More rows per
- * workgroup is what made this op tractable at all, so the obvious next step was
- * more of it; measured it costs 1.5x. Sixty-four accumulators a thread is past
- * what the register file will hold at this occupancy, and the traffic saved is
- * worth less than the occupancy lost.
+ *   - **`vec4` reads.** The scalar loop is two workgroup loads per fused
+ *     multiply-add, the ratio `ops/matmul` had before its register tile. Four
+ *     multiply-adds per two loads instead.
+ *   - **One element of padding per staged row.** Workgroup memory is banked and
+ *     adjacent threads in the score phase differ by `slot`, so they read
+ *     addresses `slot * D` apart; at `D = 128` f32 that is a multiple of the
+ *     bank count and every one of them serialises on the same bank. This was a
+ *     guess — WebGPU does not say there are banks, or how many — and it is the
+ *     single largest change in this op's history.
  *
- * **Where the remaining headroom is, stated against a measured ceiling
- * (rule 9).** The shipped shape reaches 3.88 TFLOP/s, which is 7.7% of this
- * device's measured 50.4 TFLOP/s. That is not the ceiling to compare against:
- * at `BQ = 32` the kernel does 16 FLOP per byte of k/v, against a measured
- * crossover of 29.6 (50.4 TFLOP/s over 1.70 TB/s), so bandwidth caps it at
- * 27.2 TFLOP/s — 54% of compute peak — however well it is written.
+ * Fixing `params.D` to a compile-time 128 so the loop could unroll was also
+ * tried, and measured **1.06: slower**.
  *
- * It is not near that either. The logical k/v traffic is 4.01 GB in 16.50 ms on
- * `self` and 1.04 GB in 4.34 ms on `cross`: **243 GB/s and 240 GB/s, both 14%
- * of the 1.70 TB/s roofline.** Two shapes that differ by 4x in size and 2x in
- * head count landing on the same figure says the limit is neither compute nor
- * DRAM but something inside the workgroup that both hit equally. The candidate
- * is the score loop, which reads two workgroup-memory values per fused
- * multiply-add — the same ratio `ops/matmul` had before its register tile took
- * it from 1.8% to 72%. **Untested.** `BQ * TILE_S` is 256 against 256 threads,
- * so there is no work to give a thread without taking threads away, and which
- * of those two costs more is a measurement nobody here has made.
+ * `key-outer` is the accumulate nesting: walking keys outermost reads each
+ * staged value of `v` once into a register and lets all `BQ` rows use it, where
+ * walking rows outermost re-read it `BQ` times.
+ *
+ * The two shapes agreed on every ranking above, so nothing here is a trade
+ * between them. **`BQ = 64` is slower and that bounds the query tile** — sixty
+ * -four accumulators a thread costs more occupancy than the traffic it saves.
+ *
+ * **Where it stands, against a measured ceiling (rule 9).** 10.6 TFLOP/s, or
+ * **21% of this device's measured 50.4 TFLOP/s**, from 7.7% before. The
+ * compute roofline is still not the right ceiling: at 16 FLOP per byte of k/v
+ * against a measured crossover of 29.6, bandwidth caps this kernel at
+ * 27.2 TFLOP/s, which is 54% of compute peak. So it now runs at **39% of what
+ * its arithmetic intensity allows**, and the way past that is more intensity,
+ * not more tuning.
  */
 export const FLASH_TILE = {
   bq: 32,
   tileS: 8,
-  threads: 256,
+  threads: 128,
   accumulate: "key",
   prefetch: "direct",
+  scoreReads: "vec4",
+  padRows: true,
   maxHeadDim: 128,
   maxValueDim: 128,
 } as const;

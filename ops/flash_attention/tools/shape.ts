@@ -45,6 +45,34 @@ export interface FlashShape {
    * the arithmetic whatever the compiler does.
    */
   prefetch: "direct" | "registers";
+  /**
+   * How the score dot product reads `q` and `k` out of workgroup memory.
+   *
+   * `"scalar"` walks `D` one channel at a time: **two workgroup loads per fused
+   * multiply-add**, which is the ratio `ops/matmul` had before its register
+   * tile. `"vec4"` stages both as `vec4<f32>` and uses the builtin `dot`, so
+   * four multiply-adds cost two loads — a quarter of the traffic for the same
+   * arithmetic.
+   *
+   * This is the loop that matters. Deleting it entirely takes the self shape
+   * from 16.45 ms to 5.28 ms, against 15.23 ms for deleting the accumulate —
+   * see `tools/where.ts`, which measures that by removing each in turn.
+   */
+  scoreReads: "scalar" | "vec4";
+  /**
+   * Whether each staged row of `q` and `k` gets one unused element on the end.
+   *
+   * Workgroup memory is banked. In the score phase adjacent threads differ by
+   * `slot`, so they read addresses `slot * D` apart; with `D = 128` f32 that is
+   * a multiple of the bank count and every one of them lands on the same bank,
+   * serialising a read that should have been one transaction. One element of
+   * padding makes the stride coprime with the banks.
+   *
+   * **A guess until measured.** WebGPU does not say how many banks there are,
+   * or that there are banks; the sweep is the only way to find out whether this
+   * device behaves like one that has them.
+   */
+  padRows: boolean;
 }
 
 /**
@@ -68,8 +96,10 @@ export function flashStorageBytes({ bq, tileS }: FlashShape, D: number, generati
   // per-row softmax state — a running maximum, a running sum, and the
   // correction the tile's new maximum implies. fa3 double-buffers k and v so
   // the next tile can land while the current one is still being read.
-  const staged = tileS * D * 2 * stagingBuffers(generation);
-  return (bq * D + staged + bq * tileS + bq * 3) * 4;
+  // vec4 staging rounds each row up to a multiple of four channels.
+  const padded = Math.ceil(D / 4) * 4 + 4;
+  const staged = tileS * padded * stagingBuffers(generation) + tileS * D * stagingBuffers(generation);
+  return (bq * padded + staged + bq * tileS + bq * 3) * 4;
 }
 
 /** Why a shape cannot be dispatched, or null. */

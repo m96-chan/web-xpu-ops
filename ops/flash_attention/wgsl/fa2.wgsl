@@ -23,15 +23,16 @@ struct Params {
 
 const BQ: u32 = 32u;
 const TILE_S: u32 = 8u;
-const THREADS: u32 = 256u;
+const THREADS: u32 = 128u;
 const MAX_D: u32 = 128u;
 const MAX_DV: u32 = 128u;
-const K_STRIDE: u32 = 1024u;
+const K_STRIDE: u32 = 264u;
+const ROW: u32 = 33u;
 const V_STRIDE: u32 = 1024u;
 const MASKED: f32 = -3.402823e+38;
 
-var<workgroup> sq: array<f32, 4096>;
-var<workgroup> sk: array<f32, 1024>;
+var<workgroup> sq: array<vec4<f32>, 1056>;
+var<workgroup> sk: array<vec4<f32>, 264>;
 var<workgroup> sv: array<f32, 1024>;
 var<workgroup> ss: array<f32, 256>;
 // The softmax state, per row, **shared**.
@@ -45,7 +46,7 @@ var<workgroup> smax: array<f32, 32>;
 var<workgroup> ssum: array<f32, 32>;
 var<workgroup> scorr: array<f32, 32>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_index) tid: u32,
@@ -60,11 +61,20 @@ fn main(
   let mb = select(0u, batch, params.mask_batch > 1u);
   let mh = select(0u, h, params.mask_heads > 1u);
 
-  for (var t = tid; t < BQ * params.D; t = t + THREADS) {
-    let r = t / params.D;
-    let d = t % params.D;
+  let d4n = (params.D + 3u) / 4u;
+  for (var t = tid; t < BQ * d4n; t = t + THREADS) {
+    let r = t / d4n;
+    let unit = t % d4n;
+    let c0 = unit * 4u;
     let row = q0 + r;
-    sq[t] = select(0.0, q[(head * params.L + row) * params.D + d], row < params.L);
+    var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (row < params.L) {
+      for (var c = 0u; c < 4u; c = c + 1u) {
+        let d = c0 + c;
+        if (d < params.D) { val[c] = q[(head * params.L + row) * params.D + d]; }
+      }
+    }
+    sq[r * ROW + unit] = val;
   }
 
   // One running maximum, sum and accumulator per (row this thread owns,
@@ -84,10 +94,18 @@ fn main(
     workgroupBarrier();
     // D and Dv can differ; k and v are staged with their own strides rather
     // than one shared constant.
-    for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
-      let j = (base) + e / params.D;
-      let d = e % params.D;
-      sk[(0u) * K_STRIDE + e] = select(0.0, k[k_head + j * params.D + d], j < params.S);
+    for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
+      let j = (base) + e / d4n;
+      let unit = e % d4n;
+      let c0 = unit * 4u;
+      var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (j < params.S) {
+        for (var c = 0u; c < 4u; c = c + 1u) {
+          let d = c0 + c;
+          if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
+        }
+      }
+      sk[(0u) * K_STRIDE + (e / d4n) * ROW + unit] = val;
     }
     for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
       let j = (base) + e / params.Dv;
@@ -105,12 +123,13 @@ fn main(
       var value = MASKED;
       if (j < params.S && row < params.L
           && (params.causal == 0u || i32(j) <= i32(row) + params.query_offset)) {
-        var dot = 0.0;
-        for (var d = 0u; d < params.D; d = d + 1u) {
-          dot = fma(sq[r * params.D + d], sk[(0u) * K_STRIDE + slot * params.D + d], dot);
+        var acc4 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var dv = 0u; dv < d4n; dv = dv + 1u) {
+          acc4 = fma(sq[r * ROW + dv], sk[(0u) * K_STRIDE + slot * ROW + dv], acc4);
         }
+        let dot_ = acc4.x + acc4.y + acc4.z + acc4.w;
         let mr = select(0u, row, params.mask_rows > 1u);
-        value = dot * params.scale + mask[((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S + j];
+        value = dot_ * params.scale + mask[((mb * params.mask_heads + mh) * params.mask_rows + mr) * params.S + j];
       }
       ss[e] = value;
     }

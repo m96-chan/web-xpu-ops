@@ -60,11 +60,11 @@ ${prologue(shape, shape.threads, maxDv)}
   for (var t = 0u; t < tiles; t = t + 1u) {
     let base = t * TILE_S;
     workgroupBarrier();
-${stageTile("base", "0u", "    ")}
+${stageTile(shape, "base", "0u", "    ")}
     workgroupBarrier();
 
     // Scores: both operands come out of workgroup memory, which is the point.
-${scores("base", "0u", "    ")}
+${scores(shape, "base", "0u", "    ")}
     workgroupBarrier();
 
 ${softmax("    ")}

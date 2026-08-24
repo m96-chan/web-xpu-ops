@@ -47,17 +47,31 @@ const codeFor = ({ generation, shape }: Candidate): string =>
  * with fa2 would time the same program twice and report the pair's noise as a
  * difference between them.
  */
+/**
+ * `--quick` restricts the grid to the neighbourhood of the shipped shape.
+ *
+ * The full grid is 156 pairs and every one is checked against the reference
+ * before it is timed, which is the right default and too slow to iterate on.
+ * Narrowing is a claim that the answer is nearby — true only just after a full
+ * sweep said so, which is why it is a flag and not the default.
+ */
+const quick = process.argv.includes("--quick");
+
 function candidates(): Candidate[] {
   const out: Candidate[] = [];
   for (const generation of ["fa2", "fa3"] as const) {
     const prefetches = generation === "fa3" ? (["direct", "registers"] as const) : (["direct"] as const);
-    for (const bq of [1, 2, 4, 8, 16, 32, 64, 128]) {
-      for (const tileS of [4, 8, 16, 32, 64]) {
-        for (const threads of [128, 256, 512, 1024]) {
-          for (const accumulate of ["row", "key"] as const) {
+    for (const bq of quick ? [16, 32] : [1, 2, 4, 8, 16, 32, 64, 128]) {
+      for (const tileS of quick ? [8] : [4, 8, 16, 32, 64]) {
+        for (const threads of quick ? [128, 256] : [128, 256, 512, 1024]) {
+          for (const accumulate of quick ? (["key"] as const) : (["row", "key"] as const)) {
             for (const prefetch of prefetches) {
-              const shape = { bq, tileS, threads, accumulate, prefetch };
-              if (rejectReason(shape, D, generation) === null) out.push({ generation, shape });
+              for (const scoreReads of ["scalar", "vec4"] as const) {
+                for (const padRows of [false, true]) {
+                  const shape = { bq, tileS, threads, accumulate, prefetch, scoreReads, padRows };
+                  if (rejectReason(shape, D, generation) === null) out.push({ generation, shape });
+                }
+              }
             }
           }
         }
@@ -69,7 +83,7 @@ function candidates(): Candidate[] {
 
 const label = ({ generation, shape: s }: Candidate): string =>
   `${generation.toUpperCase()} BQ=${s.bq} TILE_S=${s.tileS} ${s.threads}t ${s.accumulate}-outer` +
-  (generation === "fa3" ? ` ${s.prefetch}` : "");
+  (generation === "fa3" ? ` ${s.prefetch}` : "") + ` ${s.scoreReads}${s.padRows ? "+pad" : ""}`;
 
 
 const runner = await createRunner();
