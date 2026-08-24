@@ -134,6 +134,19 @@ export async function animaForwardResident(
   held?: Map<string, GPUBuffer>,
   trace?: AnimaTrace,
   onProgress?: (label: string, done: number, total: number) => void,
+  /**
+   * Called with a name prefix before anything under it is read.
+   *
+   * The browser loader keeps the model in the *disk* cache and hydrates the
+   * heap a block at a time; nothing here can await inside a `weights.get`,
+   * which is synchronous by design. So the caller is told what is about to be
+   * needed and is given a chance to fetch it. Node passes nothing and the hook
+   * never fires.
+   *
+   * Only the first forward does any fetching. After that the weights are
+   * resident on the device and the CPU-side arrays are never read again.
+   */
+  onBeforePrefix?: (prefix: string) => Promise<void>,
 ): Promise<Float32Array> {
   const { modelChannels: dim, numHeads, adalnLoraDim, inChannels, patchSpatial, patchTemporal, normEps } = cfg;
   const headDim = dim / numHeads;
@@ -562,6 +575,16 @@ export async function animaForwardResident(
     onProgress?.(label, stepsDone, totalSteps);
   };
 
+  // Announced **immediately before use**, not all at the top.
+  //
+  // The caller's heap is bounded, so a prefix announced early and read late is
+  // announced and then evicted. The first version hoisted all of these here and
+  // the page failed on `net.final_layer.adaln_modulation.1.weight`: 52 blocks
+  // of hydration between the announcement and the read. `verify-forward-gpu.ts`
+  // checked that every read was *covered* by some prefix, which it was — the
+  // property that actually matters is that the covering prefix is the most
+  // recent one, and that is what it checks now.
+  await onBeforePrefix?.("net.t_embed");
   progress("timestep");
   const sample = upload(timestepEmbedding(input.t, dim, cfg.maxPeriod));
   const hidden = await activation(
@@ -571,6 +594,7 @@ export async function animaForwardResident(
   const emb = await rmsnorm(sample, "net.t_embedding_norm.weight", 1, dim);
   await flush([emb, adalnLora], trace ? { name: "tEmbed", slot: emb, length: dim } : undefined);
 
+  await onBeforePrefix?.("net.x_embedder");
   progress("patch embedder");
   let x = await project(
     "net.x_embedder.proj.1.weight",
@@ -619,6 +643,7 @@ export async function animaForwardResident(
   for (let index = 0; index < cfg.numBlocks; index += 1) {
     progress(`block ${index + 1}/${cfg.numBlocks}`);
     const p = `net.blocks.${index}.`;
+    await onBeforePrefix?.(p);
 
     /** One adaLN LoRA, chunked `shift, scale, gate`. */
     const modulation = async (which: string): Promise<{ shift: Slot; scale: Slot; gate: Slot }> => {
@@ -716,6 +741,7 @@ export async function animaForwardResident(
   }
 
   // --- final layer: two chunks, shift and scale, no gate ---
+  await onBeforePrefix?.("net.final_layer");
   const finalActivated = await activation(emb, dim, ACTIVATION.silu);
   const finalInner = await project("net.final_layer.adaln_modulation.1.weight", finalActivated, 1, dim, adalnLoraDim);
   const finalProjected = await project("net.final_layer.adaln_modulation.2.weight", finalInner, 1, adalnLoraDim, 2 * dim);

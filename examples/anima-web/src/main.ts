@@ -1,0 +1,490 @@
+/**
+ * Anima-3.8B in a browser: a prompt in, an image out, on WebGPU.
+ *
+ * Issue #170 stage 6. Nothing here is new arithmetic — every stage is the one
+ * already checked against ComfyUI's own model in `examples/anima`, and this is
+ * the wiring plus the two things a page needs that a script does not: weights
+ * over HTTP instead of off a disk, and a device that survives between steps.
+ *
+ * | stage | checked by | agreement |
+ * | --- | --- | --- |
+ * | tokenizers | `tokenize.test.ts` | exact ids, 24 cases each |
+ * | encoder + adapter | `verify-encoder.ts` | 9.775e-7 |
+ * | DiT, resident | `verify-forward-gpu.ts` | 1.182e-5 |
+ * | the sampling loop | `verify-trajectory.ts` | 3.274e-3 over 8 steps |
+ * | VAE decoder | `verify-vae.ts` | 6.917e-7 |
+ *
+ * **Two devices.** The DiT runs on a resident one, where its 3.76 GB of weights
+ * stay uploaded between steps — the difference between 0.2 s and 20 s a step,
+ * measured on the Z-Image port before this one existed. The encoder and the VAE
+ * run on the per-dispatch `Runner`, which is simpler and which they only touch
+ * once each.
+ *
+ * The adapter's six blocks stay on the CPU. They are 512 tokens at dim 1024
+ * against a DiT that is 3,952 tokens at 2048, and moving them would be work
+ * with nothing measurable behind it.
+ */
+import { createBrowserRunner } from "../../llm-demo/src/browser-runtime.js";
+import { createBrowserResidentDevice } from "./browser-resident.js";
+import { FetchedAnimaWeights, FetchedSafetensors } from "./fetch-weights.js";
+import { ditKernels, encoderKernels, vaeKernels } from "./kernels-web.js";
+import { type BpeVocab } from "../../../llm/tokenizer-bpe.js";
+import { permuteLayerForRope, type Qwen3LayerWeights } from "../../zimage/src/text-encoder.js";
+import { qwen3EncodeGpu, type Qwen3GpuWeights } from "../../zimage/src/text-encoder-gpu.js";
+import type { AnimaConfig, AnimaInput } from "../../anima/src/dit.js";
+import { animaForwardResident, releaseAnimaWeights, type AnimaWeightSource } from "../../anima/src/dit-resident.js";
+import { permuteForRope } from "../../anima/src/block.js";
+import {
+  ADAPTER,
+  type AdapterBlockWeights,
+  type AdapterWeights,
+  QWEN3_06B,
+  llmAdapterForward,
+  padContext,
+  permuteAdapterBlock,
+} from "../../anima/src/text-encoder.js";
+import {
+  DEFAULTS,
+  LATENT,
+  applyCfg,
+  betaSchedule,
+  calculateDenoised,
+  cfgEnabled,
+  flowSigmas,
+  latentToVae,
+  noiseScaling,
+  resMultistep,
+  timestepOf,
+} from "../../anima/src/sampler.js";
+import { type T5Vocab, animaTokenizers, tokenizePrompt } from "../../anima/src/tokenize.js";
+import { type VaeWeights, type WanVaeConfig } from "../../anima/src/vae.js";
+import { wanVaeDecodeGpu } from "../../anima/src/vae-gpu.js";
+
+declare const BUILD_STAMP: string;
+
+const DIT_BASE = "/weights/dit";
+const ENCODER_URL = "/weights/encoder/qwen_3_06b_base.safetensors";
+const VAE_URL = "/weights/vae/qwen_image_vae.safetensors";
+
+const $ = <T extends HTMLElement>(id: string): T => {
+  const element = document.getElementById(id);
+  if (!element) throw new Error(`no element #${id}`);
+  return element as T;
+};
+
+const status = $<HTMLParagraphElement>("status");
+const detail = $<HTMLParagraphElement>("detail");
+const canvas = $<HTMLCanvasElement>("out");
+const goButton = $<HTMLButtonElement>("go");
+const promptInput = $<HTMLTextAreaElement>("prompt");
+const negativeInput = $<HTMLTextAreaElement>("negative");
+const sizeSelect = $<HTMLSelectElement>("size");
+const stepsInput = $<HTMLInputElement>("steps");
+const cfgInput = $<HTMLInputElement>("cfg");
+const seedInput = $<HTMLInputElement>("seed");
+
+function say(message: string, extra = ""): void {
+  status.textContent = message;
+  detail.textContent = extra;
+}
+
+$<HTMLElement>("build").textContent = BUILD_STAMP;
+
+/** xorshift128+ and Box-Muller, matching `examples/anima/src/generate.ts`. */
+function gaussianNoise(count: number, seedValue: number): Float32Array {
+  let s0 = (seedValue ^ 0x9e3779b9) >>> 0 || 1;
+  let s1 = (seedValue * 0x85ebca6b + 0xc2b2ae35) >>> 0 || 2;
+  const next = (): number => {
+    let x = s0;
+    const y = s1;
+    s0 = y;
+    x ^= x << 23;
+    x ^= x >>> 17;
+    x ^= y ^ (y >>> 26);
+    s1 = x >>> 0;
+    return ((s0 + s1) >>> 0) / 4294967296;
+  };
+  const out = new Float32Array(count);
+  // Not torch's Philox, so a seed reproduces this port's own runs and **not**
+  // ComfyUI's image for the same number.
+  for (let i = 0; i < count; i += 2) {
+    const u = Math.max(next(), Number.MIN_VALUE);
+    const v = next();
+    const r = Math.sqrt(-2 * Math.log(u));
+    out[i] = r * Math.cos(2 * Math.PI * v);
+    if (i + 1 < count) out[i + 1] = r * Math.sin(2 * Math.PI * v);
+  }
+  return out;
+}
+
+/** `[3, H, W]` in roughly `[-1, 1]` onto the canvas. */
+function draw(image: Float32Array, H: number, W: number): void {
+  canvas.width = W;
+  canvas.height = H;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("no 2d context");
+  const data = context.createImageData(W, H);
+  const hw = H * W;
+  for (let i = 0; i < hw; i += 1) {
+    for (let c = 0; c < 3; c += 1) {
+      const v = (image[c * hw + i]! + 1) * 0.5 * 255;
+      data.data[i * 4 + c] = Math.max(0, Math.min(255, Math.round(v)));
+    }
+    data.data[i * 4 + 3] = 255;
+  }
+  context.putImageData(data, 0, 0);
+}
+
+async function main(): Promise<void> {
+  if (!navigator.gpu) {
+    say("This browser has no WebGPU.", "Chrome 113+ or Edge 113+ on a machine with a GPU.");
+    return;
+  }
+
+  say("opening the model …");
+  const runner = await createBrowserRunner();
+  const residentDevice = await createBrowserResidentDevice();
+
+  const [dit, encoderFile, vaeFile, qwenVocab, t5Vocab] = await Promise.all([
+    FetchedAnimaWeights.open(DIT_BASE),
+    FetchedSafetensors.open(ENCODER_URL),
+    FetchedSafetensors.open(VAE_URL),
+    fetch("/weights/tokenizer/qwen-qwen3-4b.bpe-vocab.json").then((r) => r.json() as Promise<BpeVocab>),
+    fetch("/weights/tokenizer/t5.unigram-vocab.json").then((r) => r.json() as Promise<T5Vocab>),
+  ]);
+  const tokenizers = animaTokenizers(qwenVocab, t5Vocab);
+
+  // The DiT's shape, out of the manifest `convert_dit.py` writes — which reads
+  // it with `detect_unet_config` rather than transcribing it.
+  const c = dit.config as unknown as {
+    num_blocks: number; model_channels: number; num_heads: number; adaln_lora_dim: number;
+    in_channels: number; out_channels: number; patch_spatial: number; patch_temporal: number;
+    crossattn_emb_channels: number; concat_padding_mask: boolean;
+    rope_t_extrapolation_ratio: number; rope_h_extrapolation_ratio: number; rope_w_extrapolation_ratio: number;
+  };
+  const cfg: AnimaConfig = {
+    numBlocks: c.num_blocks, modelChannels: c.model_channels, numHeads: c.num_heads,
+    adalnLoraDim: c.adaln_lora_dim, inChannels: c.in_channels, outChannels: c.out_channels,
+    patchSpatial: c.patch_spatial, patchTemporal: c.patch_temporal,
+    crossattnEmbChannels: c.crossattn_emb_channels, concatPaddingMask: c.concat_padding_mask,
+    maxPeriod: 10000, normEps: 1e-6,
+    ropeExtrapolation: {
+      t: c.rope_t_extrapolation_ratio, h: c.rope_h_extrapolation_ratio, w: c.rope_w_extrapolation_ratio,
+    },
+  };
+  const headDim = cfg.modelChannels / cfg.numHeads;
+
+  /**
+   * The DiT's weights, with the self-attention rope permutation applied.
+   *
+   * `packedQ8` returns `null` for anything permuted, so the resident path's
+   * fast route cannot go around the relabelling. That is the same rule
+   * `withRopePermutation` enforces for Node, restated here because this loader
+   * is a different class — and skipping it is measured at 1.068e-1.
+   */
+  const permuted = new Map<string, Float32Array>();
+  const isPermuted = (name: string): "projection" | "norm" | null => {
+    if (/\.self_attn\.(q|k)_proj\.weight$/.test(name)) return "projection";
+    if (/\.self_attn\.(q|k)_norm\.weight$/.test(name)) return "norm";
+    return null;
+  };
+  const ditWeights: AnimaWeightSource = {
+    has: (name) => dit.has(name),
+    shapeOf: (name) => dit.shapeOf(name),
+    get: (name) => {
+      const cached = permuted.get(name);
+      if (cached) return cached;
+      const kind = isPermuted(name);
+      const raw = dit.get(name);
+      if (!kind) return raw;
+      const out = kind === "projection"
+        ? permuteForRope(raw, cfg.numHeads, headDim, cfg.modelChannels)
+        : permuteForRope(raw, 1, headDim, 1);
+      permuted.set(name, out);
+      return out;
+    },
+    packedQ8: (name) => (isPermuted(name) ? null : dit.packedQ8(name)),
+  };
+
+  const encoderLayers = new Map<number, Qwen3LayerWeights>();
+  const encoderWeights: Qwen3GpuWeights = {
+    numLayers: QWEN3_06B.numLayers,
+    embed: (ids) => encoderFile.readRows("model.embed_tokens.weight", ids, QWEN3_06B.hiddenSize),
+    async layer(index) {
+      const cached = encoderLayers.get(index);
+      if (cached) return cached;
+      const p = `model.layers.${index}.`;
+      const [
+        input_layernorm, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+        post_attention_layernorm, gate_proj, up_proj, down_proj,
+      ] = await Promise.all([
+        encoderFile.read(`${p}input_layernorm.weight`),
+        encoderFile.read(`${p}self_attn.q_proj.weight`),
+        encoderFile.read(`${p}self_attn.k_proj.weight`),
+        encoderFile.read(`${p}self_attn.v_proj.weight`),
+        encoderFile.read(`${p}self_attn.o_proj.weight`),
+        encoderFile.read(`${p}self_attn.q_norm.weight`),
+        encoderFile.read(`${p}self_attn.k_norm.weight`),
+        encoderFile.read(`${p}post_attention_layernorm.weight`),
+        encoderFile.read(`${p}mlp.gate_proj.weight`),
+        encoderFile.read(`${p}mlp.up_proj.weight`),
+        encoderFile.read(`${p}mlp.down_proj.weight`),
+      ]);
+      const built = permuteLayerForRope({
+        input_layernorm, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+        post_attention_layernorm, gate_proj, up_proj, down_proj,
+      }, QWEN3_06B);
+      // Two layers at a time: 28 of them at 1024 wide is a gigabyte held, and
+      // the Cache API already remembers the bytes.
+      if (encoderLayers.size > 2) encoderLayers.delete(encoderLayers.keys().next().value as number);
+      encoderLayers.set(index, built);
+      return built;
+    },
+    // `layer="last"` is after `model.norm` — Z-Image's encoder stops before it.
+    finalNorm: encoderFile.read("model.norm.weight"),
+  };
+
+  /**
+   * The adapter, materialized once and then held.
+   *
+   * It lives inside the DiT file, so its tensors come through the same loader —
+   * but that loader is an LRU of 48 and the adapter is 118 tensors, so
+   * preloading them all and reading them afterwards evicts most of them before
+   * the first one is used. That was the first thing this page did, and it
+   * failed on `net.llm_adapter.out_proj.bias`.
+   *
+   * Built a block at a time instead: fetch a block's nineteen tensors, permute
+   * them for rope, keep the result, and let the raw ones fall out of the LRU.
+   * What stays is the six permuted blocks and the four outer tensors — about
+   * 350 MB with the embedding table, which is held because a 32,128-row table
+   * cannot survive an LRU that is counting tensors rather than bytes.
+   */
+  const adapterBlocks = new Map<number, AdapterBlockWeights>();
+  let adapterEmbed: Float32Array | null = null;
+  let adapterOuter: { out_proj: Float32Array; out_proj_bias: Float32Array; norm: Float32Array } | null = null;
+
+  const blockTensorNames = (index: number): string[] => {
+    const p = `net.llm_adapter.blocks.${index}.`;
+    return [
+      "norm_self_attn.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+      "self_attn.o_proj.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+      "norm_cross_attn.weight", "cross_attn.q_proj.weight", "cross_attn.k_proj.weight", "cross_attn.v_proj.weight",
+      "cross_attn.o_proj.weight", "cross_attn.q_norm.weight", "cross_attn.k_norm.weight",
+      "norm_mlp.weight", "mlp.0.weight", "mlp.0.bias", "mlp.2.weight", "mlp.2.bias",
+    ].map((n) => p + n);
+  };
+
+  async function buildAdapter(report: (message: string) => void): Promise<void> {
+    if (adapterOuter && adapterEmbed) return;
+    const outerNames = [
+      "net.llm_adapter.embed.weight", "net.llm_adapter.out_proj.weight",
+      "net.llm_adapter.out_proj.bias", "net.llm_adapter.norm.weight",
+    ];
+    await dit.preload(outerNames);
+    adapterEmbed = dit.get("net.llm_adapter.embed.weight");
+    adapterOuter = {
+      out_proj: dit.get("net.llm_adapter.out_proj.weight"),
+      out_proj_bias: dit.get("net.llm_adapter.out_proj.bias"),
+      norm: dit.get("net.llm_adapter.norm.weight"),
+    };
+    for (let index = 0; index < ADAPTER.numLayers; index += 1) {
+      report(`adapter block ${index + 1}/${ADAPTER.numLayers}`);
+      await dit.preload(blockTensorNames(index));
+      const p = `net.llm_adapter.blocks.${index}.`;
+      adapterBlocks.set(index, permuteAdapterBlock({
+        norm_self_attn: dit.get(`${p}norm_self_attn.weight`),
+        self_attn_q_proj: dit.get(`${p}self_attn.q_proj.weight`),
+        self_attn_k_proj: dit.get(`${p}self_attn.k_proj.weight`),
+        self_attn_v_proj: dit.get(`${p}self_attn.v_proj.weight`),
+        self_attn_o_proj: dit.get(`${p}self_attn.o_proj.weight`),
+        self_attn_q_norm: dit.get(`${p}self_attn.q_norm.weight`),
+        self_attn_k_norm: dit.get(`${p}self_attn.k_norm.weight`),
+        norm_cross_attn: dit.get(`${p}norm_cross_attn.weight`),
+        cross_attn_q_proj: dit.get(`${p}cross_attn.q_proj.weight`),
+        cross_attn_k_proj: dit.get(`${p}cross_attn.k_proj.weight`),
+        cross_attn_v_proj: dit.get(`${p}cross_attn.v_proj.weight`),
+        cross_attn_o_proj: dit.get(`${p}cross_attn.o_proj.weight`),
+        cross_attn_q_norm: dit.get(`${p}cross_attn.q_norm.weight`),
+        cross_attn_k_norm: dit.get(`${p}cross_attn.k_norm.weight`),
+        norm_mlp: dit.get(`${p}norm_mlp.weight`),
+        mlp_0_weight: dit.get(`${p}mlp.0.weight`),
+        mlp_0_bias: dit.get(`${p}mlp.0.bias`),
+        mlp_2_weight: dit.get(`${p}mlp.2.weight`),
+        mlp_2_bias: dit.get(`${p}mlp.2.bias`),
+      }));
+    }
+  }
+
+  const adapterWeights: AdapterWeights = {
+    embed(ids) {
+      if (!adapterEmbed) throw new Error("adapter: embed read before buildAdapter");
+      const rows = new Float32Array(ids.length * ADAPTER.targetDim);
+      for (let i = 0; i < ids.length; i += 1) {
+        rows.set(adapterEmbed.subarray(ids[i]! * ADAPTER.targetDim, (ids[i]! + 1) * ADAPTER.targetDim), i * ADAPTER.targetDim);
+      }
+      return rows;
+    },
+    block(index) {
+      const built = adapterBlocks.get(index);
+      if (!built) throw new Error(`adapter: block ${index} read before buildAdapter`);
+      return built;
+    },
+    get out_proj() {
+      if (!adapterOuter) throw new Error("adapter: out_proj read before buildAdapter");
+      return adapterOuter.out_proj;
+    },
+    get out_proj_bias() {
+      if (!adapterOuter) throw new Error("adapter: out_proj_bias read before buildAdapter");
+      return adapterOuter.out_proj_bias;
+    },
+    get norm() {
+      if (!adapterOuter) throw new Error("adapter: norm read before buildAdapter");
+      return adapterOuter.norm;
+    },
+  };
+
+  const vaeCache = new Map<string, Float32Array>();
+  const vaeWeights: VaeWeights = {
+    get(name) {
+      const value = vaeCache.get(name);
+      if (!value) throw new Error(`vae: "${name}" was read before it was fetched`);
+      return value;
+    },
+    has: (name) => vaeFile.has(name),
+  };
+  const vaeCfg: WanVaeConfig = { dim: 96, zDim: LATENT.channels, dimMult: [1, 2, 4, 4], numResBlocks: 2 };
+
+  /**
+   * The whole DiT into the browser's **disk** cache, once, before anything
+   * generates.
+   *
+   * Fetching per block during the forward instead would put 3.76 GB on the wire
+   * in every denoising step — the same bytes forty times over. This pays the
+   * download once; every step after it, and every generation after this one,
+   * reads from disk and touches the network not at all.
+   */
+  const gb = (bytes: number): string => `${(bytes / 1e9).toFixed(2)} GB`;
+  await dit.preloadAll((done, total, bytes) => {
+    say("caching the DiT …", `${done}/${total} tensors, ${gb(bytes)}`);
+  });
+
+  say("ready.", `${cfg.numBlocks} blocks at ${cfg.modelChannels} wide, plus a ${ADAPTER.numLayers}-block adapter.`);
+  goButton.disabled = false;
+
+  goButton.addEventListener("click", () => {
+    void generate().catch((error: unknown) => {
+      say("failed.", error instanceof Error ? error.message : String(error));
+      goButton.disabled = false;
+      console.error(error);
+    });
+  });
+
+  async function generate(): Promise<void> {
+    goButton.disabled = true;
+    const [width, height] = sizeSelect.value.split("x").map(Number) as [number, number];
+    const steps = Number(stepsInput.value) || DEFAULTS.steps;
+    const guidance = Number(cfgInput.value);
+    const seed = Number(seedInput.value) || 0;
+    const latentH = height / 8;
+    const latentW = width / 8;
+
+    const started = performance.now();
+
+    // --- conditioning ---
+    say("conditioning …", "reading the encoder");
+    const conditioning = async (text: string): Promise<Float32Array> => {
+      const { qwenIds, t5Ids, t5Weights } = tokenizePrompt(tokenizers, text);
+      const source = await qwen3EncodeGpu(runner.run, encoderKernels, QWEN3_06B, encoderWeights, qwenIds, (index) => {
+        say("conditioning …", `encoder layer ${index + 1}/${QWEN3_06B.numLayers}`);
+      });
+      await buildAdapter((message) => say("conditioning …", message));
+      const context = llmAdapterForward(adapterWeights, source, qwenIds.length, t5Ids);
+      return padContext(context, t5Ids.length, t5Weights);
+    };
+
+    const positive = await conditioning(promptInput.value);
+    const useCfg = cfgEnabled(guidance);
+    const unconditional = useCfg ? await conditioning(negativeInput.value) : null;
+
+    // --- sampling ---
+    const sigmas = betaSchedule(flowSigmas(), steps);
+    const shape = { T: 1, H: latentH, W: latentW };
+    const x0 = noiseScaling(sigmas[0]!, gaussianNoise(LATENT.channels * latentH * latentW, seed), null);
+    const held = new Map<string, GPUBuffer>();
+    const predictions: Float32Array[] = [];
+    let out = x0;
+
+    for (let step = 0; step < sigmas.length - 1; step += 1) {
+      const sigma = sigmas[step]!;
+      const t = timestepOf(sigma);
+      const stepStarted = performance.now();
+
+      const forward = async (context: Float32Array): Promise<Float32Array> => {
+        const input: AnimaInput = { latent: out, ...shape, t, context };
+        return animaForwardResident(
+          residentDevice, ditKernels, cfg, ditWeights, input, undefined, held, undefined, undefined,
+          // Hydrates the heap a block at a time, from the disk cache. Only the
+          // first forward does any work here: after it the weights live on the
+          // device and `held` answers instead.
+          async (prefix) => {
+            await dit.preloadPrefix(prefix);
+            // Yield, so a 52-block first forward does not freeze the tab.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          },
+        );
+      };
+      const cond = await forward(positive);
+      const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
+      predictions.push(calculateDenoised(sigma, prediction, out));
+
+      // The verified stepper, replayed over its own growing prefix — see
+      // `generate.ts` for why the sampler is not made async instead.
+      let cursor = 0;
+      out = resMultistep(() => predictions[cursor++]!, x0, sigmas.slice(0, step + 2));
+
+      say(
+        `step ${step + 1}/${sigmas.length - 1}`,
+        `sigma ${sigma.toFixed(4)}, ${((performance.now() - stepStarted) / 1000).toFixed(2)}s`,
+      );
+      // Yield, so the status text above actually paints.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    releaseAnimaWeights(held);
+
+    // --- decode ---
+    say("decoding …", "reading the VAE");
+    if (vaeCache.size === 0) {
+      const names = ["conv2.weight", "conv2.bias", "decoder.conv1.weight", "decoder.conv1.bias",
+        "decoder.head.0.gamma", "decoder.head.2.weight", "decoder.head.2.bias"];
+      for (const prefix of ["decoder.middle.0.", "decoder.middle.2."]) {
+        names.push(`${prefix}residual.0.gamma`, `${prefix}residual.2.weight`, `${prefix}residual.2.bias`,
+          `${prefix}residual.3.gamma`, `${prefix}residual.6.weight`, `${prefix}residual.6.bias`);
+      }
+      names.push("decoder.middle.1.norm.gamma", "decoder.middle.1.to_qkv.weight", "decoder.middle.1.to_qkv.bias",
+        "decoder.middle.1.proj.weight", "decoder.middle.1.proj.bias");
+      for (let i = 0; i < 15; i += 1) {
+        const p = `decoder.upsamples.${i}.`;
+        for (const suffix of ["residual.0.gamma", "residual.2.weight", "residual.2.bias", "residual.3.gamma",
+          "residual.6.weight", "residual.6.bias", "shortcut.weight", "shortcut.bias",
+          "resample.1.weight", "resample.1.bias"]) {
+          if (vaeFile.has(p + suffix)) names.push(p + suffix);
+        }
+      }
+      await Promise.all(names.map(async (n) => vaeCache.set(n, await vaeFile.read(n))));
+    }
+    const image = await wanVaeDecodeGpu(
+      runner.run, vaeKernels, vaeCfg, vaeWeights, latentToVae(out), latentH, latentW, undefined,
+      (label, done, total) => say("decoding …", `${label} ${done}/${total}`),
+    );
+    draw(image, height, width);
+
+    const elapsed = (performance.now() - started) / 1000;
+    say("done.", `${width}x${height}, ${sigmas.length - 1} steps, ${elapsed.toFixed(1)}s`);
+    goButton.disabled = false;
+  }
+}
+
+void main().catch((error: unknown) => {
+  say("failed to start.", error instanceof Error ? error.message : String(error));
+  console.error(error);
+});

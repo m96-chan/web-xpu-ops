@@ -136,6 +136,46 @@ const weights = {
   },
 };
 
+/**
+ * Every name the forward reads, against the prefix announced most recently.
+ *
+ * The browser hydrates its heap from `onBeforePrefix` and reads synchronously
+ * afterwards, so a tensor no prefix covers is a run-time "read before it was
+ * preloaded" — in the page, on someone else's machine, after a 4.7 GB download.
+ *
+ * **Covered is not enough.** The caller's heap is bounded, so a prefix
+ * announced early and read late has been evicted by the announcements in
+ * between. The first version of this check asserted coverage, passed, and the
+ * page still failed on `net.final_layer.adaln_modulation.1.weight` — announced
+ * at the top and read 52 blocks later. The property that holds is that the
+ * covering prefix is the **most recent** one.
+ */
+// Only the first forward announces anything; the second finds every weight
+// already resident and reads none. Recording its calls would report the whole
+// model as stale against whatever prefix the first forward ended on.
+let watching = true;
+let currentPrefix = "";
+const announced: string[] = [];
+const stale: string[] = [];
+const read = new Set<string>();
+const note = (name: string): string => {
+  read.add(name);
+  // Weights only. Anything this forward invents for itself — the `#axes` and
+  // `#ones` scratch buffers — carries a `#` and belongs to no prefix.
+  if (!watching || !name.startsWith("net.")) return name;
+  if (!name.startsWith(currentPrefix)) stale.push(`${name} (current prefix ${JSON.stringify(currentPrefix)})`);
+  return name;
+};
+// Wraps `gpuWeights`, not `source`. Delegating `packedQ8` straight to the raw
+// source takes the fast path past the rope permutation — the first version of
+// this wrapper did, and read 4.814e-1 instead of 1.968e-5.
+const watched = {
+  has: (name: string) => gpuWeights.has(name),
+  shapeOf: (name: string) => gpuWeights.shapeOf(name),
+  get: (name: string) => gpuWeights.get(note(name)),
+  packedQ8: (name: string) => gpuWeights.packedQ8(note(name)),
+};
+
 const device = await createResidentDevice();
 if (!device) {
   console.error("verify-forward-gpu: no WebGPU adapter available.");
@@ -149,13 +189,27 @@ const input = { latent: get("x"), T: 1, H: golden.latent, W: golden.latent, t: g
 const first = blank();
 const started = Date.now();
 const trace: AnimaTrace = {};
-const out = await animaForwardResident(device, ditKernels(), cfg, gpuWeights, input, first, held, trace);
+const out = await animaForwardResident(
+  device, ditKernels(), cfg, watched, input, first, held, trace, undefined,
+  async (prefix) => { announced.push(prefix); currentPrefix = prefix; },
+);
 const firstSecs = (Date.now() - started) / 1000;
 
 // A second forward with the weights already resident — what steps 2..N cost.
 const second = blank();
 const again = Date.now();
-await animaForwardResident(device, ditKernels(), cfg, gpuWeights, input, second, held);
+watching = false;
+await animaForwardResident(device, ditKernels(), cfg, watched, input, second, held);
+
+if (stale.length > 0) {
+  console.error(
+    `\nverify-forward-gpu: ${stale.length} tensors are read after a later prefix was announced:\n` +
+      stale.slice(0, 8).map((n) => `  ${n}`).join("\n") +
+      "\nA bounded heap will have evicted them by then, which is a run-time failure in the browser.",
+  );
+  process.exit(1);
+}
+console.log(`  ${read.size} tensors read, each under the prefix announced for it (${announced.length} prefixes)`);
 console.log(`  forward 1: ${firstSecs.toFixed(1)}s, uploaded ${(first.uploadedBytes / 1e9).toFixed(2)} GB`);
 console.log(
   `  forward 2: ${((Date.now() - again) / 1000).toFixed(1)}s, uploaded ` +

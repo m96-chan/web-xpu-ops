@@ -17,24 +17,11 @@ import { join } from "node:path";
 import { dequantizeQ8 } from "../../zimage/src/weights.js";
 
 import { permuteForRope } from "./block.js";
+import type { AnimaManifest, AnimaTensor } from "./manifest.js";
 
-export interface AnimaTensor {
-  name: string;
-  kind: "q8" | "f32";
-  shape: number[];
-  /** q8 only. */
-  codesOffset?: number;
-  /** q8 only. */
-  scaleOffset?: number;
-  /** f32 only. */
-  offset?: number;
-}
-
-export interface AnimaManifest {
-  format: { quant: string };
-  blocks: number;
-  tensors: AnimaTensor[];
-}
+// The manifest's types live in `manifest.ts`, which imports nothing — the
+// browser loader needs them and cannot follow this file's `node:fs`.
+export type { AnimaManifest, AnimaTensor } from "./manifest.js";
 
 /** Reads `count` elements at `offset`, in elements not bytes. */
 function readRange(path: string, offset: number, count: number): ArrayBuffer {
