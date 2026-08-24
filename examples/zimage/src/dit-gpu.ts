@@ -107,6 +107,15 @@ export interface DitKernels {
    * scores that stop existing).
    */
   flashAttention?: string;
+  /**
+   * `ops/matmul/wgsl/tiled.wgsl` — the same function as `matmul` with a
+   * register tile instead of one output per thread.
+   *
+   * Optional for the same reason `flashAttention` is: `dit-gpu.ts` predates it
+   * and Z-Image's checked path should not change underneath it. Its grid is
+   * **not** `matmul`'s — `matmulTiledGrid` is that arithmetic.
+   */
+  matmulTiled?: string;
 }
 
 /** The kernel names, so both loaders fetch the same set. */
@@ -123,6 +132,7 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "scores", op: "attention", entry: "scores" },
   { key: "context", op: "attention", entry: "context" },
   { key: "flashAttention", op: "flash_attention", entry: "kernel" },
+  { key: "matmulTiled", op: "matmul", entry: "tiled" },
 ];
 
 const WG = 256;

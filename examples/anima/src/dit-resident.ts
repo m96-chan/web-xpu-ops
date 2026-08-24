@@ -26,6 +26,7 @@ import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { DitKernels } from "../../zimage/src/dit-gpu.js";
 import { type AnimaConfig, type AnimaInput, type AnimaTrace, patchify, timestepEmbedding, unpatchify } from "./dit.js";
 import { ropeAxisDims, ropeBases } from "./block.js";
+import { matmulTiledGrid } from "../../../ops/matmul/index.js";
 
 const WG = 256;
 const TILE = 16;
@@ -378,9 +379,13 @@ export async function animaForwardResident(
 
     // The f32 tail. `matmul` wants `[K, N]` and the checkpoint stores `[N, K]`,
     // so the transpose happens once per weight and lives on the device.
+    //
+    // `tiled` when the caller has it: same function, a register tile instead of
+    // one output per thread, and 70-72% of this device's measured roofline
+    // against 1.4-3.0% (`ops/matmul/wgsl/tiled.wgsl`). Its grid is its own.
     const out = pool.take(rows * outDim);
     await record(
-      K.matmul,
+      K.matmulTiled ?? K.matmul,
       [
         x.buffer,
         weightBuffer(`${name}#T`, () => {
@@ -394,7 +399,7 @@ export async function animaForwardResident(
         out.buffer,
         uniform(params([["u32", rows], ["u32", outDim], ["u32", inDim]])),
       ],
-      [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
+      K.matmulTiled ? matmulTiledGrid(rows, outDim) : [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
     );
     return out;
   };

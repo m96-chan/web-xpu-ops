@@ -62,9 +62,30 @@ const cfg: AnimaConfig = {
 const seq = (latentH / cfg.patchSpatial) * (latentW / cfg.patchSpatial);
 console.log(`${width}x${height} — a ${latentW}x${latentH} latent, ${seq} tokens, ${cfg.numBlocks} blocks at ${cfg.modelChannels}`);
 
-const dit = withRopePermutation(
+const permuting = withRopePermutation(
   loadAnimaSubset(ditDir), cfg.numHeads, cfg.modelChannels / cfg.numHeads, cfg.modelChannels,
 );
+
+/**
+ * Which weights take the dense path, and why.
+ *
+ * `packedQ8` returning null is what sends a projection through `matmul` instead
+ * of `matmulQ8`, and there are two unrelated reasons it can: the tensor was
+ * never quantized (`should_quantize` wants both axes >= 128), or this wrapper
+ * refuses the packed form because the weight has been permuted for rope. The
+ * second is self-inflicted and worth separating from the first.
+ */
+const dense = new Map<string, number>();
+const dit = {
+  has: (name: string) => permuting.has(name),
+  shapeOf: (name: string) => permuting.shapeOf(name),
+  get: (name: string) => permuting.get(name),
+  packedQ8: (name: string) => {
+    const packed = permuting.packedQ8(name);
+    if (packed === null) dense.set(name, (dense.get(name) ?? 0) + 1);
+    return packed;
+  },
+};
 const device = await createResidentDevice();
 if (!device) {
   console.error("profile-forward: no WebGPU adapter available.");
@@ -115,6 +136,10 @@ console.log(`  profiling inflates it ${(profSeconds / warmSeconds).toFixed(1)}x 
 // coverage is stated rather than assumed.
 console.log(`  ${counted} of ${dispatchCount} dispatches timed, ` +
   `${(total / warmSeconds * 100).toFixed(0)}% of the unprofiled forward's wall clock accounted for\n`);
+const permuted = [...dense.keys()].filter((n) => /\.self_attn\.(q|k)_proj\.weight$/.test(n));
+const unquantized = [...dense.keys()].filter((n) => !/\.self_attn\.(q|k)_proj\.weight$/.test(n));
+console.log(`  ${dense.size} weights take the dense path: ${permuted.length} refused by the rope ` +
+  `permutation, ${unquantized.length} never quantized (${unquantized.join(", ") || "none"})\n`);
 console.log("  kernel        total ms    share   dispatches   ms each");
 for (const [name, v] of rows) {
   console.log(
