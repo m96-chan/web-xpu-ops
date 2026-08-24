@@ -99,6 +99,52 @@ export function eulerStep(
 }
 
 /**
+ * Classifier-free guidance: `cond + scale * (cond - uncond)`.
+ *
+ * **Which model this is decides whether it is used at all**, and getting that
+ * wrong is not subtle. `Tongyi-MAI/Z-Image` is the *Base* model — undistilled,
+ * 28–50 steps, CFG 3.0–5.0 — while `Z-Image-Turbo` is the distilled one at 8
+ * steps with no CFG. `zimage_config.py`'s `DEFAULT_INFERENCE_STEPS = 8` and
+ * `DEFAULT_GUIDANCE_SCALE = 0.0` are Turbo's numbers; running Base on them
+ * produces an image that has not converged and barely follows the prompt.
+ *
+ * Upstream's threshold is `guidance_scale > 1.0` (`zimage_generate_image.py:577`),
+ * not `> 0`, so a scale of exactly 1 is "off" rather than "identity" — the same
+ * arithmetic either way, but one fewer forward pass.
+ */
+export function applyCfg(conditional: Float32Array, unconditional: Float32Array, scale: number): Float32Array {
+  if (conditional.length !== unconditional.length) {
+    throw new Error(
+      `applyCfg: conditional has ${conditional.length} values and unconditional ${unconditional.length}.`,
+    );
+  }
+  const out = new Float32Array(conditional.length);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = conditional[i]! + scale * (conditional[i]! - unconditional[i]!);
+  }
+  return out;
+}
+
+/** Upstream's own test for whether CFG runs at all. */
+export function cfgEnabled(scale: number): boolean {
+  return scale > 1.0;
+}
+
+/**
+ * What each published checkpoint wants, from its own model card.
+ *
+ * Kept here rather than left to a caller's memory, because the two differ in
+ * every number that matters and the failure mode of mixing them is an image
+ * that looks like a bug in the port.
+ */
+export const VARIANTS = {
+  base: { steps: 30, guidance: 4.0, note: "Tongyi-MAI/Z-Image — undistilled, 28-50 steps, CFG 3.0-5.0" },
+  turbo: { steps: 8, guidance: 0.0, note: "Tongyi-MAI/Z-Image-Turbo — distilled, 8 steps, no CFG" },
+} as const;
+
+export type Variant = keyof typeof VARIANTS;
+
+/**
  * The latent the VAE decoder wants: `latent / scalingFactor + shiftFactor`.
  *
  * `zimage_utils.shift_scale_latents_for_decode`. The two constants are the

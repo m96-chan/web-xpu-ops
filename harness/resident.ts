@@ -136,6 +136,22 @@ export interface ResidentDevice {
    */
   bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup>;
   /**
+   * A bind group over **slices** of buffers, for the one case whole buffers
+   * cannot serve: a dispatch whose workgroup count is the row count and whose
+   * row count is over WebGPU's 65,535 limit (issue #112). Splitting it means
+   * binding a range, and a range is what `bindGroup` above deliberately does
+   * not take.
+   *
+   * The caller owns the alignment. `minStorageBufferOffsetAlignment` is 256
+   * bytes on the device this was measured on, and an offset that is not a
+   * multiple of it fails validation — which is why `bindGroup` avoids offsets
+   * by default and why this is a separate method rather than a wider signature.
+   */
+  bindGroupSliced(
+    pipeline: GPUComputePipeline,
+    slices: { buffer: GPUBuffer; offset: number; size: number }[],
+  ): Promise<GPUBindGroup>;
+  /**
    * Records every op into one `GPUCommandEncoder`, submits it exactly once,
    * then maps and reads back only `readback` — everything else recorded
    * (intermediate activations, the KV-cache copies) stays device-side.
@@ -160,7 +176,9 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   // Same reasoning as `wgsl.ts#createRunner`: request the adapter's own
   // ceiling rather than the spec's low defaults. A resident engine's weight
   // buffers (`lmHead` alone is ~175 MiB packed for Sarashina2.2-1B) need it.
-  const wanted = 2 * 1024 * 1024 * 1024;
+  // The adapter's own ceiling — see `wgsl.ts` for what a fixed constant here
+  // cost. `Math.min` below is what caps it to what the device actually offers.
+  const wanted = Number.MAX_SAFE_INTEGER;
   // Issue #131: same feature-detection `wgsl.ts#createRunner` already does —
   // requested only when the adapter offers it, since asking for a feature an
   // adapter lacks fails `requestDevice` outright rather than degrading.
@@ -177,9 +195,27 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   const pipelines = new Map<string, GPUComputePipeline>();
   const modules = new Map<string, GPUShaderModule>();
 
+  /** Bytes handed out, so an allocation failure can say what was already in flight. */
+  let allocated = 0;
+
   function createStorageBuffer(bytes: number, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC): GPUBuffer {
     stats.buffersCreated += 1;
-    return device.createBuffer({ size: Math.max(4, bytes), usage });
+    const size = Math.max(4, bytes);
+    // Checked at the allocation rather than at the bind: an out-of-memory
+    // `createBuffer` returns an invalid buffer instead of throwing, and the
+    // first thing to notice is `createBindGroup`, which reports a binding index
+    // and no size. See the browser runtime's copy of this note.
+    device.pushErrorScope("out-of-memory");
+    const buffer = device.createBuffer({ size, usage });
+    void device.popErrorScope().then((error) => {
+      if (!error) return;
+      throw new Error(
+        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
+          `(${(allocated / 1e9).toFixed(2)} GB already allocated, ${stats.buffersCreated} buffers). ${error.message}`,
+      );
+    });
+    allocated += size;
+    return buffer;
   }
 
   function createUniformBuffer(bytes: number): GPUBuffer {
@@ -221,6 +257,20 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     pipelines.set(key, pipeline);
     stats.pipelinesCreated += 1;
     return pipeline;
+  }
+
+  async function bindGroupSliced(
+    pipeline: GPUComputePipeline,
+    slices: { buffer: GPUBuffer; offset: number; size: number }[],
+  ): Promise<GPUBindGroup> {
+    device.pushErrorScope("validation");
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: slices.map((slice, binding) => ({ binding, resource: slice })),
+    });
+    const invalid = await device.popErrorScope();
+    if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    return group;
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
@@ -395,6 +445,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     upload,
     pipelineFor,
     bindGroup,
+    bindGroupSliced,
     batch,
     destroy() {
       device.destroy();

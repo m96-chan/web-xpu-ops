@@ -91,6 +91,10 @@ export interface DitKernels {
   rows: string;
   ropeAxes: string;
   matmulQ8: string;
+  /** `[dim0, dim1, D] -> [dim1, dim0, D]`. Only the resident path dispatches it;
+   *  `dit-gpu.ts` does the same reshape on the CPU, which costs a readback it is
+   *  already paying for. */
+  permute: string;
   scores: string;
   context: string;
 }
@@ -105,6 +109,7 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "rows", op: "elementwise", entry: "rows" },
   { key: "ropeAxes", op: "rope", entry: "axes" },
   { key: "matmulQ8", op: "matmul", entry: "q8" },
+  { key: "permute", op: "permute", entry: "kernel" },
   { key: "scores", op: "attention", entry: "scores" },
   { key: "context", op: "attention", entry: "context" },
 ];

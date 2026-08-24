@@ -220,6 +220,60 @@ happen in the CPU engine and both GPU ones together, which is its own piece of
 work; stage 3 needs a correct encoder before it needs a fast one. This golden
 is what that work can be checked against.
 
+## A prompt goes in and a picture comes out
+
+`src/generate.ts` for the command line, `examples/zimage-web` for a page you can
+type into. Both run the same verified pieces.
+
+![1024x1024, Z-Image Base, 30 steps, CFG 4.0](fixtures/generated-1024-base.png)
+
+```
+A clean anime illustration of a young woman with long silver hair and violet
+eyes, wearing a white sailor uniform, standing in a sunlit classroom by the
+window. Crisp black lineart, flat cel shading, bright saturated colors, clear
+outlines.
+```
+
+Measured on this machine — an RTX 5090, driver 610.57.04, `webgpu@0.4.0` (Dawn),
+node v25.6.1, Linux 7.1.5-arch1-2 — with the DiT converted to q8:
+
+| | |
+| --- | --- |
+| resolution | 1024 x 1024 (4,111 tokens) |
+| variant | Z-Image **Base**, 30 steps, CFG 4.0 |
+| tokenize | 0.1 s |
+| text encoder | 30.5 s (GPU) |
+| denoise | 710.3 s — **23.7 s a step**, two forwards each because of CFG |
+| VAE decode | 18.5 s |
+| **total** | **759.5 s** |
+| VRAM | 6.17 GB weights + 5.25 GB activations |
+
+At 512 x 512 (1,039 tokens) the same settings cost 1.9 s a step and 1.32 GB of
+activations. The DiT forward itself is **0.17 s** once the weights are resident
+(70 tokens); the rest is CFG doubling the passes and attention growing with the
+square of the sequence.
+
+### The two checkpoints are not interchangeable
+
+`Tongyi-MAI/Z-Image` is **Base**: undistilled, 28-50 steps, CFG 3.0-5.0.
+`Z-Image-Turbo` is distilled for 8 steps and does not use CFG.
+`zimage_config.py`'s `DEFAULT_INFERENCE_STEPS = 8` and `DEFAULT_GUIDANCE_SCALE
+= 0.0` are **Turbo's** numbers, and this example ran Base on them for a while.
+Same prompt, same seed, same everything else:
+
+| settings | result |
+| --- | --- |
+| 8 steps, no CFG | shattered-glass artefacts; every style word in the prompt ignored |
+| 25 steps, no CFG | much better; artefacts left in the background |
+| **30 steps, CFG 4.0** | the image above |
+
+What made that hard to diagnose is that every part measured correct while the
+picture was wrong — DiT 5.560e-6, VAE 1.629e-5, the schedule exact. It was
+settled by decoding our own latent with **torch's** VAE and getting the same
+artefacts, which cleared the VAE and pointed at the settings rather than the
+port. `--variant base|turbo` now carries each checkpoint's own numbers, and the
+browser demo fills them in when you pick a model.
+
 ## Regenerating the golden
 
 The generator imports `ZImageTransformerBlock` from musubi-tuner's copy of the

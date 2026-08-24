@@ -21,9 +21,16 @@ import { type BpeVocab, ByteLevelBpeTokenizer } from "../../../llm/tokenizer-bpe
 import { type DecoderConfig } from "../../zimage-vae/src/decoder.js";
 import { decodeGpu } from "../../zimage-vae/src/decoder-gpu.js";
 import { type DitConfig } from "../../zimage/src/dit.js";
-import { ditForwardGpu, type PackedWeightSource } from "../../zimage/src/dit-gpu.js";
+import { type PackedWeightSource } from "../../zimage/src/dit-gpu.js";
+import { ditForwardResident, releaseDitWeights, type ResidentDitStats } from "../../zimage/src/dit-resident.js";
+import { createBrowserResidentDevice } from "./browser-resident.js";
 import {
+  DEFAULT_FLOW_SHIFT,
   NUM_TRAIN_TIMESTEPS,
+  VARIANTS,
+  type Variant,
+  applyCfg,
+  cfgEnabled,
   eulerStep,
   flowSchedule,
   modelTimestep,
@@ -99,10 +106,24 @@ const DIT_BASE = "/weights/dit";
 const ENCODER_BASE = "/weights/text_encoder";
 const VAE_BASE = "/weights/vae";
 
+/**
+ * The DiT's weights, on the GPU, for as long as the page lives.
+ *
+ * Held outside `generate` so a second prompt does not re-upload 6.17 GB.
+ * `releaseDitWeights` is how they go, and nothing calls it yet — the page owns
+ * them until it is closed, which is the whole point.
+ */
+const heldWeights = new Map<string, GPUBuffer>();
+
 async function main(): Promise<void> {
-  let runner;
+  let runner: Awaited<ReturnType<typeof createBrowserRunner>>;
+  let resident: Awaited<ReturnType<typeof createBrowserResidentDevice>>;
   try {
     runner = await createBrowserRunner();
+    // A second device for the DiT. The per-dispatch `Runner` above still drives
+    // the text encoder and the VAE; the DiT is the one that moves 48 GB a step
+    // through it, and the one this replaces.
+    resident = await createBrowserResidentDevice();
   } catch (error) {
     status("WebGPU is unavailable in this browser.");
     log(String(error));
@@ -210,6 +231,17 @@ async function main(): Promise<void> {
   status(`Ready — ${gb(dit.bytesHeld)} cached, nothing more to download.`, 1);
   go.disabled = false;
 
+  // Picking a checkpoint fills in its own numbers. They stay editable — the
+  // point is that the defaults are never the other model's.
+  const variantSelect = $<HTMLSelectElement>("variant");
+  const applyVariantDefaults = (): void => {
+    const chosen = VARIANTS[variantSelect.value as Variant];
+    $<HTMLInputElement>("steps").value = String(chosen.steps);
+    $<HTMLInputElement>("guidance").value = String(chosen.guidance);
+  };
+  variantSelect.addEventListener("change", applyVariantDefaults);
+  applyVariantDefaults();
+
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     void generate();
@@ -224,12 +256,14 @@ async function main(): Promise<void> {
       const size = Number($<HTMLSelectElement>("size").value);
       const steps = Number($<HTMLInputElement>("steps").value);
       const seed = Number($<HTMLInputElement>("seed").value);
-      const shift = Number($<HTMLInputElement>("shift").value);
+      const guidance = Number($<HTMLInputElement>("guidance").value);
+      const shift = DEFAULT_FLOW_SHIFT;
 
       // The chat template upstream applies, expanded for one user turn.
       const formatted = `<|im_start|>user\n${prompt}<|im_end|>\n<|im_start|>assistant\n`;
       const ids = Int32Array.from(tokenizer.encode(formatted));
       log(`prompt -> ${ids.length} tokens`);
+      log(`${variantSelect.value}: ${steps} steps, CFG ${guidance}`);
 
       // --- text encoder ---
       // Cached after the first prompt, so this is a one-time cost per page
@@ -286,6 +320,11 @@ async function main(): Promise<void> {
       );
       log(`text encoder ${((performance.now() - encodeStart) / 1000).toFixed(1)}s`);
 
+      // The unconditional branch. Upstream uses **zeros** when no negative
+      // prompt is given (`zimage_generate_image.py:579`) — not an empty string,
+      // which would be a vector the model has seen.
+      const negativeFeats = cfgEnabled(guidance) ? new Float32Array(capFeats.length) : null;
+
       // --- denoise ---
       // Upstream's own arithmetic: `vae_scale = 8 * 2`, then
       // `2 * (size // vae_scale)`, which lands on size/8 rounded so the latent
@@ -302,12 +341,22 @@ async function main(): Promise<void> {
         packedQ8: (name) => dit.packedQ8(name),
         shapeOf: (name) => dit.shapeOf(name),
       };
+      // The weights stay on the GPU across every step. Uploading them per
+      // forward would be 6.17 GB eight times over, for bytes that never change
+      // — which is what "resident" is supposed to mean and, in the first
+      // version of `dit-resident.ts`, did not.
+      const stepStats: ResidentDitStats = {
+        dispatches: 0, submits: 0, buffersCreated: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0,
+        uploadedBytes: 0, readBackBytes: 0,
+      };
 
       for (let step = 0; step < steps; step += 1) {
         const stepStart = performance.now();
         const base = 0.35 + (step / steps) * 0.6;
-        const velocity = await ditForwardGpu(
-          run,
+        const t = modelTimestep(timesteps[step]!, NUM_TRAIN_TIMESTEPS);
+        const forward = (feats: Float32Array): Promise<Float32Array> =>
+          ditForwardResident(
+          resident,
           K,
           ditCfg,
           source,
@@ -316,22 +365,39 @@ async function main(): Promise<void> {
             F: 1,
             H: latentSide,
             W: latentSide,
-            t: modelTimestep(timesteps[step]!, NUM_TRAIN_TIMESTEPS),
-            capFeats,
+            t,
+            capFeats: feats,
             capMask,
           },
-          undefined,
-          async (prefix, label) => {
-            status(`Step ${step + 1}/${steps} — ${label}`, base);
+          stepStats,
+          // Only called while a layer's weights are still on disk — the first
+          // generation, and nothing after it.
+          async (prefix) => {
             await dit.preload(prefix);
             await breathe();
           },
+          heldWeights,
+          // Called every layer, always. The bar is about the forward, not
+          // about whether anything had to be fetched for it.
+          (label, done, total) => {
+            status(`Step ${step + 1}/${steps} — ${label}`, base + (done / total) * (0.6 / steps));
+          },
         );
+
+        const conditional = await forward(capFeats);
+        // `cond + scale * (cond - uncond)` — two forwards a step, which is what
+        // CFG costs and the reason Turbo exists.
+        const velocity = negativeFeats
+          ? applyCfg(conditional, await forward(negativeFeats), guidance)
+          : conditional;
         // Negated: Z-Image predicts negative noise.
         const negated = new Float32Array(velocity.length);
         for (let i = 0; i < velocity.length; i += 1) negated[i] = -velocity[i]!;
         latents = eulerStep(latents, negated, sigmas, step);
-        log(`step ${step + 1}/${steps}  ${((performance.now() - stepStart) / 1000).toFixed(1)}s`);
+        log(
+          `step ${step + 1}/${steps}  ${((performance.now() - stepStart) / 1000).toFixed(1)}s` +
+            `  uploaded ${(stepStats.uploadedBytes / 1e9).toFixed(2)} GB`,
+        );
       }
 
       // --- decode ---

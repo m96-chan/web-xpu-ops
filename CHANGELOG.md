@@ -9,6 +9,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **Z-Image runs end to end, in a browser** (issue #166). A prompt goes in and a
+  1024x1024 image comes out, on WebGPU, composed from this repository's ops:
+  byte-level BPE, a Qwen3-4B text encoder, the 30-layer DiT, a rectified-flow
+  sampler and the VAE decoder. `examples/zimage-web` is the page;
+  `examples/zimage/src/generate.ts` is the same pipeline from a command line.
+
+  Each stage was fixed against Z-Image's own implementation before the next was
+  wired to it — one block at the shipped width (8.72e-8), the whole DiT forward
+  (4.386e-6 at 70 tokens, 4.889e-6 at 1,039, 5.560e-6 at 4,111), the text
+  encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
+  at 1024). Measured conditions are in the example's README, with the image.
+
+- The DiT's activations stay on the device (`dit-resident.ts`). The per-dispatch
+  path moved 28.57 GB up and 19.85 GB back per forward at 1,039 tokens, of which
+  only 6.17 GB was weights; the rest was activations going out to the CPU and
+  straight back in. One forward went from 20.2 s to 0.17 s once the weights are
+  resident — against 990 s for the CPU reference.
+
+### Changed
+
+- `harness/wgsl.ts` and `harness/resident.ts` request the adapter's own limits
+  rather than a fixed 512 MiB. That constant was why the VAE could not decode at
+  1024: Dawn's error said the adapter supports 1 TiB and that it had to be asked
+  for.
+
+- Both resident runtimes report an out-of-memory `createBuffer` where it
+  happens, with the size and what was already allocated. It does not throw on
+  its own — the first thing to notice was `createBindGroup`, several frames
+  later, naming a binding index and no size.
+
 - `examples/zimage-web`: **Z-Image runs in a browser.** A prompt goes in a text
   box and a picture appears on a canvas — tokenizer, Qwen3-4B text encoder, DiT
   and VAE decoder, all on WebGPU, all composed from this repository's kernels

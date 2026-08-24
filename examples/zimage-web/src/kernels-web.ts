@@ -25,6 +25,7 @@ import rowsKernel from "../../../ops/elementwise/wgsl/rows.wgsl";
 import ropeKernel from "../../../ops/rope/wgsl/kernel.wgsl";
 import ropeAxesKernel from "../../../ops/rope/wgsl/axes.wgsl";
 import matmulQ8Kernel from "../../../ops/matmul/wgsl/q8.wgsl";
+import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
 import scoresKernel from "../../../ops/attention/wgsl/scores.wgsl";
 import contextKernel from "../../../ops/attention/wgsl/context.wgsl";
 import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
@@ -39,6 +40,7 @@ export const ditKernels: DitKernels = {
   rows: rowsKernel,
   ropeAxes: ropeAxesKernel,
   matmulQ8: matmulQ8Kernel,
+  permute: permuteKernel,
   scores: scoresKernel,
   context: contextKernel,
 };
