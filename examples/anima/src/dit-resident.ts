@@ -134,6 +134,19 @@ export async function animaForwardResident(
   held?: Map<string, GPUBuffer>,
   trace?: AnimaTrace,
   onProgress?: (label: string, done: number, total: number) => void,
+  /**
+   * Called with a name prefix before anything under it is read.
+   *
+   * The browser loader keeps the model in the *disk* cache and hydrates the
+   * heap a block at a time; nothing here can await inside a `weights.get`,
+   * which is synchronous by design. So the caller is told what is about to be
+   * needed and is given a chance to fetch it. Node passes nothing and the hook
+   * never fires.
+   *
+   * Only the first forward does any fetching. After that the weights are
+   * resident on the device and the CPU-side arrays are never read again.
+   */
+  onBeforePrefix?: (prefix: string) => Promise<void>,
 ): Promise<Float32Array> {
   const { modelChannels: dim, numHeads, adalnLoraDim, inChannels, patchSpatial, patchTemporal, normEps } = cfg;
   const headDim = dim / numHeads;
@@ -562,6 +575,14 @@ export async function animaForwardResident(
     onProgress?.(label, stepsDone, totalSteps);
   };
 
+  // The weights outside the blocks: the timestep embedder, the patch embedder
+  // and the final layer. Named by a prefix that matches none of the blocks.
+  await onBeforePrefix?.("net.t_embedder");
+  await onBeforePrefix?.("net.x_embedder");
+  await onBeforePrefix?.("net.final_layer");
+  await onBeforePrefix?.("net.t_embedding_norm");
+  await onBeforePrefix?.("net.pos_embedder");
+
   progress("timestep");
   const sample = upload(timestepEmbedding(input.t, dim, cfg.maxPeriod));
   const hidden = await activation(
@@ -619,6 +640,7 @@ export async function animaForwardResident(
   for (let index = 0; index < cfg.numBlocks; index += 1) {
     progress(`block ${index + 1}/${cfg.numBlocks}`);
     const p = `net.blocks.${index}.`;
+    await onBeforePrefix?.(p);
 
     /** One adaLN LoRA, chunked `shift, scale, gate`. */
     const modulation = async (which: string): Promise<{ shift: Slot; scale: Slot; gate: Slot }> => {

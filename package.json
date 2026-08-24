@@ -64,7 +64,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/assets.mjs",
-    "lint": "tsc --noEmit && tsc -p examples/llm-demo/tsconfig.json --noEmit && tsc -p examples/zimage-web/tsconfig.json --noEmit",
+    "lint": "tsc --noEmit && tsc -p examples/llm-demo/tsconfig.json --noEmit && tsc -p examples/zimage-web/tsconfig.json --noEmit && tsc -p examples/anima-web/tsconfig.json --noEmit",
     "test": "node scripts/test.mjs",
     "test:file": "vitest run",
     "prepublishOnly": "npm run build",

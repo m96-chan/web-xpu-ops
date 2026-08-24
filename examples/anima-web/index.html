@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Anima-3.8B on WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 2rem; font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+    background: #14161a; color: #e6e8ec;
+    display: grid; grid-template-columns: minmax(320px, 26rem) 1fr; gap: 2rem; align-items: start;
+  }
+  @media (max-width: 900px) { body { grid-template-columns: 1fr; } }
+  h1 { margin: 0 0 .25rem; font-size: 1.3rem; font-weight: 600; }
+  .sub { margin: 0 0 1.5rem; color: #98a1b3; font-size: .85rem; }
+  label { display: block; margin: 0 0 1rem; font-size: .8rem; color: #98a1b3; }
+  textarea, select, input {
+    width: 100%; margin-top: .3rem; padding: .5rem .6rem; box-sizing: border-box;
+    background: #1c1f26; color: #e6e8ec; border: 1px solid #2c313b; border-radius: 6px;
+    font: inherit; font-size: .9rem;
+  }
+  textarea { resize: vertical; min-height: 4.5rem; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  button {
+    width: 100%; padding: .7rem; margin-top: .5rem; border: 0; border-radius: 6px;
+    background: #4f7cff; color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #2c313b; color: #6b7383; cursor: default; }
+  #status { margin: 1rem 0 .2rem; font-weight: 600; }
+  #detail { margin: 0; color: #98a1b3; font-size: .85rem; min-height: 1.6em; }
+  canvas { max-width: 100%; height: auto; border-radius: 8px; background: #1c1f26; display: block; }
+  .note { margin-top: 1.5rem; color: #6b7383; font-size: .78rem; }
+  code { background: #1c1f26; padding: .1rem .3rem; border-radius: 3px; }
+</style>
+
+<div>
+  <h1>Anima-3.8B on WebGPU</h1>
+  <p class="sub">
+    Every stage checked against ComfyUI's own model — conditioning 9.8e-7,
+    the DiT 1.2e-5, the sampling loop 3.3e-3, the VAE 6.9e-7.
+  </p>
+
+  <label>Prompt
+    <textarea id="prompt">1girl, silver hair, red eyes, looking at viewer, detailed background, masterpiece, best quality</textarea>
+  </label>
+  <label>Negative
+    <textarea id="negative"></textarea>
+  </label>
+  <label>Size
+    <select id="size">
+      <option value="832x1216" selected>832 x 1216 (the workflow's own)</option>
+      <option value="1216x832">1216 x 832</option>
+      <option value="1024x1024">1024 x 1024</option>
+      <option value="512x512">512 x 512</option>
+      <option value="256x256">256 x 256 (quick)</option>
+    </select>
+  </label>
+  <div class="row">
+    <label>Steps <input id="steps" type="number" min="1" max="200" value="40"></label>
+    <label>CFG <input id="cfg" type="number" min="0" max="30" step="0.5" value="8"></label>
+  </div>
+  <label>Seed <input id="seed" type="number" value="42"></label>
+  <button id="go" disabled>Generate</button>
+
+  <p id="status">starting …</p>
+  <p id="detail"></p>
+
+  <p class="note">
+    The seed reproduces this port's own runs, <strong>not</strong> ComfyUI's image
+    for the same number — the noise comes from xorshift128+, not torch's Philox.
+    Weights are cached on disk after the first visit; the first generation pays
+    for 3.76 GB of DiT, 1.19 GB of encoder and 0.25 GB of VAE.
+    Build <code id="build"></code>.
+  </p>
+</div>
+
+<canvas id="out" width="832" height="1216"></canvas>
+
+<script type="module" src="/dist/bundle.js"></script>

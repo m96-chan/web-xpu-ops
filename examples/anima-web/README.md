@@ -1,0 +1,67 @@
+# `examples/anima-web` — Anima-3.8B in a browser
+
+The same pipeline as `examples/anima`, as a page. Nothing here is new
+arithmetic: every stage is the one already checked against ComfyUI's own model,
+and this directory is the wiring plus the two things a page needs that a script
+does not — weights over HTTP instead of off a disk, and a device that survives
+between steps.
+
+```bash
+node examples/anima-web/build.mjs
+node examples/anima-web/server.mjs \
+  --dit ~/anima-q8 \
+  --encoder ~/anima-src/qwen_3_06b_base.safetensors \
+  --vae ~/anima-src/qwen_image_vae.safetensors
+```
+
+Then `http://127.0.0.1:8789/` in a browser with WebGPU. Nothing leaves the
+machine.
+
+## What runs where
+
+| | device | why |
+| --- | --- | --- |
+| the DiT | resident | its 3.76 GB stay uploaded between steps — 0.2 s a forward against 20 s |
+| the encoder | per-dispatch `Runner` | touched once per generation |
+| the VAE | per-dispatch `Runner` | touched once per generation |
+| the adapter's 6 blocks | CPU | 512 tokens at dim 1024, against a DiT of 3,952 at 2048 |
+
+## Weights, and where they live
+
+**In the browser's disk cache, not on its heap.** `preloadAll` walks every
+tensor once into the Cache API and keeps none of them; `preloadPrefix` hydrates
+one block's worth just before the forward reads it. Two wrong answers came
+first and are worth keeping written down:
+
+* fetching per block *during* the forward put 3.76 GB on the wire in every
+  denoising step — the same bytes forty times over;
+* holding everything quieted the network and put 3.76 GB on the heap, where the
+  next allocation to fail is an activation.
+
+The first visit pays for 3.76 GB of DiT, 1.19 GB of encoder and 0.25 GB of VAE.
+Every visit after it does no network at all.
+
+`server.mjs` answers `Range` requests, and `fetch-weights.ts` **refuses a 200**:
+a server that ignored ranges would "work" while sending whole files.
+
+## The two invariants a page cannot check for itself
+
+* **The rope permutation.** `packedQ8` returns `null` for anything permuted, so
+  the resident path's fast route cannot go around the relabelling. Skipping it
+  is measured at 1.068e-1 against torch.
+* **The preload prefixes.** The forward reads synchronously, so a tensor whose
+  name no announced prefix covers is a run-time failure *in the page*, after a
+  4.7 GB download. `verify-forward-gpu.ts` asserts the cover in Node instead —
+  1,049 tensors read, 57 prefixes announced, nothing uncovered.
+
+## What is and is not verified
+
+The loader is exercised: a run of this server delivered 4.68 GB in 2,416 range
+responses and the page reached its ready state, reporting the 52 blocks it read
+out of the manifest.
+
+**A full in-page generation has not been run end to end at the time of
+writing.** The arithmetic behind it is the same code `examples/anima` checks
+against ComfyUI, and the two page-specific invariants above are pinned in Node,
+but the sentence "press Generate and an image appears" is not something this
+README has earned yet.

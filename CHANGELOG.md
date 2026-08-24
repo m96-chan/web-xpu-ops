@@ -21,6 +21,17 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- **Anima-3.8B in a browser** (`examples/anima-web`, issue #170 stage 6). The
+  same pipeline as `examples/anima`, with weights over HTTP `Range` into the
+  browser's disk cache and the DiT resident between steps.
+
+  `animaForwardResident` gains an `onBeforePrefix` hook: the forward reads
+  weights synchronously, so the page is told what is about to be needed and
+  hydrates its heap a block at a time from disk. `verify-forward-gpu.ts` now
+  asserts that the announced prefixes cover every tensor read — 1,049 against
+  57 — because a gap there is a run-time failure in the page, after a 4.7 GB
+  download, and nowhere else.
+
 - **Anima-3.8B produces an image** (issue #174). Wan 2.1's VAE decoder matches
   ComfyUI's at rel-RMS 6.917e-7 on the GPU and 4.669e-7 on the CPU, and
   `generate.ts --vae` writes a PNG.

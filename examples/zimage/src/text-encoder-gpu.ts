@@ -243,6 +243,12 @@ export interface Qwen3GpuWeights {
   embed(ids: Int32Array): Float32Array | Promise<Float32Array>;
   numLayers: number;
   layer(index: number): Qwen3LayerWeights | Promise<Qwen3LayerWeights>;
+  /**
+   * `model.norm`, applied after the last layer — **optional, and absent for
+   * Z-Image**, which reads `hidden_states[-2]` from before it. The mirror of
+   * `Qwen3Weights.finalNorm`; see its doc for why the two models differ.
+   */
+  finalNorm?: Float32Array | Promise<Float32Array>;
 }
 
 /** `qwen3Encode`, dispatch for dispatch. */
@@ -296,6 +302,11 @@ export async function qwen3EncodeGpu(
     hidden = await elementwiseOp(run, K, hidden, down, ELEMENTWISE.add);
     await onLayer?.(l);
   }
-  // No `model.norm`, no LM head — `hidden_states[-2]` is before both.
+  // `model.norm` when the caller supplies it, never the LM head. Z-Image takes
+  // `hidden_states[-2]`, from before both; Anima takes the last layer, from
+  // after the norm.
+  if (weights.finalNorm) {
+    hidden = await rmsnormOp(run, K, hidden, await weights.finalNorm, seq, hiddenSize, rmsNormEps);
+  }
   return hidden;
 }

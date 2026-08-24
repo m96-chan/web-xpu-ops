@@ -76,7 +76,7 @@ type Run = Runner["run"];
  * 256x256 and once before that in the DiT. Throwing here turns "the picture
  * looks a bit off" into a stack trace with a name in it.
  */
-function guard(op: string, workgroups: number[]): number[] {
+function guard<T extends readonly number[]>(op: string, workgroups: T): T {
   const over = workgroups.findIndex((n) => n > MAX_WORKGROUPS);
   if (over >= 0) {
     throw new Error(

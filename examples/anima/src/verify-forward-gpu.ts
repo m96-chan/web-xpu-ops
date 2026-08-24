@@ -136,6 +136,26 @@ const weights = {
   },
 };
 
+/**
+ * Every name the forward reads, and every prefix it announced first.
+ *
+ * The browser hydrates its heap from `onBeforePrefix` and reads synchronously
+ * afterwards, so a tensor whose name no announced prefix covers is a run-time
+ * "read before it was preloaded" — in the page, on someone else's machine,
+ * after a 4.7 GB download. Checked here instead, where it costs one run.
+ */
+const announced: string[] = [];
+const read = new Set<string>();
+// Wraps `gpuWeights`, not `source`. Delegating `packedQ8` straight to the raw
+// source takes the fast path past the rope permutation — the first version of
+// this wrapper did, and read 4.814e-1 instead of 1.968e-5.
+const watched = {
+  has: (name: string) => { read.add(name); return gpuWeights.has(name); },
+  shapeOf: (name: string) => gpuWeights.shapeOf(name),
+  get: (name: string) => { read.add(name); return gpuWeights.get(name); },
+  packedQ8: (name: string) => { read.add(name); return gpuWeights.packedQ8(name); },
+};
+
 const device = await createResidentDevice();
 if (!device) {
   console.error("verify-forward-gpu: no WebGPU adapter available.");
@@ -149,13 +169,27 @@ const input = { latent: get("x"), T: 1, H: golden.latent, W: golden.latent, t: g
 const first = blank();
 const started = Date.now();
 const trace: AnimaTrace = {};
-const out = await animaForwardResident(device, ditKernels(), cfg, gpuWeights, input, first, held, trace);
+const out = await animaForwardResident(
+  device, ditKernels(), cfg, watched, input, first, held, trace, undefined,
+  async (prefix) => { announced.push(prefix); },
+);
 const firstSecs = (Date.now() - started) / 1000;
 
 // A second forward with the weights already resident — what steps 2..N cost.
 const second = blank();
 const again = Date.now();
-await animaForwardResident(device, ditKernels(), cfg, gpuWeights, input, second, held);
+await animaForwardResident(device, ditKernels(), cfg, watched, input, second, held);
+
+const uncovered = [...read].filter((name) => !announced.some((prefix) => name.startsWith(prefix)));
+if (uncovered.length > 0) {
+  console.error(
+    `\nverify-forward-gpu: ${uncovered.length} tensors are read but no onBeforePrefix announced them:\n` +
+      uncovered.slice(0, 8).map((n) => `  ${n}`).join("\n") +
+      "\nThe browser hydrates its heap from those prefixes, so this is a run-time failure there.",
+  );
+  process.exit(1);
+}
+console.log(`  ${read.size} tensors read, all covered by ${announced.length} announced prefixes`);
 console.log(`  forward 1: ${firstSecs.toFixed(1)}s, uploaded ${(first.uploadedBytes / 1e9).toFixed(2)} GB`);
 console.log(
   `  forward 2: ${((Date.now() - again) / 1000).toFixed(1)}s, uploaded ` +
