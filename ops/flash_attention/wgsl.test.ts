@@ -11,9 +11,26 @@ import {
 } from "../../harness/index.js";
 import { attention, defaultScale, type AttentionArgs } from "../attention/reference.js";
 import { DEFAULT_TILE, flashAttention } from "./reference.js";
-import { flashGrid, flashSupports } from "./index.js";
+import { FLASH_GENERATION, flashGrid, flashSupports } from "./index.js";
+import { shippedKernels } from "./tools/generate.js";
 
-const code = kernel(import.meta.url);
+/**
+ * Both shipped kernels, each held to the same reference.
+ *
+ * FA2 and FA3 are separate kernels with separate schedules — see
+ * `tools/fa3.wgsl.ts` for what the second one does differently and why two of
+ * FlashAttention-3's three ideas cannot be expressed in WGSL at all. What they
+ * are not free to differ in is the answer, and the only way to know that is to
+ * dispatch both. The first FA3 candidates written here were wrong by 1.6e-2 on
+ * a ragged shape (an unsigned expression that needed a bracket), which nothing
+ * but this comparison would have caught.
+ */
+const GENERATIONS = ["fa2", "fa3"] as const;
+const CODE: Record<(typeof GENERATIONS)[number], string> = {
+  fa2: kernel(import.meta.url, "fa2"),
+  fa3: kernel(import.meta.url, "fa3"),
+};
+const code = CODE[FLASH_GENERATION];
 
 /**
  * Every input, every expected value and every uniform is built here, at module
@@ -111,10 +128,10 @@ const maskFor = (args: AttentionArgs): Float32Array => args.mask ?? new Float32A
  * kernel that quietly materialised the score matrix would have to name a buffer
  * here to write it into, and the count would see it.
  */
-function dispatchFor(args: AttentionArgs): Dispatch {
+function dispatchFor(args: AttentionArgs, program = code): Dispatch {
   const { B, H, L, Dv } = args;
   return {
-    code,
+    code: program,
     bindings: [
       { kind: "storage", data: args.q },
       { kind: "storage", data: args.k },
@@ -483,8 +500,8 @@ const REPORT = GROWTH.map((p) => ({
  * separately checked against each other below; this is what the ISSUE means by
  * measuring against unfused attention rather than only against the reference.
  */
-async function check(run: Runner["run"], p: Prepared): Promise<void> {
-  const [got] = await run(p.dispatch);
+async function check(run: Runner["run"], p: Prepared, dispatch = p.dispatch): Promise<void> {
+  const [got] = await run(dispatch);
   const mine = agree(got as Float32Array, p.want, TOLERANCE);
   expect(mine, mine ? `vs flash reference: ${JSON.stringify(mine)}` : undefined).toBeNull();
   const theirs = agree(got as Float32Array, p.unfused, TOLERANCE);
@@ -531,17 +548,26 @@ const REFERENCE_AGREEMENT = ALL.map((p) => ({
 describe("flash_attention / wgsl", () => {
   useGpu();
 
+  for (const generation of GENERATIONS) {
   for (const p of ALL) {
-    gpuTest(p.name, async (run) => {
+    gpuTest(`${generation} ${p.name}`, async (run) => {
       // The shipped program is generated for a bounded `Dv`, because widening
       // it costs every caller registers — measured at 5.00 s a forward against
       // 5.92 s (`flashSupports`). A case past the bound is not a failure of
       // this kernel; it is a case `ops/attention` serves instead, and asserting
       // against it here would be asserting that the trade was not made.
       if (!flashSupports(p.args.D, p.args.Dv ?? p.args.D)) return;
-      await check(run, p);
+      await check(run, p, dispatchFor(p.args, CODE[generation]));
     });
   }
+  }
+
+  // A generator edited without regenerating ships the old kernel while the
+  // sweep times the new one — the same failure as benchmarking a program other
+  // than the one that runs.
+  it("the shipped .wgsl files are what the generators produce", () => {
+    expect(CODE).toEqual(shippedKernels());
+  });
 
   // Not a GPU test: the recurrence is a claim about the algorithm.
   it("computes the same function as unfused attention, at every tile size", () => {

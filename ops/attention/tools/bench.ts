@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRunner, params, type Dispatch } from "../../../harness/wgsl.js";
+import { FLASH_GENERATION } from "../../flash_attention/index.js";
 import { measureRoofline } from "../../../harness/roofline.js";
 
 const arg = (name: string, fallback: number): number => {
@@ -37,7 +38,7 @@ const repeats = arg("--repeats", 3);
 const read = (name: string): string =>
   readFileSync(fileURLToPath(new URL(`../wgsl/${name}.wgsl`, import.meta.url)), "utf8");
 const readFlash = (): string =>
-  readFileSync(fileURLToPath(new URL("../../flash_attention/wgsl/kernel.wgsl", import.meta.url)), "utf8");
+  readFileSync(fileURLToPath(new URL(`../../flash_attention/wgsl/${FLASH_GENERATION}.wgsl`, import.meta.url)), "utf8");
 
 /**
  * Brings the clocks up before anything is timed.

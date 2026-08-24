@@ -146,7 +146,7 @@ export async function sweep<T>(
  * caveats: a ranking taken from an unstable sweep looks exactly like one taken
  * from a stable sweep.
  */
-export function describeSweep<T>(report: SweepReport<T>, flops: number, roofline: number | null): string[] {
+export function describeSweep<T>(report: SweepReport<T>, flops: number, roofline: number | null, top = 6): string[] {
   const lines: string[] = [];
   lines.push(
     `  reference ${(report.referenceSeconds * 1000).toFixed(2)} ms, and it moved ` +
@@ -162,7 +162,7 @@ export function describeSweep<T>(report: SweepReport<T>, flops: number, roofline
     );
   }
   lines.push("  ratio  spread   ms      TFLOP/s  roofline  candidate");
-  for (const r of report.results.slice(0, 6)) {
+  for (const r of report.results.slice(0, top)) {
     const rate = flops / r.seconds;
     const share = roofline === null ? "n/a" : `${((rate / roofline) * 100).toFixed(1)}%`;
     lines.push(

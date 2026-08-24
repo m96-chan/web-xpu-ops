@@ -35,6 +35,7 @@
  * attention and matmul dispatches are two-dimensional and stay far below it at
  * any resolution this can run.
  */
+import { FLASH_GENERATION } from "../../../ops/flash_attention/index.js";
 import type { Runner } from "../../../harness/wgsl.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
@@ -124,7 +125,9 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "scores", op: "attention", entry: "scores" },
   { key: "context", op: "attention", entry: "context" },
-  { key: "flashAttention", op: "flash_attention", entry: "kernel" },
+  // Which generation ships is `FLASH_GENERATION`'s call, and it is a measured
+  // one — see `ops/flash_attention/index.ts`.
+  { key: "flashAttention", op: "flash_attention", entry: FLASH_GENERATION },
 ];
 
 const WG = 256;

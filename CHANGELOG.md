@@ -21,6 +21,39 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- **Flash attention ships as two kernels, FA2 and FA3** (issue #177). The
+  generations are separate programs with separate schedules rather than one
+  program with a switch, because they are separate algorithms; both are held to
+  `ops/flash_attention/reference.ts` by the same tests, and
+  `tools/generate.ts` writes both so a generator edited without regenerating
+  fails a test instead of shipping the old kernel quietly.
+
+  **FA3's pipelining measured a tie, and that is the finding.** Two of
+  FlashAttention-3's three ideas cannot be written in WGSL at all — warp
+  specialisation needs asynchronous copy and a way to address a subgroup as a
+  scheduling unit, and the FP8 path needs a dtype this adapter does not report.
+  The third, ping-pong scheduling, needs nothing special: double-buffer the k/v
+  staging and issue tile `t+1`'s loads before consuming tile `t`. It bought
+  nothing here — 16.54 ms against FA2's 16.50, spread 0%, over a sequence long
+  enough for 494 tiles. Most likely the latency was already hidden by occupancy.
+  FA3 stays selectable because that argument is about this device.
+
+  What did move it was the accumulate nesting and a wider sweep. Walking keys
+  outermost holds each staged value of `v` in a register while all `BQ` rows use
+  it, where walking rows outermost re-read it `BQ` times from workgroup memory;
+  with `BQ = 32` and 256 threads that is 1.95x on attention and takes Anima's
+  forward at 832x1216 from **4.90 s to 3.03 s**, measured in the same session
+  against `origin/main` in a worktree so the clock could not move between them.
+  `matmulQ8` reads 882 ms and 879 ms across the two, which is the control.
+
+  Attention now reaches 7.7% of this device's measured 50.4 TFLOP/s. **That is
+  not the ceiling to compare it against**: at 16 FLOP per byte of k/v against a
+  measured crossover of 29.6, bandwidth caps this kernel at 54% of compute peak
+  however it is written. It is not near that either — both shapes move their k/v
+  at ~240 GB/s, 14% of the measured 1.70 TB/s, and two shapes differing 4x in
+  size landing on the same figure says the limit is inside the workgroup.
+  `ops/flash_attention/index.ts` records where the next look should go.
+
 - **The kernels are tuned** (issue #177). `ops/matmul` reaches 70-72% of an RTX
   5090's measured roofline where it reached 1.4-3.0%, `matmulQ8` 42-49% where it
   reached 1.1-2.3%, and `ops/flash_attention` 8.8-9.1% where it reached 3.4%.
