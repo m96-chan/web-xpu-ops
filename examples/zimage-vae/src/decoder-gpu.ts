@@ -22,6 +22,7 @@ import { conv2dOutputSize } from "../../../ops/conv/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { nearestUpsampleScale } from "../../../ops/upsample/index.js";
 import type { DecoderConfig, Map4, Weights } from "./decoder.js";
+import { matmulGrid } from "../../../ops/matmul/index.js";
 
 /**
  * The kernels this decoder dispatches, by name.
@@ -191,7 +192,7 @@ async function linear(run: Run, K: DecoderKernels, x: Float32Array, w: Weights, 
       { kind: "uniform", data: params([["u32", rows], ["u32", outC], ["u32", inC]]) },
     ],
     // TILE = 16, as ops/matmul/wgsl.test.ts dispatches it.
-    workgroups: [Math.ceil(outC / 16), Math.ceil(rows / 16)],
+    workgroups: matmulGrid(rows, outC),
   });
   const out = y as Float32Array;
   for (let r = 0; r < rows; r += 1) for (let o = 0; o < outC; o += 1) out[r * outC + o] = out[r * outC + o]! + bias[o]!;

@@ -1,44 +1,47 @@
-// Matmul against per-row-quantized int8 weights, two-level tiled.
-//
-// Layout:
-//   a:      [N, K] f32, row-major
-//   weight: [M, ceil(K/4)] u32 — 4 codes per word, least-significant byte
-//           first, matvecQ8's own wire format
-//   scale:  [M] f32, one absmax-derived scale per output channel
-//   output: [N, M] f32, row-major
-//
-// The naming is this op's own and not `kernel.wgsl`'s: `N` counts rows of
-// `a`, `M` counts output channels. It computes `A[N, K] @ W[M, K]^T`.
-//
-// **Both operands run along K contiguously**, which the dense kernel's do not —
-// it stages a `[K, N]` operand across the grain. Here the two tiles stage the
-// same way and the inner product walks the contiguous axis of both.
-//
-// Dequantisation happens once per *staged* element rather than once per use: a
-// value is unpacked and scaled on its way into workgroup memory and then read
-// TILE_M times out of it.
-//
-// | shape (N x K x M)      | one-per-thread | this   |
-// | ---------------------- | -------------- | ------ |
-// | 3952 x 2048 x 2048     | 1.1%           | 49.4%  |
-// | 3952 x 2048 x 8192     | 2.3%           | 49.2%  |
-// | 3952 x 8192 x 2048     | 2.3%           | 42.7%  |
-//
-// Measured by `tools/bench-q8.ts`, which generates the 345 shapes this device
-// can dispatch, checks every one against `reference.ts` on a ragged 37x43x29
-// — K = 43 is not a multiple of 4 either, so the packing's own tail is
-// exercised — and times the survivors. All 345 were correct; this shape won all
-// three sizes.
-//
-// It reaches less than the dense kernel's 70-72%, and that is the expected
-// shape of the answer rather than a disappointment: a byte of weight per FMA is
-// a quarter the arithmetic intensity of an f32 one, and the unpacking is real
-// work. The number to compare against is where it started, 1.1-2.3%.
-//
-// **The grid is not one workgroup per 16x16 output.** A caller dispatches
-// `[ceil(M / BN), ceil(N / BM), 1]`; `matmulQ8Grid` in `index.ts` is that
-// arithmetic.
+/**
+ * A tiled `matmulQ8` with its tile shape as a parameter, for sweeping.
+ *
+ * Issue #177. The same two-level decomposition `wgsl/kernel.wgsl` now uses —
+ * see its header for where the structure comes from and why the constants are
+ * measured rather than copied — applied to the packed path.
+ *
+ * **The layout is not the dense kernel's, and the difference is in this op's
+ * favour.** `q8.wgsl` computes `C[N, M] = A[N, K] @ W[M, K]^T`: the weight is
+ * stored as `[out, in]` and used transposed, so *both* operands run along `K`
+ * contiguously. The dense kernel stages a `[K, N]` operand across the grain;
+ * here both tiles stage the same way and the inner product walks the contiguous
+ * axis of both.
+ *
+ * Dequantisation happens **once per staged element**, not once per use: a value
+ * pulled into workgroup memory is unpacked and scaled there, and then read
+ * `TILE_M` times out of it. The shipped kernel multiplies by `scale[col]` on
+ * every staging too, but with one output per thread "every staging" and "every
+ * use" are the same thing.
+ */
 
+import type { TileShape } from "./tiled.wgsl.js";
+
+export { rejectReason as rejectQ8Reason } from "./tiled.wgsl.js";
+
+/** Workgroup storage in bytes. Both tiles are f32 once dequantised. */
+export function q8StorageBytes({ wgM, wgN, tileM, tileN, tileK }: TileShape): number {
+  return (wgM * tileM * tileK + wgN * tileN * tileK) * 4;
+}
+
+/**
+ * `a: [N, K]` f32 by packed `weight: [M, K]` i8 with `scale: [M]`, to
+ * `output: [N, M]`.
+ *
+ * The parameter names are `q8.wgsl`'s own — `N` is the row count of `a` and `M`
+ * the output-channel count, which is the opposite of the dense kernel's naming
+ * and is kept rather than fixed so the two files can be read against each other.
+ */
+export function tiledMatmulQ8(shape: TileShape): string {
+  const { wgM, wgN, tileM, tileN, tileK } = shape;
+  const bm = wgM * tileM;
+  const bn = wgN * tileN;
+  const threads = wgM * wgN;
+  return `
 struct Params { N: u32, M: u32, K: u32 }
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -47,24 +50,24 @@ struct Params { N: u32, M: u32, K: u32 }
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-const WG_M: u32 = 16u;
-const WG_N: u32 = 32u;
-const TILE_M: u32 = 8u;
-const TILE_N: u32 = 2u;
-const TILE_K: u32 = 8u;
-const BM: u32 = 128u;
-const BN: u32 = 64u;
-const THREADS: u32 = 512u;
+const WG_M: u32 = ${wgM}u;
+const WG_N: u32 = ${wgN}u;
+const TILE_M: u32 = ${tileM}u;
+const TILE_N: u32 = ${tileN}u;
+const TILE_K: u32 = ${tileK}u;
+const BM: u32 = ${bm}u;
+const BN: u32 = ${bn}u;
+const THREADS: u32 = ${threads}u;
 
 // Both [rows, TILE_K]: sa over rows of a, sb over output channels.
-var<workgroup> sa: array<f32, 1024>;
-var<workgroup> sb: array<f32, 512>;
+var<workgroup> sa: array<f32, ${bm * tileK}>;
+var<workgroup> sb: array<f32, ${bn * tileK}>;
 
 fn unpack_i8(word: u32, lane: u32) -> f32 {
   return f32(extractBits(bitcast<i32>(word), lane * 8u, 8u));
 }
 
-@compute @workgroup_size(512)
+@compute @workgroup_size(${threads})
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_index) tid: u32,
@@ -125,4 +128,6 @@ fn main(
       if (col < params.M) { output[row * params.M + col] = acc[i][j]; }
     }
   }
+}
+`;
 }

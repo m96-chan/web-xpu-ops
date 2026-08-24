@@ -2,6 +2,7 @@ import { describe } from "vitest";
 import { expectAgrees, gpuTest, kernel, params, useGpu } from "../../harness/index.js";
 import { packQ8 } from "../matvec/index.js";
 import { matmulQ8 } from "./reference.js";
+import { matmulQ8Grid } from "./index.js";
 
 /**
  * `matmulQ8`'s own file rather than a shared `wgsl.test.ts` — same reasoning
@@ -89,7 +90,7 @@ describe("matmulQ8 / wgsl", () => {
             { kind: "out", type: "f32", length: N * M },
             { kind: "uniform", data: params([["u32", N], ["u32", M], ["u32", K]]) },
           ],
-          workgroups: [Math.ceil(M / TILE), Math.ceil(N / TILE)],
+          workgroups: matmulQ8Grid(N, M),
         },
         [matmulQ8({ a, weight, scale, N, M, K })],
         TOLERANCE,

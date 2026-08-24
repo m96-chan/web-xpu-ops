@@ -32,6 +32,14 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
+      // The kernels in `ops/` need more than the spec defaults: the tiled
+      // matmul is 512 invocations wide and stages 12 KB, against defaults of
+      // 256 and 16384. Asked for here because a device that was not asked
+      // refuses the pipeline outright — which is how this file was found, from
+      // a browser console rather than from a test.
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
     },
   });
 

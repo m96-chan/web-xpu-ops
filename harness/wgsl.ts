@@ -153,6 +153,18 @@ export async function createRunner(): Promise<Runner | null> {
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
+      // Same reason as the two above, and found the same way: a tiled matmul
+      // wanting 17,408 B of workgroup storage was refused while Dawn's own
+      // message said "This adapter supports a higher
+      // maxComputeWorkgroupStorageSize of 49152, which can be specified in
+      // requiredLimits". The spec default is 16,384 — enough for a 16x16 tile
+      // and not for the register-tiled shapes #177 is about, so a sweep run
+      // against the default measures only the shapes that were already there.
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+      // X only. Every kernel here declares a one-dimensional workgroup, so Y
+      // and Z stay at their defaults rather than being raised for nothing.
+      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
     },
   });
 

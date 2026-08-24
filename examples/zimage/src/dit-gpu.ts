@@ -70,6 +70,8 @@ export interface PackedWeightSource extends WeightSource {
  */
 export type LayerPrefetch = (prefix: string, label: string) => Promise<void>;
 import { captionPositionIds, imagePositionIds, patchify, timestepEmbedding, unpatchify } from "./dit.js";
+import { matmulGrid } from "../../../ops/matmul/index.js";
+import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 type Run = Runner["run"];
 
@@ -97,6 +99,16 @@ export interface DitKernels {
   permute: string;
   scores: string;
   context: string;
+  /**
+   * `ops/flash_attention` — the same function as `scores` + `context` in one
+   * dispatch, with the `[B, H, L, S]` score matrix never materialised.
+   *
+   * Optional because `dit-gpu.ts` does not use it and Z-Image's own path
+   * predates it. `dit-resident.ts` prefers it when present; see its
+   * `attention` for what it is worth (measured: 1.1x the speed, and 0.50 GB of
+   * scores that stop existing).
+   */
+  flashAttention?: string;
 }
 
 /** The kernel names, so both loaders fetch the same set. */
@@ -112,6 +124,7 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "scores", op: "attention", entry: "scores" },
   { key: "context", op: "attention", entry: "context" },
+  { key: "flashAttention", op: "flash_attention", entry: "kernel" },
 ];
 
 const WG = 256;
@@ -168,7 +181,7 @@ async function linearPacked(
       // `[N, M, K]` — rows of the activation, output features, contracted size.
       { kind: "uniform", data: params([["u32", rows], ["u32", outDim], ["u32", inDim]]) },
     ],
-    workgroups: [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
+    workgroups: matmulQ8Grid(rows, outDim),
   });
   const out = y as Float32Array;
   if (bias) {
@@ -202,7 +215,7 @@ async function linear(
       { kind: "out", type: "f32", length: rows * outDim },
       { kind: "uniform", data: params([["u32", rows], ["u32", outDim], ["u32", inDim]]) },
     ],
-    workgroups: [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
+    workgroups: matmulGrid(rows, outDim),
   });
   const out = y as Float32Array;
   if (bias) {

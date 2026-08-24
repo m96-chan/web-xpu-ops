@@ -1,57 +1,83 @@
-// Flash attention, tiled over query rows.
-//
-// Layout:
-//   q:      [B, H, L, D]  f32, row-major
-//   k:      [B, H, S, D]  f32
-//   v:      [B, H, S, Dv] f32
-//   mask:   additive bias, broadcast per `mask_*` — zeros mean no mask
-//   output: [B, H, L, Dv] f32
-//
-// Dispatched `[ceil(L / BQ), H, B]` — **one workgroup per BQ queries**, not
-// per query. `flashGrid` in `index.ts` is that arithmetic.
-//
-// The online recurrence is `reference.ts`'s, unchanged: a running maximum, a
-// correction when it moves, a running weight sum, and one normalisation at the
-// end. Each of the BQ rows carries its own.
-//
-// ## Why BQ exists
-//
-// The version this replaces gave one workgroup one query row, and read all of
-// k and v for it:
-//
-//     FLOPs   2 * S * D + 2 * S * Dv  = 2.02 M
-//     bytes   S * D * 4 + S * Dv * 4  = 4.05 MB
-//     -> 0.50 FLOP/byte, against a roofline crossover of 30
-//
-// Memory-bound by a factor of sixty. Three things in that kernel looked worth
-// fixing — the score phase used 64 of 256 threads, the accumulate phase 128 of
-// 256, and q was re-read from global S times — and **fixing all three measured
-// 1.0x**, because none of them was what the arithmetic said.
-//
-// Carrying BQ queries divides the k/v traffic by BQ, and that is the only thing
-// that moves this. Measured, on an RTX 5090:
-//
-// | shape                        | one query per group | BQ=16 |
-// | ---------------------------- | ------------------- | ----- |
-// | L=S=3952, 8 heads (self)     | 3.4%                | 8.8%  |
-// | L=3952 S=512, 16 heads       | 3.4%                | 9.1%  |
-//
-// 2.6-2.7x, and still far from the crossover: BQ=16 is 8 FLOP/byte against 30.
-// A larger BQ needs more workgroup storage than a 128-wide head leaves, which
-// is where this stops without a different decomposition.
-//
-// `tools/bench.ts` swept the shapes this device can dispatch and checked every
-// one against `reference.ts` on a ragged 13x37 before timing it. This shape won
-// both sizes. Rerun it on other hardware.
-//
-// ## Constraints
-//
-// `MAX_D` sizes the workgroup arrays and nothing else. WGSL fixes those at
-// compile time, but every loop below runs to `params.D`, so this one program
-// serves every head dimension up to 128 — which is what `ops/flash_attention`'s
-// own tests cover, at 8, 16 and 64. The first version of this file baked D in
-// and turned a general op into a specialised one; all of those broke.
+/**
+ * A flash-attention kernel with its shape as a parameter, for sweeping.
+ *
+ * Issue #177. `wgsl/kernel.wgsl` reaches 3.3% of an RTX 5090's measured
+ * roofline and is 80.7% of an Anima forward once the two matmuls are tiled.
+ *
+ * **Reading it suggested three fixes, all of which were worth nothing.** The
+ * score phase uses 64 of 256 threads, the accumulate phase 128 of 256, and `q`
+ * is re-read from global `S` times. Fixing all three measured **1.0x**. What
+ * the arithmetic says instead:
+ *
+ *     one workgroup = one query row
+ *     FLOPs   2 * S * D  (scores) + 2 * S * Dv (accumulate) = 2.02 M
+ *     bytes   S * D * 4  (all of k) + S * Dv * 4 (all of v) = 4.05 MB
+ *     -> 0.50 FLOP/byte, against a roofline crossover of 30
+ *
+ * It is memory-bound by a factor of sixty, so no amount of arranging the
+ * arithmetic moves it. `k` and `v` are read once per *query row* — 3,952 times
+ * per head — and the only thing that changes that is carrying more than one
+ * query in a workgroup, which divides the traffic by exactly that number.
+ *
+ *     BQ = 8  ->  4 FLOP/byte
+ *     BQ = 32 -> 16 FLOP/byte
+ *
+ * That is FlashAttention's prefill tile, and what llama.cpp's paper calls its
+ * "tile path" as against its decode path. This template is that: `BQ` query
+ * rows per workgroup, with the key and value tiles staged in workgroup memory
+ * so every one of the `BQ` rows reads them from there rather than from global.
+ *
+ * The online recurrence is unchanged and is not the sort of thing to improvise:
+ * it is `reference.ts`'s, which the tests hold both to. Each of the `BQ` rows
+ * carries its own running maximum and sum.
+ */
 
+export interface FlashShape {
+  /** Query rows per workgroup — the whole point. */
+  bq: number;
+  /** Keys staged per pass. */
+  tileS: number;
+  /** Threads per workgroup. */
+  threads: number;
+}
+
+export const WORKGROUP_STORAGE_LIMIT = 49152;
+export const INVOCATION_LIMIT = 1024;
+
+/** Workgroup storage in bytes for a given head dimension. */
+export function flashStorageBytes({ bq, tileS }: FlashShape, D: number): number {
+  // q rows, the staged k and v tiles, and one score per (row, key).
+  return (bq * D + tileS * D + tileS * D + bq * tileS) * 4;
+}
+
+/** Why a shape cannot be dispatched, or null. */
+export function rejectReason(shape: FlashShape, D: number): string | null {
+  if (shape.threads > INVOCATION_LIMIT) return `${shape.threads} invocations exceeds ${INVOCATION_LIMIT}`;
+  const bytes = flashStorageBytes(shape, D);
+  if (bytes > WORKGROUP_STORAGE_LIMIT) return `${bytes} B exceeds ${WORKGROUP_STORAGE_LIMIT}`;
+  if ((shape.tileS * D) % shape.threads !== 0) return "k/v tile is not a multiple of the thread count";
+  if ((shape.bq * shape.tileS) % shape.threads !== 0) return "score tile is not a multiple of the thread count";
+  return null;
+}
+
+/**
+ * `q: [B, H, L, D]`, `k: [B, H, S, D]`, `v: [B, H, S, Dv]` to
+ * `output: [B, H, L, Dv]`, dispatched `[ceil(L / BQ), H, B]`.
+ *
+ * **The grid is not one workgroup per query** — it is per `BQ` queries.
+ *
+ * `maxD` sizes the workgroup arrays and nothing else: WGSL fixes those at
+ * compile time, but every *loop* here runs to `params.D`, so one program serves
+ * every head dimension up to `maxD`. The first version baked `D` in and turned
+ * a general op into a specialised one — `ops/flash_attention`'s own tests cover
+ * D of 8, 16 and 64, and all of them broke.
+ */
+export function tiledFlash(shape: FlashShape, maxD: number, maxDv = maxD): string {
+  const { bq, tileS, threads } = shape;
+  const D = maxD;
+  // How many channels one thread carries. Dv can exceed the workgroup.
+  const sweeps = Math.max(1, Math.ceil(maxDv / threads));
+  return `
 struct Params {
   H: u32, L: u32, S: u32, D: u32, Dv: u32,
   scale: f32, causal: u32, query_offset: i32,
@@ -65,19 +91,19 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
 
-const BQ: u32 = 16u;
-const TILE_S: u32 = 8u;
-const THREADS: u32 = 128u;
-const MAX_D: u32 = 128u;
+const BQ: u32 = ${bq}u;
+const TILE_S: u32 = ${tileS}u;
+const THREADS: u32 = ${threads}u;
+const MAX_D: u32 = ${D}u;
 const MASKED: f32 = -3.402823e+38;
 
-var<workgroup> sq: array<f32, 2048>;
-var<workgroup> sk: array<f32, 1024>;
-var<workgroup> sv: array<f32, 1024>;
-var<workgroup> ss: array<f32, 128>;
-var<workgroup> srow: array<f32, 16>;
+var<workgroup> sq: array<f32, ${bq * D}>;
+var<workgroup> sk: array<f32, ${tileS * D}>;
+var<workgroup> sv: array<f32, ${tileS * maxDv}>;
+var<workgroup> ss: array<f32, ${bq * tileS}>;
+var<workgroup> srow: array<f32, ${bq}>;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(${threads})
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_index) tid: u32,
@@ -104,7 +130,7 @@ fn main(
   // A thread owns one channel per sweep, and sweeps until Dv is covered — Dv
   // can exceed the workgroup (the tests go to 300), which the first version
   // silently truncated to the first THREADS channels.
-  const SWEEPS: u32 = 1u;
+  const SWEEPS: u32 = ${sweeps}u;
   var m: array<f32, BQ>;
   var l: array<f32, BQ>;
   var acc: array<array<f32, SWEEPS>, BQ>;
@@ -194,4 +220,6 @@ fn main(
       p = p + 1u;
     }
   }
+}
+`;
 }

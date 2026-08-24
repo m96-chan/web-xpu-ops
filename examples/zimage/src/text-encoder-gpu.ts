@@ -17,6 +17,7 @@ import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { Qwen3Config, Qwen3LayerWeights } from "./text-encoder.js";
+import { matmulGrid } from "../../../ops/matmul/index.js";
 
 type Run = Runner["run"];
 
@@ -55,7 +56,7 @@ async function matmulOp(
       { kind: "out", type: "f32", length: rows * outDim },
       { kind: "uniform", data: params([["u32", rows], ["u32", outDim], ["u32", inDim]]) },
     ],
-    workgroups: [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
+    workgroups: matmulGrid(rows, outDim),
   });
   return y as Float32Array;
 }

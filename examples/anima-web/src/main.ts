@@ -32,7 +32,10 @@ import { type BpeVocab } from "../../../llm/tokenizer-bpe.js";
 import { permuteLayerForRope, type Qwen3LayerWeights } from "../../zimage/src/text-encoder.js";
 import { qwen3EncodeGpu, type Qwen3GpuWeights } from "../../zimage/src/text-encoder-gpu.js";
 import type { AnimaConfig, AnimaInput } from "../../anima/src/dit.js";
-import { animaForwardResident, releaseAnimaWeights, type AnimaWeightSource } from "../../anima/src/dit-resident.js";
+import {
+  animaForwardResident, releaseAnimaWeights,
+  type AnimaProfile, type AnimaWeightSource,
+} from "../../anima/src/dit-resident.js";
 import { permuteForRope } from "../../anima/src/block.js";
 import {
   ADAPTER,
@@ -82,6 +85,8 @@ const sizeSelect = $<HTMLSelectElement>("size");
 const stepsInput = $<HTMLInputElement>("steps");
 const cfgInput = $<HTMLInputElement>("cfg");
 const seedInput = $<HTMLInputElement>("seed");
+const profileBox = $<HTMLInputElement>("profile");
+const profileOut = $<HTMLDivElement>("profile-out");
 
 function say(message: string, extra = ""): void {
   status.textContent = message;
@@ -133,6 +138,46 @@ function draw(image: Float32Array, H: number, W: number): void {
     data.data[i * 4 + 3] = 255;
   }
   context.putImageData(data, 0, 0);
+}
+
+/**
+ * The per-kernel breakdown, as a table under the controls.
+ *
+ * Reported as a share of the profiled forward rather than as seconds alone: the
+ * profiling itself costs passes, so the absolute numbers are larger than the
+ * shipping ones and the proportions are what carry over.
+ */
+function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: number): void {
+  if (!profile.supported) {
+    profileOut.innerHTML =
+      '<p class="note">This device has no <code>timestamp-query</code>, so there is no GPU breakdown — ' +
+      "not a breakdown of zeros.</p>";
+    return;
+  }
+  if (profile.byKernel.size === 0) {
+    profileOut.innerHTML =
+      '<p class="note">The device has <code>timestamp-query</code> but every query came back zero, ' +
+      "which means the driver declined them. No breakdown, rather than a breakdown of zeros.</p>";
+    return;
+  }
+  const rows = [...profile.byKernel.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
+  const total = rows.reduce((sum, [, v]) => sum + v.seconds, 0);
+  const counted = rows.reduce((n, [, v]) => n + v.dispatches, 0);
+  const coverage = (total / wallSeconds) * 100;
+  // Coverage is what caught the last wrong answer: a profile that timed 78% of
+  // the forward reported shares of a partial total as though they were shares
+  // of the whole. Under about 90% here, the table is not a breakdown of this
+  // forward and should not be read as one.
+  const warn = coverage < 90
+    ? ' <strong>Under 90% — this is not a breakdown of the whole forward.</strong>'
+    : "";
+  profileOut.innerHTML =
+    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ${counted} of ` +
+    `${dispatches} dispatches — ${coverage.toFixed(0)}% of that step's ${(wallSeconds * 1000).toFixed(0)} ms.${warn}</p><table>` +
+    rows.map(([name, v]) =>
+      `<tr><td>${name}</td><td>${(v.seconds * 1000).toFixed(1)} ms</td>` +
+      `<td>${((v.seconds / total) * 100).toFixed(1)}%</td><td>${v.dispatches}</td></tr>`).join("") +
+    "</table>";
 }
 
 async function main(): Promise<void> {
@@ -388,6 +433,29 @@ async function main(): Promise<void> {
     const latentH = height / 8;
     const latentW = width / 8;
 
+    /**
+     * Where one forward's GPU time goes, by kernel.
+     *
+     * **Not free**: `batch()` needs a compute pass per timestamp pair, so a
+     * profiled forward runs one pass per dispatch against 55 submits' worth
+     * unprofiled. Only the first forward is profiled, and the numbers are
+     * reported as proportions rather than as the shipping cost.
+     */
+    const wantProfile = profileBox.checked;
+    let profile: AnimaProfile | null = null;
+    let profiledWallSeconds = 0;
+    let profiledDispatches = 0;
+    profileOut.innerHTML = "";
+    // The profiled forward is the **second** step: the first uploads 3.63 GB
+    // and hydrates the heap, so its timings are the loading cost. One step
+    // therefore has nothing to profile — said here rather than left as a table
+    // that never appears, which is how the first version failed.
+    if (wantProfile && steps < 2) {
+      profileOut.innerHTML =
+        '<p class="note">Profiling needs at least 2 steps — the first forward is the upload, ' +
+        "so the second is the one measured.</p>";
+    }
+
     const started = performance.now();
 
     // --- conditioning ---
@@ -405,6 +473,7 @@ async function main(): Promise<void> {
     const positive = await conditioning(promptInput.value);
     const useCfg = cfgEnabled(guidance);
     const unconditional = useCfg ? await conditioning(negativeInput.value) : null;
+    const conditioningSeconds = (performance.now() - started) / 1000;
 
     // --- sampling ---
     const sigmas = betaSchedule(flowSigmas(), steps);
@@ -413,16 +482,33 @@ async function main(): Promise<void> {
     const held = new Map<string, GPUBuffer>();
     const predictions: Float32Array[] = [];
     let out = x0;
+    const samplingStart = performance.now();
+    // The first forward uploads 3.63 GB of weights and hydrates the heap from
+    // the disk cache; every one after it does neither. Reported apart from the
+    // rest, because folding a one-off into a per-step average is how a page
+    // ends up disagreeing with a command line for no visible reason.
+    let firstForwardSeconds = 0;
 
     for (let step = 0; step < sigmas.length - 1; step += 1) {
       const sigma = sigmas[step]!;
       const t = timestepOf(sigma);
       const stepStarted = performance.now();
 
-      const forward = async (context: Float32Array): Promise<Float32Array> => {
+      const forward = async (context: Float32Array, first = false): Promise<Float32Array> => {
         const input: AnimaInput = { latent: out, ...shape, t, context };
-        return animaForwardResident(
-          residentDevice, ditKernels, cfg, ditWeights, input, undefined, held, undefined, undefined,
+        // The *second* step, not the first: the first uploads 3.63 GB and
+        // hydrates the heap, so its timings are the loading cost rather than
+        // the steady-state one.
+        const wanted = wantProfile && first && step === 1;
+        if (wanted && !profile) {
+          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, submitToDoneMs: 0 };
+        }
+        const stats = wanted
+          ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
+          : undefined;
+        const forwardStart = wanted ? performance.now() : 0;
+        const result = await animaForwardResident(
+          residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
           // Hydrates the heap a block at a time, from the disk cache. Only the
           // first forward does any work here: after it the weights live on the
           // device and `held` answers instead.
@@ -431,9 +517,15 @@ async function main(): Promise<void> {
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
           },
+          wanted ? profile ?? undefined : undefined,
         );
+        if (wanted && stats) {
+          profiledWallSeconds = (performance.now() - forwardStart) / 1000;
+          profiledDispatches = stats.dispatches;
+        }
+        return result;
       };
-      const cond = await forward(positive);
+      const cond = await forward(positive, true);
       const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
       predictions.push(calculateDenoised(sigma, prediction, out));
 
@@ -442,16 +534,20 @@ async function main(): Promise<void> {
       let cursor = 0;
       out = resMultistep(() => predictions[cursor++]!, x0, sigmas.slice(0, step + 2));
 
+      const stepSeconds = (performance.now() - stepStarted) / 1000;
+      if (step === 0) firstForwardSeconds = stepSeconds;
       say(
         `step ${step + 1}/${sigmas.length - 1}`,
-        `sigma ${sigma.toFixed(4)}, ${((performance.now() - stepStarted) / 1000).toFixed(2)}s`,
+        `sigma ${sigma.toFixed(4)}, ${stepSeconds.toFixed(2)}s`,
       );
       // Yield, so the status text above actually paints.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
+    const samplingSeconds = (performance.now() - samplingStart) / 1000;
     releaseAnimaWeights(held);
 
     // --- decode ---
+    const decodeStart = performance.now();
     say("decoding …", "reading the VAE");
     if (vaeCache.size === 0) {
       const names = ["conv2.weight", "conv2.bias", "decoder.conv1.weight", "decoder.conv1.bias",
@@ -478,8 +574,27 @@ async function main(): Promise<void> {
     );
     draw(image, height, width);
 
+    const decodeSeconds = (performance.now() - decodeStart) / 1000;
     const elapsed = (performance.now() - started) / 1000;
-    say("done.", `${width}x${height}, ${sigmas.length - 1} steps, ${elapsed.toFixed(1)}s`);
+    const taken = sigmas.length - 1;
+    // Split, because a total is not comparable to anything. The command-line
+    // path reports the same three separately, and a page that reports only
+    // their sum cannot be checked against it.
+    const perStep = (samplingSeconds - firstForwardSeconds) / Math.max(1, taken - 1);
+    say(
+      "done.",
+      `${width}x${height}, ${taken} steps, ${elapsed.toFixed(1)}s — ` +
+        `conditioning ${conditioningSeconds.toFixed(1)}s, ` +
+        `sampling ${samplingSeconds.toFixed(1)}s (first step ${firstForwardSeconds.toFixed(1)}s, ` +
+        `then ${perStep.toFixed(2)}s each), ` +
+        `decode ${decodeSeconds.toFixed(1)}s`,
+    );
+    if (profile) reportProfile(profile, profiledWallSeconds, profiledDispatches);
+    else if (wantProfile && steps >= 2) {
+      profileOut.innerHTML =
+        '<p class="note">Profiling was requested and produced nothing, which should not happen — ' +
+        "the second forward did not run.</p>";
+    }
     goButton.disabled = false;
   }
 }
