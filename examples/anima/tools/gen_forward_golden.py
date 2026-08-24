@@ -46,7 +46,15 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=HERE.parent / "fixtures")
     ap.add_argument("--latent", type=int, default=16, help="latent H and W; 16 gives 8x8 = 64 image tokens")
     ap.add_argument("--context", type=int, default=8, help="context tokens from the adapter")
+    ap.add_argument("--context-nonzero", type=int, default=None,
+                    help="how many of --context rows are real; the rest are zeros, as "
+                         "preprocess_text_embeds pads to 512. Defaults to all of them.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--t", type=float, default=0.7, help="the diffusion time; sampling starts at 1.0")
+    ap.add_argument("--context-file", type=Path, default=None,
+                    help="a raw f32 [N, crossattn_emb_channels] context instead of random values. "
+                         "A real prompt's context is a hundredth the magnitude of randn and 3%% dense, "
+                         "and the two are not interchangeable for finding where a port diverges.")
     args = ap.parse_args()
 
     if not COMFY.exists():
@@ -96,8 +104,21 @@ def main() -> None:
     latent = args.latent
     in_channels = config["in_channels"]
     x = torch.randn(1, in_channels, 1, latent, latent)
-    t = torch.tensor([0.7])
+    t = torch.tensor([args.t])
     context = torch.randn(1, args.context, config["crossattn_emb_channels"])
+    # `preprocess_text_embeds` pads a short prompt to 512 rows of zeros and the
+    # DiT cross-attends to all of them unmasked (`predict2.py:166` passes
+    # `attn_mask=None`). A golden whose context is dense never exercises that,
+    # and a real prompt is 3% dense — so the dilution the padding causes is
+    # untested by every fixture that came before this flag.
+    if args.context_nonzero is not None:
+        context[:, args.context_nonzero:, :] = 0
+    if args.context_file is not None:
+        raw = np.fromfile(args.context_file, dtype=np.float32)
+        channels = config["crossattn_emb_channels"]
+        context = torch.from_numpy(raw.reshape(1, -1, channels).copy())
+        print(f"context from {args.context_file}: {tuple(context.shape)}, "
+              f"{float((context != 0).float().mean()) * 100:.1f}% non-zero, std {float(context.std()):.4f}")
 
     captured: dict[str, torch.Tensor] = {}
     handles = [

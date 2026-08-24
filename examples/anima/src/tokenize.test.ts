@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { BpeVocab } from "../../../llm/tokenizer-bpe.js";
-import { type T5Vocab, animaTokenizers, normalizeT5, tokenizePrompt } from "./tokenize.js";
+import { PADDING, type T5Vocab, animaTokenizers, normalizeT5, tokenizePrompt } from "./tokenize.js";
 
 const read = (name: string): unknown =>
   JSON.parse(readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)), "utf8"));
@@ -23,21 +23,39 @@ const qwenVocab = JSON.parse(
 ) as BpeVocab;
 const t5Vocab = read("t5.unigram-vocab.json") as T5Vocab;
 const fixtures = read("tokenizer-fixtures.json") as {
+  padding: { qwenMinLength: number; qwenPadToken: number; t5MinLength: number; t5PadToken: number };
   cases: { label: string; text: string; qwen: number[]; t5: number[] }[];
 };
 
 const tokenizers = animaTokenizers(qwenVocab, t5Vocab);
 
+// The fixtures come from ComfyUI's `AnimaTokenizer`, which is both backends
+// *plus* `SDTokenizer`'s padding — so they are compared against `tokenizePrompt`,
+// which is the same whole. Comparing against the bare backends is what missed
+// `min_length` and let the pipeline throw on its first empty negative prompt.
 describe("the Qwen BPE", () => {
   it.each(fixtures.cases.map((c) => [c.label, c] as const))("encodes %s", (_label, c) => {
-    expect(Array.from(tokenizers.qwen.encode(c.text))).toEqual(c.qwen);
+    expect(Array.from(tokenizePrompt(tokenizers, c.text).qwenIds)).toEqual(c.qwen);
   });
 });
 
 describe("the T5 unigram", () => {
   it.each(fixtures.cases.map((c) => [c.label, c] as const))("encodes %s", (_label, c) => {
-    // The fixture already carries the `</s>` that `TemplateProcessing` appends.
-    expect([...tokenizers.t5.encode(c.text), t5Vocab.eosId]).toEqual(c.t5);
+    expect(Array.from(tokenizePrompt(tokenizers, c.text).t5Ids)).toEqual(c.t5);
+  });
+});
+
+describe("SDTokenizer's padding", () => {
+  it("matches what ComfyUI's tokenizer was built with", () => {
+    expect(PADDING).toEqual(fixtures.padding);
+  });
+
+  it("keeps an empty prompt from producing no tokens", () => {
+    // What CFG runs against every step. The Qwen side takes no sentinels, so
+    // without this it is a zero-length sequence and the encoder throws.
+    const out = tokenizePrompt(tokenizers, "");
+    expect(Array.from(out.qwenIds)).toEqual([PADDING.qwenPadToken]);
+    expect(out.t5Ids.length).toBeGreaterThan(0);
   });
 });
 

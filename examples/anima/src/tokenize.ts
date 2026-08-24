@@ -154,6 +154,22 @@ export function t5Tokenizer(vocab: T5Vocab): {
   };
 }
 
+/**
+ * `sd1_clip.SDTokenizer`'s padding, which sits on top of both backends
+ * (`sd1_clip.py:668`) and is invisible on every prompt but one.
+ *
+ * The empty prompt is the one — and it is not a corner case, it is what CFG
+ * runs against every step. The Qwen side takes no start or end token, so `""`
+ * tokenizes to nothing at all and the encoder is handed a zero-length sequence.
+ * `min_length` 1 with pad token 151643 is what stops that. Confirmed by running
+ * ComfyUI's own `AnimaTokenizer` on `""`: `qwen=[151643], t5=[1]`.
+ *
+ * The T5 side needs no padding in practice — its `</s>` already makes every
+ * prompt at least one token long — but the rule is carried because "in
+ * practice" is doing load-bearing work in that sentence.
+ */
+export const PADDING = { qwenMinLength: 1, qwenPadToken: 151643, t5MinLength: 1, t5PadToken: 0 } as const;
+
 export interface AnimaTokenizers {
   qwen: ByteLevelBpeTokenizer;
   t5: ReturnType<typeof t5Tokenizer>;
@@ -165,6 +181,11 @@ export function animaTokenizers(qwenVocab: BpeVocab, t5Vocab: T5Vocab): AnimaTok
   return { qwen: new ByteLevelBpeTokenizer(qwenVocab), t5: t5Tokenizer(t5Vocab), t5EosId: t5Vocab.eosId };
 }
 
+function padTo(ids: number[], minLength: number, padToken: number): number[] {
+  while (ids.length < minLength) ids.push(padToken);
+  return ids;
+}
+
 export interface TokenizedPrompt {
   qwenIds: Int32Array;
   t5Ids: Int32Array;
@@ -173,6 +194,12 @@ export interface TokenizedPrompt {
    * `preprocess_text_embeds`. Plain prompts are all 1.0; the field exists
    * because the model reads it, and because a caller that implements
    * `(emphasis:1.2)` syntax has somewhere to put the result.
+   *
+   * That syntax is **not** implemented here, which is also why this port does
+   * not reproduce one of ComfyUI's own behaviours: `escape_important` uses
+   * U+0000 and U+0001 as sentinels for escaped parentheses, so a prompt
+   * containing those two characters comes out of its parser as `")"`. Nothing
+   * to reproduce — but worth knowing before comparing ids on strange input.
    */
   t5Weights: Float32Array;
 }
@@ -185,10 +212,14 @@ export interface TokenizedPrompt {
  * that backwards shifts every position by one and is invisible in the output.
  */
 export function tokenizePrompt(tokenizers: AnimaTokenizers, text: string): TokenizedPrompt {
-  const qwenIds = Int32Array.from(tokenizers.qwen.encode(text));
-  const t5 = [...tokenizers.t5.encode(text), tokenizers.t5EosId];
+  const qwen = padTo([...tokenizers.qwen.encode(text)], PADDING.qwenMinLength, PADDING.qwenPadToken);
+  const t5 = padTo(
+    [...tokenizers.t5.encode(text), tokenizers.t5EosId],
+    PADDING.t5MinLength,
+    PADDING.t5PadToken,
+  );
   return {
-    qwenIds,
+    qwenIds: Int32Array.from(qwen),
     t5Ids: Int32Array.from(t5),
     t5Weights: new Float32Array(t5.length).fill(1),
   };

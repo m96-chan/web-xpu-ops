@@ -16,6 +16,8 @@ import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { dequantizeQ8 } from "../../zimage/src/weights.js";
 
+import { permuteForRope } from "./block.js";
+
 export interface AnimaTensor {
   name: string;
   kind: "q8" | "f32";
@@ -54,6 +56,14 @@ function readRange(path: string, offset: number, count: number): ArrayBuffer {
 }
 
 /** The converted DiT, addressed by the checkpoint's own tensor names. */
+/** What the resident forward reads: the four methods and nothing else. */
+export interface AnimaWeightView {
+  has(name: string): boolean;
+  shapeOf(name: string): number[] | undefined;
+  get(name: string): Float32Array;
+  packedQ8(name: string): { codes: Uint32Array; scale: Float32Array; N: number; K: number } | null;
+}
+
 export class AnimaWeights {
   readonly blocks: number;
   readonly #dir: string;
@@ -144,4 +154,73 @@ export function loadAnimaSubset(dir: string, _wanted?: (name: string) => boolean
 /** Every tensor of one block — `(name) => name.startsWith(blockPrefix(0))`. */
 export function blockPrefix(index: number): string {
   return `net.blocks.${index}.`;
+}
+
+/**
+ * Wraps a weight source so the DiT's self-attention arrives in `ops/rope`'s
+ * channel order.
+ *
+ * The model pairs rope channels half a head apart; `ops/rope` pairs them
+ * adjacently. `permuteForRope` relabels the projection rows once, and the
+ * QK-Norm weight has to travel with the projection it follows — it is
+ * `[headDim]` and multiplies channel by channel inside a head, so leaving it
+ * behind scales each channel by another's factor.
+ *
+ * **This exists because every caller has to do it and one of them forgot.**
+ * `verify-forward-gpu.ts` applied the permutation inline and matched the model
+ * at 6.5e-6; `verify-trajectory.ts` and `generate.ts` passed the raw source and
+ * were 1.068e-1 out, which is the same magnitude the same omission cost the
+ * Z-Image port. A correctness rule that lives in one caller is a rule the next
+ * caller does not have.
+ *
+ * Cross-attention is **not** permuted: its keys come from the context and it
+ * has no rope at all (`predict2.py:166` passes `attn_mask=None` and no
+ * `rope_emb`), so its `q_norm`/`k_norm` are ordinary norms.
+ */
+/** The tensors whose channels have to be relabelled, and how many heads' worth. */
+function ropePermuted(name: string): "projection" | "norm" | null {
+  if (/\.self_attn\.(q|k)_proj\.weight$/.test(name)) return "projection";
+  if (/\.self_attn\.(q|k)_norm\.weight$/.test(name)) return "norm";
+  return null;
+}
+
+export function withRopePermutation(
+  source: AnimaWeights,
+  numHeads: number,
+  headDim: number,
+  modelChannels: number,
+): AnimaWeightView {
+  const cache = new Map<string, Float32Array>();
+  return {
+    has: (name) => source.has(name),
+    shapeOf: (name) => source.shapeOf(name),
+    get: (name) => {
+      const cached = cache.get(name);
+      if (cached) return cached;
+      const kind = ropePermuted(name);
+      const raw = source.get(name);
+      if (!kind) return raw;
+      const out = kind === "projection"
+        ? permuteForRope(raw, numHeads, headDim, modelChannels)
+        : permuteForRope(raw, 1, headDim, 1);
+      cache.set(name, out);
+      return out;
+    },
+    /**
+     * **`null` for anything permuted**, which is the whole reason this is
+     * written out rather than delegated.
+     *
+     * The resident path prefers packed codes and only falls back to `get` when
+     * there are none. Handing back the packed form of a tensor whose channels
+     * were supposed to move would take the fast path straight past the
+     * permutation and reintroduce exactly the bug this wrapper exists to close
+     * — silently, and only for the four tensors per block that matter.
+     *
+     * The cost is that 208 of the DiT's tensors dequantize through `get`
+     * instead of uploading packed. They are the q/k projections and their
+     * norms; the MLP and the cross-attention, which are the bulk, are
+     * unaffected.
+     */
+    packedQ8: (name) => (ropePermuted(name) ? null : source.packedQ8(name)),
+  };
 }

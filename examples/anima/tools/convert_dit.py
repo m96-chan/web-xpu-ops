@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,31 @@ def main() -> None:
         from huggingface_hub import hf_hub_download
         path = Path(hf_hub_download(REPO, DIT))
 
+    # The model's own shape, read out of the state dict the way ComfyUI reads
+    # it. Requires the clone; see `gen_block_golden.py` for the command.
+    comfy = Path("/tmp/ComfyUI")
+    if not comfy.exists():
+        sys.exit(f"{comfy} not found — needed for model_detection; see gen_block_golden.py")
+    sys.path.insert(0, str(comfy))
+    from comfy import model_detection
+
+    class Shaped:
+        """`detect_unet_config` reads `.shape` and `.ndim`; a slice has neither.
+
+        Wrapping is what keeps this from loading 7.5 GB to measure shapes it
+        could have read from the header.
+        """
+
+        def __init__(self, entry) -> None:
+            self.shape = tuple(entry.get_shape())
+            self.ndim = len(self.shape)
+
+    with safe_open(path, framework="pt") as f:
+        config = model_detection.detect_unet_config({k: Shaped(f.get_slice(k)) for k in f.keys()}, "net.")
+    config.pop("image_model", None)
+    config = {k: (v.item() if hasattr(v, "item") else v) for k, v in sorted(config.items())}
+    print("config from the checkpoint:", json.dumps(config, default=str))
+
     args.out.mkdir(parents=True, exist_ok=True)
     q8_out = open(args.out / "dit.q8.bin", "wb")
     scales_out = open(args.out / "dit.q8scales.bin", "wb")
@@ -145,6 +171,13 @@ def main() -> None:
         "format": {"quant": "q8-per-row", "range": [-127, 127], "codesPerWord": 4,
                    "reciprocal": "127/absmax in f64", "rounding": "floor(x) + (frac >= 0.5)"},
         "blocks": blocks,
+        # The model's own shape, so the manifest describes what it holds.
+        # Without it a runtime has to be told the configuration out of band —
+        # `verify-forward-gpu.ts` read it from a *golden*, which is fine for a
+        # checker and wrong for anything that generates: the fixture and the
+        # weights are then two things that must agree and nothing checks it.
+        # Read by `model_detection.detect_unet_config`, never transcribed.
+        "config": config,
         "limitBlocks": args.limit_blocks,
         "tensors": manifest,
     }, indent=1) + "\n")

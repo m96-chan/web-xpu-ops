@@ -45,6 +45,33 @@ export const LATENT = {
     2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
     3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
   ]),
+  /**
+   * `Wan21.latent_rgb_factors`, `[16, 3]` row-major, with its bias.
+   *
+   * The linear 16-to-3 projection ComfyUI shows as a live preview while
+   * sampling. It is **not** a decoder: one eighth of the resolution and a
+   * matrix multiply, against a VAE with 194 tensors. Useful for seeing that a
+   * latent has structure at all, and for nothing that needs to look right.
+   */
+  rgbFactors: Float32Array.from([
+    -0.1299, -0.1692, 0.2932,,
+    0.0671, 0.0406, 0.0442,,
+    0.3568, 0.2548, 0.1747,,
+    0.0372, 0.2344, 0.142,,
+    0.0313, 0.0189, -0.0328,,
+    0.0296, -0.0956, -0.0665,,
+    -0.3477, -0.4059, -0.2925,,
+    0.0166, 0.1902, 0.1975,,
+    -0.0412, 0.0267, -0.1364,,
+    -0.1293, 0.074, 0.1636,,
+    0.068, 0.3019, 0.1128,,
+    0.0032, 0.0581, 0.0639,,
+    -0.1251, 0.0927, 0.1699,,
+    0.006, -0.0633, 0.0005,,
+    0.3477, 0.2275, 0.295,,
+    0.1984, 0.0913, 0.1861,
+  ]),
+  rgbBias: Float32Array.from([-0.1835, -0.0868, -0.336]),
 } as const;
 
 /** `time_snr_shift` (`model_sampling.py:279`). */
@@ -247,10 +274,23 @@ export function calculateDenoised(sigma: number, modelOutput: Float32Array, mode
   return out;
 }
 
-/** `cond + scale * (cond - uncond)`, the same convention Z-Image's port uses. */
+/**
+ * `uncond + scale * (cond - uncond)` — `cfg_function` (`samplers.py:598`).
+ *
+ * **Not** `cond + scale * (cond - uncond)`, which `examples/zimage`'s port uses
+ * for a model whose own repository defines it that way. The two differ by
+ * exactly one unit of scale — `cond + s*d == uncond + (s+1)*d` — so the
+ * workflow's CFG 8 would silently be run at 9. Nothing looks broken; the images
+ * are just over-guided.
+ *
+ * Order against `calculateDenoised` does not matter and the port relies on it:
+ * ComfyUI applies CFG to the *denoised* predictions, this applies it to the raw
+ * model outputs, and since `x - v * sigma` is affine in `v` the two agree
+ * exactly. Applying it to the raw outputs halves what has to be kept per step.
+ */
 export function applyCfg(cond: Float32Array, uncond: Float32Array, scale: number): Float32Array {
   const out = new Float32Array(cond.length);
-  for (let i = 0; i < out.length; i += 1) out[i] = cond[i]! + scale * (cond[i]! - uncond[i]!);
+  for (let i = 0; i < out.length; i += 1) out[i] = uncond[i]! + scale * (cond[i]! - uncond[i]!);
   return out;
 }
 

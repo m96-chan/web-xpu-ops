@@ -323,33 +323,103 @@ export async function animaForwardResident(
     return out;
   };
 
+  /**
+   * Splits a flat, per-element dispatch that would exceed the workgroup limit.
+   *
+   * Every op below is elementwise: lane `i` reads index `i` and writes index
+   * `i`, with no state between lanes, so a split is exact rather than an
+   * approximation — only the number of submits changes.
+   *
+   * Needed at Anima's shipped resolution and not at the fixture's: 832x1216 is
+   * 3,952 tokens, and the MLP's 8,192-wide activation is 32.4M elements, or
+   * 126,464 workgroups against a limit of 65,535. The `#112` guard named the op
+   * and this is the answer to it, carried over from
+   * `examples/zimage/src/dit-resident.ts` which met the same wall first.
+   */
+  const chunkedFlat = async (
+    code: string,
+    n: number,
+    slice: (offset: number, count: number) => { buffer: GPUBuffer; offset: number; size: number }[],
+  ): Promise<void> => {
+    const perDispatch = MAX_WORKGROUPS * WG;
+    const pipeline = await pipelineFor(code);
+    // 64 elements is 256 bytes — the binding-offset alignment. A whole number
+    // of workgroups is not required, only a whole number of elements.
+    const step = n <= perDispatch ? n : Math.floor(perDispatch / 64) * 64;
+    for (let at = 0; at < n; at += step) {
+      const count = Math.min(step, n - at);
+      ops.push({
+        kind: "dispatch",
+        pipeline,
+        bindGroup: await device.bindGroupSliced(pipeline, slice(at, count)),
+        workgroups: [Math.ceil(count / WG)],
+      });
+      dispatches += 1;
+    }
+  };
+
   const elementwise = async (a: Slot, b: Slot, n: number, kind: number): Promise<Slot> => {
     const out = pool.take(n);
-    await record(
-      K.elementwise,
-      [a.buffer, b.buffer, out.buffer, uniform(params([["u32", n], ["u32", kind]]))],
-      [Math.ceil(n / WG)],
-    );
+    await chunkedFlat(K.elementwise, n, (at, count) => [
+      { buffer: a.buffer, offset: at * 4, size: count * 4 },
+      { buffer: b.buffer, offset: at * 4, size: count * 4 },
+      { buffer: out.buffer, offset: at * 4, size: count * 4 },
+      { buffer: uniform(params([["u32", count], ["u32", kind]])), offset: 0, size: 256 },
+    ]);
     return out;
   };
 
+  /**
+   * `a` is `[S, D]`, `b` is `[D]` broadcast down the rows.
+   *
+   * Split by **rows**, not by elements: `b` is indexed by column, so a chunk
+   * has to start at a row boundary or every lane in it reads the wrong entry of
+   * `b`. That is why this is not `chunkedFlat`.
+   */
   const rowsOp = async (a: Slot, b: Slot, S: number, D: number, kind: number): Promise<Slot> => {
     const out = pool.take(S * D);
-    await record(
-      K.rows,
-      [a.buffer, b.buffer, out.buffer, uniform(params([["u32", S], ["u32", D], ["u32", kind]]))],
-      [Math.ceil((S * D) / WG)],
-    );
+    const perDispatch = MAX_WORKGROUPS * WG;
+    if (S * D <= perDispatch) {
+      await record(
+        K.rows,
+        [a.buffer, b.buffer, out.buffer, uniform(params([["u32", S], ["u32", D], ["u32", kind]]))],
+        [Math.ceil((S * D) / WG)],
+      );
+      return out;
+    }
+    const rowBytes = D * 4;
+    if (rowBytes % 256 !== 0) {
+      throw new Error(
+        `animaForwardResident: rows must be split but a row is ${rowBytes} bytes, not a multiple of 256.`,
+      );
+    }
+    const rowsPer = Math.max(1, Math.floor(perDispatch / D));
+    const pipeline = await pipelineFor(K.rows);
+    for (let row = 0; row < S; row += rowsPer) {
+      const count = Math.min(rowsPer, S - row);
+      ops.push({
+        kind: "dispatch",
+        pipeline,
+        bindGroup: await device.bindGroupSliced(pipeline, [
+          { buffer: a.buffer, offset: row * rowBytes, size: count * rowBytes },
+          { buffer: b.buffer, offset: 0, size: rowBytes },
+          { buffer: out.buffer, offset: row * rowBytes, size: count * rowBytes },
+          { buffer: uniform(params([["u32", count], ["u32", D], ["u32", kind]])), offset: 0, size: 256 },
+        ]),
+        workgroups: [Math.ceil((count * D) / WG)],
+      });
+      dispatches += 1;
+    }
     return out;
   };
 
   const activation = async (x: Slot, n: number, kind: number): Promise<Slot> => {
     const out = pool.take(n);
-    await record(
-      K.activation,
-      [x.buffer, out.buffer, uniform(params([["u32", n], ["u32", kind], ["f32", 1]]))],
-      [Math.ceil(n / WG)],
-    );
+    await chunkedFlat(K.activation, n, (at, count) => [
+      { buffer: x.buffer, offset: at * 4, size: count * 4 },
+      { buffer: out.buffer, offset: at * 4, size: count * 4 },
+      { buffer: uniform(params([["u32", count], ["u32", kind], ["f32", 1]])), offset: 0, size: 256 },
+    ]);
     return out;
   };
 

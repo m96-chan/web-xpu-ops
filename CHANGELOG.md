@@ -21,6 +21,18 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B generates a latent from a prompt on the GPU
+  (`examples/anima/src/generate.ts`), and the whole loop is checked against the
+  same loop in torch step by step — final rel-RMS 3.274e-3 over 8 steps from the
+  same noise and the same conditioning. There is no image yet: Anima decodes
+  with Wan 2.1's 3D causal VAE, tracked as issue #174. The page writes the
+  latent and the 16-to-3 projection ComfyUI shows as a live preview.
+
+  `convert_dit.py` now records the model's configuration in its manifest, read
+  by `detect_unet_config` rather than transcribed. Before this a runtime had to
+  be told the shape out of band, and the only place carrying it was a test
+  fixture.
+
 - Anima-3.8B's two tokenizers (`examples/anima/src/tokenize.ts`), matching
   `transformers` and `tokenizers` on 23 cases each. `llm/tokenizer.ts` grows one
   path it did not have: a model with `byteFallback` off now emits `unk_id` for a

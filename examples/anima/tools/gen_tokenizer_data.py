@@ -46,6 +46,10 @@ HERE = Path(__file__).resolve().parent
 # wrong. Every line says what it is for, following `llm/tools/gen_bpe_fixtures.py`.
 CASES: list[tuple[str, str]] = [
     ("empty", ""),
+    # The case that matters most and looks like it matters least: an empty
+    # negative prompt is what CFG runs against, and the Qwen side has no
+    # sentinels, so without `min_length` it produces nothing at all.
+    ("only spaces", "  "),
     ("plain", "a cat"),
     ("the golden's prompt", "1girl, silver hair, red eyes, looking at viewer, detailed background"),
     ("danbooru tags", "masterpiece, best quality, 1girl, solo, looking at viewer"),
@@ -69,7 +73,14 @@ CASES: list[tuple[str, str]] = [
     ("emoji", "a 🐱 b"),                    # outside the BMP, and byte-fallback
     ("accent composed", "café"),
     ("accent decomposed", "café"),   # NFKC must compose it to match
-    ("unknown bytes", "\x00\x01"),
+    # Control characters, but **not** U+0000 or U+0001. `escape_important`
+    # (`sd1_clip.py`) uses those two as its own sentinels for escaped
+    # parentheses, so `"\x00\x01"` comes out of ComfyUI's prompt parser as the
+    # single character `")"` — a collision in the weighting syntax, nothing to
+    # do with tokenization. This port implements no `(emphasis:1.2)` syntax and
+    # so has no such collision; a fixture built on those two bytes would be
+    # asserting that it reproduces someone else's escape bug.
+    ("control characters", "\x0b\x1f"),
     ("long", "highly detailed illustration of a silver haired girl, " * 4),
 ]
 
@@ -81,6 +92,7 @@ def main() -> None:
 
     if not COMFY.exists():
         sys.exit(f"{COMFY} not found — see gen_block_golden.py for the clone command")
+    sys.path.insert(0, str(COMFY))
 
     from tokenizers import Tokenizer
     from transformers import AutoTokenizer, Qwen2Tokenizer
@@ -166,22 +178,41 @@ def main() -> None:
     if t5_vocab["metaspace"]["type"] != "Metaspace":
         sys.exit(f"expected a Metaspace pre-tokenizer, got {t5_vocab['metaspace']['type']}")
 
-    # --- fixtures: both tokenizers over the same cases ---
+    # --- fixtures: `AnimaTokenizer` itself, not the two backends ---
+    #
+    # The backends alone are not the reference. `sd1_clip.SDTokenizer` wraps
+    # each one and applies `min_length` and a pad token on top
+    # (`sd1_clip.py:668`), which is invisible on every prompt except the empty
+    # one -- where the Qwen side has no sentinels at all and would otherwise
+    # produce zero tokens. Generating from the backends missed it, and the
+    # pipeline threw on its first empty negative prompt.
+    from comfy.text_encoders.anima import AnimaTokenizer
+
+    anima_tok = AnimaTokenizer()
     fixtures = []
     for label, text in CASES:
+        pairs = anima_tok.tokenize_with_weights(text)
         fixtures.append({
             "label": label,
             "text": text,
-            # `has_start_token=False, has_end_token=False` on the Qwen side.
-            "qwen": qwen_hf(text, add_special_tokens=False)["input_ids"],
-            # The T5 side keeps its `</s>` — appended by the backend's own
-            # `TemplateProcessing`, so `encode` already carries it. Adding one
-            # here as well is the mistake this comment exists to prevent; it
-            # was made once and caught by the fixture disagreeing with the
-            # encoder golden, which tokenizes through `transformers` instead.
-            "t5": t5_backend_tok.encode(text).ids,
+            "qwen": [k[0] for k in pairs["qwen3_06b"][0]],
+            # The T5 side keeps its `</s>`, appended by `TemplateProcessing`.
+            # An earlier version added a second one by hand, caught by the
+            # encoder golden disagreeing.
+            "t5": [k[0] for k in pairs["t5xxl"][0]],
         })
     longest = max(fixtures, key=lambda f: len(f["t5"]))
+    # Read off the constructed tokenizer, not off `anima.py`'s argument list.
+    # These go with the fixtures rather than with the Qwen vocabulary, which is
+    # shared with Qwen3-4B and has no business carrying Anima's padding.
+    padding = {
+        "qwenMinLength": anima_tok.qwen3_06b.min_length,
+        "qwenPadToken": anima_tok.qwen3_06b.pad_token,
+        "t5MinLength": anima_tok.t5xxl.min_length,
+        "t5PadToken": anima_tok.t5xxl.pad_token,
+    }
+    print(f"padding: {padding}")
+
     print(f"{len(fixtures)} cases, longest {longest['label']}: "
           f"{len(longest['qwen'])} qwen / {len(longest['t5'])} t5 ids")
 
@@ -210,7 +241,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     for name, blob in (
         ("t5.unigram-vocab.json", t5_vocab),
-        ("tokenizer-fixtures.json", {"cases": fixtures}),
+        ("tokenizer-fixtures.json", {"padding": padding, "cases": fixtures}),
     ):
         out = args.out / name
         out.write_text(json.dumps(blob, ensure_ascii=False))

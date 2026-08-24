@@ -13,8 +13,10 @@ import { fileURLToPath } from "node:url";
 import {
   LATENT,
   SAMPLING,
+  applyCfg,
   betaPpf,
   betaSchedule,
+  cfgEnabled,
   calculateDenoised,
   flowSigmas,
   latentToVae,
@@ -181,6 +183,43 @@ describe("res_multistep", () => {
 
   it("refuses a schedule it cannot step", () => {
     expect(() => resMultistep(toyDenoise, new Float32Array(4), [1.0])).toThrow(/at least two sigmas/);
+  });
+});
+
+describe("CFG", () => {
+  it("interpolates from the unconditional, not from the conditional", () => {
+    const cond = Float32Array.from([2, 4]);
+    const uncond = Float32Array.from([1, 1]);
+    // `uncond + 3 * (cond - uncond)` = [4, 10]. The other convention that keeps
+    // turning up, `cond + 3 * (cond - uncond)`, gives [5, 13] — the same family
+    // of answers one unit of scale further along, which is why it is invisible
+    // except by comparing against the reference.
+    expect(Array.from(applyCfg(cond, uncond, 3))).toEqual([4, 10]);
+    expect(Array.from(applyCfg(cond, uncond, 1))).toEqual(Array.from(cond));
+    expect(Array.from(applyCfg(cond, uncond, 0))).toEqual(Array.from(uncond));
+  });
+
+  it("commutes with the denoising, which is why it runs before it", () => {
+    // ComfyUI applies CFG to the denoised predictions; this port applies it to
+    // the raw model outputs. `x - v * sigma` is affine in `v`, so the two agree
+    // — asserted rather than argued, because the port depends on it.
+    const x = Float32Array.from([0.5, -0.25]);
+    const cond = Float32Array.from([2, 4]);
+    const uncond = Float32Array.from([1, 1]);
+    const sigma = 0.4, scale = 3;
+    const before = calculateDenoised(sigma, applyCfg(cond, uncond, scale), x);
+    const after = applyCfg(
+      calculateDenoised(sigma, cond, x),
+      calculateDenoised(sigma, uncond, x),
+      scale,
+    );
+    expect(maxAbs(before, after)).toBeLessThan(1e-6);
+  });
+
+  it("is off at or below 1.0", () => {
+    expect(cfgEnabled(1.0)).toBe(false);
+    expect(cfgEnabled(0)).toBe(false);
+    expect(cfgEnabled(8)).toBe(true);
   });
 });
 
