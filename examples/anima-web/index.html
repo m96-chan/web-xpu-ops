@@ -29,6 +29,9 @@
   canvas { max-width: 100%; height: auto; border-radius: 8px; background: #1c1f26; display: block; }
   .note { margin-top: 1.5rem; color: #6b7383; font-size: .78rem; }
   code { background: #1c1f26; padding: .1rem .3rem; border-radius: 3px; }
+  #profile-out table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }
+  #profile-out td { padding: .2rem .4rem; border-top: 1px solid #2c313b; }
+  #profile-out td:nth-child(2), #profile-out td:nth-child(3), #profile-out td:nth-child(4) { text-align: right; color: #98a1b3; }
 </style>
 
 <div>
@@ -58,10 +61,15 @@
     <label>CFG <input id="cfg" type="number" min="0" max="30" step="0.5" value="8"></label>
   </div>
   <label>Seed <input id="seed" type="number" value="42"></label>
+  <label style="display:flex; align-items:center; gap:.5rem; margin:.75rem 0 0;">
+    <input id="profile" type="checkbox" style="width:auto; margin:0;">
+    Profile one forward (adds a compute pass per dispatch — read the shares, not the milliseconds)
+  </label>
   <button id="go" disabled>Generate</button>
 
   <p id="status">starting …</p>
   <p id="detail"></p>
+  <div id="profile-out"></div>
 
   <p class="note">
     The seed reproduces this port's own runs, <strong>not</strong> ComfyUI's image

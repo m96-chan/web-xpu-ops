@@ -13,11 +13,16 @@
  * verifier measures in Node — which is visible, since both are held to the same
  * golden.
  *
- * The profiling half of the Node interface (`BatchProfile`, timestamp queries)
- * is left out: nothing here asks for it, and a stub that silently reports
- * nothing would be worse than its absence.
+ * The profiling half is ported too. It was left out at first — "nothing here
+ * asks for it" — and then the page grew a profile checkbox wired to a device
+ * that hardcoded `timestampsSupported: false` and dropped the argument on the
+ * floor. The checkbox did nothing and said nothing, which is the failure mode
+ * the original comment was trying to avoid and reached anyway by being the
+ * only half that was implemented.
  */
-import type { ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
+import type {
+  BatchProfile, ResidentDevice, ResidentOp, ResidentReadback,
+} from "../../../harness/resident.js";
 
 export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   const gpu = (navigator as Navigator & { gpu?: GPU }).gpu;
@@ -25,10 +30,17 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   const adapter = await gpu.requestAdapter();
   if (!adapter) throw new Error("createBrowserResidentDevice: requestAdapter() returned null");
 
+  // Optional, and asked for only when the adapter has it: a `requiredFeatures`
+  // entry the adapter cannot serve makes `requestDevice` reject outright, so a
+  // device without timestamps has to come back working and unprofilable rather
+  // than not come back at all.
+  const timestampsSupported = adapter.features.has("timestamp-query");
+
   // The adapter's own ceiling, for the reason both harnesses give: the spec's
   // defaults are far below what a real checkpoint's projections need, and a
   // fixed number would be a guess about this particular device.
   const device = await adapter.requestDevice({
+    requiredFeatures: timestampsSupported ? ["timestamp-query"] : [],
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -132,7 +144,22 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   async function batch(
     ops: ResidentOp[],
     readback: ResidentReadback[],
+    profile?: BatchProfile,
   ): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
+    // `GPUComputePassTimestampWrites` allows one pair per pass, so a timed
+    // dispatch needs a pass of its own — and so does an *untimed* one next to
+    // it, or a timed pass would span work outside the dispatch it names. That
+    // is why this is opt-in: it turns one pass per batch into one per dispatch.
+    const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
+    const labeledSlots: string[] = [];
+    if (wantsGpuTiming) {
+      profile!.labels!.forEach((label, index) => {
+        if (label != null && ops[index]?.kind === "dispatch") labeledSlots.push(label);
+      });
+    }
+    const queryCount = labeledSlots.length * 2;
+    const querySet = queryCount > 0 ? device.createQuerySet({ type: "timestamp", count: queryCount }) : null;
+
     const encoder = device.createCommandEncoder();
     let pass: GPUComputePassEncoder | null = null;
     const endPass = (): void => {
@@ -142,9 +169,28 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       }
     };
 
-    for (const op of ops) {
+    let queryCursor = 0;
+    for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
-        if (!pass) pass = encoder.beginComputePass();
+        const label = profile?.labels ? (profile.labels[i] ?? null) : null;
+        if (wantsGpuTiming) {
+          endPass();
+          const timeThis = label != null;
+          pass = encoder.beginComputePass(
+            timeThis
+              ? {
+                  timestampWrites: {
+                    querySet: querySet!,
+                    beginningOfPassWriteIndex: queryCursor,
+                    endOfPassWriteIndex: queryCursor + 1,
+                  },
+                }
+              : undefined,
+          );
+          if (timeThis) queryCursor += 2;
+        } else if (!pass) {
+          pass = encoder.beginComputePass();
+        }
         pass.setPipeline(op.pipeline);
         pass.setBindGroup(0, op.bindGroup);
         pass.dispatchWorkgroups(...(op.workgroups as [number, number?, number?]));
@@ -162,14 +208,34 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       encoder.copyBufferToBuffer(r.source, r.sourceOffset, r.staging, 0, r.length * 4);
     }
 
+    let queryReadable: GPUBuffer | null = null;
+    if (querySet) {
+      const resolved = device.createBuffer({
+        size: queryCount * 8,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      });
+      queryReadable = device.createBuffer({
+        size: queryCount * 8,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      // Counted, because `stats.buffersCreated` is meant to be the complete
+      // number a test can snapshot to prove a loop allocates nothing.
+      stats.buffersCreated += 2;
+      encoder.resolveQuerySet(querySet, 0, queryCount, resolved, 0);
+      encoder.copyBufferToBuffer(resolved, 0, queryReadable, 0, queryCount * 8);
+    }
+
     device.pushErrorScope("validation");
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`batch is not valid: ${invalid.message}`);
 
+    const submitT0 = profile ? performance.now() : 0;
     await device.queue.onSubmittedWorkDone();
+    if (profile) profile.sink.submitToDoneMs = performance.now() - submitT0;
 
+    const readbackT0 = profile ? performance.now() : 0;
     const results: (Float32Array | Int32Array | Uint32Array)[] = [];
     for (const r of readback) {
       await r.staging.mapAsync(GPUMapMode.READ);
@@ -179,12 +245,30 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
         r.type === "i32" ? new Int32Array(bytes) : r.type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes),
       );
     }
+    if (profile) profile.sink.readbackMs = performance.now() - readbackT0;
+
+    if (querySet && queryReadable) {
+      await queryReadable.mapAsync(GPUMapMode.READ);
+      const stamps = new BigUint64Array(queryReadable.getMappedRange().slice(0));
+      queryReadable.unmap();
+      const entries: { label: string; seconds: number }[] = [];
+      for (const [k, label] of labeledSlots.entries()) {
+        // Nanoseconds. A zero delta means the driver declined that particular
+        // query rather than a dispatch that really took no time, so it is left
+        // out instead of reported as a duration.
+        const elapsed = stamps[k * 2 + 1]! - stamps[k * 2]!;
+        if (elapsed > 0n) entries.push({ label, seconds: Number(elapsed) / 1e9 });
+      }
+      profile!.sink.gpuEntries = entries;
+      querySet.destroy();
+      queryReadable.destroy();
+    }
     return results;
   }
 
   return {
     stats,
-    timestampsSupported: false,
+    timestampsSupported,
     createStorageBuffer,
     createUniformBuffer,
     upload,

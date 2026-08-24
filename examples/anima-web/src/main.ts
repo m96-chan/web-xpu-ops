@@ -32,7 +32,10 @@ import { type BpeVocab } from "../../../llm/tokenizer-bpe.js";
 import { permuteLayerForRope, type Qwen3LayerWeights } from "../../zimage/src/text-encoder.js";
 import { qwen3EncodeGpu, type Qwen3GpuWeights } from "../../zimage/src/text-encoder-gpu.js";
 import type { AnimaConfig, AnimaInput } from "../../anima/src/dit.js";
-import { animaForwardResident, releaseAnimaWeights, type AnimaWeightSource } from "../../anima/src/dit-resident.js";
+import {
+  animaForwardResident, releaseAnimaWeights,
+  type AnimaProfile, type AnimaWeightSource,
+} from "../../anima/src/dit-resident.js";
 import { permuteForRope } from "../../anima/src/block.js";
 import {
   ADAPTER,
@@ -82,6 +85,8 @@ const sizeSelect = $<HTMLSelectElement>("size");
 const stepsInput = $<HTMLInputElement>("steps");
 const cfgInput = $<HTMLInputElement>("cfg");
 const seedInput = $<HTMLInputElement>("seed");
+const profileBox = $<HTMLInputElement>("profile");
+const profileOut = $<HTMLDivElement>("profile-out");
 
 function say(message: string, extra = ""): void {
   status.textContent = message;
@@ -133,6 +138,38 @@ function draw(image: Float32Array, H: number, W: number): void {
     data.data[i * 4 + 3] = 255;
   }
   context.putImageData(data, 0, 0);
+}
+
+/**
+ * The per-kernel breakdown, as a table under the controls.
+ *
+ * Reported as a share of the profiled forward rather than as seconds alone: the
+ * profiling itself costs passes, so the absolute numbers are larger than the
+ * shipping ones and the proportions are what carry over.
+ */
+function reportProfile(profile: AnimaProfile): void {
+  if (!profile.supported) {
+    profileOut.innerHTML =
+      '<p class="note">This device has no <code>timestamp-query</code>, so there is no GPU breakdown — ' +
+      "not a breakdown of zeros.</p>";
+    return;
+  }
+  if (profile.byKernel.size === 0) {
+    profileOut.innerHTML =
+      '<p class="note">The device has <code>timestamp-query</code> but every query came back zero, ' +
+      "which means the driver declined them. No breakdown, rather than a breakdown of zeros.</p>";
+    return;
+  }
+  const rows = [...profile.byKernel.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
+  const total = rows.reduce((sum, [, v]) => sum + v.seconds, 0);
+  profileOut.innerHTML =
+    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ` +
+    `${rows.reduce((n, [, v]) => n + v.dispatches, 0)} dispatches. Profiling adds a compute pass ` +
+    `per dispatch, so read the shares, not the milliseconds.</p><table>` +
+    rows.map(([name, v]) =>
+      `<tr><td>${name}</td><td>${(v.seconds * 1000).toFixed(1)} ms</td>` +
+      `<td>${((v.seconds / total) * 100).toFixed(1)}%</td><td>${v.dispatches}</td></tr>`).join("") +
+    "</table>";
 }
 
 async function main(): Promise<void> {
@@ -388,6 +425,27 @@ async function main(): Promise<void> {
     const latentH = height / 8;
     const latentW = width / 8;
 
+    /**
+     * Where one forward's GPU time goes, by kernel.
+     *
+     * **Not free**: `batch()` needs a compute pass per timestamp pair, so a
+     * profiled forward runs one pass per dispatch against 55 submits' worth
+     * unprofiled. Only the first forward is profiled, and the numbers are
+     * reported as proportions rather than as the shipping cost.
+     */
+    const wantProfile = profileBox.checked;
+    let profile: AnimaProfile | null = null;
+    profileOut.innerHTML = "";
+    // The profiled forward is the **second** step: the first uploads 3.63 GB
+    // and hydrates the heap, so its timings are the loading cost. One step
+    // therefore has nothing to profile — said here rather than left as a table
+    // that never appears, which is how the first version failed.
+    if (wantProfile && steps < 2) {
+      profileOut.innerHTML =
+        '<p class="note">Profiling needs at least 2 steps — the first forward is the upload, ' +
+        "so the second is the one measured.</p>";
+    }
+
     const started = performance.now();
 
     // --- conditioning ---
@@ -419,8 +477,15 @@ async function main(): Promise<void> {
       const t = timestepOf(sigma);
       const stepStarted = performance.now();
 
-      const forward = async (context: Float32Array): Promise<Float32Array> => {
+      const forward = async (context: Float32Array, first = false): Promise<Float32Array> => {
         const input: AnimaInput = { latent: out, ...shape, t, context };
+        // The *second* step, not the first: the first uploads 3.63 GB and
+        // hydrates the heap, so its timings are the loading cost rather than
+        // the steady-state one.
+        const wanted = wantProfile && first && step === 1;
+        if (wanted && !profile) {
+          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, submitToDoneMs: 0 };
+        }
         return animaForwardResident(
           residentDevice, ditKernels, cfg, ditWeights, input, undefined, held, undefined, undefined,
           // Hydrates the heap a block at a time, from the disk cache. Only the
@@ -431,9 +496,10 @@ async function main(): Promise<void> {
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
           },
+          wanted ? profile ?? undefined : undefined,
         );
       };
-      const cond = await forward(positive);
+      const cond = await forward(positive, true);
       const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
       predictions.push(calculateDenoised(sigma, prediction, out));
 
@@ -480,6 +546,12 @@ async function main(): Promise<void> {
 
     const elapsed = (performance.now() - started) / 1000;
     say("done.", `${width}x${height}, ${sigmas.length - 1} steps, ${elapsed.toFixed(1)}s`);
+    if (profile) reportProfile(profile);
+    else if (wantProfile && steps >= 2) {
+      profileOut.innerHTML =
+        '<p class="note">Profiling was requested and produced nothing, which should not happen — ' +
+        "the second forward did not run.</p>";
+    }
     goButton.disabled = false;
   }
 }

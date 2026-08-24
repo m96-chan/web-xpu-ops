@@ -19,7 +19,7 @@
  * The two are never compared against each other: two ports that drift the same
  * way agree with each other and with nothing else.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
+import type { BatchProfile, BatchProfileSink, ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
@@ -34,6 +34,13 @@ const MAX_WORKGROUPS = 65535;
 interface Slot {
   buffer: GPUBuffer;
   bytes: number;
+}
+
+/** Per-kernel GPU seconds for one forward — see `animaForwardResident`'s `profile`. */
+export interface AnimaProfile {
+  byKernel: Map<string, { seconds: number; dispatches: number }>;
+  supported: boolean;
+  submitToDoneMs: number;
 }
 
 export interface AnimaResidentStats {
@@ -147,6 +154,17 @@ export async function animaForwardResident(
    * resident on the device and the CPU-side arrays are never read again.
    */
   onBeforePrefix?: (prefix: string) => Promise<void>,
+  /**
+   * Where the forward's GPU time went, by kernel.
+   *
+   * Opt-in because it is not free: `batch()` needs a compute pass per timestamp
+   * pair, so asking for a breakdown turns 55 submits' worth of passes into one
+   * per dispatch. Read the numbers as proportions, not as the shipping cost.
+   *
+   * `supported` is false on a device without `timestamp-query`, and the
+   * caller must say "no breakdown" rather than reporting zeros as a duration.
+   */
+  profile?: AnimaProfile,
 ): Promise<Float32Array> {
   const { modelChannels: dim, numHeads, adalnLoraDim, inChannels, patchSpatial, patchTemporal, normEps } = cfg;
   const headDim = dim / numHeads;
@@ -166,6 +184,18 @@ export async function animaForwardResident(
   let ops: ResidentOp[] = [];
   let uploaded = 0;
   let dispatches = 0;
+  /**
+   * One label per recorded dispatch, parallel to `ops`, or `null` when nothing
+   * asked for a breakdown.
+   *
+   * `batch()` ends a compute pass at every non-null label so it can bracket the
+   * dispatch with timestamps (`GPUComputePassTimestampWrites` allows one pair
+   * per pass), so labelling **costs passes**: 3,290 of them against 55 submits'
+   * worth. That is why it is opt-in and why the number it reports is the
+   * profiled shape rather than the shipping one — stated here rather than
+   * discovered from a profile that reads slower than the thing it profiles.
+   */
+  const labels: (string | null)[] | null = profile ? [] : null;
 
   const pipelineFor = async (code: string): Promise<GPUComputePipeline> => {
     let pipeline = pipelines.get(code);
@@ -200,23 +230,83 @@ export async function animaForwardResident(
       );
     }
     const pipeline = await pipelineFor(code);
-    ops.push({ kind: "dispatch", pipeline, bindGroup: await device.bindGroup(pipeline, buffers), workgroups });
-    dispatches += 1;
+    push(
+      { kind: "dispatch", pipeline, bindGroup: await device.bindGroup(pipeline, buffers), workgroups },
+      kernelNames.get(code) ?? "?",
+    );
+  };
+
+  /**
+   * The sink for the batch about to be submitted, and the fold of the one
+   * before it.
+   *
+   * `batch()` writes into the sink it is handed, so a fresh one per batch is
+   * what keeps the numbers from being overwritten; `collect` folds it into the
+   * per-kernel totals once the batch has resolved.
+   */
+  let sink: BatchProfileSink | null = null;
+  const batchProfile = (): BatchProfile | undefined => {
+    if (!labels || !profile) return undefined;
+    sink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    return { labels: [...labels], sink };
+  };
+  const collect = (): void => {
+    if (!sink || !profile) return;
+    profile.submitToDoneMs += sink.submitToDoneMs ?? 0;
+    for (const entry of sink.gpuEntries) {
+      const seen = profile.byKernel.get(entry.label) ?? { seconds: 0, dispatches: 0 };
+      seen.seconds += entry.seconds;
+      seen.dispatches += 1;
+      profile.byKernel.set(entry.label, seen);
+    }
+    sink = null;
+  };
+
+  /**
+   * The **only** way an op enters the batch.
+   *
+   * `labels` is positional against `ops`, so the two have to grow together or
+   * every label after the first gap names the wrong dispatch. They did not:
+   * `copy` was pushed straight onto `ops` in four places and the nulls were
+   * added in a sweep at flush time, which is too late — from the first copy
+   * onward the whole array was off by one.
+   *
+   * That is what produced the profile saying `scores` cost 0.127 ms when it
+   * costs 35 ms measured alone. Not a mistimed dispatch: a misnamed one. The
+   * profiler's own attribution is fine, and `harness/attribution.test.ts`
+   * proves it against a known answer.
+   */
+  const push = (op: ResidentOp, label: string | null): void => {
+    ops.push(op);
+    labels?.push(label);
+    if (op.kind === "dispatch") dispatches += 1;
   };
 
   const flush = async (keep: Slot[], capture?: { name: keyof AnimaTrace; slot: Slot; length: number }): Promise<void> => {
     if (ops.length === 0 && !capture) return;
+    // The invariant `push` exists to keep. Checked rather than trusted: the
+    // version this replaces let them drift and produced a profile that named
+    // the wrong kernels, which is worse than no profile because it reads like
+    // an answer (rule 9).
+    if (labels && labels.length !== ops.length) {
+      throw new Error(
+        `animaForwardResident: ${labels.length} labels against ${ops.length} ops — ` +
+          "a profile built from these would name the wrong dispatches.",
+      );
+    }
     if (trace && capture) {
       const staging = device.createStorageBuffer(capture.length * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       const [read] = await device.batch(ops, [
         { staging, source: capture.slot.buffer, sourceOffset: 0, length: capture.length, type: "f32" },
-      ]);
+      ], batchProfile());
       trace[capture.name] = (read as Float32Array).slice();
       staging.destroy();
     } else if (ops.length > 0) {
-      await device.batch(ops, []);
+      await device.batch(ops, [], batchProfile());
     }
+    collect();
     ops = [];
+    if (labels) labels.length = 0;
     uniformAt = 0;
     pool.release(keep);
   };
@@ -361,13 +451,15 @@ export async function animaForwardResident(
     const step = n <= perDispatch ? n : Math.floor(perDispatch / 64) * 64;
     for (let at = 0; at < n; at += step) {
       const count = Math.min(step, n - at);
-      ops.push({
-        kind: "dispatch",
-        pipeline,
-        bindGroup: await device.bindGroupSliced(pipeline, slice(at, count)),
-        workgroups: [Math.ceil(count / WG)],
-      });
-      dispatches += 1;
+      push(
+        {
+          kind: "dispatch",
+          pipeline,
+          bindGroup: await device.bindGroupSliced(pipeline, slice(at, count)),
+          workgroups: [Math.ceil(count / WG)],
+        },
+        kernelNames.get(code) ?? "?",
+      );
     }
   };
 
@@ -410,18 +502,20 @@ export async function animaForwardResident(
     const pipeline = await pipelineFor(K.rows);
     for (let row = 0; row < S; row += rowsPer) {
       const count = Math.min(rowsPer, S - row);
-      ops.push({
-        kind: "dispatch",
-        pipeline,
-        bindGroup: await device.bindGroupSliced(pipeline, [
-          { buffer: a.buffer, offset: row * rowBytes, size: count * rowBytes },
-          { buffer: b.buffer, offset: 0, size: rowBytes },
-          { buffer: out.buffer, offset: row * rowBytes, size: count * rowBytes },
-          { buffer: uniform(params([["u32", count], ["u32", D], ["u32", kind]])), offset: 0, size: 256 },
-        ]),
-        workgroups: [Math.ceil((count * D) / WG)],
-      });
-      dispatches += 1;
+      push(
+        {
+          kind: "dispatch",
+          pipeline,
+          bindGroup: await device.bindGroupSliced(pipeline, [
+            { buffer: a.buffer, offset: row * rowBytes, size: count * rowBytes },
+            { buffer: b.buffer, offset: 0, size: rowBytes },
+            { buffer: out.buffer, offset: row * rowBytes, size: count * rowBytes },
+            { buffer: uniform(params([["u32", count], ["u32", D], ["u32", kind]])), offset: 0, size: 256 },
+          ]),
+          workgroups: [Math.ceil((count * D) / WG)],
+        },
+        kernelNames.get(K.rows) ?? "rows",
+      );
     }
     return out;
   };
@@ -470,7 +564,7 @@ export async function animaForwardResident(
 
     for (let h0 = 0; h0 < numHeads; h0 += perBatch) {
       const count = Math.min(perBatch, numHeads - h0);
-      ops.push({
+      push({
         kind: "dispatch",
         pipeline: scoresPipeline,
         bindGroup: await device.bindGroupSliced(scoresPipeline, [
@@ -492,8 +586,8 @@ export async function animaForwardResident(
           },
         ]),
         workgroups: [L, count, 1],
-      });
-      ops.push({
+      }, "scores");
+      push({
         kind: "dispatch",
         pipeline: contextPipeline,
         bindGroup: await device.bindGroupSliced(contextPipeline, [
@@ -503,7 +597,7 @@ export async function animaForwardResident(
           { buffer: uniform(params([["u32", count], ["u32", L], ["u32", S], ["u32", headDim]])), offset: 0, size: 256 },
         ]),
         workgroups: [L, count, 1],
-      });
+      }, "context");
       dispatches += 2;
     }
     return out;
@@ -653,7 +747,7 @@ export async function animaForwardResident(
       const biased = await elementwise(projected, adalnLora, 3 * dim, ELEMENTWISE.add);
       const chunk = (at: number): Slot => {
         const out = pool.take(dim);
-        ops.push({ kind: "copy", src: biased.buffer, srcOffset: at * dim * 4, dst: out.buffer, dstOffset: 0, size: dim * 4 });
+        push({ kind: "copy", src: biased.buffer, srcOffset: at * dim * 4, dst: out.buffer, dstOffset: 0, size: dim * 4 }, null);
         return out;
       };
       return { shift: chunk(0), scale: chunk(1), gate: chunk(2) };
@@ -747,12 +841,12 @@ export async function animaForwardResident(
   const finalProjected = await project("net.final_layer.adaln_modulation.2.weight", finalInner, 1, adalnLoraDim, 2 * dim);
   // The LoRA's **first two thirds** — `adaln_lora[:, :, :2*D]` (`predict2.py:381`).
   const loraPrefix = pool.take(2 * dim);
-  ops.push({ kind: "copy", src: adalnLora.buffer, srcOffset: 0, dst: loraPrefix.buffer, dstOffset: 0, size: 2 * dim * 4 });
+  push({ kind: "copy", src: adalnLora.buffer, srcOffset: 0, dst: loraPrefix.buffer, dstOffset: 0, size: 2 * dim * 4 }, null);
   const finalMod = await elementwise(finalProjected, loraPrefix, 2 * dim, ELEMENTWISE.add);
   const finalShift = pool.take(dim);
   const finalScale = pool.take(dim);
-  ops.push({ kind: "copy", src: finalMod.buffer, srcOffset: 0, dst: finalShift.buffer, dstOffset: 0, size: dim * 4 });
-  ops.push({ kind: "copy", src: finalMod.buffer, srcOffset: dim * 4, dst: finalScale.buffer, dstOffset: 0, size: dim * 4 });
+  push({ kind: "copy", src: finalMod.buffer, srcOffset: 0, dst: finalShift.buffer, dstOffset: 0, size: dim * 4 }, null);
+  push({ kind: "copy", src: finalMod.buffer, srcOffset: dim * 4, dst: finalScale.buffer, dstOffset: 0, size: dim * 4 }, null);
 
   const normedFinal = await layernormNoAffine(x, seq, dim);
   const one = weightSlot("#ones", () => new Float32Array(dim).fill(1));
