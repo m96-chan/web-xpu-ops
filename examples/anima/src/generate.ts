@@ -13,17 +13,16 @@
  * | DiT, resident | `verify-forward-gpu.ts` | 1.182e-5 |
  * | schedule and stepper | `sampler.test.ts` | 2e-6 on the trajectory |
  *
- * **There is no VAE yet — issue #174.** Anima decodes with Wan 2.1's 3D causal
- * VAE, which shares nothing with `examples/zimage-vae`'s 2D one:
- * `CausalConv3d`, `RMS_norm` over channels, temporal upsampling. Until it
- * exists this writes the latent out, and renders the 16-to-3 projection
- * `latent_formats.Wan21.latent_rgb_factors` provides — what ComfyUI itself
- * shows as a live preview while sampling.
+ * | VAE decoder (#174) | `verify-vae.ts` | 6.917e-7 |
  *
- * **The preview is not the image the model makes.** It is a linear map at one
- * eighth the resolution, against a decoder with 194 tensors. It shows that a
- * latent has structure, composition and colour, and nothing finer. Judging the
- * model by it would be judging the projection.
+ * The decoder is Wan 2.1's, which is a 3D causal VAE — and for one frame it
+ * reduces exactly to a 2D one, by ComfyUI's own control flow rather than by any
+ * simplification taken here. `vae.ts` sets out why.
+ *
+ * `--preview` also writes the 16-to-3 projection `latent_rgb_factors` provides,
+ * which is what ComfyUI shows while sampling. It is a linear map at one eighth
+ * the resolution and is **not** the model's picture — useful for seeing that a
+ * latent has structure at all, and misleading for anything else.
  *
  *     npx tsx examples/anima/src/generate.ts \
  *       --encoder ~/anima-src/qwen_3_06b_base.safetensors --dit ~/anima-q8 \
@@ -34,6 +33,10 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createResidentDevice } from "../../../harness/resident.js";
 import { encodePng } from "../../zimage-vae/src/render.js";
+import { type VaeWeights, type WanVaeConfig } from "./vae.js";
+import { wanVaeDecodeGpu } from "./vae-gpu.js";
+import { vaeKernels } from "./vae-kernels-node.js";
+import { createRunner } from "../../../harness/wgsl.js";
 import type { BpeVocab } from "../../../llm/tokenizer-bpe.js";
 import { qwen3Encode, type Qwen3LayerWeights, type Qwen3Weights, permuteLayerForRope } from "../../zimage/src/text-encoder.js";
 import { SafetensorsFile } from "../../zimage/src/safetensors.js";
@@ -77,12 +80,14 @@ const number = (name: string, fallback: number): number => {
   return value;
 };
 
+const vaePath = arg("--vae") ?? process.env.ANIMA_VAE;
 const encoderPath = arg("--encoder") ?? process.env.ANIMA_ENCODER;
 const ditDir = arg("--dit") ?? process.env.ANIMA_DIT_DIR;
 if (!encoderPath || !ditDir) {
   console.error(
     "generate: pass --encoder <qwen_3_06b_base.safetensors> --dit <convert_dit.py output dir>\n" +
-      "  [--prompt <text>] [--negative <text>] [--steps N] [--cfg N] [--width N] [--height N] [--seed N] [--out path]",
+      "  [--vae <qwen_image_vae.safetensors>] [--prompt <text>] [--negative <text>] [--steps N] [--cfg N]\n" +
+      "  [--width N] [--height N] [--seed N] [--out path] [--preview]",
   );
   process.exit(2);
 }
@@ -393,33 +398,85 @@ await device.destroy();
 
 // --- output ---
 const forVae = latentToVae(sampled);
-mkdirSync(dirname(`${outPath}.bin`) || ".", { recursive: true });
-writeFileSync(`${outPath}.bin`, Buffer.from(forVae.buffer, forVae.byteOffset, forVae.byteLength));
+mkdirSync(dirname(`${outPath}.png`) || ".", { recursive: true });
+
+if (vaePath) {
+  console.log(`\ndecoding with ${vaePath}`);
+  const runner = await createRunner();
+  if (!runner) throw new Error("generate: --vae given but no WebGPU adapter is available");
+  const vaeFile = new SafetensorsFile(vaePath);
+  const vaeCache = new Map<string, Float32Array>();
+  const vaeWeights: VaeWeights = {
+    get(name) {
+      const cached = vaeCache.get(name);
+      if (cached) return cached;
+      const value = vaeFile.read(name);
+      vaeCache.set(name, value);
+      return value;
+    },
+    has(name) {
+      try {
+        vaeFile.read(name);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+  // Read off the checkpoint, not transcribed — the same rule the DiT's config
+  // follows. `dimMult` and `numResBlocks` are `WanVAE`'s defaults and are
+  // checked against `decoder.conv1`'s width rather than trusted.
+  const vaeCfg: WanVaeConfig = {
+    dim: vaeWeights.get("decoder.head.2.weight").length / (3 * 27),
+    zDim: LATENT.channels,
+    dimMult: [1, 2, 4, 4],
+    numResBlocks: 2,
+  };
+  const firstWidth = vaeWeights.get("decoder.conv1.bias").length;
+  if (vaeCfg.dim * vaeCfg.dimMult[vaeCfg.dimMult.length - 1]! !== firstWidth) {
+    throw new Error(
+      `generate: decoder.conv1 gives ${firstWidth} channels but dim ${vaeCfg.dim} x ` +
+        `${vaeCfg.dimMult[vaeCfg.dimMult.length - 1]} is not that — this VAE is not the shape assumed here`,
+    );
+  }
+
+  const vaeStarted = Date.now();
+  const image = await wanVaeDecodeGpu(
+    runner.run, vaeKernels(), vaeCfg, vaeWeights, forVae, latentH, latentW, undefined,
+    (label, done, total) => process.stdout.write(`\r  ${label.padEnd(22)} ${done}/${total}   `),
+  );
+  process.stdout.write("\n");
+  runner.destroy?.();
+  console.log(`  decoded in ${((Date.now() - vaeStarted) / 1000).toFixed(1)}s`);
+
+  writeFileSync(`${outPath}.png`, encodePng(image, height, width));
+  console.log(`\nwrote ${outPath}.png (${width}x${height})`);
+} else {
+  writeFileSync(`${outPath}.bin`, Buffer.from(forVae.buffer, forVae.byteOffset, forVae.byteLength));
+  console.log(`\nwrote ${outPath}.bin (${(forVae.byteLength / 1e6).toFixed(1)} MB, ${LATENT.channels}x${latentH}x${latentW}, VAE input)`);
+  console.log("No image: pass --vae <qwen_image_vae.safetensors> to decode.");
+}
+
 writeFileSync(
   `${outPath}.json`,
   JSON.stringify({ prompt, negative, steps: sigmas.length - 1, guidance, width, height, seed, shape, channels: LATENT.channels }, null, 1),
 );
-console.log(`\nwrote ${outPath}.bin (${(forVae.byteLength / 1e6).toFixed(1)} MB, ${LATENT.channels}x${latentH}x${latentW}, VAE input)`);
-console.log(`      ${outPath}.json`);
 
-// The 16-to-3 projection ComfyUI shows while sampling — `latent_rgb_factors`
-// applied to the raw latent, before `process_out`. It is one eighth of the
-// resolution and a linear map, so it shows composition and colour and nothing
-// finer. It is **not** the model's image, and is written under a name that says
-// so rather than under `${outPath}.png`.
-const preview = new Float32Array(3 * latentH * latentW);
-for (let i = 0; i < latentH * latentW; i += 1) {
-  for (let c = 0; c < 3; c += 1) {
-    let sum = LATENT.rgbBias[c]!;
-    for (let ch = 0; ch < LATENT.channels; ch += 1) {
-      sum += sampled[ch * latentH * latentW + i]! * LATENT.rgbFactors[ch * 3 + c]!;
+if (process.argv.includes("--preview")) {
+  // The 16-to-3 projection ComfyUI shows while sampling — `latent_rgb_factors`
+  // applied to the raw latent, before `process_out`. One eighth of the
+  // resolution and a matrix multiply, so it shows composition and colour and
+  // nothing finer. Written under a name that says so.
+  const preview = new Float32Array(3 * latentH * latentW);
+  for (let i = 0; i < latentH * latentW; i += 1) {
+    for (let c = 0; c < 3; c += 1) {
+      let sum = LATENT.rgbBias[c]!;
+      for (let ch = 0; ch < LATENT.channels; ch += 1) {
+        sum += sampled[ch * latentH * latentW + i]! * LATENT.rgbFactors[ch * 3 + c]!;
+      }
+      preview[c * latentH * latentW + i] = sum * 2;
     }
-    preview[c * latentH * latentW + i] = sum * 2;
   }
+  writeFileSync(`${outPath}.preview.png`, encodePng(preview, latentH, latentW));
+  console.log(`      ${outPath}.preview.png (${latentW}x${latentH}, the latent's RGB projection — not the image)`);
 }
-writeFileSync(`${outPath}.preview.png`, encodePng(preview, latentH, latentW));
-console.log(`      ${outPath}.preview.png (${latentW}x${latentH}, the latent's RGB projection — not the image)`);
-console.log(
-  "\nNo decoded image: Anima uses Wan 2.1's 3D causal VAE, which this repository\n" +
-    "does not have yet. The .bin above is exactly what that decoder takes.",
-);

@@ -21,6 +21,18 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- **Anima-3.8B produces an image** (issue #174). Wan 2.1's VAE decoder matches
+  ComfyUI's at rel-RMS 6.917e-7 on the GPU and 4.669e-7 on the CPU, and
+  `generate.ts --vae` writes a PNG.
+
+  No `conv3d` was needed, and that is a derivation rather than a shortcut. For a
+  single frame `WanVAE.decode` computes `iter_ = 1`, so no frame cache exists;
+  `CausalConv3d` takes its `x.shape[2] == 1` fast path, which truncates the
+  weight to its last temporal tap; and `Resample`'s `time_conv` lives entirely
+  inside the cache branch and never runs. What is left is Conv2d, an RMS norm
+  over channels, SiLU, nearest 2x upsampling and one single-head attention —
+  every one an op this repository already had.
+
 - Anima-3.8B generates a latent from a prompt on the GPU
   (`examples/anima/src/generate.ts`), and the whole loop is checked against the
   same loop in torch step by step — final rel-RMS 3.274e-3 over 8 steps from the
