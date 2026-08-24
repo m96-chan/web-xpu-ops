@@ -102,6 +102,17 @@ export interface Qwen3Weights {
   numLayers: number;
   /** One layer, already permuted for `ops/rope` — see `permuteLayerForRope`. */
   layer(index: number): Qwen3LayerWeights;
+  /**
+   * `model.norm`, applied after the last layer — **optional, and absent for
+   * Z-Image**, which reads `hidden_states[-2]` from before it.
+   *
+   * Anima's Qwen3-0.6B is the other case: `Qwen3_06BModel` asks for
+   * `layer="last"`, which `sd1_clip.py:281` takes from `outputs[0]`, and that
+   * is after `model.norm` because `final_norm` is True. The two conventions
+   * differ by one RMSNorm and by nothing else, so the difference is a weight
+   * that is either supplied or not rather than a second copy of the loop.
+   */
+  finalNorm?: Float32Array;
 }
 
 /** `nn.Linear` without bias — Qwen3 sets `attention_bias: false` throughout. */
@@ -223,6 +234,11 @@ export function qwen3Encode(cfg: Qwen3Config, weights: Qwen3Weights, tokenIds: I
     hidden = elementwise({ a: hidden, b: down, kind: ELEMENTWISE.add });
   }
 
-  // No `model.norm` and no LM head: `hidden_states[-2]` is taken before both.
+  // `model.norm` when the caller supplies it, never the LM head. Z-Image takes
+  // `hidden_states[-2]`, from before both; Anima takes the last layer, from
+  // after the norm.
+  if (weights.finalNorm) {
+    hidden = rmsnorm({ input: hidden, weight: weights.finalNorm, N: seq, D: hiddenSize, eps: rmsNormEps });
+  }
   return hidden;
 }

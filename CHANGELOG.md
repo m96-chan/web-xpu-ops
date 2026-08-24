@@ -21,6 +21,19 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B's conditioning path (`examples/anima/src/text-encoder.ts`) matches
+  the model at rel-RMS 9.775e-7 — Qwen3-0.6B, then the `llm_adapter` that ships
+  inside the DiT checkpoint. Two tokenizers run over the same prompt: the Qwen
+  ids condition the 0.6B whose hidden states become the adapter's keys, and T5
+  ids index the adapter's own embedding table to become its queries. The T5
+  model itself is never loaded.
+
+  The encoder is **not** quantized, and that is measured rather than stylistic:
+  q8 on its 196 layer matrices moves its output by rel-RMS 0.223, against 0.028
+  for the adapter and 0.040 for the whole 52-block DiT. A 0.6B has one absmax
+  scale per 1024 numbers to spend and its outlier channels do not fit in it;
+  0.6 GB saved is not worth conditioning on different words.
+
 - Anima-3.8B's DiT runs resident on the device (`examples/anima/src/dit-resident.ts`),
   matching the model's own forward at 1.182e-5 against its quantized weights —
   against 4.018e-2, measured separately in torch, for what q8 itself costs over
