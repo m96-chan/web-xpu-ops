@@ -9,6 +9,23 @@ out of a checkpoint header (reproduce with `tools/read_checkpoint.py`) or a
 quotation from the reference implementation. Where neither exists, it says
 **unmeasured**.
 
+## What #170 measured, and what it overturned
+
+Three of the claims below turned out to be wrong, and they are corrected here
+rather than edited away: a spike is a record of what was believed from reading,
+and the value of keeping it is being able to see where reading was not enough.
+
+| claim below | what running it says |
+| --- | --- |
+| RoPE splits `head_dim` **44 / 44 / 40** | **44 / 42 / 42**. The formula is right; `dim_h = dim // 6 * 2` is 42 for head_dim 128, not 44. Arithmetic done by eye. |
+| whether `ops/rope` can express the DiT's 2x2 matrices is **unresolved**, and "the one place a new kernel looks plausible" | **It can, and no new kernel was written.** The matrices satisfy `a == d`, `b == -c`, determinant 1 — the same rotation `ops/rope` applies. What the spike missed is that the three axes do **not share a base**: h and w carry an extrapolation ratio of 4.0 against t's 1.0, so their bases are 42870.9 against 10000. `ops/rope`'s `axes` entry takes one base per dispatch, so the head is dispatched three times with the other two axes' positions zeroed. |
+| `text-encoder.ts` **does not transfer**; Qwen3.5's hybrid `SSMBlock` needs a new kernel (#173) | It transfers. The released workflow's own node builds its second conditioning as `native + strength * (expanded - native)`, and calls strength 0.0 "native Anima" — so `native` is **Qwen3-0.6B**, which `text-encoder.ts` runs with a config change and one optional final norm. #173's scan is what the `expanded` residual needs, and nothing on the path to an image does. |
+
+A fourth is narrower: **F8_E4M3 reading is not needed** either. The encoder the
+native path loads is `qwen_3_06b_base.safetensors`, which is BF16 throughout.
+
+The port is `examples/anima`, and its README carries the numbers.
+
 ## Reproducing the shapes
 
 ```bash
@@ -109,7 +126,8 @@ the right shape and different contents — the same failure mode that
 
 `position_embedding.py:83-93` splits `head_dim` as `dim_h = dim // 6 * 2`,
 `dim_w = dim_h`, `dim_t = dim - 2 * dim_h` — for head_dim 128 that is
-**44 / 44 / 40**, against Z-Image's `[32, 48, 48]`. Both are three-axis;
+~~**44 / 44 / 40**~~ **44 / 42 / 42** (`128 // 6 * 2` is 42, not 44; corrected
+above), against Z-Image's `[32, 48, 48]`. Both are three-axis;
 `ops/rope`'s `axes` entry takes the split as a parameter, so this is
 configuration rather than a missing kernel.
 
@@ -121,8 +139,11 @@ Two things are genuinely different and need care in #170:
   used it for Qwen3. Note that it is used by the **LLM adapter**; the DiT's own
   blocks take `rope_emb` from `VideoRopePosition3DEmb`, which builds explicit
   2×2 rotation matrices (`position_embedding.py:151-163`) rather than cos/sin
-  pairs. **Whether `ops/rope` can express that form is unresolved** — it is the
-  one place in this spike where a new kernel looks plausible.
+  pairs. ~~**Whether `ops/rope` can express that form is unresolved** — it is the
+  one place in this spike where a new kernel looks plausible.~~ **It can** — see
+  the corrections above; the matrices are the same rotation, and no new kernel
+  was written. The thing to carry into #170 is the *per-axis base*, which this
+  spike did not notice.
 - **The three buffers in the checkpoint** — `dim_spatial_range [21]`,
   `dim_temporal_range [22]`, `seq [256]` — are not learned parameters. They are
   `register_buffer(..., persistent=False)` values (`:85-93`) that happen to have
@@ -211,8 +232,16 @@ look at reads as a completeness claim:
 
 ## Qwen3.5 is not Qwen3, and this is the part that needs new kernels
 
-`examples/zimage/src/text-encoder.ts` **does not transfer**. Qwen3.5 is a
-**hybrid state-space model**, not a stack of attention blocks.
+> **Corrected by #170.** Everything in this section is true *of Qwen3.5*, and
+> Qwen3.5 is not on the path to an image. The released workflow's own node
+> (`prompt.py:219`) builds its second conditioning as `native + strength *
+> (expanded - native)` and describes strength 0.0 as "native Anima": `native` is
+> **Qwen3-0.6B**, and `text-encoder.ts` runs it with a config change and one
+> optional final norm. What follows is what #173 needs for the `expanded`
+> residual, not what a port needs to generate.
+
+`examples/zimage/src/text-encoder.ts` **does not transfer** *to Qwen3.5*. It is
+a **hybrid state-space model**, not a stack of attention blocks.
 `text_encoder/layers.py:248-280`'s `HybridBlock` chooses per layer:
 
 ```python
