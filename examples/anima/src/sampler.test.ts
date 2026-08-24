@@ -186,6 +186,37 @@ describe("res_multistep", () => {
   });
 });
 
+describe("the latent's RGB projection", () => {
+  it("is 48 real numbers", () => {
+    // The observation point that was missing. A generated array literal came
+    // out with `0.2932,,` — a doubled comma — and an elision in an array
+    // literal is legal TypeScript, so `tsc` said nothing. `Float32Array.from`
+    // turns the hole into NaN, every projected pixel became NaN, and the
+    // preview clamped to a perfectly black image that looked exactly like a
+    // model producing nothing.
+    expect(LATENT.rgbFactors.length).toBe(LATENT.channels * 3);
+    expect(LATENT.rgbBias.length).toBe(3);
+    expect(Array.from(LATENT.rgbFactors).every(Number.isFinite)).toBe(true);
+    expect(Array.from(LATENT.rgbBias).every(Number.isFinite)).toBe(true);
+  });
+
+  it("projects a latent to something with contrast in it", () => {
+    // Not just finite: a table of zeros is finite too, and would give the same
+    // black image. A varying latent has to come out varying.
+    const latent = Float32Array.from({ length: LATENT.channels * 64 }, (_, i) => Math.sin(i * 0.7));
+    const px: number[] = [];
+    for (let i = 0; i < 64; i += 1) {
+      for (let c = 0; c < 3; c += 1) {
+        let sum = LATENT.rgbBias[c]!;
+        for (let ch = 0; ch < LATENT.channels; ch += 1) sum += latent[ch * 64 + i]! * LATENT.rgbFactors[ch * 3 + c]!;
+        px.push(sum);
+      }
+    }
+    expect(px.every(Number.isFinite)).toBe(true);
+    expect(Math.max(...px) - Math.min(...px)).toBeGreaterThan(0.5);
+  });
+});
+
 describe("CFG", () => {
   it("interpolates from the unconditional, not from the conditional", () => {
     const cond = Float32Array.from([2, 4]);
