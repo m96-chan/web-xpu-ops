@@ -21,6 +21,19 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima's DiT uses `ops/flash_attention` where it used `scores` + `context`
+  (issue #177). The forward goes from 8.31 s to 7.72 s at 832x1216, and the
+  `[H, L, S]` score matrix stops existing: self-attention was materialising
+  0.50 GB of it per dispatch, with a 512 MB budget cutting the heads into
+  batches to make it fit.
+
+  **Fusing is not why anything got faster, and it barely did.** Measured on
+  their own at both shapes this model uses, the fused kernel is 1.1x the split
+  pair, and both sit at 1.5-1.8% of this device's measured roofline of 50.7
+  TFLOP/s. The score matrix was never the constraint. What is, is the inner
+  loop both share — one thread per output, no register tiling — which is what
+  #177 is now about.
+
 - **Anima-3.8B in a browser** (`examples/anima-web`, issue #170 stage 6). The
   same pipeline as `examples/anima`, with weights over HTTP `Range` into the
   browser's disk cache and the DiT resident between steps.

@@ -547,13 +547,48 @@ export async function animaForwardResident(
   /**
    * Attention over all heads, `L` queries against `S` keys.
    *
-   * Batched by a VRAM budget rather than taken whole: the scores are
-   * `H * L * S` floats on the device, and at a large image that is gigabytes
-   * next to the weights.
+   * `ops/flash_attention` when the caller supplies its kernel, and the
+   * `scores` + `context` pair otherwise. Both compute the same function —
+   * that is what `ops/flash_attention`'s own tests hold it to — and the
+   * difference is what they leave on the device.
+   *
+   * **Measured, because the obvious expectation was wrong.** Fusing does not
+   * make this faster in any way worth the word: at both shapes this model uses
+   * it is 1.1x, and both sit at 1.5-1.8% of this device's measured roofline.
+   * The split path's `[H, L, S]` score matrix was never the constraint; the
+   * inner loop that both share is (#177).
+   *
+   * What it *does* buy is the buffer. Self-attention at 832x1216 is 8 heads x
+   * 3952 x 3952 floats = 0.50 GB of scores, and `SCORE_BUDGET` exists solely to
+   * cut that into pieces that fit. The fused kernel materialises none of it, so
+   * the budget, the head batching and the pool slot all stop existing.
    */
   const SCORE_BUDGET = 512 * 1024 * 1024;
   const attention = async (q: Slot, k: Slot, v: Slot, L: number, S: number): Promise<Slot> => {
     const out = pool.take(numHeads * L * headDim);
+
+    if (K.flashAttention) {
+      // One dispatch for every head at once. `[L, H, B]` is the op's own
+      // grid, and an additive bias of zeros is what "no mask" means here —
+      // `ops/attention`'s convention, inherited rather than restated.
+      await record(
+        K.flashAttention,
+        [
+          q.buffer, k.buffer, v.buffer, zeroBias, out.buffer,
+          uniform(
+            params([
+              ["u32", numHeads], ["u32", L], ["u32", S], ["u32", headDim], ["u32", headDim],
+              ["f32", 1 / Math.sqrt(headDim)],
+              ["u32", 0], ["i32", 0],
+              ["u32", 1], ["u32", 1], ["u32", 1],
+            ]),
+          ),
+        ],
+        [L, numHeads, 1],
+      );
+      return out;
+    }
+
     const perHead = L * S * 4;
     const perBatch = Math.max(1, Math.min(numHeads, Math.floor(SCORE_BUDGET / Math.max(perHead, 1))));
     const qBytes = L * headDim * 4;
@@ -598,6 +633,7 @@ export async function animaForwardResident(
         ]),
         workgroups: [L, count, 1],
       }, "context");
+
       dispatches += 2;
     }
     return out;

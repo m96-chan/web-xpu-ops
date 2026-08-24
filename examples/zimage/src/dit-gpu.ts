@@ -97,6 +97,16 @@ export interface DitKernels {
   permute: string;
   scores: string;
   context: string;
+  /**
+   * `ops/flash_attention` — the same function as `scores` + `context` in one
+   * dispatch, with the `[B, H, L, S]` score matrix never materialised.
+   *
+   * Optional because `dit-gpu.ts` does not use it and Z-Image's own path
+   * predates it. `dit-resident.ts` prefers it when present; see its
+   * `attention` for what it is worth (measured: 1.1x the speed, and 0.50 GB of
+   * scores that stop existing).
+   */
+  flashAttention?: string;
 }
 
 /** The kernel names, so both loaders fetch the same set. */
@@ -112,6 +122,7 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "scores", op: "attention", entry: "scores" },
   { key: "context", op: "attention", entry: "context" },
+  { key: "flashAttention", op: "flash_attention", entry: "kernel" },
 ];
 
 const WG = 256;

@@ -12,6 +12,11 @@
  * sheet — WebGPU exposes no clock and no compute-unit count, so there is
  * nothing to compute a theoretical peak from (rule 9).
  *
+ * `ops/flash_attention` is timed beside them, because it computes the same
+ * function in one dispatch without ever materialising `[B, H, L, S]` — the
+ * comparison this repository already had and that `examples/anima` was not
+ * using.
+ *
  *     npx tsx ops/attention/tools/bench.ts [--L 3952] [--S 3952] [--D 128] [--heads 16]
  */
 import { readFileSync } from "node:fs";
@@ -31,6 +36,8 @@ const repeats = arg("--repeats", 3);
 
 const read = (name: string): string =>
   readFileSync(fileURLToPath(new URL(`../wgsl/${name}.wgsl`, import.meta.url)), "utf8");
+const readFlash = (): string =>
+  readFileSync(fileURLToPath(new URL("../../flash_attention/wgsl/kernel.wgsl", import.meta.url)), "utf8");
 
 const runner = await createRunner();
 if (!runner) {
@@ -95,11 +102,33 @@ const contextDispatch: Dispatch = {
   workgroups: [L, heads, 1],
 };
 
+// One dispatch, no `[B, H, L, S]` anywhere. An additive bias of zeros is what
+// "no mask" is, matching `ops/attention`'s own convention.
+const flashDispatch: Dispatch = {
+  code: readFlash(),
+  bindings: [
+    { kind: "storage", data: q },
+    { kind: "storage", data: k },
+    { kind: "storage", data: v },
+    { kind: "storage", data: new Float32Array(S) },
+    { kind: "out", type: "f32", length: heads * L * D },
+    {
+      kind: "uniform",
+      data: params([
+        ["u32", heads], ["u32", L], ["u32", S], ["u32", D], ["u32", D],
+        ["f32", 1 / Math.sqrt(D)], ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
+      ]),
+    },
+  ],
+  workgroups: [L, heads, 1],
+};
+
 // `time()` reads a timestamp query written around the compute pass. Wall clock
 // here would measure buffer creation and the readback round trip — about a
 // millisecond, several times a real dispatch (`Runner.time`'s own doc).
 const scoresSeconds = await best("scores", () => runner.time(scoresDispatch));
 const contextSeconds = await best("context", () => runner.time(contextDispatch));
+const flashSeconds = await best("flash", () => runner.time(flashDispatch));
 
 runner.destroy?.();
 
@@ -107,7 +136,11 @@ runner.destroy?.();
 const flops = 2 * heads * L * S * D;
 console.log(`  each is ${(flops / 1e12).toFixed(2)} TFLOP of multiply-add\n`);
 console.log("  kernel      seconds     TFLOP/s   share of the measured roofline");
-for (const [label, seconds] of [["scores", scoresSeconds], ["context", contextSeconds]] as const) {
+for (const [label, seconds] of [
+  ["scores", scoresSeconds], ["context", contextSeconds],
+  ["split total", scoresSeconds !== null && contextSeconds !== null ? scoresSeconds + contextSeconds : null],
+  ["flash", flashSeconds],
+] as const) {
   if (seconds === null) continue;
   const achieved = flops / seconds;
   const share = roof ? `${((achieved / roof.compute) * 100).toFixed(1)}%` : "unavailable";
@@ -115,6 +148,9 @@ for (const [label, seconds] of [["scores", scoresSeconds], ["context", contextSe
     `  ${label.padEnd(9)} ${seconds.toFixed(4).padStart(9)} ${(achieved / 1e12).toFixed(2).padStart(11)} ${share.padStart(9)}`,
   );
 }
-if (scoresSeconds !== null && contextSeconds !== null) {
-  console.log(`\n  context / scores = ${(contextSeconds / scoresSeconds).toFixed(1)}x`);
+if (scoresSeconds !== null && contextSeconds !== null && flashSeconds !== null) {
+  const split = scoresSeconds + contextSeconds;
+  console.log(`\n  split (scores + context) / flash = ${(split / flashSeconds).toFixed(1)}x`);
+  const probsBytes = heads * L * S * 4;
+  console.log(`  the split path also materialises ${(probsBytes / 1e9).toFixed(2)} GB of scores; flash materialises none`);
 }
