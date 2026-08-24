@@ -147,7 +147,7 @@ function draw(image: Float32Array, H: number, W: number): void {
  * profiling itself costs passes, so the absolute numbers are larger than the
  * shipping ones and the proportions are what carry over.
  */
-function reportProfile(profile: AnimaProfile): void {
+function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: number): void {
   if (!profile.supported) {
     profileOut.innerHTML =
       '<p class="note">This device has no <code>timestamp-query</code>, so there is no GPU breakdown — ' +
@@ -162,10 +162,18 @@ function reportProfile(profile: AnimaProfile): void {
   }
   const rows = [...profile.byKernel.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
   const total = rows.reduce((sum, [, v]) => sum + v.seconds, 0);
+  const counted = rows.reduce((n, [, v]) => n + v.dispatches, 0);
+  const coverage = (total / wallSeconds) * 100;
+  // Coverage is what caught the last wrong answer: a profile that timed 78% of
+  // the forward reported shares of a partial total as though they were shares
+  // of the whole. Under about 90% here, the table is not a breakdown of this
+  // forward and should not be read as one.
+  const warn = coverage < 90
+    ? ' <strong>Under 90% — this is not a breakdown of the whole forward.</strong>'
+    : "";
   profileOut.innerHTML =
-    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ` +
-    `${rows.reduce((n, [, v]) => n + v.dispatches, 0)} dispatches. Profiling adds a compute pass ` +
-    `per dispatch, so read the shares, not the milliseconds.</p><table>` +
+    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ${counted} of ` +
+    `${dispatches} dispatches — ${coverage.toFixed(0)}% of that step's ${(wallSeconds * 1000).toFixed(0)} ms.${warn}</p><table>` +
     rows.map(([name, v]) =>
       `<tr><td>${name}</td><td>${(v.seconds * 1000).toFixed(1)} ms</td>` +
       `<td>${((v.seconds / total) * 100).toFixed(1)}%</td><td>${v.dispatches}</td></tr>`).join("") +
@@ -435,6 +443,8 @@ async function main(): Promise<void> {
      */
     const wantProfile = profileBox.checked;
     let profile: AnimaProfile | null = null;
+    let profiledWallSeconds = 0;
+    let profiledDispatches = 0;
     profileOut.innerHTML = "";
     // The profiled forward is the **second** step: the first uploads 3.63 GB
     // and hydrates the heap, so its timings are the loading cost. One step
@@ -486,8 +496,12 @@ async function main(): Promise<void> {
         if (wanted && !profile) {
           profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, submitToDoneMs: 0 };
         }
-        return animaForwardResident(
-          residentDevice, ditKernels, cfg, ditWeights, input, undefined, held, undefined, undefined,
+        const stats = wanted
+          ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
+          : undefined;
+        const forwardStart = wanted ? performance.now() : 0;
+        const result = await animaForwardResident(
+          residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
           // Hydrates the heap a block at a time, from the disk cache. Only the
           // first forward does any work here: after it the weights live on the
           // device and `held` answers instead.
@@ -498,6 +512,11 @@ async function main(): Promise<void> {
           },
           wanted ? profile ?? undefined : undefined,
         );
+        if (wanted && stats) {
+          profiledWallSeconds = (performance.now() - forwardStart) / 1000;
+          profiledDispatches = stats.dispatches;
+        }
+        return result;
       };
       const cond = await forward(positive, true);
       const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
@@ -546,7 +565,7 @@ async function main(): Promise<void> {
 
     const elapsed = (performance.now() - started) / 1000;
     say("done.", `${width}x${height}, ${sigmas.length - 1} steps, ${elapsed.toFixed(1)}s`);
-    if (profile) reportProfile(profile);
+    if (profile) reportProfile(profile, profiledWallSeconds, profiledDispatches);
     else if (wantProfile && steps >= 2) {
       profileOut.innerHTML =
         '<p class="note">Profiling was requested and produced nothing, which should not happen — ' +
