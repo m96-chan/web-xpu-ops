@@ -21,6 +21,69 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B generates a latent from a prompt on the GPU
+  (`examples/anima/src/generate.ts`), and the whole loop is checked against the
+  same loop in torch step by step — final rel-RMS 3.274e-3 over 8 steps from the
+  same noise and the same conditioning. There is no image yet: Anima decodes
+  with Wan 2.1's 3D causal VAE, tracked as issue #174. The page writes the
+  latent and the 16-to-3 projection ComfyUI shows as a live preview.
+
+  `convert_dit.py` now records the model's configuration in its manifest, read
+  by `detect_unet_config` rather than transcribed. Before this a runtime had to
+  be told the shape out of band, and the only place carrying it was a test
+  fixture.
+
+- Anima-3.8B's two tokenizers (`examples/anima/src/tokenize.ts`), matching
+  `transformers` and `tokenizers` on 23 cases each. `llm/tokenizer.ts` grows one
+  path it did not have: a model with `byteFallback` off now emits `unk_id` for a
+  codepoint no piece covers, merging adjacent ones as SentencePiece does,
+  instead of throwing. Before this it refused any prompt containing one unusual
+  character.
+
+  T5's `Precompiled` normalizer is a 316 kB charsmap, and the port does not
+  carry it. `tools/gen_tokenizer_data.py` compares it against NFKC at every
+  codepoint in the BMP and emits the 51 that differ as a table — 31 of them
+  control characters, where the charsmap maps tab and newline to a space and
+  NFKC does not. So the port is the engine's own `String.normalize("NFKC")`
+  plus a measured exception list, derived on every run rather than transcribed.
+
+- Anima-3.8B's sampler (`examples/anima/src/sampler.ts`) — the `beta` schedule
+  and `res_multistep`, matched step by step against ComfyUI's own on a toy
+  denoiser. It is not Z-Image's sampler with different numbers: that one takes
+  Euler steps down a linear schedule, this one inverts a Beta(0.6, 0.6) CDF onto
+  a 1000-entry table and takes second-order exponential multistep steps.
+
+  `multiplier` is 1.0 where `ModelSamplingDiscreteFlow` defaults to 1000, so the
+  DiT is handed sigma itself rather than sigma times a thousand. The table
+  cannot catch a wrong multiplier — it cancels there — so `timestepOf` is where
+  it is pinned.
+
+- Anima-3.8B's conditioning path (`examples/anima/src/text-encoder.ts`) matches
+  the model at rel-RMS 9.775e-7 — Qwen3-0.6B, then the `llm_adapter` that ships
+  inside the DiT checkpoint. Two tokenizers run over the same prompt: the Qwen
+  ids condition the 0.6B whose hidden states become the adapter's keys, and T5
+  ids index the adapter's own embedding table to become its queries. The T5
+  model itself is never loaded.
+
+  The encoder is **not** quantized, and that is measured rather than stylistic:
+  q8 on its 196 layer matrices moves its output by rel-RMS 0.223, against 0.028
+  for the adapter and 0.040 for the whole 52-block DiT. A 0.6B has one absmax
+  scale per 1024 numbers to spend and its outlier channels do not fit in it;
+  0.6 GB saved is not worth conditioning on different words.
+
+- Anima-3.8B's DiT runs resident on the device (`examples/anima/src/dit-resident.ts`),
+  matching the model's own forward at 1.182e-5 against its quantized weights —
+  against 4.018e-2, measured separately in torch, for what q8 itself costs over
+  52 blocks. One forward takes 0.2 s once the 4.94 GB of weights are resident,
+  against 814 s for the CPU port of the same forward.
+
+  Anima's three rope axes do not share a base (t=10000, h/w=42870.9, from an
+  extrapolation ratio of 4.0) and `ops/rope`'s `axes` entry takes one base per
+  dispatch. Rather than gathering each axis's channels out of every head, the
+  whole head is dispatched three times with the other two axes' positions set to
+  zero: an angle of zero is the identity whatever base is in force, so each pass
+  rotates one axis and leaves the rest as it found them.
+
 - The DiT's activations stay on the device (`dit-resident.ts`). The per-dispatch
   path moved 28.57 GB up and 19.85 GB back per forward at 1,039 tokens, of which
   only 6.17 GB was weights; the rest was activations going out to the CPU and
