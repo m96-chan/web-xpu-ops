@@ -103,7 +103,12 @@ def main() -> None:
     handles = [
         model.blocks[0].register_forward_hook(lambda _m, _i, o: captured.__setitem__("afterBlock0", o)),
         model.blocks[-1].register_forward_hook(lambda _m, _i, o: captured.__setitem__("afterBlocks", o)),
-        model.t_embedder.register_forward_hook(lambda _m, _i, o: captured.__setitem__("tEmbed", o[0] if isinstance(o, tuple) else o)),
+        # `t_embedder` is an `nn.Sequential` the model never calls as a whole —
+        # `_forward` reaches into `t_embedder[1](t_embedder[0](...))`, so a hook
+        # on the container never fires. Hooking the inner module is what
+        # captures anything, and `t_embedding_norm` is what the blocks actually
+        # read (`predict2.py:836`).
+        model.t_embedding_norm.register_forward_hook(lambda _m, _i, o: captured.__setitem__("tEmbed", o)),
     ]
     out_dense = model(x, t, context)
     dense_trace = {f"{k}Dense": v for k, v in captured.items()}

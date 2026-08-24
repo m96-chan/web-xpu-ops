@@ -40,7 +40,7 @@ import { ACTIVATION, activation } from "../../../ops/activation/index.js";
 import { matmul } from "../../../ops/matmul/index.js";
 import { rmsnorm } from "../../../ops/rmsnorm/index.js";
 import { layernorm } from "../../../ops/layernorm/index.js";
-import { type AnimaBlockConfig, type AnimaBlockWeights, animaBlock } from "./block.js";
+import { type AnimaBlockConfig, type AnimaBlockWeights, animaBlock, ropeAxisDims, ropeBases } from "./block.js";
 
 export interface AnimaConfig {
   numBlocks: number;
@@ -56,6 +56,8 @@ export interface AnimaConfig {
   /** `10000` inside the sinusoidal embedding — `Timesteps` (`predict2.py:228`). */
   maxPeriod: number;
   normEps: number;
+  /** The checkpoint's own RoPE extrapolation ratios — 4.0 / 4.0 / 1.0 here. */
+  ropeExtrapolation: { t: number; h: number; w: number };
 }
 
 /** Anything that hands back a tensor by name. */
@@ -293,6 +295,7 @@ export function animaForward(
     weights.has("net.x_embedder.proj.1.bias") ? weights.get("net.x_embedder.proj.1.bias") : undefined,
   );
 
+  const axisDims = ropeAxisDims(headDim);
   const blockCfg: AnimaBlockConfig = {
     dim,
     numHeads,
@@ -304,10 +307,33 @@ export function animaForward(
     seq,
     contextSeq,
     normEps,
+    ropeAxisDims: axisDims,
+    ropeThetaPerAxis: ropeBases(axisDims, cfg.ropeExtrapolation),
   };
 
+  // `(t, h, w)` per token, row-major over the token grid — `seq = arange(max(H,
+  // W, T))` indexed per axis (`position_embedding.py:136-143`), so each axis's
+  // position is simply its own coordinate.
+  const tTokens = T / patchTemporal;
+  const hTokens = H / patchSpatial;
+  const wTokens = W / patchSpatial;
+  const positions = new Int32Array(seq * 3);
+  {
+    let at = 0;
+    for (let t = 0; t < tTokens; t += 1) {
+      for (let h = 0; h < hTokens; h += 1) {
+        for (let w = 0; w < wTokens; w += 1) {
+          positions[at] = t;
+          positions[at + 1] = h;
+          positions[at + 2] = w;
+          at += 3;
+        }
+      }
+    }
+  }
+
   for (let i = 0; i < cfg.numBlocks; i += 1) {
-    x = animaBlock(blockCfg, collect(weights, i), x, emb, adalnLora, input.context);
+    x = animaBlock(blockCfg, collect(weights, i), x, emb, adalnLora, input.context, positions);
     if (trace && i === 0) trace.afterBlock0 = x.slice();
   }
   if (trace) trace.afterBlocks = x.slice();

@@ -65,20 +65,96 @@ export interface AnimaBlockConfig {
    */
   ropeAxisDims: number[];
   /**
-   * `10000 * extrapolation_ratio ** (dim / (dim - 2))`.
+   * One base per axis, `t, h, w`.
    *
-   * The ratio is **4.0** for h and w and **1.0** for t in this checkpoint
-   * (`model_detection.py:869`), which is not a default anyone would guess and
-   * changes every spatial frequency. Computed by the caller from the config
-   * rather than hardcoded.
+   * `10000 * extrapolation_ratio ** (dim / (dim - 2))` for each. The ratios are
+   * **4.0** for h and w and **1.0** for t in this checkpoint
+   * (`model_detection.py:869`), so the bases are 10000, 42870.9, 42870.9 —
+   * not a default anyone would guess, and it changes every spatial frequency.
+   * `ropeBases` computes them; hardcoding is what this exists to avoid.
    */
-  ropeTheta: number;
+  ropeThetaPerAxis: number[];
+}
+
+/**
+ * Three-axis RoPE where **each axis has its own base**.
+ *
+ * `ops/rope`'s `axes` entry takes one `thetaBase` for the whole head, which is
+ * what Z-Image needs. Anima does not: `VideoRopePosition3DEmb` scales each
+ * axis's base by its own NTK factor (`position_embedding.py:96-98`), and this
+ * checkpoint's extrapolation ratios are 4.0 for h and w against 1.0 for t —
+ * so t stays at 10000 while h and w become 42870.9.
+ *
+ * The exponent's normalisation already matches: both divide by the *axis's* own
+ * channel count rather than by `head_dim`. So the axes can be rotated one at a
+ * time, each with its own base, over its own slice of the head — three calls
+ * that together are what one call with per-axis bases would be.
+ *
+ * Rotating an axis in isolation is exact because RoPE never mixes channels
+ * across a pair, and the pairs never straddle an axis boundary (every axis dim
+ * is even, which `ropeAxes` itself checks).
+ */
+function applyAxisRope(
+  x: Float32Array,
+  seq: number,
+  numHeads: number,
+  headDim: number,
+  positions: Int32Array,
+  cfg: AnimaBlockConfig,
+): Float32Array {
+  const out = new Float32Array(x.length);
+  out.set(x);
+  let from = 0;
+  for (const [axis, dim] of cfg.ropeAxisDims.entries()) {
+    // One axis's channels, gathered out of every head into a contiguous
+    // `[seq, numHeads, dim]` so `ropeAxes` can treat it as a whole head.
+    const slice = new Float32Array(seq * numHeads * dim);
+    for (let token = 0; token < seq; token += 1) {
+      for (let head = 0; head < numHeads; head += 1) {
+        const src = (token * numHeads + head) * headDim + from;
+        slice.set(out.subarray(src, src + dim), (token * numHeads + head) * dim);
+      }
+    }
+    const axisPositions = new Int32Array(seq);
+    for (let token = 0; token < seq; token += 1) {
+      axisPositions[token] = positions[token * cfg.ropeAxisDims.length + axis]!;
+    }
+    const rotated = ropeAxes({
+      input: slice,
+      N: seq,
+      numHeads,
+      axisDims: [dim],
+      positions: axisPositions,
+      thetaBase: cfg.ropeThetaPerAxis[axis]!,
+    });
+    for (let token = 0; token < seq; token += 1) {
+      for (let head = 0; head < numHeads; head += 1) {
+        const dst = (token * numHeads + head) * headDim + from;
+        out.set(rotated.subarray((token * numHeads + head) * dim, (token * numHeads + head + 1) * dim), dst);
+      }
+    }
+    from += dim;
+  }
+  return out;
 }
 
 /** `head_dim` split into `t, h, w` the way `VideoRopePosition3DEmb` does. */
 export function ropeAxisDims(headDim: number): number[] {
   const spatial = Math.floor(headDim / 6) * 2;
   return [headDim - 2 * spatial, spatial, spatial];
+}
+
+/**
+ * One RoPE base per axis, from the checkpoint's extrapolation ratios.
+ *
+ * `theta = 10000 * ratio ** (dim / (dim - 2))` (`position_embedding.py:96-98`
+ * and `:127-129`). The exponent uses the **axis's** channel count, not the
+ * head's.
+ */
+export function ropeBases(axisDims: number[], ratios: { t: number; h: number; w: number }): number[] {
+  const [dimT, dimH, dimW] = axisDims as [number, number, number];
+  const ntk = (ratio: number, dim: number): number => 10000 * ratio ** (dim / (dim - 2));
+  return [ntk(ratios.t, dimT), ntk(ratios.h, dimH), ntk(ratios.w, dimW)];
 }
 
 /**
@@ -262,11 +338,9 @@ function attend(
   k = rmsnorm({ input: k, weight: kNorm, N: contextSeq * numHeads, D: headDim, eps: normEps });
 
   if (positions) {
-    // Self-attention only. The weights were permuted at load time into
-    // `ops/rope`'s adjacent-pair order — see `ROPE_AXES` on why the model's
-    // 2x2 matrices are the same rotation in HF's pairing.
-    q = ropeAxes({ input: q, N: seq, numHeads, axisDims: cfg.ropeAxisDims, positions, thetaBase: cfg.ropeTheta });
-    k = ropeAxes({ input: k, N: seq, numHeads, axisDims: cfg.ropeAxisDims, positions, thetaBase: cfg.ropeTheta });
+    // Self-attention only, and **one call per axis** — see `applyAxisRope`.
+    q = applyAxisRope(q, seq, numHeads, headDim, positions, cfg);
+    k = applyAxisRope(k, seq, numHeads, headDim, positions, cfg);
   }
 
   const attended = attention({
