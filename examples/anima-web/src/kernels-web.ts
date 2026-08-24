@@ -29,7 +29,6 @@ import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
 import scoresKernel from "../../../ops/attention/wgsl/scores.wgsl";
 import contextKernel from "../../../ops/attention/wgsl/context.wgsl";
 import flashAttentionKernel from "../../../ops/flash_attention/wgsl/kernel.wgsl";
-import matmulTiledKernel from "../../../ops/matmul/wgsl/tiled.wgsl";
 import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
 import gqaContextKernel from "../../../ops/gqa/wgsl/context.wgsl";
 
@@ -46,7 +45,6 @@ export const ditKernels: DitKernels = {
   scores: scoresKernel,
   context: contextKernel,
   flashAttention: flashAttentionKernel,
-  matmulTiled: matmulTiledKernel,
 };
 
 export const encoderKernels: EncoderKernels = {

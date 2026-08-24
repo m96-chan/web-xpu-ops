@@ -1,11 +1,17 @@
 import { describe } from "vitest";
 import { expectAgrees, gpuTest, kernel, params, useGpu } from "../../harness/index.js";
 import { matmul } from "./reference.js";
+import { matmulGrid } from "./index.js";
 
 const code = kernel(import.meta.url);
 
 /** Must match `TILE` in `wgsl/kernel.wgsl`; the shapes below are chosen around it. */
-const TILE = 16;
+// The workgroup tile, so the ragged shapes below stay chosen *around* it. It
+// used to be 16 in both dimensions; the kernel now covers 64 rows by 128
+// columns per workgroup, and a catalogue built for 16 would stop probing any
+// boundary at all.
+const TILE = 64;
+const TILE_N = 128;
 
 const wave = (n: number, k: number, phase = 0) =>
   Float32Array.from({ length: n }, (_, i) => Math.sin(i * k + phase) * 1.5);
@@ -48,9 +54,9 @@ const TOLERANCE = { rel: 1e-5, abs: 2e-5 };
 //            below to be visible at all.
 const SHAPES: [M: number, N: number, K: number, why: string][] = [
   [1, 1, 1, "one element"],
-  [TILE, TILE, TILE, "exactly one tile in every dimension"],
+  [TILE, TILE_N, TILE, "exactly one tile in every dimension"],
   [TILE + 1, TILE, TILE, "M tail only"],
-  [TILE, TILE + 1, TILE, "N tail only"],
+  [TILE, TILE_N + 1, TILE, "N tail only"],
   [TILE, TILE, TILE + 1, "K tail only"],
   [TILE - 3, TILE - 5, TILE - 7, "every dimension shorter than one tile"],
   [17, 19, 23, "all three ragged, two tiles each"],
@@ -78,7 +84,7 @@ describe("matmul / wgsl", () => {
             { kind: "out", type: "f32", length: M * N },
             { kind: "uniform", data: params([["u32", M], ["u32", N], ["u32", K]]) },
           ],
-          workgroups: [Math.ceil(N / TILE), Math.ceil(M / TILE)],
+          workgroups: matmulGrid(M, N),
         },
         [matmul({ a, b, M, N, K })],
         TOLERANCE,
@@ -118,7 +124,7 @@ describe("matmul / wgsl", () => {
           { kind: "out", type: "f32", length: M * N },
           { kind: "uniform", data: params([["u32", M], ["u32", N], ["u32", K]]) },
         ],
-        workgroups: [Math.ceil(N / TILE), Math.ceil(M / TILE)],
+        workgroups: matmulGrid(M, N),
       },
       [matmul({ a: a.subarray(0, M * K), b: b.subarray(0, K * N), M, N, K })],
       TOLERANCE,
@@ -146,7 +152,7 @@ describe("matmul / wgsl", () => {
           { kind: "out", type: "f32", length: M * N },
           { kind: "uniform", data: params([["u32", M], ["u32", N], ["u32", K]]) },
         ],
-        workgroups: [Math.ceil(N / TILE), Math.ceil(M / TILE)],
+        workgroups: matmulGrid(M, N),
       },
       [matmul({ a, b, M, N, K })],
       TOLERANCE,

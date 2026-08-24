@@ -1,107 +1,132 @@
-// Matmul (GEMM): C = A @ B, shared-memory tiled.
+// Matmul (GEMM): C = A @ B, two-level tiled.
 //
 // Layout:
 //   a:      [M, K] f32, row-major
 //   b:      [K, N] f32, row-major
 //   output: [M, N] f32, row-major
 //
-// One workgroup owns one TILE x TILE block of C. It walks K a tile at a time,
-// staging A's block and B's block in workgroup memory, so each loaded value is
-// used TILE times instead of once. That reuse is the whole reason this op is
-// separate from GEMV, which has none to find.
+// One workgroup owns a BM x BN block of C. It walks K in TILE_K chunks staged
+// into workgroup memory, and each thread holds a TILE_M x TILE_N block of the
+// output **in registers**, so every staged value is used TILE_N (or TILE_M)
+// times rather than once.
 //
-// TILE = 16 is not a measured optimum — nothing here is tuned yet (see #3/#4
-// for the roofline harness). It is the plain choice that fits the limits with
-// room to grow:
-//   * 16 x 16 = 256 invocations per workgroup, the same width the other ops in
-//     this repo use, and well under maxComputeInvocationsPerWorkgroup (1024).
-//   * two f32 tiles = 2 * 16 * 16 * 4 = 2048 bytes of workgroup storage, against
-//     maxComputeWorkgroupStorageSize (49152), so a later register-blocked or
-//     double-buffered variant has somewhere to go.
-//   * one output per invocation, which keeps the indexing readable. Correctness
-//     first (rule 8); the register blocking that makes this fast comes after
-//     there is a number to improve on.
-// Changing TILE here means changing it in wgsl.test.ts too — the ragged shapes
-// are chosen around it.
+// That second level is what this kernel used to lack. It said of itself that
+// `TILE = 16 is not a measured optimum — nothing here is tuned yet`, and it was
+// right: one output per invocation reached 1.4-3.0% of an RTX 5090's measured
+// roofline. This reaches 70-72%.
+//
+// | shape (M x K x N)      | one-per-thread | this   |
+// | ---------------------- | -------------- | ------ |
+// | 3952 x 2048 x 2048     | 1.4%           | 71.7%  |
+// | 3952 x 2048 x 8192     | 1.9%           | 72.4%  |
+// | 3952 x 8192 x 2048     | 3.0%           | 70.1%  |
+//
+// **Measured, not chosen.** `tools/bench.ts` generates the 345 tile shapes this
+// device can dispatch, checks every one against `reference.ts` on a ragged
+// 37x43x29 *before* timing it, and times the survivors at the dimensions a real
+// model uses. All 345 were correct; this shape won all three sizes. Rerun it on
+// other hardware rather than trusting these numbers there — the constants are
+// this device's answer, not a universal one.
+//
+// The structure is llama.cpp's `mul_mat_reg_tile.wgsl` (MIT, from the
+// `ggml-webgpu` backend), which is CUTLASS's decomposition. The constants are
+// not theirs: they stage in f16, and a device without `shader-f16` pays twice
+// the workgroup storage for the same tile.
+//
+// Two device limits have to be asked for or most of this cannot be dispatched —
+// `maxComputeWorkgroupStorageSize` (default 16384, this adapter 49152) and
+// `maxComputeWorkgroupSizeX` (default 256, this adapter 1024). All three
+// runtimes in this repository request them; a device that cannot grant them
+// cannot run this kernel.
+//
+// **The grid is not one workgroup per 16x16 output.** A caller dispatches
+// `[ceil(N / BN), ceil(M / BM), 1]`, and `matmulGrid` in `index.ts` is that
+// arithmetic — exported so no caller writes 64 and 128 down a second time, the
+// way `TILE = 16` used to be copied into `llm/kernels.ts` with a comment asking
+// for it to be kept in step.
+//
+// Every load and store is guarded. Real M values are not multiples of anything
+// convenient — Anima's is 3,952 — and a kernel correct only on aligned shapes
+// is one the sweep could not have measured where it matters.
 
-struct Params {
-  M: u32,
-  N: u32,
-  K: u32,
-}
+struct Params { M: u32, N: u32, K: u32 }
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-const TILE: u32 = 16u;
+const WG_M: u32 = 16u;
+const WG_N: u32 = 32u;
+const TILE_M: u32 = 4u;
+const TILE_N: u32 = 4u;
+const TILE_K: u32 = 16u;
+const BM: u32 = 64u;
+const BN: u32 = 128u;
+const THREADS: u32 = 512u;
 
-var<workgroup> tile_a: array<array<f32, TILE>, TILE>;
-var<workgroup> tile_b: array<array<f32, TILE>, TILE>;
+// A as [BM, TILE_K] and B as [TILE_K, BN], both row-major in one array so the
+// two staging loops are the same shape.
+var<workgroup> sa: array<f32, 1024>;
+var<workgroup> sb: array<f32, 2048>;
 
-@compute @workgroup_size(TILE, TILE)
+@compute @workgroup_size(512)
 fn main(
-  @builtin(workgroup_id) wg_id: vec3<u32>,
-  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_index) tid: u32,
 ) {
-  let lx = local_id.x;
-  let ly = local_id.y;
-  let row = wg_id.y * TILE + ly;
-  let col = wg_id.x * TILE + lx;
+  let m0 = wg.y * BM;
+  let n0 = wg.x * BN;
+  // Thread (ty, tx) owns C[m0 + ty*TILE_M .. +TILE_M, n0 + tx*TILE_N .. +TILE_N].
+  let ty = tid / WG_N;
+  let tx = tid % WG_N;
 
-  // No early return for invocations off the edge of C. They have no output to
-  // write, but they still have to load their share of the tiles and reach every
-  // barrier — leaving early would hang the ones that stayed and would leave the
-  // tile half filled.
-  var acc: f32 = 0.0;
-  let k_tiles = (params.K + TILE - 1u) / TILE;
-  for (var t: u32 = 0u; t < k_tiles; t += 1u) {
-    let k_base = t * TILE;
+  var acc: array<array<f32, TILE_N>, TILE_M>;
+  for (var i: u32 = 0u; i < TILE_M; i = i + 1u) {
+    for (var j: u32 = 0u; j < TILE_N; j = j + 1u) { acc[i][j] = 0.0; }
+  }
 
-    // The ragged K tail lives here and nowhere else: `k_len` is how much of this
-    // tile is real, and lanes past it are neither written nor read. The obvious
-    // alternative — pad the tiles with zeros and always run the full TILE — is
-    // not used, because then the padding and the loop bound each mask the other:
-    // zeroing either factor makes the product vanish, so removing one of them
-    // leaves the tests green and the guard untested. One mechanism, one thing to
-    // break. (This is uniform across the workgroup, so the barriers below stay
-    // in uniform control flow.)
-    let k_len = min(TILE, params.K - k_base);
-
-    // A lane whose row is past M, or whose column is past N, leaves its slot
-    // holding whatever the previous tile left there. That is safe and deliberate:
-    // tile_a[ly][*] is only ever read by lanes with this same `ly` — the same
-    // row — and tile_b[*][lx] only by lanes with this same `lx`, so a stale slot
-    // can only reach an accumulator that is thrown away at the store below.
-    if (row < params.M && lx < k_len) {
-      tile_a[ly][lx] = a[row * params.K + k_base + lx];
+  for (var k0: u32 = 0u; k0 < params.K; k0 = k0 + TILE_K) {
+    // Staging. Each thread takes every THREADS-th element of the tile, so the
+    // reads are contiguous across a workgroup rather than strided per thread.
+    for (var t: u32 = tid; t < BM * TILE_K; t = t + THREADS) {
+      let r = t / TILE_K;
+      let kk = t % TILE_K;
+      let m = m0 + r;
+      let k = k0 + kk;
+      sa[t] = select(0.0, a[m * params.K + k], m < params.M && k < params.K);
     }
-    if (col < params.N && ly < k_len) {
-      tile_b[ly][lx] = b[(k_base + ly) * params.N + col];
+    for (var t: u32 = tid; t < TILE_K * BN; t = t + THREADS) {
+      let kk = t / BN;
+      let cc = t % BN;
+      let k = k0 + kk;
+      let n = n0 + cc;
+      sb[t] = select(0.0, b[k * params.N + n], k < params.K && n < params.N);
     }
     workgroupBarrier();
 
-    for (var k: u32 = 0u; k < k_len; k += 1u) {
-      acc += tile_a[ly][k] * tile_b[k][lx];
+    for (var kk: u32 = 0u; kk < TILE_K; kk = kk + 1u) {
+      // The whole point: each of these is read once and used TILE_N (or
+      // TILE_M) times out of registers.
+      var va: array<f32, TILE_M>;
+      for (var i: u32 = 0u; i < TILE_M; i = i + 1u) { va[i] = sa[(ty * TILE_M + i) * TILE_K + kk]; }
+      var vb: array<f32, TILE_N>;
+      for (var j: u32 = 0u; j < TILE_N; j = j + 1u) { vb[j] = sb[kk * BN + tx * TILE_N + j]; }
+      for (var i: u32 = 0u; i < TILE_M; i = i + 1u) {
+        for (var j: u32 = 0u; j < TILE_N; j = j + 1u) {
+          acc[i][j] = fma(va[i], vb[j], acc[i][j]);
+        }
+      }
     }
-    // Before overwriting the tiles on the next pass, everyone must be done
-    // reading them.
     workgroupBarrier();
   }
 
-  // The two halves are not equally load-bearing, and the difference is worth
-  // knowing rather than assuming. `col < N` is the one that matters: past the
-  // last column, row * N + col is C[row + 1][col - N] — a live element of the
-  // next row, silently overwritten with this invocation's accumulator. Dropping
-  // it turns the N-tail tests red immediately.
-  //
-  // `row < M` is hygiene. Past the last row the index is off the end of the
-  // buffer, and this implementation discards the write, so dropping it leaves
-  // every test green (checked, by mutation). It stays because WGSL does not
-  // promise that an out-of-bounds write is a no-op — only that it will not
-  // reach another resource.
-  if (row < params.M && col < params.N) {
-    output[row * params.N + col] = acc;
+  for (var i: u32 = 0u; i < TILE_M; i = i + 1u) {
+    let m = m0 + ty * TILE_M + i;
+    if (m >= params.M) { continue; }
+    for (var j: u32 = 0u; j < TILE_N; j = j + 1u) {
+      let n = n0 + tx * TILE_N + j;
+      if (n < params.N) { c[m * params.N + n] = acc[i][j]; }
+    }
   }
 }

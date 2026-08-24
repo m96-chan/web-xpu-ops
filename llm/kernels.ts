@@ -1,6 +1,7 @@
 import { kernel, params, type Runner } from "../harness/index.js";
 import type { ActivationKind } from "../ops/activation/index.js";
 import type { ElementwiseKind } from "../ops/elementwise/index.js";
+import { matmulGrid } from "../ops/matmul/index.js";
 
 /**
  * GPU dispatch wrappers around the ops this engine composes, one function per
@@ -220,9 +221,6 @@ export interface MatMulArgs {
   K: number;
 }
 
-/** Must match `TILE` in `ops/matmul/wgsl/kernel.wgsl`. */
-const MATMUL_TILE = 16;
-
 export async function runMatMul(run: Runner["run"], { a, b, M, N, K }: MatMulArgs): Promise<Float32Array> {
   const [out] = await run({
     code: CODE.matmul,
@@ -232,7 +230,7 @@ export async function runMatMul(run: Runner["run"], { a, b, M, N, K }: MatMulArg
       { kind: "out", type: "f32", length: M * N },
       { kind: "uniform", data: params([["u32", M], ["u32", N], ["u32", K]]) },
     ],
-    workgroups: [Math.ceil(N / MATMUL_TILE), Math.ceil(M / MATMUL_TILE)],
+    workgroups: matmulGrid(M, N),
   });
   return asF32(out!);
 }
