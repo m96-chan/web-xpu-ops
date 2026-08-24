@@ -473,6 +473,7 @@ async function main(): Promise<void> {
     const positive = await conditioning(promptInput.value);
     const useCfg = cfgEnabled(guidance);
     const unconditional = useCfg ? await conditioning(negativeInput.value) : null;
+    const conditioningSeconds = (performance.now() - started) / 1000;
 
     // --- sampling ---
     const sigmas = betaSchedule(flowSigmas(), steps);
@@ -481,6 +482,12 @@ async function main(): Promise<void> {
     const held = new Map<string, GPUBuffer>();
     const predictions: Float32Array[] = [];
     let out = x0;
+    const samplingStart = performance.now();
+    // The first forward uploads 3.63 GB of weights and hydrates the heap from
+    // the disk cache; every one after it does neither. Reported apart from the
+    // rest, because folding a one-off into a per-step average is how a page
+    // ends up disagreeing with a command line for no visible reason.
+    let firstForwardSeconds = 0;
 
     for (let step = 0; step < sigmas.length - 1; step += 1) {
       const sigma = sigmas[step]!;
@@ -527,16 +534,20 @@ async function main(): Promise<void> {
       let cursor = 0;
       out = resMultistep(() => predictions[cursor++]!, x0, sigmas.slice(0, step + 2));
 
+      const stepSeconds = (performance.now() - stepStarted) / 1000;
+      if (step === 0) firstForwardSeconds = stepSeconds;
       say(
         `step ${step + 1}/${sigmas.length - 1}`,
-        `sigma ${sigma.toFixed(4)}, ${((performance.now() - stepStarted) / 1000).toFixed(2)}s`,
+        `sigma ${sigma.toFixed(4)}, ${stepSeconds.toFixed(2)}s`,
       );
       // Yield, so the status text above actually paints.
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
+    const samplingSeconds = (performance.now() - samplingStart) / 1000;
     releaseAnimaWeights(held);
 
     // --- decode ---
+    const decodeStart = performance.now();
     say("decoding …", "reading the VAE");
     if (vaeCache.size === 0) {
       const names = ["conv2.weight", "conv2.bias", "decoder.conv1.weight", "decoder.conv1.bias",
@@ -563,8 +574,21 @@ async function main(): Promise<void> {
     );
     draw(image, height, width);
 
+    const decodeSeconds = (performance.now() - decodeStart) / 1000;
     const elapsed = (performance.now() - started) / 1000;
-    say("done.", `${width}x${height}, ${sigmas.length - 1} steps, ${elapsed.toFixed(1)}s`);
+    const taken = sigmas.length - 1;
+    // Split, because a total is not comparable to anything. The command-line
+    // path reports the same three separately, and a page that reports only
+    // their sum cannot be checked against it.
+    const perStep = (samplingSeconds - firstForwardSeconds) / Math.max(1, taken - 1);
+    say(
+      "done.",
+      `${width}x${height}, ${taken} steps, ${elapsed.toFixed(1)}s — ` +
+        `conditioning ${conditioningSeconds.toFixed(1)}s, ` +
+        `sampling ${samplingSeconds.toFixed(1)}s (first step ${firstForwardSeconds.toFixed(1)}s, ` +
+        `then ${perStep.toFixed(2)}s each), ` +
+        `decode ${decodeSeconds.toFixed(1)}s`,
+    );
     if (profile) reportProfile(profile, profiledWallSeconds, profiledDispatches);
     else if (wantProfile && steps >= 2) {
       profileOut.innerHTML =
