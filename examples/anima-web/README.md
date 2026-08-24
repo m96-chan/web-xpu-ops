@@ -54,14 +54,21 @@ a server that ignored ranges would "work" while sending whole files.
   4.7 GB download. `verify-forward-gpu.ts` asserts the cover in Node instead —
   1,049 tensors read, 57 prefixes announced, nothing uncovered.
 
-## What is and is not verified
+## Measured
 
-The loader is exercised: a run of this server delivered 4.68 GB in 2,416 range
-responses and the page reached its ready state, reporting the 52 blocks it read
-out of the manifest.
+Chrome 151, NVIDIA GeForce RTX 5090, driver 610.57.04, over `server.mjs` on
+loopback.
 
-**A full in-page generation has not been run end to end at the time of
-writing.** The arithmetic behind it is the same code `examples/anima` checks
-against ComfyUI, and the two page-specific invariants above are pinned in Node,
-but the sentence "press Generate and an image appears" is not something this
-README has earned yet.
+| | |
+| --- | --- |
+| first visit, caching the DiT | 4.68 GB in 2,416 range responses |
+| a 256x256 generation, 8 steps, CFG 8 | **64.5 s** end to end |
+| a DiT forward at 256x256, weights resident | ~4.1 s a step, two per step under CFG |
+
+The first forward is slower than the rest: it hydrates the heap block by block
+from the disk cache and uploads 3.63 GB to the device. Every step after it, and
+every generation after the first, does neither.
+
+832x1216 is **not measured here**. The command-line path takes 672 s of
+sampling for it, and a page that holds the tab for eleven minutes is a
+different question from whether the arithmetic is right.
