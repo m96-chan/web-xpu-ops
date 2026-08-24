@@ -21,6 +21,17 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B's sampler (`examples/anima/src/sampler.ts`) — the `beta` schedule
+  and `res_multistep`, matched step by step against ComfyUI's own on a toy
+  denoiser. It is not Z-Image's sampler with different numbers: that one takes
+  Euler steps down a linear schedule, this one inverts a Beta(0.6, 0.6) CDF onto
+  a 1000-entry table and takes second-order exponential multistep steps.
+
+  `multiplier` is 1.0 where `ModelSamplingDiscreteFlow` defaults to 1000, so the
+  DiT is handed sigma itself rather than sigma times a thousand. The table
+  cannot catch a wrong multiplier — it cancels there — so `timestepOf` is where
+  it is pinned.
+
 - Anima-3.8B's conditioning path (`examples/anima/src/text-encoder.ts`) matches
   the model at rel-RMS 9.775e-7 — Qwen3-0.6B, then the `llm_adapter` that ships
   inside the DiT checkpoint. Two tokenizers run over the same prompt: the Qwen
