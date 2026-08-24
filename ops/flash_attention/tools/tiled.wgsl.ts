@@ -46,8 +46,10 @@ export const INVOCATION_LIMIT = 1024;
 
 /** Workgroup storage in bytes for a given head dimension. */
 export function flashStorageBytes({ bq, tileS }: FlashShape, D: number): number {
-  // q rows, the staged k and v tiles, and one score per (row, key).
-  return (bq * D + tileS * D + tileS * D + bq * tileS) * 4;
+  // q rows, the staged k and v tiles, one score per (row, key), and the
+  // per-row softmax state — a running maximum, a running sum, and the
+  // correction the tile's new maximum implies.
+  return (bq * D + tileS * D + tileS * D + bq * tileS + bq * 3) * 4;
 }
 
 /** Why a shape cannot be dispatched, or null. */
@@ -101,7 +103,17 @@ var<workgroup> sq: array<f32, ${bq * D}>;
 var<workgroup> sk: array<f32, ${tileS * D}>;
 var<workgroup> sv: array<f32, ${tileS * maxDv}>;
 var<workgroup> ss: array<f32, ${bq * tileS}>;
-var<workgroup> srow: array<f32, ${bq}>;
+// The softmax state, per row, **shared**.
+//
+// It used to be m[BQ] and l[BQ] in every thread's registers, which is
+// where BQ stopped: they are per-row values, so every thread owning a channel
+// of the same row held its own identical copy. At BQ=16 that is 32 f32 of
+// duplicate state per thread on top of the accumulators, and BQ=32 measured
+// *slower* than BQ=16 for that reason while workgroup storage sat two-thirds
+// empty.
+var<workgroup> smax: array<f32, ${bq}>;
+var<workgroup> ssum: array<f32, ${bq}>;
+var<workgroup> scorr: array<f32, ${bq}>;
 
 @compute @workgroup_size(${threads})
 fn main(
@@ -131,14 +143,11 @@ fn main(
   // can exceed the workgroup (the tests go to 300), which the first version
   // silently truncated to the first THREADS channels.
   const SWEEPS: u32 = ${sweeps}u;
-  var m: array<f32, BQ>;
-  var l: array<f32, BQ>;
   var acc: array<array<f32, SWEEPS>, BQ>;
   for (var r = 0u; r < BQ; r = r + 1u) {
-    m[r] = MASKED;
-    l[r] = 0.0;
     for (var p = 0u; p < SWEEPS; p = p + 1u) { acc[r][p] = 0.0; }
   }
+  if (tid < BQ) { smax[tid] = MASKED; ssum[tid] = 0.0; }
 
   let tiles = (params.S + TILE_S - 1u) / TILE_S;
   for (var t = 0u; t < tiles; t = t + 1u) {
@@ -179,44 +188,51 @@ fn main(
     }
     workgroupBarrier();
 
-    // The tile's maximum per row. One thread per row rather than a reduction:
-    // BQ is small and a reduction over TILE_S would cost more barriers than it
-    // saves.
+    // One thread per row updates that row's state and turns the scores into
+    // weights in place, so the accumulate loop below reads weights rather than
+    // recomputing exp once per channel.
     if (tid < BQ) {
       var best = MASKED;
       for (var slot = 0u; slot < TILE_S; slot = slot + 1u) { best = max(best, ss[tid * TILE_S + slot]); }
-      srow[tid] = best;
+      let m_new = max(smax[tid], best);
+      let corr = select(exp(smax[tid] - m_new), 0.0, smax[tid] == MASKED);
+      var sum = 0.0;
+      for (var slot = 0u; slot < TILE_S; slot = slot + 1u) {
+        let s = ss[tid * TILE_S + slot];
+        let w = select(exp(s - m_new), 0.0, s == MASKED);
+        ss[tid * TILE_S + slot] = w;
+        sum = sum + w;
+      }
+      ssum[tid] = ssum[tid] * corr + sum;
+      scorr[tid] = corr;
+      smax[tid] = m_new;
     }
     workgroupBarrier();
 
     for (var r = 0u; r < BQ; r = r + 1u) {
-      let m_new = max(m[r], srow[r]);
-      let corr = select(exp(m[r] - m_new), 0.0, m[r] == MASKED);
-      var sum = 0.0;
+      let corr = scorr[r];
       var weighted: array<f32, SWEEPS>;
       for (var p = 0u; p < SWEEPS; p = p + 1u) { weighted[p] = 0.0; }
       for (var slot = 0u; slot < TILE_S; slot = slot + 1u) {
-        let s = ss[r * TILE_S + slot];
-        let w = select(exp(s - m_new), 0.0, s == MASKED);
-        sum = sum + w;
+        let w = ss[r * TILE_S + slot];
         var p = 0u;
         for (var c = tid; c < params.Dv; c = c + THREADS) {
           weighted[p] = fma(w, sv[slot * params.Dv + c], weighted[p]);
           p = p + 1u;
         }
       }
-      l[r] = l[r] * corr + sum;
       for (var p = 0u; p < SWEEPS; p = p + 1u) { acc[r][p] = acc[r][p] * corr + weighted[p]; }
-      m[r] = m_new;
     }
   }
 
+  workgroupBarrier();
   for (var r = 0u; r < BQ; r = r + 1u) {
     let row = q0 + r;
     if (row >= params.L) { continue; }
+    let denom = ssum[r];
     var p = 0u;
     for (var c = tid; c < params.Dv; c = c + THREADS) {
-      output[(head * params.L + row) * params.Dv + c] = select(acc[r][p] / l[r], 0.0, l[r] == 0.0);
+      output[(head * params.L + row) * params.Dv + c] = select(acc[r][p] / denom, 0.0, denom == 0.0);
       p = p + 1u;
     }
   }

@@ -14,6 +14,8 @@ import { flashAttention } from "../reference.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { flashStorageBytes, rejectReason, tiledFlash, type FlashShape } from "./tiled.wgsl.js";
+import { FLASH_TILE } from "../index.js";
+import { describeSweep, sweep } from "../../../harness/sweep.js";
 
 const D = 128;
 const SHAPES = [
@@ -35,6 +37,7 @@ function candidates(): FlashShape[] {
 }
 
 const label = (s: FlashShape): string => `BQ=${s.bq}, TILE_S=${s.tileS}, ${s.threads} threads`;
+
 
 const runner = await createRunner();
 if (!runner) { console.error("bench: no adapter"); process.exit(2); }
@@ -92,28 +95,24 @@ for (const { name, L, S, heads } of SHAPES) {
   const flops = 2 * 2 * heads * L * S * D;
   console.log(`${name}  L=${L} S=${S} heads=${heads}  (${(flops / 1e9).toFixed(1)} GFLOP)`);
 
-  const baseline = await runner.time(dispatchFor(shipped, q, k, v, heads, L, S));
-  if (baseline !== null) {
-    const share = roof ? ` (${((flops / baseline / roof.compute) * 100).toFixed(1)}%)` : "";
-    console.log(`  shipped:  ${(baseline * 1000).toFixed(2)} ms, ${(flops / baseline / 1e12).toFixed(2)} TFLOP/s${share}`);
+  // `FLASH_TILE.bq`, not 1. The shipped kernel takes BQ queries per workgroup,
+  // and dispatching one per query gives it sixteen times the work — which is
+  // what made a baseline read 83.93 ms against its real 8.43, and would have
+  // made every candidate look like a triumph.
+  const reference = dispatchFor(shipped, q, k, v, heads, L, S, FLASH_TILE.bq);
+  const entries = correct.map((shape) => ({
+    candidate: shape,
+    label: label(shape),
+    dispatch: dispatchFor(tiledFlash(shape, D), q, k, v, heads, L, S, shape.bq),
+  }));
+
+  const report = await sweep(runner, reference, entries);
+  if (!report) {
+    console.log("  the device declined to time it\n");
+    continue;
   }
-  const scored: { shape: FlashShape; seconds: number }[] = [];
-  for (const shape of correct) {
-    const seconds = await runner.time(dispatchFor(tiledFlash(shape, D), q, k, v, heads, L, S, shape.bq));
-    if (seconds !== null) scored.push({ shape, seconds });
-  }
-  scored.sort((a, b) => a.seconds - b.seconds);
-  console.log("  best 5:");
-  for (const { shape, seconds } of scored.slice(0, 5)) {
-    const achieved = flops / seconds;
-    const share = roof ? `${((achieved / roof.compute) * 100).toFixed(1)}%` : "n/a";
-    const speedup = baseline !== null ? `${(baseline / seconds).toFixed(1)}x` : "n/a";
-    console.log(
-      `    ${label(shape).padEnd(26)} ${(seconds * 1000).toFixed(2).padStart(7)} ms  ` +
-        `${(achieved / 1e12).toFixed(2).padStart(6)} TFLOP/s  ${share.padStart(6)}  ${speedup.padStart(5)}  ` +
-        `${(flashStorageBytes(shape, D) / 1024).toFixed(1)} KB`,
-    );
-  }
+  for (const line of describeSweep(report, flops, roof?.compute ?? null)) console.log(line);
   console.log();
 }
+
 runner.destroy();
