@@ -266,6 +266,12 @@ export class SentencePieceTokenizer {
         throw new Error("SentencePieceTokenizer: byteFallback=true but the vocab has no NORMAL pieces");
       }
       this.byteFallbackScore = minNormalScore - UNK_PENALTY;
+    } else if (Number.isFinite(minNormalScore)) {
+      // The same magnitude for the `unk_id` edge. Uncovered codepoints never
+      // compete with a real piece — the branch only runs when nothing matched
+      // — but the score still has to be worse than any real path so that a
+      // longer piece spanning this position always wins.
+      this.byteFallbackScore = minNormalScore - UNK_PENALTY;
     }
   }
 
@@ -387,18 +393,27 @@ export class SentencePieceTokenizer {
         // No piece of any length starts here: forced byte-fallback for
         // exactly this one codepoint (see module doc — never in competition
         // with a real piece).
-        const bytes = utf8Bytes(cps[i] as string);
+        // Two ways to cover a codepoint no piece matches, and which one a
+        // model uses is `byteFallback`, not a preference. With it on, the
+        // codepoint becomes its UTF-8 bytes. With it off — T5's case, and the
+        // reason this branch exists — it becomes `unk_id`, which is what
+        // SentencePiece does when there are no BYTE pieces to fall back to.
+        // Throwing here instead, as this did before Anima needed T5, refuses
+        // to encode any prompt containing one unusual character.
         const ids: number[] = [];
-        for (const b of bytes) {
-          const byteId = this.byteIdByValue[b] as number;
-          if (byteId === -1) {
-            throw new Error(
-              `SentencePieceTokenizer: byte 0x${b.toString(16)} has no BYTE piece and ` +
-                `byteFallback is ${this.vocab.byteFallback ? "on" : "off"} — cannot encode ` +
-                `codepoint ${JSON.stringify(cps[i])}`,
-            );
+        if (!this.vocab.byteFallback) {
+          ids.push(this.vocab.unkId);
+        } else {
+          for (const b of utf8Bytes(cps[i] as string)) {
+            const byteId = this.byteIdByValue[b] as number;
+            if (byteId === -1) {
+              throw new Error(
+                `SentencePieceTokenizer: byte 0x${b.toString(16)} has no BYTE piece and ` +
+                  `byteFallback is on — cannot encode codepoint ${JSON.stringify(cps[i])}`,
+              );
+            }
+            ids.push(byteId);
           }
-          ids.push(byteId);
         }
         // One score for the whole codepoint, regardless of how many UTF-8
         // bytes it expands to — matching SentencePiece's real
@@ -433,7 +448,13 @@ export class SentencePieceTokenizer {
       segments.unshift(ids);
       pos = prev;
     }
-    return segments.flat();
+    const flat = segments.flat();
+    if (this.vocab.byteFallback) return flat;
+    // SentencePiece emits one unknown node per *character* but merges adjacent
+    // ones on the way out, so nine unrepresentable characters in a row are one
+    // `<unk>`, not nine. Measured against the real tokenizer, not assumed:
+    // `"女の子、銀髪、赤い目"` encodes to a single unknown id.
+    return flat.filter((id, at) => id !== this.vocab.unkId || flat[at - 1] !== this.vocab.unkId);
   }
 
   /**

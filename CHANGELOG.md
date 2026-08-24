@@ -21,6 +21,20 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B's two tokenizers (`examples/anima/src/tokenize.ts`), matching
+  `transformers` and `tokenizers` on 23 cases each. `llm/tokenizer.ts` grows one
+  path it did not have: a model with `byteFallback` off now emits `unk_id` for a
+  codepoint no piece covers, merging adjacent ones as SentencePiece does,
+  instead of throwing. Before this it refused any prompt containing one unusual
+  character.
+
+  T5's `Precompiled` normalizer is a 316 kB charsmap, and the port does not
+  carry it. `tools/gen_tokenizer_data.py` compares it against NFKC at every
+  codepoint in the BMP and emits the 51 that differ as a table — 31 of them
+  control characters, where the charsmap maps tab and newline to a space and
+  NFKC does not. So the port is the engine's own `String.normalize("NFKC")`
+  plus a measured exception list, derived on every run rather than transcribed.
+
 - Anima-3.8B's sampler (`examples/anima/src/sampler.ts`) — the `beta` schedule
   and `res_multistep`, matched step by step against ComfyUI's own on a toy
   denoiser. It is not Z-Image's sampler with different numbers: that one takes
