@@ -28,6 +28,7 @@ import { type AnimaConfig, type AnimaInput, type AnimaTrace, patchify, timestepE
 import { ropeAxisDims, ropeBases } from "./block.js";
 import { matmulGrid } from "../../../ops/matmul/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
+import { flashGrid, flashSupports } from "../../../ops/flash_attention/index.js";
 
 const WG = 256;
 const TILE = 16;
@@ -569,7 +570,7 @@ export async function animaForwardResident(
   const attention = async (q: Slot, k: Slot, v: Slot, L: number, S: number): Promise<Slot> => {
     const out = pool.take(numHeads * L * headDim);
 
-    if (K.flashAttention) {
+    if (K.flashAttention && flashSupports(headDim, headDim)) {
       // One dispatch for every head at once. `[L, H, B]` is the op's own
       // grid, and an additive bias of zeros is what "no mask" means here —
       // `ops/attention`'s convention, inherited rather than restated.
@@ -586,7 +587,7 @@ export async function animaForwardResident(
             ]),
           ),
         ],
-        [L, numHeads, 1],
+        flashGrid(L, numHeads, 1),
       );
       return out;
     }
