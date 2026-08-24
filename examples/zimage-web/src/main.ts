@@ -346,7 +346,7 @@ async function main(): Promise<void> {
       // — which is what "resident" is supposed to mean and, in the first
       // version of `dit-resident.ts`, did not.
       const stepStats: ResidentDitStats = {
-        dispatches: 0, submits: 0, buffersCreated: 0, poolSlots: 0, weightBuffers: 0,
+        dispatches: 0, submits: 0, buffersCreated: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0,
         uploadedBytes: 0, readBackBytes: 0,
       };
 

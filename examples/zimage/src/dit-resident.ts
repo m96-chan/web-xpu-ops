@@ -50,6 +50,8 @@ export interface ResidentDitStats {
   buffersCreated: number;
   /** Activation slots only. This is the one that says whether the pool works. */
   poolSlots: number;
+  /** VRAM the activation pool holds — what decides whether a resolution fits. */
+  poolBytes: number;
   /** Buffers holding weights: two per q8 tensor, one per f32. */
   weightBuffers: number;
   uploadedBytes: number;
@@ -97,7 +99,18 @@ class BufferPool {
     return slot;
   }
 
-  /** Releases everything recorded so far except `keep` — call only after a submit. */
+  /**
+   * Releases everything recorded so far except `keep`.
+   *
+   * **Only valid immediately after a submit.** Ops are recorded, not executed:
+   * a slot handed back while an unsubmitted dispatch still names it lets a
+   * later dispatch in the same batch overwrite a buffer an earlier one is about
+   * to read. An attempt at a mid-block release — keeping what looked like the
+   * live set — produced `used in submit while destroyed`, which is the good
+   * failure: the driver caught what the reasoning missed. Anything cleverer
+   * than "release at the boundary" needs the liveness tracked rather than
+   * argued.
+   */
   release(keep: Slot[]): void {
     const kept = new Set(keep);
     for (const slot of this.#inFlight) {
@@ -109,6 +122,13 @@ class BufferPool {
 
   get created(): number {
     return this.#created;
+  }
+
+  /** Bytes the pool is holding — the number that decides whether a size fits. */
+  get bytes(): number {
+    let total = 0;
+    for (const slot of [...this.#free, ...this.#inFlight]) total += slot.bytes;
+    return total;
   }
 
   destroy(): void {
@@ -810,6 +830,7 @@ export async function ditForwardResident(
     const gated1 = await rowsOp(normed2, gateMsa, seq, dim, ELEMENTWISE.multiply);
     const h1 = await elementwise(x, gated1, seq * dim, ELEMENTWISE.add);
 
+
     const normed3 = await rmsnorm(h1, w("ffn_norm1.weight"), seq, dim);
     const scaled2 = await rowsOp(normed3, scaleMlp, seq, dim, ELEMENTWISE.multiply);
     const gate = await activation(
@@ -990,6 +1011,7 @@ export async function ditForwardResident(
     stats.submits = device.stats.submits;
     stats.buffersCreated = device.stats.buffersCreated;
     stats.poolSlots = pool.created;
+    stats.poolBytes = pool.bytes;
     stats.weightBuffers = weightBuffers.size;
     stats.uploadedBytes = uploaded;
     stats.readBackBytes = xSeq * patchDim * 4;

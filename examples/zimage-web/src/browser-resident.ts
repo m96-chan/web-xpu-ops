@@ -38,12 +38,36 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
 
+  /**
+   * Bytes handed out, so an allocation failure can say how much was already in
+   * flight rather than only that one more did not fit.
+   */
+  let allocated = 0;
+
   function createStorageBuffer(
     bytes: number,
     usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   ): GPUBuffer {
     stats.buffersCreated += 1;
-    return device.createBuffer({ size: Math.max(4, bytes), usage });
+    const size = Math.max(4, bytes);
+    // **Checked here, not at the bind.** A `createBuffer` that runs out of
+    // device memory returns an *invalid* buffer rather than throwing, and the
+    // first thing that notices is `createBindGroup` several frames later —
+    // reporting `entries[1] is invalid due to a previous error`, which names
+    // the binding and not the allocation. This turns that into a message with
+    // a size in it.
+    device.pushErrorScope("out-of-memory");
+    const buffer = device.createBuffer({ size, usage });
+    void device.popErrorScope().then((error) => {
+      if (!error) return;
+      throw new Error(
+        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
+          `(${(allocated / 1e9).toFixed(2)} GB already allocated by this device, ` +
+          `${stats.buffersCreated} buffers). ${error.message}`,
+      );
+    });
+    allocated += size;
+    return buffer;
   }
 
   function createUniformBuffer(bytes: number): GPUBuffer {

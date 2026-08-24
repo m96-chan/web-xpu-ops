@@ -195,9 +195,27 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   const pipelines = new Map<string, GPUComputePipeline>();
   const modules = new Map<string, GPUShaderModule>();
 
+  /** Bytes handed out, so an allocation failure can say what was already in flight. */
+  let allocated = 0;
+
   function createStorageBuffer(bytes: number, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC): GPUBuffer {
     stats.buffersCreated += 1;
-    return device.createBuffer({ size: Math.max(4, bytes), usage });
+    const size = Math.max(4, bytes);
+    // Checked at the allocation rather than at the bind: an out-of-memory
+    // `createBuffer` returns an invalid buffer instead of throwing, and the
+    // first thing to notice is `createBindGroup`, which reports a binding index
+    // and no size. See the browser runtime's copy of this note.
+    device.pushErrorScope("out-of-memory");
+    const buffer = device.createBuffer({ size, usage });
+    void device.popErrorScope().then((error) => {
+      if (!error) return;
+      throw new Error(
+        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
+          `(${(allocated / 1e9).toFixed(2)} GB already allocated, ${stats.buffersCreated} buffers). ${error.message}`,
+      );
+    });
+    allocated += size;
+    return buffer;
   }
 
   function createUniformBuffer(bytes: number): GPUBuffer {
