@@ -21,6 +21,19 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+- Anima-3.8B's DiT runs resident on the device (`examples/anima/src/dit-resident.ts`),
+  matching the model's own forward at 1.182e-5 against its quantized weights —
+  against 4.018e-2, measured separately in torch, for what q8 itself costs over
+  52 blocks. One forward takes 0.2 s once the 4.94 GB of weights are resident,
+  against 814 s for the CPU port of the same forward.
+
+  Anima's three rope axes do not share a base (t=10000, h/w=42870.9, from an
+  extrapolation ratio of 4.0) and `ops/rope`'s `axes` entry takes one base per
+  dispatch. Rather than gathering each axis's channels out of every head, the
+  whole head is dispatched three times with the other two axes' positions set to
+  zero: an angle of zero is the identity whatever base is in force, so each pass
+  rotates one axis and leaves the rest as it found them.
+
 - The DiT's activations stay on the device (`dit-resident.ts`). The per-dispatch
   path moved 28.57 GB up and 19.85 GB back per forward at 1,039 tokens, of which
   only 6.17 GB was weights; the rest was activations going out to the CPU and
