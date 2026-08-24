@@ -34,6 +34,7 @@ import type { DitConfig, DitInput } from "./dit.js";
 import type { DitKernels, PackedWeightSource } from "./dit-gpu.js";
 import { captionPositionIds, imagePositionIds, patchify, timestepEmbedding, unpatchify } from "./dit.js";
 import { matmulGrid } from "../../../ops/matmul/index.js";
+import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 const WG = 256;
 const TILE = 16;
@@ -372,7 +373,7 @@ export async function ditForwardResident(
           out.buffer,
           uniform(params([["u32", rows], ["u32", N!], ["u32", Kdim!]])),
         ],
-        [Math.ceil(N! / TILE), Math.ceil(rows / TILE)],
+        matmulQ8Grid(rows, N!),
       );
       return out;
     }
@@ -398,7 +399,7 @@ export async function ditForwardResident(
           out.buffer,
           uniform(params([["u32", rows], ["u32", packed.N], ["u32", packed.K]])),
         ],
-        [Math.ceil(packed.N / TILE), Math.ceil(rows / TILE)],
+        matmulQ8Grid(rows, packed.N),
       );
       return out;
     }

@@ -26,3 +26,15 @@ export const MATMUL_TILE = { bm: 64, bn: 128, threads: 512 } as const;
 export function matmulGrid(M: number, N: number): [number, number, number] {
   return [Math.ceil(N / MATMUL_TILE.bn), Math.ceil(M / MATMUL_TILE.bm), 1];
 }
+
+/**
+ * `q8.wgsl`'s workgroup tile. Not the same shape as `MATMUL_TILE`: the sweep
+ * that chose it ran against the packed kernel, and it won with a taller,
+ * narrower thread tile — 8x2 against the dense kernel's 4x4.
+ */
+export const MATMUL_Q8_TILE = { bm: 128, bn: 64, threads: 512 } as const;
+
+/** `[x, y, z]` a caller dispatches for `q8.wgsl` computing `[N, M]`. */
+export function matmulQ8Grid(N: number, M: number): [number, number, number] {
+  return [Math.ceil(M / MATMUL_Q8_TILE.bn), Math.ceil(N / MATMUL_Q8_TILE.bm), 1];
+}

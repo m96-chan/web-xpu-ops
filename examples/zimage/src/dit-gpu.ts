@@ -71,6 +71,7 @@ export interface PackedWeightSource extends WeightSource {
 export type LayerPrefetch = (prefix: string, label: string) => Promise<void>;
 import { captionPositionIds, imagePositionIds, patchify, timestepEmbedding, unpatchify } from "./dit.js";
 import { matmulGrid } from "../../../ops/matmul/index.js";
+import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 type Run = Runner["run"];
 
@@ -180,7 +181,7 @@ async function linearPacked(
       // `[N, M, K]` — rows of the activation, output features, contracted size.
       { kind: "uniform", data: params([["u32", rows], ["u32", outDim], ["u32", inDim]]) },
     ],
-    workgroups: [Math.ceil(outDim / TILE), Math.ceil(rows / TILE)],
+    workgroups: matmulQ8Grid(rows, outDim),
   });
   const out = y as Float32Array;
   if (bias) {

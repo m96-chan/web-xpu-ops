@@ -27,6 +27,7 @@ import type { DitKernels } from "../../zimage/src/dit-gpu.js";
 import { type AnimaConfig, type AnimaInput, type AnimaTrace, patchify, timestepEmbedding, unpatchify } from "./dit.js";
 import { ropeAxisDims, ropeBases } from "./block.js";
 import { matmulGrid } from "../../../ops/matmul/index.js";
+import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 const WG = 256;
 const TILE = 16;
@@ -355,7 +356,7 @@ export async function animaForwardResident(
           out.buffer,
           uniform(params([["u32", rows], ["u32", N!], ["u32", Kd!]])),
         ],
-        [Math.ceil(N! / TILE), Math.ceil(rows / TILE)],
+        matmulQ8Grid(rows, N!),
       );
       return out;
     }
@@ -372,7 +373,7 @@ export async function animaForwardResident(
           out.buffer,
           uniform(params([["u32", rows], ["u32", packed.N], ["u32", packed.K]])),
         ],
-        [Math.ceil(packed.N / TILE), Math.ceil(rows / TILE)],
+        matmulQ8Grid(rows, packed.N),
       );
       return out;
     }
