@@ -109,11 +109,18 @@ export function timestepEmbedding(t: number, channels: number, maxPeriod: number
 }
 
 /**
- * `[C, T, H, W]` to `[T*H*W, pT*pH*pW*C]`, with the padding-mask channel added.
+ * `[C, T, H, W]` to `[T*H*W, C*pT*pH*pW]`, with the padding-mask channel added.
  *
  * The mask is a channel of zeros appended after the latent's own (`:812`), and
- * the patch packs `(pT, pH, pW, C)` with **C last**. `Rearrange` in the model
- * spells it `"... (t p1 p2 c)"`, which is the same order.
+ * the patch packs **`(C, pT, pH, pW)` — channel first**. `PatchEmbed`'s own
+ * `Rearrange` spells it `"b c (t r) (h m) (w n) -> b t h w (c r m n)"`
+ * (`:300-302`).
+ *
+ * Z-Image puts the channel **last** within a patch, and writing that here from
+ * memory cost a 3.5e-1 mismatch at the first block — a tensor of exactly the
+ * right shape whose every row was a different linear combination. The two
+ * models do not share this convention, and neither does this file's own
+ * `unpatchify`, which unpacks `(pH, pW, pT, C)`.
  */
 export function patchify(
   latent: Float32Array,
@@ -135,10 +142,12 @@ export function patchify(
   for (let tt = 0; tt < tTokens; tt += 1) {
     for (let ht = 0; ht < hTokens; ht += 1) {
       for (let wt = 0; wt < wTokens; wt += 1) {
-        for (let pt = 0; pt < patchT; pt += 1) {
-          for (let ph = 0; ph < patch; ph += 1) {
-            for (let pw = 0; pw < patch; pw += 1) {
-              for (let c = 0; c < totalC; c += 1) {
+        // `(c r m n)`: channel outermost, then the temporal and two spatial
+        // offsets within the patch.
+        for (let c = 0; c < totalC; c += 1) {
+          for (let pt = 0; pt < patchT; pt += 1) {
+            for (let ph = 0; ph < patch; ph += 1) {
+              for (let pw = 0; pw < patch; pw += 1) {
                 // The mask channel is zero: `torch.zeros(...)` when the caller
                 // gives none, which text-to-image never does.
                 if (c >= channels) {
