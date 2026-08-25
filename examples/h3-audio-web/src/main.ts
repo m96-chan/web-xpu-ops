@@ -82,9 +82,13 @@ const gate: GateOptions = {
   // Written here, from the same place the page acts on, because the first
   // version of another demo copied this sentence out of its neighbour's markup
   // and inherited the wrong size and the wrong licence with it.
+  // "Powered by MiniMax H3" is the agreement's own wording for a product that
+  // uses the model, not a courtesy. Its territory clause -- worldwide except
+  // the EU, the UK, South Korea and the USA -- is why nothing here mirrors the
+  // weights: a public host cannot honour it.
   licence:
-    "The model is MiniMax's, under the MiniMax H3 Community License Agreement — not this page's MIT, " +
-    "and nothing here redistributes it.",
+    "Powered by MiniMax H3. The model is licensed under the MiniMax H3 Community License Agreement, " +
+    "not this page's MIT, and nothing here redistributes it.",
 };
 
 /** xorshift128+ and Box-Muller, the same generator the other demos seed with. */

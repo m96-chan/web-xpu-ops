@@ -48,9 +48,25 @@ front, which is a phase error no unit test hears.
 
 ## Running it
 
-The weights are **not in this repository and are not redistributed by it**. The
-model is under the MiniMax H3 Community License Agreement, which is not this
-code's MIT — see issue #190. Convert your own copy:
+## The licence, read rather than assumed
+
+The MiniMax H3 Community License Agreement (dated 2 August 2026) was read on
+26 August 2026. It **permits redistribution** — with a copy of the agreement and
+a NOTICE file — but only **within an "Applicable Territory" that excludes the
+European Union, the United Kingdom, the Republic of Korea and the United States
+of America**. A public mirror cannot honour that, so the arrangement Anima and
+Z-Image use is not available here and converting your own copy is the only path.
+
+It also requires any product using the model to display **"Powered by MiniMax
+H3"**, which the page does, and separate written authorisation for commercial
+use past $20 M/year in revenue.
+
+A reading, not legal advice; the text is at
+`https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE`. See issue #190.
+
+## Running it
+
+Convert your own copy:
 
 ```bash
 # the audio_vae/ directory from MiniMaxAI/MiniMax-H3 — the .py files,
