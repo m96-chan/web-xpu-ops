@@ -16,7 +16,7 @@
  * required.
  */
 import { DirectoryByteSource, HttpByteSource, directoryBindingSupported, type ByteSource } from "./byte-source.js";
-import { provision, readReceipt } from "./provision.js";
+import { provision, readReceipt, type ProvisionPlan } from "./provision.js";
 import { forgetFolder, hasPermission, pickFolder, rememberFolder, rememberedFolder, requestPermission } from "./bound-folder.js";
 
 /**
@@ -39,8 +39,14 @@ export interface GateElements {
 
 export interface GateOptions {
   elements: GateElements;
-  /** Every file the folder must hold. Order is the download order. */
-  files: string[];
+  /**
+   * Every file the folder must hold. Order is the download order.
+   *
+   * An entry may name its own base — Z-Image's text encoder is 8.04 GB that
+   * upstream already publishes, and copying it into a second repository to keep
+   * one base URL would redistribute what the original host serves.
+   */
+  files: ProvisionPlan["files"];
   /** Where a folder is filled from, when it is empty. */
   weightsBase: string;
   /** How much, in words, so the dialog can say before it starts. */
@@ -88,12 +94,19 @@ export async function bindFolder(
   await rememberFolder(handle);
   if (!(await readReceipt(handle))) {
     e.bar.style.display = "block";
-    await provision(handle, new HttpByteSource(o.weightsBase), { files: o.files }, (p) => {
-      e.progress.textContent =
-        `${p.file} — ${(p.bytesDone / 1e9).toFixed(2)} of ${(p.bytesTotal / 1e9).toFixed(2)} GB ` +
-        `(${p.fileIndex + 1}/${p.fileCount})`;
-      e.barFill.style.width = `${(p.bytesDone / Math.max(1, p.bytesTotal)) * 100}%`;
-    });
+    await provision(
+      handle,
+      new HttpByteSource(o.weightsBase),
+      { files: o.files },
+      (p) => {
+        e.progress.textContent =
+          `${p.file} — ${(p.bytesDone / 1e9).toFixed(2)} of ${(p.bytesTotal / 1e9).toFixed(2)} GB ` +
+          `(${p.fileIndex + 1}/${p.fileCount})`;
+        e.barFill.style.width = `${(p.bytesDone / Math.max(1, p.bytesTotal)) * 100}%`;
+      },
+      // A file that names its own base gets a source for it.
+      (base) => new HttpByteSource(base),
+    );
   }
   return new DirectoryByteSource(handle);
 }

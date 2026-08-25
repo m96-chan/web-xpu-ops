@@ -11,6 +11,7 @@
  * file would "work" while downloading gigabytes per tensor, so the status is
  * checked: 206 is required, and a 200 is an error rather than a slow success.
  */
+import type { ByteSource } from "../../web-common/src/byte-source.js";
 import {
   GROUP_SIZE,
   dequantizeQ4G128,
@@ -51,7 +52,25 @@ async function cacheStore(): Promise<Cache | null> {
  * fetched once and re-read every step without the heap ever holding more than
  * the layer in flight.
  */
-async function cachedRange(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
+/**
+ * A byte range, through a `ByteSource` when there is one.
+ *
+ * Issue #194. A bound folder is already on the user's disk, outside the
+ * origin's quota and under their control; caching it again would put the whole
+ * model back into the quota the folder exists to leave.
+ */
+async function cachedRange(
+  source: ByteSource | null,
+  url: string,
+  file: string,
+  byteOffset: number,
+  byteLength: number,
+): Promise<ArrayBuffer> {
+  if (source) return source.read(file, byteOffset, byteLength);
+  return cachedRangeHttp(url, byteOffset, byteLength);
+}
+
+async function cachedRangeHttp(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
   const cache = await cacheStore();
   if (!cache) return readRange(url, byteOffset, byteLength);
 
@@ -126,15 +145,22 @@ export class FetchedDitWeights {
   readonly #cache = new Map<string, Float32Array>();
   readonly #packedCache = new Map<string, { codes: Uint32Array; scale: Float32Array; N: number; K: number }>();
   readonly #limit: number;
+  /** Where the bytes come from, or null for "over HTTP, through the Cache API". */
+  readonly #source: ByteSource | null;
 
-  private constructor(base: string, manifest: DitManifest, limit: number) {
+  private constructor(base: string, manifest: DitManifest, limit: number, source: ByteSource | null) {
     this.#base = base;
+    this.#source = source;
     this.#limit = limit;
     this.config = manifest.config;
     for (const tensor of manifest.tensors) this.#byName.set(tensor.name, tensor);
   }
 
-  static async open(base: string, maxCachedTensors = 48): Promise<FetchedDitWeights> {
+  static async open(
+    base: string,
+    maxCachedTensors = 48,
+    source: ByteSource | null = null,
+  ): Promise<FetchedDitWeights> {
     const response = await fetch(`${base}/dit.manifest.json`);
     if (!response.ok) {
       throw new Error(
@@ -146,7 +172,7 @@ export class FetchedDitWeights {
     if (manifest.format.groupSize !== GROUP_SIZE) {
       throw new Error(`fetch-weights: manifest declares group size ${manifest.format.groupSize}, not ${GROUP_SIZE}.`);
     }
-    return new FetchedDitWeights(base, manifest, maxCachedTensors);
+    return new FetchedDitWeights(base, manifest, maxCachedTensors, source);
   }
 
   /** Total bytes fetched, for the progress read-out — the number the user is waiting on. */
@@ -277,8 +303,8 @@ export class FetchedDitWeights {
     const [N, K] = tensor.shape as [number, number];
     const words = N * Math.ceil(K / 4);
     const [codes, scale] = await Promise.all([
-      cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
-      cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N * 4),
+      cachedRange(this.#source, `${this.#base}/dit.q8.bin`, "dit.q8.bin", tensor.codesOffset * 4, words * 4),
+      cachedRange(this.#source, `${this.#base}/dit.q8scales.bin`, "dit.q8scales.bin", tensor.scaleOffset * 4, N * 4),
     ]);
     this.bytesHeld += codes.byteLength + scale.byteLength;
     return this.#remember(this.#packedCache, name, {
@@ -301,8 +327,8 @@ export class FetchedDitWeights {
       const words = N! * Math.ceil(K! / 8);
       const groups = N! * Math.ceil(K! / GROUP_SIZE);
       const [codes, scales] = await Promise.all([
-        cachedRange(`${this.#base}/dit.codes.bin`, tensor.codesOffset * 4, words * 4),
-        cachedRange(`${this.#base}/dit.scales.bin`, tensor.scaleOffset * 4, groups * 4),
+        cachedRange(this.#source, `${this.#base}/dit.codes.bin`, "dit.codes.bin", tensor.codesOffset * 4, words * 4),
+        cachedRange(this.#source, `${this.#base}/dit.scales.bin`, "dit.scales.bin", tensor.scaleOffset * 4, groups * 4),
       ]);
       out = dequantizeQ4G128({
         packed: new Uint32Array(codes),
@@ -313,12 +339,12 @@ export class FetchedDitWeights {
     } else if (tensor.kind === "q8") {
       const words = N! * Math.ceil(K! / 4);
       const [codes, scale] = await Promise.all([
-        cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset * 4, words * 4),
-        cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset * 4, N! * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8.bin`, "dit.q8.bin", tensor.codesOffset * 4, words * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8scales.bin`, "dit.q8scales.bin", tensor.scaleOffset * 4, N! * 4),
       ]);
       out = dequantizeQ8({ packed: new Uint32Array(codes), scale: new Float32Array(scale), N: N!, K: K! });
     } else {
-      const buffer = await cachedRange(`${this.#base}/dit.f32.bin`, tensor.offset * 4, N! * K! * 4);
+      const buffer = await cachedRange(this.#source, `${this.#base}/dit.f32.bin`, "dit.f32.bin", tensor.offset * 4, N! * K! * 4);
       out = new Float32Array(buffer);
     }
     this.bytesHeld += out.byteLength;
@@ -335,26 +361,41 @@ interface SafetensorsEntry {
 /** A `.safetensors` shard, read over HTTP. The header is fetched once. */
 export class FetchedSafetensors {
   readonly #url: string;
+  readonly #file: string;
   readonly #dataStart: number;
   readonly #entries: Map<string, SafetensorsEntry>;
+  readonly #source: ByteSource | null;
 
-  private constructor(url: string, dataStart: number, entries: Map<string, SafetensorsEntry>) {
+  private constructor(
+    url: string,
+    file: string,
+    dataStart: number,
+    entries: Map<string, SafetensorsEntry>,
+    source: ByteSource | null,
+  ) {
+    this.#file = file;
+    this.#source = source;
     this.#url = url;
     this.#dataStart = dataStart;
     this.#entries = entries;
   }
 
-  static async open(url: string): Promise<FetchedSafetensors> {
-    const lengthBytes = await readRange(url, 0, 8);
+  /** `file` is the name within `source`; `url` is used only when there is none. */
+  static async open(
+    url: string,
+    source: ByteSource | null = null,
+    file = url.split("/").pop()!,
+  ): Promise<FetchedSafetensors> {
+    const lengthBytes = await cachedRange(source, url, file, 0, 8);
     const headerLength = Number(new DataView(lengthBytes).getBigUint64(0, true));
-    const headerBytes = await readRange(url, 8, headerLength);
+    const headerBytes = await cachedRange(source, url, file, 8, headerLength);
     const header = JSON.parse(new TextDecoder().decode(headerBytes)) as Record<string, SafetensorsEntry>;
     const entries = new Map<string, SafetensorsEntry>();
     for (const [name, value] of Object.entries(header)) {
       if (name === "__metadata__") continue;
       entries.set(name, value);
     }
-    return new FetchedSafetensors(url, 8 + headerLength, entries);
+    return new FetchedSafetensors(url, file, 8 + headerLength, entries, source);
   }
 
   has(name: string): boolean {
@@ -392,7 +433,7 @@ export class FetchedSafetensors {
     const out = new Float32Array(rows.length * rowLength);
     for (let i = 0; i < rows.length; i += 1) {
       const at = this.#dataStart + entry.data_offsets[0] + rows[i]! * rowLength * perElement;
-      const buffer = await cachedRange(this.#url, at, rowLength * perElement);
+      const buffer = await cachedRange(this.#source, this.#url, this.#file, at, rowLength * perElement);
       const row =
         entry.dtype === "F32" ? new Float32Array(buffer) : bf16ToF32(new Uint16Array(buffer));
       out.set(row, i * rowLength);
@@ -420,12 +461,14 @@ export class FetchedShards {
   constructor(
     readonly base: string,
     readonly weightMap: Record<string, string>,
+    /** Passed to each shard, so a bound folder is read rather than the network. */
+    readonly source: ByteSource | null = null,
   ) {}
 
   async #file(shard: string): Promise<FetchedSafetensors> {
     let file = this.#files.get(shard);
     if (!file) {
-      file = await FetchedSafetensors.open(`${this.base}/${shard}`);
+      file = await FetchedSafetensors.open(`${this.base}/${shard}`, this.source, shard);
       this.#files.set(shard, file);
     }
     return file;
