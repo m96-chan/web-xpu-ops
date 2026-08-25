@@ -70,6 +70,28 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+### Added
+
+- **A transformer block of MiniMax-H3's visual VAE decoder** (issue #200). The
+  decoder is 36 identical blocks over 2048 channels — **9.69 GB of the
+  checkpoint's 10.42** — so a port is right or wrong at the block and the rest
+  is a loop. Built in the order `examples/zimage` and `examples/anima` were.
+
+  Held to **the model's own output**: `tools/gen_block_golden.py` imports
+  `TransformerBlock` and `RotaryEmbeddingND` from the bundle the checkpoint
+  ships and runs block 0 on a fixed input. Worst element **1.192e-7**, RMS
+  1.773e-9.
+
+  Three things it does that Z-Image's block does not, each of which returns a
+  well-formed tensor when got wrong: **Q, K and V come from one `to_qkv` and are
+  interleaved per head** (`view(B, L, -1, 3 * dim_head)`, not three separate
+  blocks); **QK-norm has no weights** (`qk_norm_affine: false`, passed as ones
+  rather than a second path); and the branches carry **LayerScale**, a
+  per-channel parameter that multiplies each before the residual.
+
+  No new kernel: `matmul`, `rmsnorm`, `attention`, `rope`'s axes entry,
+  `activation` and `elementwise` cover it.
+
 ### Changed
 
 - **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
