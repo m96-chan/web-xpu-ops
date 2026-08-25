@@ -171,6 +171,11 @@ def convert(model_dir: Path, out_dir: Path) -> dict:
         write_quant("lmHead", "lm_head.weight")
 
     manifest = {
+        # Null when the operator did not say. Recorded either way, so "we do not
+        # know" is a fact the artifact carries rather than something a reader
+        # has to infer from an absent key.
+        "sourceRepo": args.source_repo,
+        "license": args.license,
         "generatedBy": "llm/tools/convert_weights.py",
         "sourceModelDir": str(model_dir),
         "config": config,
@@ -191,6 +196,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-dir", required=True, type=Path, help="HF checkpoint directory (config.json + model.safetensors)")
     ap.add_argument("--out-dir", required=True, type=Path, help="output directory for manifest.json + weights.*.bin")
+    # Provenance, carried by the artifact rather than by whoever remembers.
+    # This converter takes a directory, so it cannot know the upstream on its
+    # own -- but the operator does, and an artifact that cannot name its
+    # source is one nobody can decide anything about later (issue #190).
+    ap.add_argument("--source-repo", default=None,
+                    help="Where the checkpoint came from, e.g. sbintuitions/sarashina2.2-1b-instruct-v0.1")
+    ap.add_argument("--license", default=None,
+                    help="Its licence, e.g. mit. Written into the manifest verbatim.")
     args = ap.parse_args()
 
     sizes = convert(args.model_dir, args.out_dir)

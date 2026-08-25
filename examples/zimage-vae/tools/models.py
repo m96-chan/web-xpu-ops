@@ -26,6 +26,15 @@ import os
 from pathlib import Path
 
 REPO = "Tongyi-MAI/Z-Image"
+# Recorded into every manifest a converter writes, not only in a README.
+#
+# Tracing Anima's licence took an hour because its converted weights named a
+# repository that declared no licence and deferred to an upstream it did not
+# name (issue #190). A converted artifact that cannot say where it came from is
+# an artifact nobody can decide anything about later -- including whether it may
+# be redistributed at all.
+LICENSE = "apache-2.0"
+LICENSE_URL = f"https://huggingface.co/{REPO}"
 
 # What each component needs, as `snapshot_download` patterns.
 COMPONENTS = {
