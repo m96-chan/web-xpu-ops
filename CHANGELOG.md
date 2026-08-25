@@ -21,6 +21,22 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+### Fixed
+
+- **The Anima demo's cache buster had never fired** (issue #177). The server
+  stamps the bundle's mtime onto the `<script src>` because `Cache-Control:
+  no-store` was measured not to be enough — a tab that had loaded the page
+  before the header existed kept running the bundle it already had. It replaced
+  the literal `"./dist/bundle.js"`, and that page's tag says
+  `"/dist/bundle.js"`, so the rewrite matched nothing and returned its input.
+  Nothing failed: the request was logged, 200 was returned, and the stale tab
+  went on running an old bundle while the server reported serving a new one.
+
+  Found while confirming a browser would actually run a newly tuned kernel,
+  which is exactly the measurement it would have corrupted. Both demo servers
+  now match by pattern and **throw when the rewrite does not fire**, since a
+  no-op string replacement is otherwise invisible.
+
 - **Flash attention ships as two kernels, FA2 and FA3, and runs 5.4x faster**
   (issue #177). The generations are separate programs with separate schedules
   rather than one program with a switch, because they are separate algorithms;

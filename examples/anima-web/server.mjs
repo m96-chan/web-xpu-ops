@@ -119,7 +119,16 @@ function resolve(urlPath) {
 function indexWithStamp(file) {
   const bundle = path.join(here, "dist/bundle.js");
   const stamp = existsSync(bundle) ? statSync(bundle).mtimeMs.toFixed(0) : "0";
-  return readFileSync(file, "utf8").replace("./dist/bundle.js", `./dist/bundle.js?v=${stamp}`);
+  const html = readFileSync(file, "utf8");
+  // Matched by pattern rather than by one literal spelling, and **checked to
+  // have landed**. The first version replaced the literal "./dist/bundle.js"
+  // while this page's tag said "/dist/bundle.js", so the rewrite quietly did
+  // nothing and every guarantee in the comment above was void: a stale tab kept
+  // running an old bundle while the server reported serving a new one. A
+  // no-op rewrite has to be an error, not a silent pass.
+  const stamped = html.replace(/(src=")(\.?\/dist\/bundle\.js)(")/, `$1$2?v=${stamp}$3`);
+  if (stamped === html) throw new Error(`${file}: no <script src=".../dist/bundle.js"> to stamp — the cache buster would be a no-op`);
+  return stamped;
 }
 
 /**
