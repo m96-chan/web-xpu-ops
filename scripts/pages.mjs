@@ -131,6 +131,12 @@ ${DEMOS.map((d) => card(`${d.slug}/`, d.title, d.blurb)).join("\n")}
 ${NEEDS_A_CLONE.map(([dir, title, why]) =>
   card("", title, `Runs from a checkout: <code>${dir}</code>.`, `Not published here — it ${why}.`),
 ).join("\n")}
+${card(
+  "https://voxshot.m96-chan.dev/",
+  "Text to speech — VoxShot",
+  "Browser TTS and zero-shot voice cloning, built on these ops. A separate project, and the reason " +
+    "<code>istft</code> has a <code>&quot;same&quot;</code> mode and <code>snake</code> has two entry points.",
+)}
 
 <p class="note">
   <strong>The models are not MIT.</strong> Anima is

@@ -33,6 +33,17 @@ something else and always will: a few ops take a row per entry point
 (`matvecQ8`, `matmulQ8`, `ropeAxes`), and `permute` and `dequant_transpose` are
 described in the LLM-engine sections that produced them rather than here.
 
+**Who runs these.** `examples/` carries two image models checked against their
+own implementations — [Anima-3.8B](examples/anima/) and
+[Z-Image](examples/zimage/) — and an LLM engine in `llm/`. The audio ops have a
+consumer too, and it is in another repository:
+[**VoxShot**](https://github.com/m96-chan/voxshot) builds MioTTS on them —
+browser text-to-speech and zero-shot voice cloning, `istft`'s `"same"` padding,
+`snake.beta`, `group_norm` and `conv_transpose` among others. It is why those
+ops have the conventions they do; the rows below name MioCodec because MioCodec
+is what they were written against. There is no TTS example here, deliberately —
+the port exists there and one copy of it is better than two.
+
 **Speed is unmeasured for all but one of them.** The roofline each would be
 reported against does not exist yet, and a number without one would be a
 statement about this GPU rather than about the kernel — so the column says so
