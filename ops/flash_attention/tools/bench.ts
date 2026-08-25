@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { rejectReason, type FlashShape, type Generation } from "./shape.js";
 import { fa2Flash } from "./fa2.wgsl.js";
 import { fa3Flash } from "./fa3.wgsl.js";
-import { FLASH_GENERATION, FLASH_TILE } from "../index.js";
+import { FLASH_GENERATION, flashGrid } from "../index.js";
 import { describeSweep, sweep } from "../../../harness/sweep.js";
 
 const arg = (name: string): string | undefined => {
@@ -99,7 +99,8 @@ const uniforms = (H: number, L: number, S: number): ArrayBuffer =>
   ]);
 
 function dispatchFor(
-  code: string, q: Float32Array, k: Float32Array, v: Float32Array, H: number, L: number, S: number, bq = 1,
+  code: string, q: Float32Array, k: Float32Array, v: Float32Array, H: number, L: number, S: number,
+  grid?: [number, number, number], bq = 1,
 ): Dispatch {
   return {
     code,
@@ -111,7 +112,7 @@ function dispatchFor(
       { kind: "out", type: "f32", length: H * L * D },
       { kind: "uniform", data: uniforms(H, L, S) },
     ],
-    workgroups: [Math.ceil(L / bq), H, 1],
+    workgroups: grid ?? [Math.ceil(L / bq), H, 1],
   };
 }
 
@@ -128,7 +129,7 @@ console.log(`\n${all.length} generation/shape pairs fit this device's limits`);
 console.log("checking each against ops/flash_attention's reference on a ragged 13x37 …");
 const correct: Candidate[] = [];
 for (const candidate of all) {
-  const [got] = await runner.run(dispatchFor(codeFor(candidate), cq, ck, cv, CH, CL, CS, candidate.shape.bq));
+  const [got] = await runner.run(dispatchFor(codeFor(candidate), cq, ck, cv, CH, CL, CS, undefined, candidate.shape.bq));
   const out = got as Float32Array;
   let worst = 0;
   for (let i = 0; i < want.length; i += 1) worst = Math.max(worst, Math.abs(out[i]! - want[i]!));
@@ -146,11 +147,12 @@ for (const { name, L, S, heads } of SHAPES) {
   // and dispatching one per query gives it sixteen times the work — which is
   // what made a baseline read 83.93 ms against its real 8.43, and would have
   // made every candidate look like a triumph.
-  const reference = dispatchFor(shipped, q, k, v, heads, L, S, FLASH_TILE.bq);
+  // The shipped kernel's grid comes from the op, not from a tile restated here.
+  const reference = dispatchFor(shipped, q, k, v, heads, L, S, flashGrid(L, heads, 1));
   const entries = correct.map((candidate) => ({
     candidate,
     label: label(candidate),
-    dispatch: dispatchFor(codeFor(candidate), q, k, v, heads, L, S, candidate.shape.bq),
+    dispatch: dispatchFor(codeFor(candidate), q, k, v, heads, L, S, undefined, candidate.shape.bq),
   }));
 
   const report = await sweep(runner, reference, entries);

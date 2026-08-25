@@ -22,7 +22,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRunner, params, type Dispatch } from "../../../harness/wgsl.js";
-import { FLASH_GENERATION } from "../../flash_attention/index.js";
+import { FLASH_GENERATION, flashGrid } from "../../flash_attention/index.js";
 import { measureRoofline } from "../../../harness/roofline.js";
 
 const arg = (name: string, fallback: number): number => {
@@ -136,7 +136,11 @@ const flashDispatch: Dispatch = {
       ]),
     },
   ],
-  workgroups: [L, heads, 1],
+  // `flashGrid`, not one workgroup per query. This kernel takes `FLASH_TILE.bq`
+  // query rows at a time, so `[L, heads, 1]` launched thirty-two times too many
+  // workgroups and timed the shipped kernel at thirty-two times its cost --
+  // against which the split path here looked competitive when it is not.
+  workgroups: flashGrid(L, heads, 1),
 };
 
 // `time()` reads a timestamp query written around the compute pass. Wall clock

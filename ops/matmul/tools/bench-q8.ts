@@ -13,6 +13,8 @@
  *     npx tsx ops/matmul/tools/bench-q8.ts [--shape qkv|mlp-up|mlp-down] [--quick]
  */
 import { createRunner, params, type Dispatch } from "../../../harness/wgsl.js";
+import { matmulQ8Grid } from "../index.js";
+import { describeSweep, sweep } from "../../../harness/sweep.js";
 import { measureRoofline } from "../../../harness/roofline.js";
 import { matmulQ8 } from "../reference.js";
 import { packQ8 } from "../../matvec/index.js";
@@ -98,8 +100,15 @@ function quantize(dense: Float32Array, M: number, K: number): { weight: Uint32Ar
   return { weight: packQ8({ codes, N: M, K }), scale };
 }
 
+/**
+ * The shipped kernel's own dispatch, for the baseline row.
+ *
+ * **The grid comes from `matmulQ8Grid`.** It used to be `ceil(M / 16) x
+ * ceil(N / 16)`, which is what this kernel wanted before it was tiled; the
+ * tiled one covers 128x64 outputs per workgroup, so that grid launched
+ * **thirty-two times too many workgroups**, each recomputing a whole tile.
+ */
 function shippedDispatch(a: Float32Array, w: Uint32Array, s: Float32Array, N: number, K: number, M: number): Dispatch {
-  const TILE = 16;
   return {
     code: shipped,
     bindings: [
@@ -109,7 +118,7 @@ function shippedDispatch(a: Float32Array, w: Uint32Array, s: Float32Array, N: nu
       { kind: "out", type: "f32", length: N * M },
       { kind: "uniform", data: params([["u32", N], ["u32", M], ["u32", K]]) },
     ],
-    workgroups: [Math.ceil(M / TILE), Math.ceil(N / TILE), 1],
+    workgroups: matmulQ8Grid(N, M),
   };
 }
 
@@ -164,28 +173,22 @@ for (const { name, N, K, M } of SHAPES.filter((s) => want === "all" || s.name ==
   const flops = 2 * N * K * M;
   console.log(`${name}  N=${N} K=${K} M=${M}  (${(flops / 1e9).toFixed(1)} GFLOP)`);
 
-  const baseline = await runner.time(shippedDispatch(a, weight, scale, N, K, M));
-  if (baseline !== null) {
-    const share = roof ? ` (${((flops / baseline / roof.compute) * 100).toFixed(1)}% of roofline)` : "";
-    console.log(`  shipped TILE=16:  ${(baseline * 1000).toFixed(2)} ms, ${(flops / baseline / 1e12).toFixed(2)} TFLOP/s${share}`);
-  }
-
-  const scored: { shape: TileShape; seconds: number }[] = [];
-  for (const shape of pool) {
-    const seconds = await runner.time(tiledDispatch(shape, a, weight, scale, N, K, M));
-    if (seconds !== null) scored.push({ shape, seconds });
-  }
-  scored.sort((x, y) => x.seconds - y.seconds);
-  console.log("  best 5:");
-  for (const { shape, seconds } of scored.slice(0, 5)) {
-    const achieved = flops / seconds;
-    const share = roof ? `${((achieved / roof.compute) * 100).toFixed(1)}%` : "n/a";
-    const speedup = baseline !== null ? `${(baseline / seconds).toFixed(1)}x` : "n/a";
-    console.log(
-      `    ${label(shape).padEnd(34)} ${(seconds * 1000).toFixed(2).padStart(7)} ms  ` +
-        `${(achieved / 1e12).toFixed(2).padStart(6)} TFLOP/s  ${share.padStart(6)}  ${speedup.padStart(5)}  ` +
-        `${(q8StorageBytes(shape) / 1024).toFixed(1)} KB shmem`,
-    );
+  // Interleaved against the shipped kernel, in the same rounds, because this
+  // device's clock does not hold still -- see `harness/sweep.ts`. Timing
+  // candidates in order measured the ramp as if it were the code.
+  const report = await sweep(
+    runner,
+    shippedDispatch(a, weight, scale, N, K, M),
+    pool.map((shape) => ({
+      candidate: shape,
+      label: `${label(shape)}, ${(q8StorageBytes(shape) / 1024).toFixed(1)} KB`,
+      dispatch: tiledDispatch(shape, a, weight, scale, N, K, M),
+    })),
+  );
+  if (report) {
+    for (const line of describeSweep(report, flops, roof?.compute ?? null, Number(arg("--top") ?? 6))) console.log(line);
+  } else {
+    console.log("  the device declined to time it");
   }
   console.log();
 }

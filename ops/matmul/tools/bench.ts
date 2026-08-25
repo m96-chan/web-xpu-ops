@@ -16,6 +16,7 @@
  *     npx tsx ops/matmul/tools/bench.ts [--shape qkv|mlp-up|mlp-down|all] [--quick]
  */
 import { createRunner, params, type Dispatch } from "../../../harness/wgsl.js";
+import { matmulGrid } from "../index.js";
 import { measureRoofline } from "../../../harness/roofline.js";
 import { matmul } from "../reference.js";
 import { readFileSync } from "node:fs";
@@ -97,9 +98,17 @@ if (roof) {
 
 const shipped = readFileSync(fileURLToPath(new URL("../wgsl/kernel.wgsl", import.meta.url)), "utf8");
 
-/** The shipped kernel's own dispatch, for the baseline row. */
+/**
+ * The shipped kernel's own dispatch, for the baseline row.
+ *
+ * **The grid comes from `matmulGrid`.** It used to be `ceil(N / 16) x
+ * ceil(M / 16)`, which is what this kernel wanted before it was tiled; the
+ * tiled one covers 64x128 outputs per workgroup, so that grid launched
+ * **thirty-two times too many workgroups**, each recomputing a whole tile. The
+ * answer stayed right and the baseline was ~32x too slow, so every candidate
+ * measured against it looked like a triumph.
+ */
 function shippedDispatch(a: Float32Array, b: Float32Array, M: number, K: number, N: number): Dispatch {
-  const TILE = 16;
   return {
     code: shipped,
     bindings: [
@@ -108,7 +117,7 @@ function shippedDispatch(a: Float32Array, b: Float32Array, M: number, K: number,
       { kind: "out", type: "f32", length: M * N },
       { kind: "uniform", data: params([["u32", M], ["u32", N], ["u32", K]]) },
     ],
-    workgroups: [Math.ceil(N / TILE), Math.ceil(M / TILE), 1],
+    workgroups: matmulGrid(M, N),
   };
 }
 
@@ -171,7 +180,7 @@ for (const { name, M, K, N, per } of shapes) {
   const baseline = await runner.time(shippedDispatch(a, b, M, K, N));
   if (baseline !== null) {
     const share = roof ? ` (${((flops / baseline / roof.compute) * 100).toFixed(1)}% of roofline)` : "";
-    console.log(`  shipped TILE=16:  ${(baseline * 1000).toFixed(2)} ms, ${(flops / baseline / 1e12).toFixed(2)} TFLOP/s${share}`);
+    console.log(`  shipped:  ${(baseline * 1000).toFixed(2)} ms, ${(flops / baseline / 1e12).toFixed(2)} TFLOP/s${share}`);
   }
 
   const scored: { shape: TileShape; seconds: number }[] = [];
