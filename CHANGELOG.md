@@ -70,6 +70,28 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+### Changed
+
+- **Flash attention stages `k` and `v` without dividing** (issue #177). The
+  staging loops turned a flat index into an address the way the arithmetic reads
+  — row `base + e / Dv`, channel `e % Dv` — and **a GPU has no integer divide
+  instruction**, so each is a short inline sequence the compiler emits and
+  cannot fold, because `Dv` is a uniform. They cancel exactly:
+  `(base + e / Dv) * Dv + e % Dv == base * Dv + e`. The bound check goes with
+  them.
+
+  **4% off the kernel and 3.9% off attention in a forward**, RTX 5090 / driver
+  610.57.04 / Dawn `webgpu@0.4.0`, q8 weights and f32 activations, at Anima's
+  own shapes (self L=S=3952 8 heads, cross L=3952 S=512 16 heads, D=128): the
+  self shape goes 5.84 → 5.60 ms with the reference moving 0% across three runs,
+  and an 832x1216 forward's `flashAttention` goes 748 → 719 ms over three
+  alternating pairs. Measured in both orders, because with `linear` always first
+  the *control* kernel moved 1.2% too — the figure above is from the order where
+  the control moved against it.
+
+  The addressing is a swept field rather than a rewrite, so #198 can re-decide
+  it on hardware that is not this one.
+
 ### Fixed
 
 - **The Anima demo re-read weights it already had on the GPU, once per forward**

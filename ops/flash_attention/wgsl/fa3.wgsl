@@ -95,8 +95,9 @@ fn main(
   // D and Dv can differ; k and v are staged with their own strides rather
   // than one shared constant.
   for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
-    let j = (0u) + e / d4n;
-    let unit = e % d4n;
+    let row = e / d4n;
+    let unit = e - row * d4n;
+    let j = (0u) + row;
     let c0 = unit * 4u;
     var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (j < params.S) {
@@ -105,12 +106,12 @@ fn main(
         if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
       }
     }
-    sk[(0u) * K_STRIDE + (e / d4n) * ROW + unit] = val;
+    sk[(0u) * K_STRIDE + row * ROW + unit] = val;
   }
+  let v_at = v_head + (0u) * params.Dv;
+  let v_live = select(0u, (params.S - (0u)) * params.Dv, params.S > (0u));
   for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
-    let j = (0u) + e / params.Dv;
-    let d = e % params.Dv;
-    sv[(0u) * V_STRIDE + e] = select(0.0, v[v_head + j * params.Dv + d], j < params.S);
+    sv[(0u) * V_STRIDE + e] = select(0.0, v[v_at + e], e < v_live);
   }
 
   var cur = 0u;
@@ -125,8 +126,9 @@ fn main(
         // D and Dv can differ; k and v are staged with their own strides rather
         // than one shared constant.
         for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
-          let j = ((t + 1u) * TILE_S) + e / d4n;
-          let unit = e % d4n;
+          let row = e / d4n;
+          let unit = e - row * d4n;
+          let j = ((t + 1u) * TILE_S) + row;
           let c0 = unit * 4u;
           var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
           if (j < params.S) {
@@ -135,12 +137,12 @@ fn main(
               if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
             }
           }
-          sk[(1u - cur) * K_STRIDE + (e / d4n) * ROW + unit] = val;
+          sk[(1u - cur) * K_STRIDE + row * ROW + unit] = val;
         }
+        let v_at = v_head + ((t + 1u) * TILE_S) * params.Dv;
+        let v_live = select(0u, (params.S - ((t + 1u) * TILE_S)) * params.Dv, params.S > ((t + 1u) * TILE_S));
         for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
-          let j = ((t + 1u) * TILE_S) + e / params.Dv;
-          let d = e % params.Dv;
-          sv[(1u - cur) * V_STRIDE + e] = select(0.0, v[v_head + j * params.Dv + d], j < params.S);
+          sv[(1u - cur) * V_STRIDE + e] = select(0.0, v[v_at + e], e < v_live);
         }
       }
 

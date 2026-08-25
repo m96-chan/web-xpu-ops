@@ -68,8 +68,10 @@ function candidates(): Candidate[] {
             for (const prefetch of prefetches) {
               for (const scoreReads of ["scalar", "vec4"] as const) {
                 for (const padRows of [false, true]) {
-                  const shape = { bq, tileS, threads, accumulate, prefetch, scoreReads, padRows };
-                  if (rejectReason(shape, D, generation) === null) out.push({ generation, shape });
+                  for (const stageAddressing of ["divide", "linear"] as const) {
+                    const shape = { bq, tileS, threads, accumulate, prefetch, scoreReads, padRows, stageAddressing };
+                    if (rejectReason(shape, D, generation) === null) out.push({ generation, shape });
+                  }
                 }
               }
             }
@@ -83,7 +85,8 @@ function candidates(): Candidate[] {
 
 const label = ({ generation, shape: s }: Candidate): string =>
   `${generation.toUpperCase()} BQ=${s.bq} TILE_S=${s.tileS} ${s.threads}t ${s.accumulate}-outer` +
-  (generation === "fa3" ? ` ${s.prefetch}` : "") + ` ${s.scoreReads}${s.padRows ? "+pad" : ""}`;
+  (generation === "fa3" ? ` ${s.prefetch}` : "") +
+  ` ${s.scoreReads}${s.padRows ? "+pad" : ""}${s.stageAddressing === "linear" ? "+lin" : ""}`;
 
 
 const runner = await createRunner();
