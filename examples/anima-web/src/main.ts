@@ -364,6 +364,18 @@ async function bindFolder(existing: FileSystemDirectoryHandle | null): Promise<B
 }
 
 async function gate(): Promise<ByteSource | null> {
+  // Checked before `navigator.gpu`, because `navigator.gpu` is undefined in an
+  // insecure context and "this browser has no WebGPU" would be a lie about a
+  // browser that has it. The published site is reachable over plain HTTP, so
+  // this is a state a real visitor can be in.
+  if (!isSecureContext) {
+    openGate(
+      "Sorry — this page needs HTTPS",
+      `WebGPU is only available in a secure context, and this page was loaded over ${location.protocol}. ` +
+        "The same address over https works.",
+    );
+    return null;
+  }
   if (!navigator.gpu) {
     openGate(
       "Sorry — no WebGPU here",
