@@ -43,14 +43,19 @@ if (missing.length > 0) {
  * URL prefix to the directory behind it. Longest prefix wins.
  *
  * The encoder and the VAE are single files rather than directories, so they are
- * mounted by their parent and reached by name — the page asks for
- * `/weights/encoder/qwen_3_06b_base.safetensors`, and a file that is not the
- * one named here simply is not found.
+ * mounted by their parent and reached by name. Three mounts share the
+ * `/weights/` prefix, and "longest prefix wins" does not separate them — the
+ * resolver has to try each and take the first that has the file, which is why
+ * the loop below does not stop at the first matching prefix.
  */
 const mounts = [
-  ["/weights/dit/", ditDir],
-  ["/weights/encoder/", path.dirname(encoderFile)],
-  ["/weights/vae/", path.dirname(vaeFile)],
+  // Flat, matching the published layout, so `?weights=/weights` reaches the
+  // same names here as the default base does on Hugging Face. When the two
+  // differ, local development exercises a path production never takes --
+  // which is how the demo ended up with a cache buster that had never fired.
+  ["/weights/", ditDir],
+  ["/weights/", path.dirname(encoderFile)],
+  ["/weights/", path.dirname(vaeFile)],
   // Both tokenizer vocabularies: the Qwen BPE is the one this repository
   // already carries for Qwen3-4B — byte-for-byte the same 151,643 pieces — and
   // the T5 unigram is Anima's own fixture.

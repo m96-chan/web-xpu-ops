@@ -20,13 +20,20 @@
  *
  *     node examples/anima-web/tools/measure.mjs [--steps 2] [--size 832x1216]
  *                                              [--url http://127.0.0.1:8789]
+ *                                              [--profile-dir DIR]
  *                                              [--keep] [--timeout 900]
+ *
+ * **`--profile-dir` is how the bound folder survives between runs.** The page
+ * requires one (issue #180) and `showDirectoryPicker` is a native dialog that
+ * CDP cannot answer — there is no automating the first bind. Point every run at
+ * the same profile, bind once by hand, and the handle and its permission are
+ * there for every run after.
  *
  * `--steps 2` is the minimum that profiles anything: the first forward is the
  * upload, so the second is the one measured.
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -50,6 +57,7 @@ if (STEPS < 2) {
 /** Chrome and its scratch profile, tracked so `cleanup` can always reach them. */
 let chrome = null;
 let profileDir = null;
+let ephemeralProfile = true;
 let socket = null;
 let cleaned = false;
 
@@ -95,7 +103,7 @@ function cleanup() {
       // Gone, which is what the wait was for.
     }
   }
-  if (profileDir && !flag("keep")) {
+  if (profileDir && !flag("keep") && ephemeralProfile) {
     try {
       rmSync(profileDir, { recursive: true, force: true });
     } catch (error) {
@@ -165,7 +173,13 @@ async function main() {
     process.exit(2);
   }
 
-  profileDir = mkdtempSync(path.join(tmpdir(), "anima-measure-"));
+  const wanted = arg("profile-dir", null);
+  // A reused profile is not this tool's to delete, and keeping the bound folder
+  // is the whole reason to point at one.
+  const ephemeral = wanted === null;
+  profileDir = ephemeral ? mkdtempSync(path.join(tmpdir(), "anima-measure-")) : wanted;
+  ephemeralProfile = ephemeral;
+  if (!ephemeral) mkdirSync(profileDir, { recursive: true });
   chrome = spawn(
     "google-chrome-stable",
     [
@@ -200,6 +214,46 @@ async function main() {
   if (!page) throw new Error("measure: Chrome opened no page for the demo");
   const { sessionId } = await send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
 
+  // Console and exceptions, forwarded.
+  //
+  // Without this the page can fail, reload, or throw and the driver reports
+  // only that no profile appeared — which is what happened the first time a run
+  // restarted itself mid-generation. A tool that watches a browser and cannot
+  // see what the browser is saying is a tool that reports mysteries.
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.method === "Runtime.consoleAPICalled") {
+      const text = (message.params.args ?? [])
+        .map((a) => a.value ?? a.description ?? a.type)
+        .join(" ");
+      if (message.params.type === "error" || message.params.type === "warning") {
+        console.log(`  [page ${message.params.type}] ${text}`);
+      }
+    } else if (message.method === "Runtime.exceptionThrown") {
+      const d = message.params.exceptionDetails;
+      console.log(`  [page threw] ${d.exception?.description ?? d.text}`);
+    } else if (message.method === "Inspector.targetCrashed") {
+      console.log("  [page crashed] the renderer went away — usually out of memory");
+    } else if (message.method === "Page.frameNavigated" && !message.params.frame.parentId) {
+      console.log(`  [navigated] ${message.params.frame.url}`);
+    }
+  });
+  // Who navigates, with a stack. `Page.frameNavigated` says that it happened;
+  // this says from where.
+  await send(
+    "Page.addScriptToEvaluateOnNewDocument",
+    {
+      source:
+        "addEventListener('beforeunload', () => { console.warn('UNLOAD ' + new Error().stack); });" +
+        "addEventListener('error', (e) => { console.warn('WINDOW ERROR ' + e.message); });" +
+        "addEventListener('unhandledrejection', (e) => { console.warn('UNHANDLED ' + (e.reason && e.reason.message || e.reason)); });",
+    },
+    sessionId,
+  );
+  await send("Runtime.enable", {}, sessionId);
+  await send("Page.enable", {}, sessionId);
+  await send("Inspector.enable", {}, sessionId);
+
   // The page disables Generate until the weights are open. Waiting for the
   // button rather than for a fixed delay: the load is minutes on a cold cache
   // and seconds on a warm one.
@@ -210,7 +264,14 @@ async function main() {
   console.log(`measure: waiting for ${URL_} to be ready …`);
   const readyBy = Date.now() + TIMEOUT_MS;
   while (Date.now() < readyBy) {
-    const ready = await evaluate(sessionId, "!document.getElementById('go')?.disabled");
+    // The button must **exist and be enabled**. `!el?.disabled` was the first
+    // version and it reads `true` for an element that is not there yet, so the
+    // driver clicked a disabled button mid-load, waited for it to enable at the
+    // end of loading, and reported a generation that never ran.
+    const ready = await evaluate(
+      sessionId,
+      "(() => { const b = document.getElementById('go'); return !!b && !b.disabled; })()",
+    );
     if (ready) break;
     const status = await evaluate(sessionId, "document.getElementById('status')?.textContent ?? ''");
     if (status !== lastStatus) console.log(`  ${status}`);
@@ -236,7 +297,10 @@ async function main() {
   const doneBy = Date.now() + TIMEOUT_MS;
   while (Date.now() < doneBy) {
     // The button re-enables when `generate()` returns, success or failure.
-    const done = await evaluate(sessionId, "!document.getElementById('go').disabled");
+    const done = await evaluate(
+      sessionId,
+      "(() => { const b = document.getElementById('go'); return !!b && !b.disabled; })()",
+    );
     const status = await evaluate(sessionId, "document.getElementById('status')?.textContent ?? ''");
     if (status !== lastStatus) console.log(`  ${status}`);
     lastStatus = status;
@@ -273,7 +337,10 @@ async function main() {
   if (report.detail) console.log(report.detail);
   console.log();
   if (!report.profile) {
-    console.log("measure: the page reported no profile. Nothing to read — not a profile of zeros.");
+    console.log(
+      `measure: the page reported no profile — its status is "${report.status}". ` +
+        "Nothing to read, and not a profile of zeros.",
+    );
     process.exitCode = 1;
   } else {
     console.log(report.profile);

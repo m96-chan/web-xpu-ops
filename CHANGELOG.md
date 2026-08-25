@@ -9,6 +9,34 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The Anima demo runs from a folder you pick, and is published** (issues #180,
+  #192). Point it at an empty folder; the weights are downloaded into it once
+  from
+  [`m96-chan/Anima-3.8B-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Anima-3.8B-q8-web-xpu-ops)
+  and read from there every time after. No clone, no `npm install`, no dev
+  server, and no re-fetching 5.0 GB on a reload.
+
+  **A folder is required rather than offered.** The alternative was the Cache
+  API, which puts 5.0 GB in the origin's storage quota where an eviction the
+  page cannot see turns the next run into another download; keeping both paths
+  would mean keeping one nobody chooses. `preloadAll`, which existed to fill
+  that cache, is gone.
+
+  Filling a folder can stop part-way, and what that leaves behind opens, has a
+  plausible size, and produces a **wrong image rather than an error**. So a
+  receipt naming every file and its exact length is written last and checked
+  against the folder before it is used. What the receipt cannot catch — a file
+  of the right length holding the wrong bytes — is recorded rather than papered
+  over: only a digest would, and that costs a full read of 5 GB every start.
+
+  The model's licence is **not** this repository's. Anima is non-commercial;
+  see the README.
+
+- `scripts/pages.mjs` builds the published site, and refuses to emit a page
+  whose cache-buster did not fire. The stamp is the bundle's content hash, so a
+  rebuild that changes nothing does not invalidate anyone's cache.
+
+
 - **Z-Image runs end to end, in a browser** (issue #166). A prompt goes in and a
   1024x1024 image comes out, on WebGPU, composed from this repository's ops:
   byte-level BPE, a Qwen3-4B text encoder, the 30-layer DiT, a rectified-flow

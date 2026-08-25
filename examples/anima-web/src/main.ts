@@ -25,6 +25,14 @@
  * with nothing measurable behind it.
  */
 import { createBrowserRunner, type RunnerStats } from "../../llm-demo/src/browser-runtime.js";
+import {
+  DEFAULT_WEIGHTS_BASE, DirectoryByteSource, HttpByteSource,
+  directoryBindingSupported, type ByteSource,
+} from "./byte-source.js";
+import { provision, readReceipt } from "./provision.js";
+import {
+  forgetFolder, hasPermission, pickFolder, rememberFolder, rememberedFolder, requestPermission,
+} from "./bound-folder.js";
 import { createBrowserResidentDevice } from "./browser-resident.js";
 import { FetchedAnimaWeights, FetchedSafetensors } from "./fetch-weights.js";
 import { ditKernels, encoderKernels, vaeKernels } from "./kernels-web.js";
@@ -64,9 +72,36 @@ import { wanVaeDecodeGpu } from "../../anima/src/vae-gpu.js";
 
 declare const BUILD_STAMP: string;
 
-const DIT_BASE = "/weights/dit";
-const ENCODER_URL = "/weights/encoder/qwen_3_06b_base.safetensors";
-const VAE_URL = "/weights/vae/qwen_image_vae.safetensors";
+/**
+ * Where the weights come from, and where they are kept.
+ *
+ * Issue #180. `?weights=` overrides the base for anyone pointing at their own
+ * copy or a local server; the default is the published conversion, whose
+ * licence is **not** this repository's (see the README). Everything is read
+ * through a `ByteSource`, so a bound folder and an HTTP host are the same code
+ * path with a different transport.
+ */
+const WEIGHTS_BASE = new URLSearchParams(location.search).get("weights") ?? DEFAULT_WEIGHTS_BASE;
+/**
+ * The two tokenizer vocabularies, 6.8 MB, which are **this repository's files
+ * and not the model's** — so they travel with the page rather than with the
+ * weights. Relative, so the page works from a subdirectory (issue #192).
+ */
+const TOKENIZER_BASE = new URL("weights/tokenizer", `${location.origin}${location.pathname}`).href;
+const DIT_BASE = WEIGHTS_BASE;
+const ENCODER_FILE = "qwen_3_06b_base.safetensors";
+const VAE_FILE = "qwen_image_vae.safetensors";
+const ENCODER_URL = `${WEIGHTS_BASE}/${ENCODER_FILE}`;
+const VAE_URL = `${WEIGHTS_BASE}/${VAE_FILE}`;
+/** Every file a folder must hold to be usable offline. */
+const WEIGHT_FILES = [
+  "dit.manifest.json",
+  "dit.q8.bin",
+  "dit.q8scales.bin",
+  "dit.f32.bin",
+  ENCODER_FILE,
+  VAE_FILE,
+];
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
@@ -84,6 +119,17 @@ const sizeSelect = $<HTMLSelectElement>("size");
 const stepsInput = $<HTMLInputElement>("steps");
 const cfgInput = $<HTMLInputElement>("cfg");
 const seedInput = $<HTMLInputElement>("seed");
+const gateDialog = $<HTMLDialogElement>("gate");
+const gateTitle = $<HTMLHeadingElement>("gate-title");
+const gateBody = $<HTMLParagraphElement>("gate-body");
+const gateAction = $<HTMLButtonElement>("gate-action");
+const gateDismiss = $<HTMLButtonElement>("gate-dismiss");
+const gateProgress = $<HTMLParagraphElement>("gate-progress");
+const gateBar = $<HTMLDivElement>("gate-bar");
+const gateBarFill = gateBar.firstElementChild as HTMLDivElement;
+const bindButton = $<HTMLButtonElement>("bind");
+const folderRow = $<HTMLDivElement>("folder-row");
+const folderState = $<HTMLSpanElement>("folder-state");
 const profileBox = $<HTMLInputElement>("profile");
 const profileOut = $<HTMLDivElement>("profile-out");
 
@@ -253,22 +299,205 @@ function reportProfile(
     "</table>";
 }
 
-async function main(): Promise<void> {
+/**
+ * Shows the dialog and keeps it shown.
+ *
+ * `showModal` rather than a hand-rolled overlay: it centres itself, dims the
+ * page through `::backdrop`, traps focus, and a click on a button inside it
+ * still counts as the user gesture `showDirectoryPicker` needs — which a
+ * synthetic overlay would also give, but only by accident.
+ *
+ * `required` blocks Escape. A modal the user can dismiss into a page that
+ * cannot work is a modal that lies about being required.
+ */
+function openGate(title: string, body: string, { required = true, action = "" } = {}): void {
+  gateTitle.textContent = title;
+  gateBody.textContent = body;
+  gateAction.hidden = action === "";
+  gateAction.textContent = action;
+  gateAction.disabled = false;
+  gateDismiss.hidden = required;
+  gateProgress.textContent = "";
+  gateBar.style.display = "none";
+  if (!gateDialog.open) gateDialog.showModal();
+  gateDialog.oncancel = (event) => {
+    if (required) event.preventDefault();
+  };
+}
+
+/**
+ * Two things this page cannot do without, checked before anything is fetched.
+ *
+ * Issue #180. **A folder is required, not offered.** The weights are 5.0 GB and
+ * the alternative — the Cache API — puts them in the origin's storage quota,
+ * where an eviction the page cannot see or control turns the next run into
+ * another 5 GB download. Keeping both paths would mean keeping one nobody
+ * chooses, and the one nobody chooses is the one that rots.
+ *
+ * Each failure stops here and says so, in the dialog. A page that half-starts
+ * and then fails at the first tensor read has spent the user's time to tell
+ * them something it knew at the outset.
+ */
+async function bindFolder(existing: FileSystemDirectoryHandle | null): Promise<ByteSource | null> {
+  const handle = existing ?? (await pickFolder());
+  if (!handle) {
+    gateProgress.textContent = "Sorry — no folder, so there is nothing to run from.";
+    return null;
+  }
+  // Asked inside the click, because a permission prompt outside a user gesture
+  // is refused without telling anyone.
+  if (!(await requestPermission(handle, "readwrite"))) {
+    gateProgress.textContent = "Sorry — that folder was not granted permission.";
+    return null;
+  }
+  await rememberFolder(handle);
+  if (!(await readReceipt(handle))) {
+    gateBar.style.display = "block";
+    await provision(handle, new HttpByteSource(WEIGHTS_BASE), { files: WEIGHT_FILES }, (p) => {
+      gateProgress.textContent =
+        `${p.file} — ${(p.bytesDone / 1e9).toFixed(2)} of ${(p.bytesTotal / 1e9).toFixed(2)} GB ` +
+        `(${p.fileIndex + 1}/${p.fileCount})`;
+      gateBarFill.style.width = `${(p.bytesDone / Math.max(1, p.bytesTotal)) * 100}%`;
+    });
+  }
+  return new DirectoryByteSource(handle);
+}
+
+async function gate(): Promise<ByteSource | null> {
+  // Checked before `navigator.gpu`, because `navigator.gpu` is undefined in an
+  // insecure context and "this browser has no WebGPU" would be a lie about a
+  // browser that has it. The published site is reachable over plain HTTP, so
+  // this is a state a real visitor can be in.
+  if (!isSecureContext) {
+    openGate(
+      "Sorry — this page needs HTTPS",
+      `WebGPU is only available in a secure context, and this page was loaded over ${location.protocol}. ` +
+        "The same address over https works.",
+    );
+    return null;
+  }
   if (!navigator.gpu) {
-    say("This browser has no WebGPU.", "Chrome 113+ or Edge 113+ on a machine with a GPU.");
-    return;
+    openGate(
+      "Sorry — no WebGPU here",
+      "This browser has no WebGPU, and nothing on this page can run without it. " +
+        "Chrome 113+ or Edge 113+, on a machine with a GPU.",
+    );
+    return null;
+  }
+  if (!directoryBindingSupported()) {
+    openGate(
+      "Sorry — this browser cannot bind a folder",
+      "Keeping 5.0 GB outside the browser's own storage needs the File System Access API, " +
+        "which only Chromium-based browsers have.",
+    );
+    return null;
   }
 
-  say("opening the model …");
+  // A folder from a previous visit. `hasPermission` rather than a request:
+  // prompting needs a user gesture, and asking on load is refused silently.
+  const remembered = await rememberedFolder();
+  if (remembered && (await hasPermission(remembered, "readwrite")) && (await readReceipt(remembered))) {
+    return new DirectoryByteSource(remembered);
+  }
+
+  openGate(
+    remembered ? "This folder needs permission again" : "A folder is required",
+    remembered
+      ? `The browser drops folder permission between sessions. One click restores it for "${remembered.name}" — ` +
+        "nothing is downloaded again."
+      : "Pick an empty folder. The weights are downloaded into it once, and read from it every time after.",
+    { action: remembered ? `Use "${remembered.name}" again` : "Choose a folder" },
+  );
+
+  return new Promise<ByteSource | null>((resolve) => {
+    // `onclick` rather than `addEventListener`, throughout: the change-folder
+    // flow later assigns its own, and an accumulated listener from here would
+    // fire alongside it — re-binding the old folder and closing the dialog out
+    // from under the new one.
+    gateAction.onclick = () => {
+      void (async () => {
+        gateAction.disabled = true;
+        try {
+          const source = await bindFolder(remembered);
+          if (!source) {
+            // Offer the picker rather than the remembered folder: refusing the
+            // one that was remembered is a reason to choose a different one.
+            gateAction.textContent = "Choose a folder";
+            gateAction.disabled = false;
+            return;
+          }
+          gateDialog.close();
+          resolve(source);
+        } catch (error) {
+          // Forgotten on failure: a remembered folder that cannot be filled
+          // would be offered as usable next time and rejected every time
+          // without saying why.
+          await forgetFolder();
+          gateProgress.textContent = `Sorry — ${(error as Error).message}`;
+          gateAction.textContent = "Choose a folder";
+          gateAction.disabled = false;
+        }
+      })();
+    };
+  });
+}
+
+async function main(): Promise<void> {
+  const source = await gate();
+  if (!source) return;
+
+  say("opening the model …", `from ${source.describe} — nothing is downloaded`);
+  folderRow.hidden = false;
+  folderState.textContent = source.describe;
+
+  /**
+   * Changing the folder, after one is bound.
+   *
+   * Reloads once the new folder is ready, rather than re-pointing everything in
+   * place. The manifests, the safetensors headers and the resident weight
+   * buffers were all opened through the old source; swapping it live would be a
+   * second code path whose only job is to avoid one navigation, and the kind of
+   * second code path that is exercised once and then rots.
+   */
+  bindButton.onclick = () => {
+    void (async () => {
+      openGate(
+        "Change folder",
+        `The weights are read from ${source.describe}. A different folder is filled from scratch ` +
+          "unless it already holds a complete copy.",
+        { required: false, action: "Choose a different folder" },
+      );
+      const once = async (): Promise<void> => {
+        gateAction.disabled = true;
+        try {
+          const next = await bindFolder(null);
+          if (!next) {
+            gateAction.disabled = false;
+            return;
+          }
+          gateProgress.textContent = "reloading to read from the new folder …";
+          location.reload();
+        } catch (error) {
+          await forgetFolder();
+          gateProgress.textContent = `Sorry — ${(error as Error).message}`;
+          gateAction.disabled = false;
+        }
+      };
+      gateAction.onclick = () => void once();
+      // Dismissible here: an existing folder still works, so backing out leaves
+      // the page in a state that runs.
+      gateDismiss.onclick = () => gateDialog.close();
+    })();
+  };
   const runner = await createBrowserRunner();
   const residentDevice = await createBrowserResidentDevice();
 
   const [dit, encoderFile, vaeFile, qwenVocab, t5Vocab] = await Promise.all([
-    FetchedAnimaWeights.open(DIT_BASE),
-    FetchedSafetensors.open(ENCODER_URL),
-    FetchedSafetensors.open(VAE_URL),
-    fetch("/weights/tokenizer/qwen-qwen3-4b.bpe-vocab.json").then((r) => r.json() as Promise<BpeVocab>),
-    fetch("/weights/tokenizer/t5.unigram-vocab.json").then((r) => r.json() as Promise<T5Vocab>),
+    FetchedAnimaWeights.open(DIT_BASE, 48, source),
+    FetchedSafetensors.open(ENCODER_URL, source, ENCODER_FILE),
+    FetchedSafetensors.open(VAE_URL, source, VAE_FILE),
+    fetch(`${TOKENIZER_BASE}/qwen-qwen3-4b.bpe-vocab.json`).then((r) => r.json() as Promise<BpeVocab>),
+    fetch(`${TOKENIZER_BASE}/t5.unigram-vocab.json`).then((r) => r.json() as Promise<T5Vocab>),
   ]);
   const tokenizers = animaTokenizers(qwenVocab, t5Vocab);
 
@@ -481,11 +710,10 @@ async function main(): Promise<void> {
    * download once; every step after it, and every generation after this one,
    * reads from disk and touches the network not at all.
    */
-  const gb = (bytes: number): string => `${(bytes / 1e9).toFixed(2)} GB`;
-  await dit.preloadAll((done, total, bytes) => {
-    say("caching the DiT …", `${done}/${total} tensors, ${gb(bytes)}`);
-  });
-
+  // No `preloadAll` any more. It existed to put all 5.0 GB into the Cache API
+  // so a second generation did no network -- which is exactly what a bound
+  // folder does, without the origin's storage quota, without an eviction the
+  // page cannot see, and without a second copy of the model on the disk.
   say("ready.", `${cfg.numBlocks} blocks at ${cfg.modelChannels} wide, plus a ${ADAPTER.numLayers}-block adapter.`);
   goButton.disabled = false;
 
