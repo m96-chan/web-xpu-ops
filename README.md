@@ -2184,4 +2184,37 @@ after the first release rather than before it.
 
 ## License
 
-MIT
+MIT — **and that covers the code in this repository, not any model it runs.**
+
+Every model this repository can run is somebody else's, under somebody else's
+terms, and those terms are not MIT and do not become MIT by being loaded here.
+Nothing in `ops/`, `llm/` or `harness/` contains model weights; the examples
+tell you where to fetch them and the licence you accept when you do.
+
+Anima, which `examples/anima/` runs, is the sharpest case: it is
+**non-commercial**, and this library is not.
+
+| | licence | |
+| --- | --- | --- |
+| this repository | MIT | code only |
+| `circlestone-labs/Anima` and anything derived from it, including `lylogummy/Anima-3.8B` and any conversion of it | [CircleStone Labs Non-Commercial License v1.2](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md) | **non-commercial and non-production use only** |
+| its base, `nvidia/Cosmos-Predict2-2B-Text2Image` | [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license) | commercially usable, but stacked under the above; requires a "Built on NVIDIA Cosmos" attribution |
+| the text encoder and VAE, upstream `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen-Image` | Apache-2.0 | distributed inside the CircleStone repo, whose §9 keeps third-party terms in force |
+
+Two licences apply to the Anima weights at once, and **the more restrictive one
+governs**: NVIDIA permits commercial use, CircleStone does not, so the answer is
+non-commercial.
+
+A copy of Anima converted to this repository's int8 format is published at
+[`m96-chan/Anima-3.8B-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Anima-3.8B-q8-web-xpu-ops),
+because the demos need somewhere to fetch from. **Converting it did not change
+its licence**, which is why that repository carries the licence texts and the
+verbatim attribution its terms require rather than this one's MIT.
+
+Z-Image and the LLM demo carry their own upstreams' terms in the same way; see
+each example's README.
+
+Running MIT code against a non-commercially-licensed checkpoint does not make
+your use non-commercial-exempt, and putting the two side by side does not merge
+them. If you intend to build a product on any of this, read the model's licence,
+not this line.

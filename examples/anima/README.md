@@ -185,6 +185,28 @@ Weights:
 | `qwen_3_06b_base.safetensors` | `circlestone-labs/Anima`, `split_files/text_encoders` |
 | `qwen_image_vae.safetensors` | the same repo, `split_files/vae` |
 
+**These weights are not MIT, and this library's licence does not reach them.**
+The chain is `nvidia/Cosmos-Predict2-2B-Text2Image` (NVIDIA Open Model License)
+→ `circlestone-labs/Anima` (**CircleStone Labs Non-Commercial License v1.2**) →
+`lylogummy/Anima-3.8B`, whose own repository declares no licence and defers to
+its upstream. Two licences therefore apply at once and the more restrictive one
+governs: **non-commercial and non-production use only**. The encoder and the VAE
+are Qwen components (`Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen-Image`, both Apache-2.0)
+redistributed inside the CircleStone repository, whose §9 keeps their own terms
+in force.
+
+A converted copy is published at
+[`m96-chan/Anima-3.8B-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Anima-3.8B-q8-web-xpu-ops)
+so this demo has somewhere to fetch from — **the same licence, unchanged**. It
+carries the licence texts and the attribution the licences require, and it is
+not endorsed by CircleStone Labs, lylogummy or NVIDIA. Built on NVIDIA Cosmos.
+
+Read [`LICENSE.md`](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md)
+before downloading anything, not after. Redistributing a converted copy is
+permitted by §2(a) and carries the conditions in §3 — the licence text, a
+verbatim attribution notice, a statement that the model was modified, and
+NVIDIA's "Built on NVIDIA Cosmos".
+
 Verifying, each against its own golden:
 
 ```bash
