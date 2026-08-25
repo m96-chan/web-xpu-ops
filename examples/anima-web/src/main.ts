@@ -170,9 +170,15 @@ function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: n
   // of the whole. It is now a share of the *named* wall clock rather than of
   // GPU alone, so a browser forward that spends half its time outside every
   // dispatch says so instead of reading as a 52% mystery.
-  const warn = acct.coverage < 90
-    ? ' <strong>Under 90% — some of this forward is still unaccounted for.</strong>'
-    : "";
+  // Two different failures, and the second one used to read as success: a
+  // counter summing more forwards than it measured named 2853% of the wall and
+  // the cap turned that into "100% accounted for".
+  const warn = acct.overAccountedMs > 0
+    ? ` <strong>The phases name ${ms(acct.overAccountedMs)} more than this forward lasted — ` +
+      "a counter is measuring something other than this forward, so nothing below is trustworthy.</strong>"
+    : acct.coverage < 90
+      ? ' <strong>Under 90% — some of this forward is still unaccounted for.</strong>'
+      : "";
   profileOut.innerHTML =
     `<p class="note">One forward, ${ms(acct.wallMs)} wall — ${acct.coverage.toFixed(0)}% accounted for.${warn}</p>` +
     "<table>" +
@@ -471,6 +477,9 @@ async function main(): Promise<void> {
         "so the second is the one measured.</p>";
     }
 
+    /** Cumulative across every forward; a forward's share is a difference. */
+    let hostCallbackMsTotal = 0;
+
     const started = performance.now();
 
     // --- conditioning ---
@@ -523,6 +532,7 @@ async function main(): Promise<void> {
           : undefined;
         // Device counters are cumulative; a forward's share is the difference.
         const bindGroupsBefore = residentDevice.stats.bindGroupMs;
+        const hostCallbackBefore = hostCallbackMsTotal;
         const bindGroupCountBefore = residentDevice.stats.bindGroups;
         const forwardStart = wanted ? performance.now() : 0;
         const result = await animaForwardResident(
@@ -535,7 +545,11 @@ async function main(): Promise<void> {
             await dit.preloadPrefix(prefix);
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
-            if (profile) profile.hostCallbackMs += performance.now() - t0;
+            // Into a counter that runs for every forward, never straight into
+            // `profile`: this callback fires on all eighty and `profile`
+            // outlives the one being measured, so `+= into profile` summed the
+            // whole generation and reported 2853% of one forward.
+            hostCallbackMsTotal += performance.now() - t0;
           },
           wanted ? profile ?? undefined : undefined,
         );
@@ -545,6 +559,7 @@ async function main(): Promise<void> {
           if (profile) {
             profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
             profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
+            profile.hostCallbackMs = hostCallbackMsTotal - hostCallbackBefore;
           }
         }
         return result;

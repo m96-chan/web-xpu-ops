@@ -112,8 +112,19 @@ export interface ForwardAccounting {
   unattributedMs: number;
   /** Wall clock this decomposes. */
   wallMs: number;
-  /** How much of `wallMs` is named, as a percentage. Never above 100. */
+  /** How much of `wallMs` is named, as a percentage. Never above 100 — see `overAccountedMs`. */
   coverage: number;
+  /**
+   * How much the phases name *beyond* the wall clock, when they overshoot.
+   *
+   * Zero in a healthy forward. Non-zero means a counter is wrong — a phase
+   * accumulating across more forwards than it was measured over, a span timed
+   * twice — and it has to be **reported**, not clamped away. The first version
+   * clamped: a browser forward whose callback counter had been summing all
+   * eighty forwards named 2853% of the wall, and the table said "100%
+   * accounted for", which is the most confident a wrong number can look.
+   */
+  overAccountedMs: number;
 }
 
 export function accountForForward(profile: AnimaProfile, wallSeconds: number): ForwardAccounting {
@@ -135,6 +146,7 @@ export function accountForForward(profile: AnimaProfile, wallSeconds: number): F
     unattributedMs: Math.max(0, wallMs - named),
     wallMs,
     coverage: wallMs > 0 ? (Math.min(named, wallMs) / wallMs) * 100 : 0,
+    overAccountedMs: Math.max(0, named - wallMs),
   };
 }
 

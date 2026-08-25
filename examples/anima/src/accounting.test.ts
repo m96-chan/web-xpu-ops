@@ -87,6 +87,26 @@ describe("anima / forward accounting", () => {
     expect(acct.unattributedMs).toBe(0);
   });
 
+  it("says when the phases overshoot instead of capping quietly", () => {
+    // The browser's second run: a callback counter that had been summing every
+    // forward of the generation reported 106,952 ms against a 3,749 ms
+    // forward. Capping coverage at 100 turned that into "100% accounted for",
+    // which is the most confident a wrong number can look — so the overshoot
+    // is a field, and the display leads with it.
+    const acct = accountForForward(
+      profile(1968, { encodeMs: 5, submitToDoneMs: 2042, readbackMs: 0, bindGroupMs: 184, hostCallbackMs: 106952 }),
+      3.749,
+    );
+    expect(acct.overAccountedMs).toBeGreaterThan(100_000);
+    expect(acct.coverage).toBe(100);
+    expect(acct.unattributedMs).toBe(0);
+  });
+
+  it("reports no overshoot when the phases fit", () => {
+    const acct = accountForForward(profile(600, { encodeMs: 200, submitToDoneMs: 700, readbackMs: 50 }), 1.0);
+    expect(acct.overAccountedMs).toBe(0);
+  });
+
   it("a forward with no wall clock reports no coverage, not a division by zero", () => {
     const acct = accountForForward(profile(0, { encodeMs: 0, submitToDoneMs: 0, readbackMs: 0 }), 0);
     expect(acct.coverage).toBe(0);

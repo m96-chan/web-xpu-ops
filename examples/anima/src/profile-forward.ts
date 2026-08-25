@@ -142,7 +142,12 @@ profile.bindGroupMs = device.stats.bindGroupMs - bindGroupsBefore;
 profile.bindGroups = device.stats.bindGroups - bindGroupCountBefore;
 const acct = accountForForward(profile, profSeconds);
 console.log(`  ${counted} of ${dispatchCount} dispatches timed; ${acct.coverage.toFixed(0)}% of this forward's wall accounted for`);
-if (acct.coverage < 90) console.log("  **under 90% — some of this forward is still unattributed**");
+if (acct.overAccountedMs > 0) {
+  console.log(`  **the phases name ${acct.overAccountedMs.toFixed(0)} ms more than this forward lasted — a counter ` +
+    "is measuring something other than this forward, so nothing below is trustworthy**");
+} else if (acct.coverage < 90) {
+  console.log("  **under 90% — some of this forward is still unattributed**");
+}
 console.log("\n  where the wall went          ms      share");
 for (const [name, value] of [
   ["inside compute passes", acct.inPassesMs],
