@@ -82,6 +82,11 @@ function fakeSource(sizes: Record<string, number>, failAt?: { file: string; afte
   let served = 0;
   return {
     describe: "fake://weights",
+    async size(file) {
+      const n = sizes[file];
+      if (n === undefined) throw new Error(`no such file ${file}`);
+      return n;
+    },
     async read(file, offset, length) {
       if (failAt && file === failAt.file) {
         served += length;
@@ -94,35 +99,12 @@ function fakeSource(sizes: Record<string, number>, failAt?: { file: string; afte
   };
 }
 
-/** `provision` asks the network for lengths; this stands in for that. */
-function withFetch<T>(sizes: Record<string, number>, body: () => Promise<T>): Promise<T> {
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (url: string | URL, init?: { headers?: Record<string, string> }) => {
-    const name = String(url).split("/").pop()!;
-    const size = sizes[name];
-    if (size === undefined) return { status: 404, headers: new Headers() } as unknown as Response;
-    void init;
-    return {
-      status: 206,
-      headers: new Headers({ "content-range": `bytes 0-0/${size}` }),
-      async arrayBuffer() {
-        return new ArrayBuffer(1);
-      },
-    } as unknown as Response;
-  }) as typeof fetch;
-  return body().finally(() => {
-    globalThis.fetch = original;
-  });
-}
-
 const SIZES = { "a.bin": 20 * 1024 * 1024 + 7, "b.bin": 5 };
 
 describe("anima-web / provisioning a folder", () => {
   it("writes every file and a receipt that matches them", async () => {
     const dir = fakeDir();
-    const receipt = await withFetch(SIZES, () =>
-      provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) }),
-    );
+    const receipt = await provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) });
     expect(receipt.sizes).toEqual(SIZES);
     expect(dir.files.get("a.bin")!.byteLength).toBe(SIZES["a.bin"]);
     // The chunking must not lose or duplicate a byte across its 8 MB boundaries.
@@ -143,7 +125,7 @@ describe("anima-web / provisioning a folder", () => {
     // after the receipt was written. Its name and its receipt entry both look
     // right; only its length does not.
     const dir = fakeDir();
-    await withFetch(SIZES, () => provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) }));
+    await provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) });
     expect(await readReceipt(dir)).not.toBeNull();
     dir.files.set("b.bin", new Uint8Array(4));
     expect(await readReceipt(dir)).toBeNull();
@@ -151,7 +133,7 @@ describe("anima-web / provisioning a folder", () => {
 
   it("a receipt naming a file that is gone is not usable", async () => {
     const dir = fakeDir();
-    await withFetch(SIZES, () => provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) }));
+    await provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) });
     dir.files.delete("a.bin");
     expect(await readReceipt(dir)).toBeNull();
   });
@@ -159,21 +141,22 @@ describe("anima-web / provisioning a folder", () => {
   it("an interrupted download leaves no receipt, so the folder stays unusable", async () => {
     const dir = fakeDir();
     await expect(
-      withFetch(SIZES, () =>
-        provision(dir, fakeSource(SIZES, { file: "a.bin", after: 8 * 1024 * 1024 }), {
-          files: Object.keys(SIZES),
-        }),
-      ),
+      provision(dir, fakeSource(SIZES, { file: "a.bin", after: 8 * 1024 * 1024 }), {
+        files: Object.keys(SIZES),
+      }),
     ).rejects.toThrow(/network went away/);
     expect(await readReceipt(dir)).toBeNull();
   });
 
   it("re-running skips a file that is already the right length", async () => {
     const dir = fakeDir();
-    await withFetch(SIZES, () => provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) }));
+    await provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) });
     let reads = 0;
     const counting: ByteSource = {
       describe: "fake://weights",
+      async size(file) {
+        return SIZES[file as keyof typeof SIZES];
+      },
       async read(file, offset, length) {
         reads += 1;
         void file;
@@ -181,7 +164,7 @@ describe("anima-web / provisioning a folder", () => {
         return new ArrayBuffer(length);
       },
     };
-    await withFetch(SIZES, () => provision(dir, counting, { files: Object.keys(SIZES) }));
+    await provision(dir, counting, { files: Object.keys(SIZES) });
     expect(reads, "a complete folder should be re-read zero times").toBe(0);
   });
 
@@ -192,7 +175,7 @@ describe("anima-web / provisioning a folder", () => {
     // next run would trust the folder.
     const dir = fakeDir({}, 1024);
     await expect(
-      withFetch(SIZES, () => provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) })),
+      provision(dir, fakeSource(SIZES), { files: Object.keys(SIZES) }),
     ).rejects.toThrow(/wrote 1024 bytes of a\.bin, expected/);
     expect(await readReceipt(dir)).toBeNull();
   });

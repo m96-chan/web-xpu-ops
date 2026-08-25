@@ -22,6 +22,7 @@
 import { bf16ToF32 } from "../../zimage/src/bf16.js";
 import { dequantizeQ8 } from "../../zimage/src/weights.js";
 import type { AnimaManifest, AnimaTensor } from "../../anima/src/manifest.js";
+import type { ByteSource } from "./byte-source.js";
 
 let store: Cache | null | undefined;
 async function cacheStore(): Promise<Cache | null> {
@@ -34,6 +35,14 @@ async function cacheStore(): Promise<Cache | null> {
   return store;
 }
 
+/**
+ * Reads a range through a `ByteSource`, keeping a copy in the Cache API.
+ *
+ * Only for sources that are worth caching. A `DirectoryByteSource` already
+ * reads from the user's own disk, so putting a second copy in the origin's
+ * quota would be the 5 GB duplication #180 exists to avoid — `cachedRange`
+ * asks the source whether it wants that.
+ */
 async function readRange(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
   if (byteLength === 0) return new ArrayBuffer(0);
   const response = await fetch(url, {
@@ -53,7 +62,18 @@ async function readRange(url: string, byteOffset: number, byteLength: number): P
 }
 
 /** A byte range, from the browser's disk cache when it has been seen before. */
-async function cachedRange(url: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
+async function cachedRange(
+  source: ByteSource | null,
+  url: string,
+  file: string,
+  byteOffset: number,
+  byteLength: number,
+): Promise<ArrayBuffer> {
+  // A bound folder is already on the user's disk, outside the origin's quota
+  // and under their control. Caching it again would put 5 GB back into the
+  // quota this exists to leave.
+  if (source) return source.read(file, byteOffset, byteLength);
+
   const cache = await cacheStore();
   if (!cache) return readRange(url, byteOffset, byteLength);
 
@@ -84,10 +104,23 @@ export class FetchedAnimaWeights {
   readonly #cache = new Map<string, Float32Array>();
   readonly #packed = new Map<string, { codes: Uint32Array; scale: Float32Array; N: number; K: number }>();
   readonly #limit: number;
+  /**
+   * Where the bytes come from, or null for "over HTTP, through the Cache API".
+   *
+   * Null is the old behaviour and stays the default, so a browser without the
+   * File System Access API keeps working exactly as before (#180).
+   */
+  readonly #source: ByteSource | null;
 
-  private constructor(base: string, manifest: AnimaManifest & { config?: Record<string, number | boolean | string> }, limit: number) {
+  private constructor(
+    base: string,
+    manifest: AnimaManifest & { config?: Record<string, number | boolean | string> },
+    limit: number,
+    source: ByteSource | null,
+  ) {
     this.#base = base;
     this.#limit = limit;
+    this.#source = source;
     if (!manifest.config) {
       throw new Error(
         `fetch-weights: ${base}/dit.manifest.json carries no "config" — it predates ` +
@@ -98,8 +131,17 @@ export class FetchedAnimaWeights {
     for (const tensor of manifest.tensors) this.#byName.set(tensor.name, tensor);
   }
 
-  static async open(base: string, maxCachedTensors = 48): Promise<FetchedAnimaWeights> {
-    const response = await fetch(`${base}/dit.manifest.json`);
+  static async open(
+    base: string,
+    maxCachedTensors = 48,
+    source: ByteSource | null = null,
+  ): Promise<FetchedAnimaWeights> {
+    // Through the source when there is one: a bound folder has the manifest in
+    // it, and reaching past the source to `fetch` would put the network back in
+    // a path that is supposed to have none.
+    const response = source
+      ? new Response(await source.read("dit.manifest.json", 0, await source.size("dit.manifest.json")))
+      : await fetch(`${base}/dit.manifest.json`);
     if (!response.ok) {
       throw new Error(
         `fetch-weights: no manifest at ${base}/dit.manifest.json (${response.status}). ` +
@@ -113,7 +155,7 @@ export class FetchedAnimaWeights {
           "not q8-per-row. This is the Anima loader; Z-Image's is in examples/zimage-web.",
       );
     }
-    return new FetchedAnimaWeights(base, manifest, maxCachedTensors);
+    return new FetchedAnimaWeights(base, manifest, maxCachedTensors, source);
   }
 
   has(name: string): boolean {
@@ -170,13 +212,13 @@ export class FetchedAnimaWeights {
       const [N, K] = tensor.shape as [number, number];
       const words = Math.ceil(K / 4) * N;
       await Promise.all([
-        cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset! * 4, words * 4),
-        cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset! * 4, N * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8.bin`, "dit.q8.bin", tensor.codesOffset! * 4, words * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8scales.bin`, "dit.q8scales.bin", tensor.scaleOffset! * 4, N * 4),
       ]);
       return words * 4 + N * 4;
     }
     const count = tensor.shape.reduce((a, b) => a * b, 1);
-    await cachedRange(`${this.#base}/dit.f32.bin`, tensor.offset! * 4, count * 4);
+    await cachedRange(this.#source, `${this.#base}/dit.f32.bin`, "dit.f32.bin", tensor.offset! * 4, count * 4);
     return count * 4;
   }
 
@@ -227,8 +269,8 @@ export class FetchedAnimaWeights {
       const [N, K] = tensor.shape as [number, number];
       const words = Math.ceil(K / 4) * N;
       const [codes, scale] = await Promise.all([
-        cachedRange(`${this.#base}/dit.q8.bin`, tensor.codesOffset! * 4, words * 4),
-        cachedRange(`${this.#base}/dit.q8scales.bin`, tensor.scaleOffset! * 4, N * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8.bin`, "dit.q8.bin", tensor.codesOffset! * 4, words * 4),
+        cachedRange(this.#source, `${this.#base}/dit.q8scales.bin`, "dit.q8scales.bin", tensor.scaleOffset! * 4, N * 4),
       ]);
       this.#packed.set(name, {
         codes: new Uint32Array(codes), scale: new Float32Array(scale), N, K,
@@ -243,7 +285,7 @@ export class FetchedAnimaWeights {
     }
     if (this.#cache.has(name)) return;
     const count = tensor.shape.reduce((a, b) => a * b, 1);
-    const bytes = await cachedRange(`${this.#base}/dit.f32.bin`, tensor.offset! * 4, count * 4);
+    const bytes = await cachedRange(this.#source, `${this.#base}/dit.f32.bin`, "dit.f32.bin", tensor.offset! * 4, count * 4);
     this.#remember(name, new Float32Array(bytes));
   }
 }
@@ -251,26 +293,37 @@ export class FetchedAnimaWeights {
 /** One `.safetensors` file, read a tensor at a time over `Range`. */
 export class FetchedSafetensors {
   readonly #url: string;
+  readonly #file: string;
   readonly #dataStart: number;
   readonly #entries: Map<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>;
+  readonly #source: ByteSource | null;
 
-  private constructor(url: string, dataStart: number, entries: Map<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>) {
+  private constructor(
+    url: string,
+    file: string,
+    dataStart: number,
+    entries: Map<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>,
+    source: ByteSource | null,
+  ) {
     this.#url = url;
+    this.#file = file;
     this.#dataStart = dataStart;
     this.#entries = entries;
+    this.#source = source;
   }
 
-  static async open(url: string): Promise<FetchedSafetensors> {
-    const head = await readRange(url, 0, 8);
+  /** `file` is the name within `source`; `url` is used only when there is none. */
+  static async open(url: string, source: ByteSource | null = null, file = url.split("/").pop()!): Promise<FetchedSafetensors> {
+    const head = await cachedRange(source, url, file, 0, 8);
     const headerLength = Number(new DataView(head).getBigUint64(0, true));
-    const headerBytes = await readRange(url, 8, headerLength);
+    const headerBytes = await cachedRange(source, url, file, 8, headerLength);
     const header = JSON.parse(new TextDecoder().decode(headerBytes)) as Record<string, unknown>;
     const entries = new Map<string, { dtype: string; shape: number[]; data_offsets: [number, number] }>();
     for (const [name, value] of Object.entries(header)) {
       if (name === "__metadata__") continue;
       entries.set(name, value as { dtype: string; shape: number[]; data_offsets: [number, number] });
     }
-    return new FetchedSafetensors(url, 8 + headerLength, entries);
+    return new FetchedSafetensors(url, file, 8 + headerLength, entries, source);
   }
 
   has(name: string): boolean {
@@ -285,7 +338,7 @@ export class FetchedSafetensors {
     const entry = this.#entries.get(name);
     if (!entry) throw new Error(`fetch-weights: ${this.#url} has no tensor "${name}"`);
     const [from, to] = entry.data_offsets;
-    const bytes = await cachedRange(this.#url, this.#dataStart + from, to - from);
+    const bytes = await cachedRange(this.#source, this.#url, this.#file, this.#dataStart + from, to - from);
     if (entry.dtype === "F32") return new Float32Array(bytes);
     if (entry.dtype === "BF16") return bf16ToF32(new Uint16Array(bytes));
     throw new Error(`fetch-weights: "${name}" is ${entry.dtype}; only F32 and BF16 are read.`);
@@ -306,7 +359,7 @@ export class FetchedSafetensors {
     const out = new Float32Array(rows.length * width);
     await Promise.all(
       Array.from(rows, async (row, i) => {
-        const bytes = await cachedRange(this.#url, this.#dataStart + from + row * width * elementBytes, width * elementBytes);
+        const bytes = await cachedRange(this.#source, this.#url, this.#file, this.#dataStart + from + row * width * elementBytes, width * elementBytes);
         out.set(entry.dtype === "BF16" ? bf16ToF32(new Uint16Array(bytes)) : new Float32Array(bytes), i * width);
       }),
     );

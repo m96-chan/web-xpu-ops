@@ -32,7 +32,42 @@
   #profile-out table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .5rem; }
   #profile-out td { padding: .2rem .4rem; border-top: 1px solid #2c313b; }
   #profile-out td:nth-child(2), #profile-out td:nth-child(3), #profile-out td:nth-child(4) { text-align: right; color: #98a1b3; }
+
+  /* The folder gate. `<dialog>` rather than a hand-rolled overlay: it centres
+     itself, gets `::backdrop` for free, traps focus, and -- the part that
+     matters -- a click on a button inside it still counts as the user gesture
+     `showDirectoryPicker` requires. */
+  #gate::backdrop { background: rgba(10, 12, 15, .72); backdrop-filter: blur(3px); }
+  #gate {
+    border: 1px solid #2c313b; border-radius: 12px; padding: 2rem;
+    background: #171a20; color: #e6e8ec; max-width: 30rem; width: calc(100% - 4rem);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  }
+  #gate h2 { margin: 0 0 .5rem; font-size: 1.1rem; font-weight: 600; }
+  #gate p { margin: 0 0 1rem; color: #98a1b3; font-size: .87rem; }
+  #gate .why { margin: 1.25rem 0 0; color: #6b7383; font-size: .78rem; }
+  #gate-progress { margin: .75rem 0 0; color: #98a1b3; font-size: .82rem; min-height: 1.4em; font-variant-numeric: tabular-nums; }
+  #gate-bar { height: 4px; border-radius: 2px; background: #2c313b; margin-top: .5rem; overflow: hidden; display: none; }
+  #gate-bar > div { height: 100%; width: 0; background: #4f7cff; transition: width .2s ease; }
+  #gate-dismiss { background: transparent; color: #98a1b3; font-weight: 400; }
+  #folder-row { display: flex; align-items: center; gap: .6rem; margin-top: .75rem; font-size: .78rem; color: #6b7383; }
+  #folder-row button { width: auto; margin: 0; padding: .3rem .6rem; font-size: .78rem; font-weight: 400; background: #2c313b; color: #98a1b3; }
 </style>
+
+<dialog id="gate">
+  <h2 id="gate-title">A folder is required</h2>
+  <p id="gate-body"></p>
+  <button id="gate-action">Choose a folder</button>
+  <button id="gate-dismiss" hidden>Keep the current folder</button>
+  <p id="gate-progress"></p>
+  <div id="gate-bar"><div></div></div>
+  <p class="why">
+    The weights are 5.0 GB. Kept in a folder you choose, they are downloaded
+    once and live outside the browser's own storage, where nothing evicts them
+    and you can delete them yourself. They are
+    <strong>non-commercial</strong> — see the model's licence.
+  </p>
+</dialog>
 
 <div>
   <h1>Anima-3.8B on WebGPU</h1>
@@ -66,6 +101,11 @@
     Profile one forward (adds a compute pass per dispatch — read the shares, not the milliseconds)
   </label>
   <button id="go" disabled>Generate</button>
+
+  <div id="folder-row" hidden>
+    <span id="folder-state"></span>
+    <button id="bind">Change folder</button>
+  </div>
 
   <p id="status">starting …</p>
   <p id="detail"></p>

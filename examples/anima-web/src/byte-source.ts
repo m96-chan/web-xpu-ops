@@ -29,6 +29,16 @@ export interface ByteSource {
    * which is a wrong image rather than an error.
    */
   read(file: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer>;
+  /**
+   * How many bytes `file` has.
+   *
+   * Here because two callers needed it and both had invented their own way:
+   * `provision` reached past the source to `fetch` a one-byte range and parse
+   * `content-range`, and the manifest reader binary-searched for the end by
+   * reading until a read threw. Neither belonged outside the thing that knows
+   * how to talk to the store.
+   */
+  size(file: string): Promise<number>;
   /** For error messages — where this source is reading from. */
   readonly describe: string;
 }
@@ -64,6 +74,24 @@ export class HttpByteSource implements ByteSource {
 
   get describe(): string {
     return this.#base;
+  }
+
+  async size(file: string): Promise<number> {
+    const url = `${this.#base}/${file}`;
+    // A one-byte range rather than HEAD: it doubles as proof the host serves
+    // ranges at all, which is better learned here than three gigabytes into a
+    // download.
+    const response = await fetch(url, { headers: { Range: "bytes=0-0" } });
+    if (response.status !== 206) {
+      throw new Error(
+        `byte-source: ${url} answered ${response.status} for a Range request, so its length cannot be ` +
+          "read without downloading it whole.",
+      );
+    }
+    const total = response.headers.get("content-range")?.match(/\/(\d+)\s*$/)?.[1];
+    await response.arrayBuffer();
+    if (!total) throw new Error(`byte-source: ${url} gave no usable content-range.`);
+    return Number(total);
   }
 
   async read(file: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
@@ -104,17 +132,24 @@ export class DirectoryByteSource implements ByteSource {
     return `the folder "${this.#dir.name}"`;
   }
 
-  async read(file: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
-    if (byteLength === 0) return new ArrayBuffer(0);
-    let handle: FileSystemFileHandle;
+  async size(file: string): Promise<number> {
+    return (await (await this.#handle(file)).getFile()).size;
+  }
+
+  async #handle(file: string): Promise<FileSystemFileHandle> {
     try {
-      handle = await this.#dir.getFileHandle(file);
+      return await this.#dir.getFileHandle(file);
     } catch {
       throw new Error(
         `byte-source: ${this.describe} has no "${file}". ` +
           "Either it holds a different model or the download did not finish.",
       );
     }
+  }
+
+  async read(file: string, byteOffset: number, byteLength: number): Promise<ArrayBuffer> {
+    if (byteLength === 0) return new ArrayBuffer(0);
+    const handle = await this.#handle(file);
     const blob = await handle.getFile();
     if (byteOffset + byteLength > blob.size) {
       throw new Error(

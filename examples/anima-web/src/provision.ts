@@ -95,26 +95,6 @@ export async function readReceipt(dir: FileSystemDirectoryHandle): Promise<Recei
   return receipt;
 }
 
-/** How many bytes a file has, from the source, via a `Range` for one byte. */
-async function sizeOf(source: ByteSource, file: string): Promise<number> {
-  // `HttpByteSource` throws on anything but 206, so this doubles as a check
-  // that the host serves ranges at all — better here, on a 1-byte request,
-  // than three gigabytes into the first download.
-  const url = `${source.describe}/${file}`;
-  const response = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  if (response.status !== 206) {
-    throw new Error(
-      `provision: ${url} answered ${response.status} for a Range request, so its length cannot be read ` +
-        "without downloading it whole.",
-    );
-  }
-  const range = response.headers.get("content-range");
-  const total = range?.match(/\/(\d+)\s*$/)?.[1];
-  if (!total) throw new Error(`provision: ${url} gave no usable content-range (${range ?? "absent"}).`);
-  await response.arrayBuffer();
-  return Number(total);
-}
-
 /**
  * Copies every file in `plan` from `source` into `dir`, then writes the receipt.
  *
@@ -129,7 +109,7 @@ export async function provision(
   onProgress?: (p: ProvisionProgress) => void,
 ): Promise<Receipt> {
   const sizes: Record<string, number> = {};
-  for (const file of plan.files) sizes[file] = await sizeOf(source, file);
+  for (const file of plan.files) sizes[file] = await source.size(file);
   const bytesTotal = Object.values(sizes).reduce((a, b) => a + b, 0);
 
   let bytesDone = 0;
