@@ -112,6 +112,14 @@ export class VideoDecoderGpu {
   private readonly pool = new Map<number, GPUBuffer[]>();
   private readonly lent: GPUBuffer[] = [];
   private readonly lentUniforms: GPUBuffer[] = [];
+  /**
+   * Blocks recorded into one command buffer.
+   *
+   * Everything a batch records has to stay live until it is submitted, so this
+   * trades scratch memory against submit count directly. Set from the measured
+   * default; `--blocks-per-submit` on `verify-decode.ts` sweeps it.
+   */
+  blocksPerSubmit = 1;
 
   private constructor(
     private readonly device: ResidentDevice,
@@ -240,10 +248,18 @@ export class VideoDecoderGpu {
    */
   private async flush(ops: ResidentOp[], keep: GPUBuffer[]): Promise<void> {
     if (ops.length === 0) return;
+    const at = performance.now();
     await this.device.batch(ops, []);
+    this.submitMs += performance.now() - at;
+    this.dispatches += ops.length;
     ops.length = 0;
     this.release(keep);
   }
+
+  /** Where a decode's wall clock went. Reset at the top of `decode`. */
+  submitMs = 0;
+  recordMs = 0;
+  dispatches = 0;
 
   destroy(): void {
     for (const buffer of this.weights.values()) buffer.destroy();
@@ -260,6 +276,16 @@ export class VideoDecoderGpu {
     return buffer;
   }
 
+  /**
+   * No per-call timers here, deliberately.
+   *
+   * A `performance.now()` pair straddling an `await` charges whatever else the
+   * event loop runs to whatever is being awaited. Instrumenting this function
+   * that way attributed **502 ms to `pipelineFor`**, which a tight loop then
+   * priced at **0.1 µs a call** — the same class of wrong answer
+   * `accountForForward` was written for. `decode` times its phases instead, and
+   * the split it reports is a whole-phase one.
+   */
   private async dispatch(
     ops: ResidentOp[],
     code: string,
@@ -409,6 +435,9 @@ export class VideoDecoderGpu {
     }
 
     const ops: ResidentOp[] = [];
+    this.submitMs = 0;
+    this.dispatches = 0;
+    const decodeStart = performance.now();
     this.ensureMask(seq);
 
     // `_pack_tensors_3d(z, 1, 1)` is a channels-last flatten: the latent
@@ -455,7 +484,14 @@ export class VideoDecoderGpu {
       hidden = await this.block(ops, hidden, i, positions, this.w("attn.noMask"));
       // `positions` is read by every block, so it is kept alongside the
       // residual stream; everything else goes back to the pool.
-      await this.flush(ops, [hidden.buffer, positions]);
+      //
+      // How often this happens is a trade, and `blocksPerSubmit` is where it is
+      // made: everything a batch records stays live until it is submitted, so a
+      // larger group holds proportionally more scratch and issues
+      // proportionally fewer submits. Measured, not assumed -- see the README.
+      if ((i + 1) % this.blocksPerSubmit === 0 || i === c.num_layers - 1) {
+        await this.flush(ops, [hidden.buffer, positions]);
+      }
     }
 
     // `norm_out` is a LayerNorm -- weight **and** bias -- where every norm
@@ -482,6 +518,10 @@ export class VideoDecoderGpu {
     ]);
     staging.destroy();
     this.release();
+    // Everything that is not the queue: building bind groups, writing uniforms,
+    // and the host-side reshapes. Named rather than left in the gap, because a
+    // gap reads as GPU time.
+    this.recordMs = performance.now() - decodeStart - this.submitMs;
 
     return unpackPatches(tokens as Float32Array, dims, c.out_channels, c.patch_size_t, c.patch_size);
   }

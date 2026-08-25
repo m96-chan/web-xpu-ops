@@ -73,6 +73,7 @@ if (!device) {
 
 const uploadStart = performance.now();
 const decoder = await VideoDecoderGpu.create(device, videoKernels(), manifest, read);
+decoder.blocksPerSubmit = Number(arg("--blocks-per-submit") ?? 1);
 closeSync(fd);
 console.log(`uploaded in ${((performance.now() - uploadStart) / 1000).toFixed(1)} s`);
 
@@ -87,6 +88,7 @@ const got = await decoder.decode(latent, golden.dims);
 const took = performance.now() - started;
 
 console.log(`latent ${golden.dims.join("x")} -> ${golden.frames}x${golden.height}x${golden.width} in ${took.toFixed(0)} ms`);
+console.log(`  ${decoder.dispatches} dispatches: ${decoder.submitMs.toFixed(0)} ms in the queue, ${decoder.recordMs.toFixed(0)} ms recording them (${(decoder.recordMs / decoder.dispatches * 1000).toFixed(0)} us each)`);
 
 if (!want) {
   console.log(`(--bench: nothing to compare against — this is a time, not a correctness claim)`);
@@ -118,7 +120,12 @@ console.log(`worst ${worst.toExponential(3)}  rms ${Math.sqrt(sum / want.length)
 // The cls token is exactly that: `ViT3DDecoder` builds it as
 // `torch.zeros_like(...)`, and deleting the explicit clear leaves a
 // single-decode check green.
+const secondStart = performance.now();
 const second = await decoder.decode(latent, golden.dims);
+console.log(
+  `second decode: ${(performance.now() - secondStart).toFixed(0)} ms ` +
+    `(${decoder.submitMs.toFixed(0)} ms in the queue) — the scratch pool is warm by now`,
+);
 let repeat = 0;
 for (let i = 0; i < got.length; i += 1) repeat = Math.max(repeat, Math.abs(second[i]! - got[i]!));
 console.log(`same latent twice: worst difference ${repeat.toExponential(3)}`);

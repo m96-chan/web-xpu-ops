@@ -72,6 +72,20 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The video decoder reports where its time goes, and it is not the GPU**
+  (issue #200). At 8 frames of 128x128: **647 ms the first decode, 152 ms the
+  second, 4 ms in the GPU queue**. The first pays about 520 ms of `createBuffer`
+  for its scratch; the pool amortises it. Grouping blocks into fewer submits was
+  measured and is **slower** (628 ms at one block per submit against 725 ms at
+  all thirty-six), so the submit count is not the cost either.
+
+  What the remaining 150 ms is has **not** been established. The parts priced
+  individually — bind groups 10 µs, uniforms 3 µs, pipeline lookups 0.1 µs — do
+  not add up to it, and the README says so rather than naming a suspect.
+
+  `blocksPerSubmit` is a field rather than a constant so that measurement can be
+  repeated on other hardware.
+
 - **A browser page that decodes video** (issue #200). `examples/h3-video-web`,
   on the same folder-bound, server-free footing as the other demos: a latent in,
   frames on a canvas, with a transport to play them at 24 fps.

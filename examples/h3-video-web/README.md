@@ -33,9 +33,24 @@ resident:
 | 32 frames, 512x512 | 568 ms |
 | 64 frames, 512x512 | 665 ms |
 
-The times barely move with the token count because at these sizes they are not
-compute: 36 submits and their pipeline lookups dominate. That is a number to
-improve, not a throughput to quote.
+The times barely move with the token count because **almost none of it is
+compute**. Split, at 8 frames of 128x128:
+
+| | |
+| --- | --- |
+| first decode | 647 ms |
+| ...of which the GPU queue | **4 ms** |
+| **second decode**, pool warm | **152 ms** |
+
+So the first decode is paying for its scratch buffers — about 520 ms of
+`createBuffer` — and every decode after it is 150 ms of host-side recording
+against 3 ms of GPU. Grouping blocks into fewer submits was tried and is
+**slower** (628 ms at one block per submit, 725 ms at all thirty-six), so the
+submit count is not the cost either. What the remaining 150 ms is has not been
+established; the parts that were priced individually — bind groups 10 µs,
+uniforms 3 µs, pipeline lookups 0.1 µs — do not add up to it.
+
+That is a number to improve, not a throughput to quote.
 
 **The in-browser decode is unmeasured.** Everything above is Node against the
 same `VideoDecoderGpu` class the page instantiates; what the page adds is the
