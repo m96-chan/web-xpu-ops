@@ -19,6 +19,7 @@
  * The two are never compared against each other: two ports that drift the same
  * way agree with each other and with nothing else.
  */
+import { checkTraceCoverage, irTracing, noteDispatch } from "./ir-trace.js";
 import type { BatchProfile, BatchProfileSink, ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
@@ -313,10 +314,20 @@ export async function animaForwardResident(
     return pipeline;
   };
 
+  /**
+   * The values most recently packed, kept for the IR probe (issue #185).
+   *
+   * Read at the call site rather than back off the GPU: the numbers are in hand
+   * here and reading a uniform buffer would need a copy and a map. A uniform is
+   * 256 bytes of which few are used, so the whole thing is decoded as u32 and
+   * the reader decides what is meaningful.
+   */
+  let lastUniform: number[] = [];
   const uniform = (data: ArrayBuffer): GPUBuffer => {
     if (uniformAt === uniforms.length) uniforms.push(device.createUniformBuffer(256));
     const buffer = uniforms[uniformAt]!;
     uniformAt += 1;
+    if (irTracing()) lastUniform = [...new Uint32Array(data)];
     device.upload(buffer, 0, new Uint8Array(data));
     return buffer;
   };
@@ -337,9 +348,14 @@ export async function animaForwardResident(
       );
     }
     const pipeline = await pipelineFor(code);
+    const name = kernelNames.get(code) ?? "?";
+    // Before the bind group swallows them: a `GPUBindGroup` cannot be asked
+    // what went into it, so a trace taken later has nodes and no edges.
+    noteDispatch(name, buffers, workgroups, lastUniform, labels ? (labels[labels.length - 1] ?? null) : null);
+    lastUniform = [];
     push(
       { kind: "dispatch", pipeline, bindGroup: await device.bindGroup(pipeline, buffers), workgroups },
-      kernelNames.get(code) ?? "?",
+      name,
     );
   };
 
@@ -508,13 +524,56 @@ export async function animaForwardResident(
     return out;
   };
 
+  /**
+   * RMSNorm over `N` rows of `D`.
+   *
+   * **Chunked, because one workgroup per row runs out of grid** (#112). At a
+   * 1024x1024 image this is called with `N = tokens * numHeads = 4096 * 16 =
+   * 65,536`, and the limit is 65,535 — over by exactly one, and 1024x1024 is a
+   * size the demo offers. It threw rather than producing a wrong picture, which
+   * is `record`'s guard doing its job, but throwing on an offered size is still
+   * a broken size.
+   *
+   * Splitting rows is safe here because every row is independent and this
+   * caller passes no group count, so `row % max(G, 1)` is 0 and all rows share
+   * one gamma. A caller that packed a real `G` could not be split at an
+   * arbitrary row, and there is no such caller.
+   */
   const rmsnorm = async (x: Slot, name: string, N: number, D: number): Promise<Slot> => {
     const out = pool.take(N * D);
-    await record(
-      K.rmsnorm,
-      [x.buffer, weightBuffer(name, () => weights.get(name)), out.buffer, uniform(params([["u32", N], ["u32", D], ["f32", normEps]]))],
-      [N],
-    );
+    const weight = weightBuffer(name, () => weights.get(name));
+    if (N <= MAX_WORKGROUPS) {
+      await record(
+        K.rmsnorm,
+        [x.buffer, weight, out.buffer, uniform(params([["u32", N], ["u32", D], ["f32", normEps]]))],
+        [N],
+      );
+      return out;
+    }
+    const pipeline = await pipelineFor(K.rmsnorm);
+    // 64 elements is 256 bytes, the binding-offset alignment; a chunk is a whole
+    // number of rows, so the step is rounded down to keep `at * D * 4` aligned.
+    const step = Math.max(1, Math.floor(MAX_WORKGROUPS / 64) * 64);
+    for (let at = 0; at < N; at += step) {
+      const count = Math.min(step, N - at);
+      const bound = [
+        { buffer: x.buffer, offset: at * D * 4, size: count * D * 4 },
+        { buffer: weight, offset: 0, size: weight.size },
+        { buffer: out.buffer, offset: at * D * 4, size: count * D * 4 },
+        { buffer: uniform(params([["u32", count], ["u32", D], ["f32", normEps]])), offset: 0, size: 256 },
+      ];
+      noteDispatch("rmsnorm", bound.map((s2) => s2.buffer), [count], lastUniform, null);
+      lastUniform = [];
+      push(
+        {
+          kind: "dispatch",
+          pipeline,
+          bindGroup: await device.bindGroupSliced(pipeline, bound),
+          workgroups: [count],
+        },
+        "rmsnorm",
+      );
+    }
     return out;
   };
 
@@ -548,6 +607,14 @@ export async function animaForwardResident(
    * and this is the answer to it, carried over from
    * `examples/zimage/src/dit-resident.ts` which met the same wall first.
    */
+  /**
+   * `slice` is called per chunk and its result both binds and is traced.
+   *
+   * Every dispatch that goes through `bindGroupSliced` bypasses `record`, and
+   * the first version of the IR probe (#185) therefore did not see any of them.
+   * It reported `rmsnorm` dropping from 209 dispatches to 53 between two
+   * shapes and I took that for control flow; it was the instrument.
+   */
   const chunkedFlat = async (
     code: string,
     n: number,
@@ -560,14 +627,18 @@ export async function animaForwardResident(
     const step = n <= perDispatch ? n : Math.floor(perDispatch / 64) * 64;
     for (let at = 0; at < n; at += step) {
       const count = Math.min(step, n - at);
+      const bound = slice(at, count);
+      const name = kernelNames.get(code) ?? "?";
+      noteDispatch(name, bound.map((s2) => s2.buffer), [Math.ceil(count / WG)], lastUniform, null);
+      lastUniform = [];
       push(
         {
           kind: "dispatch",
           pipeline,
-          bindGroup: await device.bindGroupSliced(pipeline, slice(at, count)),
+          bindGroup: await device.bindGroupSliced(pipeline, bound),
           workgroups: [Math.ceil(count / WG)],
         },
-        kernelNames.get(code) ?? "?",
+        name,
       );
     }
   };
@@ -1031,5 +1102,7 @@ export async function animaForwardResident(
   staging.destroy();
   for (const buffer of uniforms) buffer.destroy();
   if (!held) for (const buffer of weightBuffers.values()) buffer.destroy();
+  // Throws if any dispatch skipped `noteDispatch` (#185).
+  checkTraceCoverage(dispatches);
   return latent;
 }
