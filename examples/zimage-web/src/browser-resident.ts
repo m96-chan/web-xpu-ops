@@ -43,7 +43,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     },
   });
 
-  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0 };
+  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
 
   /**

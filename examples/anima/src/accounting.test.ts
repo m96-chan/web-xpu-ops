@@ -19,13 +19,25 @@ import { fileURLToPath } from "node:url";
 import { accountForForward, type AnimaProfile } from "./dit-resident.js";
 
 /** `byKernel` totalling `gpuMs`, split over two kernels so the sum is not the identity. */
-function profile(gpuMs: number, cpu: { encodeMs: number; submitToDoneMs: number; readbackMs: number }): AnimaProfile {
+function profile(
+  gpuMs: number,
+  cpu: {
+    encodeMs: number;
+    submitToDoneMs: number;
+    readbackMs: number;
+    bindGroupMs?: number;
+    hostCallbackMs?: number;
+  },
+): AnimaProfile {
   return {
     byKernel: new Map([
       ["a", { seconds: (gpuMs * 0.75) / 1000, dispatches: 3 }],
       ["b", { seconds: (gpuMs * 0.25) / 1000, dispatches: 1 }],
     ]),
     supported: true,
+    bindGroupMs: 0,
+    bindGroups: 0,
+    hostCallbackMs: 0,
     ...cpu,
   };
 }
@@ -91,6 +103,22 @@ describe("anima / forward accounting", () => {
    * sink field of the same name, which is the specific way that was missed:
    * a field added to the interface and forgotten one level up.
    */
+  it("counts the phases that happen between batches, not only inside one", () => {
+    // The measurement that opened this second round: `batch()`'s own timers
+    // named 55% of a browser forward, because bind groups are built between
+    // batches and the caller's callbacks run there too. A decomposition that
+    // only knows about `batch()` reports the rest as a mystery.
+    const acct = accountForForward(
+      profile(1926, { encodeMs: 6, submitToDoneMs: 1987, readbackMs: 0, bindGroupMs: 1400, hostCallbackMs: 200 }),
+      3.645,
+    );
+    expect(acct.bindGroupMs).toBe(1400);
+    expect(acct.hostCallbackMs).toBe(200);
+    // 1926 + 61 + 6 + 0 + 1400 + 200 = 3593 of 3645.
+    expect(acct.unattributedMs).toBeCloseTo(52, 0);
+    expect(acct.coverage).toBeGreaterThan(98);
+  });
+
   it("collect() accumulates every CPU field, not just the ones it started with", () => {
     const source = readFileSync(fileURLToPath(new URL("./dit-resident.ts", import.meta.url)), "utf8");
     for (const field of ["encodeMs", "submitToDoneMs", "readbackMs"] as const) {

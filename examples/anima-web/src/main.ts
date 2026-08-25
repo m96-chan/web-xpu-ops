@@ -182,6 +182,10 @@ function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: n
     `<td>${pct(acct.aroundPassesMs)}</td><td></td></tr>` +
     `<tr><td>recording the commands</td><td>${ms(acct.encodeMs)}</td><td>${pct(acct.encodeMs)}</td><td></td></tr>` +
     `<tr><td>reading results back</td><td>${ms(acct.readbackMs)}</td><td>${pct(acct.readbackMs)}</td><td></td></tr>` +
+    `<tr><td>building bind groups</td><td>${ms(acct.bindGroupMs)}</td><td>${pct(acct.bindGroupMs)}</td>` +
+    `<td>${profile.bindGroups}</td></tr>` +
+    `<tr><td>the caller's callbacks</td><td>${ms(acct.hostCallbackMs)}</td><td>${pct(acct.hostCallbackMs)}</td>` +
+    "<td></td></tr>" +
     `<tr><td>unattributed</td><td>${ms(acct.unattributedMs)}</td><td>${pct(acct.unattributedMs)}</td><td></td></tr>` +
     "</table>" +
     `<p class="note">Of the ${ms(acct.inPassesMs)} inside compute passes, by kernel:</p><table>` +
@@ -512,11 +516,14 @@ async function main(): Promise<void> {
         // the steady-state one.
         const wanted = wantProfile && first && step === 1;
         if (wanted && !profile) {
-          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0 };
+          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0, bindGroupMs: 0, bindGroups: 0, hostCallbackMs: 0 };
         }
         const stats = wanted
           ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
           : undefined;
+        // Device counters are cumulative; a forward's share is the difference.
+        const bindGroupsBefore = residentDevice.stats.bindGroupMs;
+        const bindGroupCountBefore = residentDevice.stats.bindGroups;
         const forwardStart = wanted ? performance.now() : 0;
         const result = await animaForwardResident(
           residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
@@ -524,15 +531,21 @@ async function main(): Promise<void> {
           // first forward does any work here: after it the weights live on the
           // device and `held` answers instead.
           async (prefix) => {
+            const t0 = performance.now();
             await dit.preloadPrefix(prefix);
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
+            if (profile) profile.hostCallbackMs += performance.now() - t0;
           },
           wanted ? profile ?? undefined : undefined,
         );
         if (wanted && stats) {
           profiledWallSeconds = (performance.now() - forwardStart) / 1000;
           profiledDispatches = stats.dispatches;
+          if (profile) {
+            profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
+            profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
+          }
         }
         return result;
       };

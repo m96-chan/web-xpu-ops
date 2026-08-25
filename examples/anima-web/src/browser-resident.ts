@@ -59,7 +59,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     },
   });
 
-  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0 };
+  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
 
   /**
@@ -128,6 +128,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -135,6 +136,8 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 
@@ -143,6 +146,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
   ): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -150,6 +154,8 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 

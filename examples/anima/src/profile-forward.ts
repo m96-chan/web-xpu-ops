@@ -109,7 +109,9 @@ await animaForwardResident(device, ditKernels(), cfg, dit, input, undefined, hel
 const warmSeconds = (Date.now() - warmStart) / 1000;
 console.log(`unprofiled forward: ${warmSeconds.toFixed(2)}s\n`);
 
-const profile: AnimaProfile = { byKernel: new Map(), supported: device.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0 };
+const profile: AnimaProfile = { byKernel: new Map(), supported: device.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0, bindGroupMs: 0, bindGroups: 0, hostCallbackMs: 0 };
+const bindGroupsBefore = device.stats.bindGroupMs;
+const bindGroupCountBefore = device.stats.bindGroups;
 const stats = { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 };
 const profStart = Date.now();
 await animaForwardResident(device, ditKernels(), cfg, dit, input, stats, held, undefined, undefined, undefined, profile);
@@ -136,6 +138,8 @@ console.log(`  profiling inflates it ${(profSeconds / warmSeconds).toFixed(1)}x 
 // coverage is stated rather than assumed.
 // Against the *profiled* wall, because that is the run these numbers came
 // from; comparing them to the unprofiled one mixes two forwards.
+profile.bindGroupMs = device.stats.bindGroupMs - bindGroupsBefore;
+profile.bindGroups = device.stats.bindGroups - bindGroupCountBefore;
 const acct = accountForForward(profile, profSeconds);
 console.log(`  ${counted} of ${dispatchCount} dispatches timed; ${acct.coverage.toFixed(0)}% of this forward's wall accounted for`);
 if (acct.coverage < 90) console.log("  **under 90% — some of this forward is still unattributed**");
@@ -145,6 +149,8 @@ for (const [name, value] of [
   ["queue/driver, outside", acct.aroundPassesMs],
   ["recording the commands", acct.encodeMs],
   ["reading results back", acct.readbackMs],
+  [`building ${profile.bindGroups} bind groups`, acct.bindGroupMs],
+  ["the caller's callbacks", acct.hostCallbackMs],
   ["unattributed", acct.unattributedMs],
 ] as const) {
   console.log(`  ${name.padEnd(26)} ${value.toFixed(0).padStart(6)} ${((value / acct.wallMs) * 100).toFixed(1).padStart(8)}%`);

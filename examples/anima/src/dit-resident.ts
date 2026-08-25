@@ -57,6 +57,25 @@ export interface AnimaProfile {
   submitToDoneMs: number;
   /** Summed over every `batch()`. Timed after the GPU wait, so it is the round trip alone. */
   readbackMs: number;
+  /**
+   * Wall spent building bind groups, taken from the device's own counter.
+   *
+   * Not a `batch()` field: bind groups are built *between* batches, which is
+   * why `batch()`'s three timers named only 55% of a browser forward.
+   */
+  bindGroupMs: number;
+  /** How many, so the cost of one can be read off. */
+  bindGroups: number;
+  /**
+   * Wall spent inside the caller's `onBeforePrefix`, which the caller sets.
+   *
+   * The browser's callback awaits `setTimeout(0)` once per prefix so a
+   * 52-block first forward cannot freeze the tab — 55 yields a forward, every
+   * forward, and a browser clamps `setTimeout(0)` to something like 4 ms. That
+   * is a plausible slice of the 1653 ms this file could not name, and the way
+   * to know is not to reason about the clamp but to time the callback.
+   */
+  hostCallbackMs: number;
 }
 
 /**
@@ -72,7 +91,9 @@ export interface AnimaProfile {
  *     queue and driver, outside    submitToDoneMs - sum of byKernel
  *     recording the commands       encodeMs
  *     reading results back         readbackMs
- *     unattributed                 wall - the four above
+ *     building bind groups         bindGroupMs   (between batches, not inside one)
+ *     the caller's own callbacks   hostCallbackMs
+ *     unattributed                 wall - the six above
  */
 export interface ForwardAccounting {
   /** Summed pass timestamps — time inside compute passes. */
@@ -83,6 +104,10 @@ export interface ForwardAccounting {
   encodeMs: number;
   /** The readback round trip. */
   readbackMs: number;
+  /** Building bind groups, between batches. */
+  bindGroupMs: number;
+  /** Inside the caller's own callbacks. */
+  hostCallbackMs: number;
   /** Wall clock the phases above do not explain. */
   unattributedMs: number;
   /** Wall clock this decomposes. */
@@ -98,12 +123,15 @@ export function accountForForward(profile: AnimaProfile, wallSeconds: number): F
   // sum of passes can exceed the wait they happened inside. A negative row
   // would read as a measurement rather than as the artefact it is.
   const aroundPassesMs = Math.max(0, profile.submitToDoneMs - inPassesMs);
-  const named = inPassesMs + aroundPassesMs + profile.encodeMs + profile.readbackMs;
+  const named =
+    inPassesMs + aroundPassesMs + profile.encodeMs + profile.readbackMs + profile.bindGroupMs + profile.hostCallbackMs;
   return {
     inPassesMs,
     aroundPassesMs,
     encodeMs: profile.encodeMs,
     readbackMs: profile.readbackMs,
+    bindGroupMs: profile.bindGroupMs,
+    hostCallbackMs: profile.hostCallbackMs,
     unattributedMs: Math.max(0, wallMs - named),
     wallMs,
     coverage: wallMs > 0 ? (Math.min(named, wallMs) / wallMs) * 100 : 0,
