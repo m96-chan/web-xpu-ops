@@ -72,6 +72,29 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **MiniMax-H3's visual VAE decoder runs, end to end, on the GPU** (issue #200).
+  A latent in, video frames out: 36 transformer blocks over 2048 channels, the
+  embedding, the projection and the two reshapes that turn tokens back into
+  pixels.
+
+  Checked against **the model's own `decode`**: worst element **4.530e-6**, RMS
+  9.051e-7, on a signal peaking at 1.64. **9.69 GB of f32 weights upload in 4.0
+  s and a 2x3x4 latent decodes to 8 frames of 48x64 in 640 ms** (RTX 5090,
+  driver 610.57.04, Dawn `webgpu@0.4.0`).
+
+  **No new kernel.** `matmul`, `rmsnorm`, `layernorm`, `flash_attention`,
+  `rope`'s axes entry, `activation`, `elementwise` and `permute` cover it. Three
+  things that would each be a strided copy per token happen once at conversion
+  instead: `to_qkv` split into three projections, `ff.w1` split into gate and
+  up, and every weight stored `[in, out]` because that is what `ops/matmul`
+  reads.
+
+  The verification decodes the same latent **twice** and requires the two to
+  agree exactly. Scratch buffers are pooled, so the second decode is the first
+  to see a *used* one — and the zero cls token, which the model builds as
+  `torch.zeros_like(...)`, is right the first time and wrong after if the clear
+  is dropped. A single-decode check stayed green through exactly that mutation.
+
 - **A transformer block of MiniMax-H3's visual VAE decoder** (issue #200). The
   decoder is 36 identical blocks over 2048 channels — **9.69 GB of the
   checkpoint's 10.42** — so a port is right or wrong at the block and the rest
