@@ -1,0 +1,51 @@
+# Publishes the browser demos that work without a server.
+#
+# Issue #192. Only `examples/anima-web` qualifies: its weights come from a URL
+# and it keeps them in a folder the user picks, so it needs nothing but static
+# files. `scripts/pages.mjs` decides what goes in and refuses to emit a page
+# whose cache-buster did not fire.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; queued rather than cancelled, so a push does not
+# leave the site half-replaced by an older build.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      # The demos are typechecked here and nowhere else in this workflow --
+      # a page that builds and then throws on load is worse than one that
+      # fails to build.
+      - run: npm run lint
+      - run: node scripts/pages.mjs --out _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

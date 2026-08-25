@@ -16,3 +16,6 @@ examples/zimage-vae/fixtures-tiny/decoded.png
 
 # Workflow subagents get their own worktrees here; they are throwaway.
 .claude/worktrees/
+
+# Built by scripts/pages.mjs; the workflow uploads it, git does not carry it.
+_site/

@@ -122,4 +122,8 @@
 
 <canvas id="out" width="832" height="1216"></canvas>
 
-<script type="module" src="/dist/bundle.js"></script>
+<!-- Relative, not "/dist/…": on GitHub Pages this page lives under a
+     subdirectory, and an absolute path resolves to the site root, where there
+     is no bundle. A module script that fails to load raises no exception a
+     page can catch, so the page simply does nothing and says nothing. -->
+<script type="module" src="./dist/bundle.js"></script>
