@@ -23,6 +23,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **The Anima demo re-read weights it already had on the GPU, once per forward**
+  (issue #186). A 40-step generation at 832x1216 goes from **347.4 s to
+  225.3 s**, and a steady-state step from **7.26 s to 4.28 s** — measured on the
+  same machine in the same session, before and after, with the generated image
+  identical to the byte (`sha256[0:8] 7571bd1f8a34836b` both times).
+
+  `animaForwardResident` keeps weight buffers across forwards and both paths
+  that need one check that first, so from the second forward onward the weight
+  source is never consulted. The page called `preloadPrefix` anyway, at all four
+  announcement sites, pulling each block's tensors off disk for a forward that
+  would not read them. It was not even a warm-cache no-op: the heap holds 192
+  packed tensors against 898 in the model, so every forward re-read what the
+  last one evicted. **1258 ms of a 3582 ms forward, 35%, all of it waste.**
+
+  The comment above the callback already said only the first forward does any
+  work there. Nothing checked, and it was false. What made it visible was
+  #182's breakdown — `batch()`'s own timers named 55% of a browser forward and
+  the rest was outside every dispatch.
+
+
 - **The Anima demo's cache buster had never fired** (issue #177). The server
   stamps the bundle's mtime onto the `<script src>` because `Cache-Control:
   no-store` was measured not to be enough — a tab that had loaded the page
