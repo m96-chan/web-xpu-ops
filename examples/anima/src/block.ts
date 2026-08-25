@@ -40,6 +40,7 @@ import { attention } from "../../../ops/attention/index.js";
 import { ELEMENTWISE, elementwise, elementwiseRows } from "../../../ops/elementwise/index.js";
 import { layernorm } from "../../../ops/layernorm/index.js";
 import { matmul } from "../../../ops/matmul/index.js";
+import { activationFor, weightFor } from "./quantization-probe.js";
 import { rmsnorm } from "../../../ops/rmsnorm/index.js";
 import { ropeAxes } from "../../../ops/rope/index.js";
 
@@ -206,11 +207,15 @@ export interface AnimaBlockWeights {
  * visible.
  */
 function linear(x: Float32Array, weight: Float32Array, rows: number, inDim: number, outDim: number): Float32Array {
+  // Identity unless a probe has asked for a quantized simulation — see
+  // `quantization-probe.ts`. Off in every test and every shipped path.
+  const q = weightFor(weight, outDim, inDim);
+  const a = activationFor(x, rows, inDim);
   const wT = new Float32Array(inDim * outDim);
   for (let o = 0; o < outDim; o += 1) {
-    for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = weight[o * inDim + i]!;
+    for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = q[o * inDim + i]!;
   }
-  return matmul({ a: x, b: wT, M: rows, N: outDim, K: inDim });
+  return matmul({ a, b: wT, M: rows, N: outDim, K: inDim });
 }
 
 /** `[S, H*D]` token-major to `[H, S, D]` head-major, `ops/attention`'s layout. */

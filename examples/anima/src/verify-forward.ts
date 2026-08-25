@@ -10,6 +10,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { type AnimaConfig, type AnimaTrace, animaForward } from "./dit.js";
+import { setQuantizationMode, type QuantizationMode } from "./quantization-probe.js";
 import { permuteForRope, ropeAxisDims } from "./block.js";
 import { type AnimaWeights, loadAnimaSubset } from "./weights-node.js";
 
@@ -109,6 +110,28 @@ const weights = {
   },
 };
 
+/**
+ * `--quant weights|w8a8` simulates a quantized matmul in the CPU port.
+ *
+ * Issue #184. The only `subgroup-matrix` configurations this GPU offers are
+ * `i8 x i8 -> i32`, so reaching a tensor core means quantizing the
+ * *activation* as well as the weight. What that costs is measurable here,
+ * before any WGSL exists.
+ *
+ * `weights` is the calibration, not a result: it simulates what the GPU path
+ * already does, and the answer is known to be 4.018e-2 against the dense
+ * golden. If this run does not reproduce that, the `w8a8` number below it is
+ * worth nothing.
+ */
+const quantAt = process.argv.indexOf("--quant");
+const quant = (quantAt >= 0 ? process.argv[quantAt + 1] : "off") as QuantizationMode;
+if (!["off", "weights", "w8a8"].includes(quant)) {
+  console.error(`verify-forward: --quant must be off, weights or w8a8 (got ${quant})`);
+  process.exit(2);
+}
+setQuantizationMode(quant);
+console.log(`  matmul simulation: ${quant}`);
+
 const started = Date.now();
 const trace: AnimaTrace = {};
 const out = animaForward(
@@ -129,7 +152,9 @@ const checkpoints: [string, Float32Array | undefined][] = [
 // The port's own error on one block is 3.221e-7. Over 52 blocks f32
 // accumulation drifts further, so the bar is 1e-4 — far below the 4.018e-2 that
 // q8 costs, which is what makes a failure here mean "the port".
-const bar = 1e-4;
+// Only meaningful with `--quant off`: the other modes are asking how far a
+// quantization moves the answer, so a "mismatch" is the measurement.
+const bar = quant === "off" ? 1e-4 : Infinity;
 let failed = false;
 console.log("");
 for (const [name, got] of checkpoints) {

@@ -38,6 +38,7 @@
  */
 import { ACTIVATION, activation } from "../../../ops/activation/index.js";
 import { matmul } from "../../../ops/matmul/index.js";
+import { activationFor, weightFor } from "./quantization-probe.js";
 import { rmsnorm } from "../../../ops/rmsnorm/index.js";
 import { layernorm } from "../../../ops/layernorm/index.js";
 import { type AnimaBlockConfig, type AnimaBlockWeights, animaBlock, ropeAxisDims, ropeBases } from "./block.js";
@@ -76,11 +77,15 @@ function linear(
   outDim: number,
   bias?: Float32Array,
 ): Float32Array {
+  // Identity unless a probe has asked for a quantized simulation — see
+  // `quantization-probe.ts`. Off in every test and every shipped path.
+  const q = weightFor(weight, outDim, inDim);
+  const a = activationFor(x, rows, inDim);
   const wT = new Float32Array(inDim * outDim);
   for (let o = 0; o < outDim; o += 1) {
-    for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = weight[o * inDim + i]!;
+    for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = q[o * inDim + i]!;
   }
-  const out = matmul({ a: x, b: wT, M: rows, N: outDim, K: inDim });
+  const out = matmul({ a, b: wT, M: rows, N: outDim, K: inDim });
   if (bias) {
     for (let r = 0; r < rows; r += 1) {
       for (let o = 0; o < outDim; o += 1) out[r * outDim + o] = out[r * outDim + o]! + bias[o]!;
