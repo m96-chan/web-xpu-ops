@@ -195,6 +195,12 @@ are Qwen components (`Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen-Image`, both Apache-2.0)
 redistributed inside the CircleStone repository, whose §9 keeps their own terms
 in force.
 
+A converted copy is published at
+[`m96-chan/Anima-3.8B-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Anima-3.8B-q8-web-xpu-ops)
+so this demo has somewhere to fetch from — **the same licence, unchanged**. It
+carries the licence texts and the attribution the licences require, and it is
+not endorsed by CircleStone Labs, lylogummy or NVIDIA. Built on NVIDIA Cosmos.
+
 Read [`LICENSE.md`](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md)
 before downloading anything, not after. Redistributing a converted copy is
 permitted by §2(a) and carries the conditions in §3 — the licence text, a

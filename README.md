@@ -2205,6 +2205,12 @@ Two licences apply to the Anima weights at once, and **the more restrictive one
 governs**: NVIDIA permits commercial use, CircleStone does not, so the answer is
 non-commercial.
 
+A copy of Anima converted to this repository's int8 format is published at
+[`m96-chan/Anima-3.8B-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Anima-3.8B-q8-web-xpu-ops),
+because the demos need somewhere to fetch from. **Converting it did not change
+its licence**, which is why that repository carries the licence texts and the
+verbatim attribution its terms require rather than this one's MIT.
+
 Z-Image and the LLM demo carry their own upstreams' terms in the same way; see
 each example's README.
 
