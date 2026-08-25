@@ -59,7 +59,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     },
   });
 
-  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0 };
+  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
 
   /**
@@ -128,6 +128,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -135,6 +136,8 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 
@@ -143,6 +146,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
   ): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -150,6 +154,8 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 
@@ -162,6 +168,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     // dispatch needs a pass of its own — and so does an *untimed* one next to
     // it, or a timed pass would span work outside the dispatch it names. That
     // is why this is opt-in: it turns one pass per batch into one per dispatch.
+    const encodeT0 = profile ? performance.now() : 0;
     const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
     const labeledSlots: string[] = [];
     if (wantsGpuTiming) {
@@ -237,6 +244,9 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       encoder.copyBufferToBuffer(resolved, 0, queryReadable, 0, queryCount * 8);
     }
 
+    // Before `submit`, so recording is timed alone and does not overlap the
+    // wait below. Issue #182.
+    if (profile) profile.sink.encodeMs = performance.now() - encodeT0;
     device.pushErrorScope("validation");
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;

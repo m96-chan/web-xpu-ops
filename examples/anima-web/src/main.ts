@@ -34,8 +34,7 @@ import { qwen3EncodeGpu, type Qwen3GpuWeights } from "../../zimage/src/text-enco
 import type { AnimaConfig, AnimaInput } from "../../anima/src/dit.js";
 import {
   animaForwardResident, releaseAnimaWeights,
-  type AnimaProfile, type AnimaWeightSource,
-} from "../../anima/src/dit-resident.js";
+  type AnimaProfile, type AnimaWeightSource, accountForForward } from "../../anima/src/dit-resident.js";
 import { permuteForRope } from "../../anima/src/block.js";
 import {
   ADAPTER,
@@ -147,7 +146,13 @@ function draw(image: Float32Array, H: number, W: number): void {
  * profiling itself costs passes, so the absolute numbers are larger than the
  * shipping ones and the proportions are what carry over.
  */
-function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: number): void {
+function reportProfile(
+  profile: AnimaProfile,
+  wallSeconds: number,
+  dispatches: number,
+  preloadMs: number,
+  yieldMs: number,
+): void {
   if (!profile.supported) {
     profileOut.innerHTML =
       '<p class="note">This device has no <code>timestamp-query</code>, so there is no GPU breakdown — ' +
@@ -163,17 +168,43 @@ function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: n
   const rows = [...profile.byKernel.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
   const total = rows.reduce((sum, [, v]) => sum + v.seconds, 0);
   const counted = rows.reduce((n, [, v]) => n + v.dispatches, 0);
-  const coverage = (total / wallSeconds) * 100;
+  const acct = accountForForward(profile, wallSeconds);
+  const ms = (v: number): string => `${v.toFixed(0)} ms`;
+  const pct = (v: number): string => `${((v / acct.wallMs) * 100).toFixed(0)}%`;
   // Coverage is what caught the last wrong answer: a profile that timed 78% of
   // the forward reported shares of a partial total as though they were shares
-  // of the whole. Under about 90% here, the table is not a breakdown of this
-  // forward and should not be read as one.
-  const warn = coverage < 90
-    ? ' <strong>Under 90% — this is not a breakdown of the whole forward.</strong>'
-    : "";
+  // of the whole. It is now a share of the *named* wall clock rather than of
+  // GPU alone, so a browser forward that spends half its time outside every
+  // dispatch says so instead of reading as a 52% mystery.
+  // Two different failures, and the second one used to read as success: a
+  // counter summing more forwards than it measured named 2853% of the wall and
+  // the cap turned that into "100% accounted for".
+  const warn = acct.overAccountedMs > 0
+    ? ` <strong>The phases name ${ms(acct.overAccountedMs)} more than this forward lasted — ` +
+      "a counter is measuring something other than this forward, so nothing below is trustworthy.</strong>"
+    : acct.coverage < 90
+      ? ' <strong>Under 90% — some of this forward is still unaccounted for.</strong>'
+      : "";
   profileOut.innerHTML =
-    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ${counted} of ` +
-    `${dispatches} dispatches — ${coverage.toFixed(0)}% of that step's ${(wallSeconds * 1000).toFixed(0)} ms.${warn}</p><table>` +
+    `<p class="note">One forward, ${ms(acct.wallMs)} wall — ${acct.coverage.toFixed(0)}% accounted for.${warn}</p>` +
+    "<table>" +
+    `<tr><td>inside compute passes</td><td>${ms(acct.inPassesMs)}</td><td>${pct(acct.inPassesMs)}</td>` +
+    `<td>${counted} of ${dispatches}</td></tr>` +
+    `<tr><td>queue and driver, outside the passes</td><td>${ms(acct.aroundPassesMs)}</td>` +
+    `<td>${pct(acct.aroundPassesMs)}</td><td></td></tr>` +
+    `<tr><td>recording the commands</td><td>${ms(acct.encodeMs)}</td><td>${pct(acct.encodeMs)}</td><td></td></tr>` +
+    `<tr><td>reading results back</td><td>${ms(acct.readbackMs)}</td><td>${pct(acct.readbackMs)}</td><td></td></tr>` +
+    `<tr><td>building bind groups</td><td>${ms(acct.bindGroupMs)}</td><td>${pct(acct.bindGroupMs)}</td>` +
+    `<td>${profile.bindGroups}</td></tr>` +
+    `<tr><td>the caller's callbacks</td><td>${ms(acct.hostCallbackMs)}</td><td>${pct(acct.hostCallbackMs)}</td>` +
+    "<td></td></tr>" +
+    `<tr><td>&nbsp;&nbsp;— re-reading weights (preloadPrefix)</td><td>${ms(preloadMs)}</td><td>${pct(preloadMs)}</td>` +
+    "<td></td></tr>" +
+    `<tr><td>&nbsp;&nbsp;— yielding to the event loop</td><td>${ms(yieldMs)}</td><td>${pct(yieldMs)}</td>` +
+    "<td>55</td></tr>" +
+    `<tr><td>unattributed</td><td>${ms(acct.unattributedMs)}</td><td>${pct(acct.unattributedMs)}</td><td></td></tr>` +
+    "</table>" +
+    `<p class="note">Of the ${ms(acct.inPassesMs)} inside compute passes, by kernel:</p><table>` +
     rows.map(([name, v]) =>
       `<tr><td>${name}</td><td>${(v.seconds * 1000).toFixed(1)} ms</td>` +
       `<td>${((v.seconds / total) * 100).toFixed(1)}%</td><td>${v.dispatches}</td></tr>`).join("") +
@@ -445,6 +476,8 @@ async function main(): Promise<void> {
     let profile: AnimaProfile | null = null;
     let profiledWallSeconds = 0;
     let profiledDispatches = 0;
+    let profiledPreloadMs = 0;
+    let profiledYieldMs = 0;
     profileOut.innerHTML = "";
     // The profiled forward is the **second** step: the first uploads 3.63 GB
     // and hydrates the heap, so its timings are the loading cost. One step
@@ -455,6 +488,23 @@ async function main(): Promise<void> {
         '<p class="note">Profiling needs at least 2 steps — the first forward is the upload, ' +
         "so the second is the one measured.</p>";
     }
+
+    /**
+     * Cumulative across every forward; a forward's share is a difference.
+     *
+     * Split, because the callback does two things and they have different
+     * fixes. `preloadPrefix` re-reads from the Cache API — the heap holds at
+     * most `48 * 4 = 192` packed tensors against 898 in the model, so the LRU
+     * thrashes and every forward re-reads what the last one evicted, even
+     * though the weights have been resident on the device since the first.
+     * The `setTimeout(0)` yield is 55 turns of the event loop a forward
+     * against a browser's clamp. Which of the two costs 1370 ms is a
+     * measurement, and reading the code is how the last four guesses were
+     * made.
+     */
+    let hostCallbackMsTotal = 0;
+    let preloadMsTotal = 0;
+    let yieldMsTotal = 0;
 
     const started = performance.now();
 
@@ -501,11 +551,17 @@ async function main(): Promise<void> {
         // the steady-state one.
         const wanted = wantProfile && first && step === 1;
         if (wanted && !profile) {
-          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, submitToDoneMs: 0 };
+          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0, bindGroupMs: 0, bindGroups: 0, hostCallbackMs: 0 };
         }
         const stats = wanted
           ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
           : undefined;
+        // Device counters are cumulative; a forward's share is the difference.
+        const bindGroupsBefore = residentDevice.stats.bindGroupMs;
+        const hostCallbackBefore = hostCallbackMsTotal;
+        const preloadBefore = preloadMsTotal;
+        const yieldBefore = yieldMsTotal;
+        const bindGroupCountBefore = residentDevice.stats.bindGroups;
         const forwardStart = wanted ? performance.now() : 0;
         const result = await animaForwardResident(
           residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
@@ -513,15 +569,31 @@ async function main(): Promise<void> {
           // first forward does any work here: after it the weights live on the
           // device and `held` answers instead.
           async (prefix) => {
+            const t0 = performance.now();
             await dit.preloadPrefix(prefix);
+            const t1 = performance.now();
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
+            preloadMsTotal += t1 - t0;
+            yieldMsTotal += performance.now() - t1;
+            // Into a counter that runs for every forward, never straight into
+            // `profile`: this callback fires on all eighty and `profile`
+            // outlives the one being measured, so `+= into profile` summed the
+            // whole generation and reported 2853% of one forward.
+            hostCallbackMsTotal += performance.now() - t0;
           },
           wanted ? profile ?? undefined : undefined,
         );
         if (wanted && stats) {
           profiledWallSeconds = (performance.now() - forwardStart) / 1000;
           profiledDispatches = stats.dispatches;
+          if (profile) {
+            profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
+            profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
+            profile.hostCallbackMs = hostCallbackMsTotal - hostCallbackBefore;
+            profiledPreloadMs = preloadMsTotal - preloadBefore;
+            profiledYieldMs = yieldMsTotal - yieldBefore;
+          }
         }
         return result;
       };
@@ -589,7 +661,9 @@ async function main(): Promise<void> {
         `then ${perStep.toFixed(2)}s each), ` +
         `decode ${decodeSeconds.toFixed(1)}s`,
     );
-    if (profile) reportProfile(profile, profiledWallSeconds, profiledDispatches);
+    if (profile) {
+      reportProfile(profile, profiledWallSeconds, profiledDispatches, profiledPreloadMs, profiledYieldMs);
+    }
     else if (wantProfile && steps >= 2) {
       profileOut.innerHTML =
         '<p class="note">Profiling was requested and produced nothing, which should not happen — ' +

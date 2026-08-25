@@ -68,8 +68,8 @@ export interface ResidentReadback {
  * so nothing about its own encoding changes.
  *
  * `sink` is written into once `batch()` resolves, not returned separately —
- * the caller constructs it (typically `{ submitToDoneMs: null, readbackMs:
- * null, gpuEntries: [] }`) and passes the same object in, so a driving
+ * the caller constructs it (typically `{ encodeMs: null,
+ * submitToDoneMs: null, readbackMs: null, gpuEntries: [] }`) and passes the same object in, so a driving
  * script can read it straight off the object it already holds.
  */
 export interface BatchProfile {
@@ -78,6 +78,18 @@ export interface BatchProfile {
 }
 
 export interface BatchProfileSink {
+  /**
+   * `performance.now()` elapsed from the top of `batch()` to the instant
+   * before `queue.submit()` — recording the command buffer, and nothing that
+   * waits on the GPU.
+   *
+   * Issue #182. Without it a forward's wall clock has a hole in it that reads
+   * as GPU work: a browser forward summed 2014 ms of pass timestamps against
+   * 3841 ms of wall, and the two fields below could not say where the rest
+   * went because neither of them covers the encode. `null` until `batch()`
+   * writes it.
+   */
+  encodeMs: number | null;
   /** `performance.now()` elapsed between `queue.submit()` and `queue.onSubmittedWorkDone()` resolving — the GPU-side wait `batch()` would otherwise fold silently into the readback `mapAsync` call below. `null` until `batch()` writes it. */
   submitToDoneMs: number | null;
   /** `performance.now()` elapsed across every `readback` entry's `mapAsync`+copy, timed *after* `onSubmittedWorkDone` above has already resolved — so this is the readback round trip on its own, not padded with GPU completion wait. `null` until `batch()` writes it. */
@@ -103,7 +115,25 @@ export interface ResidentDevice {
    * once this file has more than one caller, per rule 1 ("観測点が間違っている"
    * failures do not show up in coverage).
    */
-  readonly stats: { buffersCreated: number; pipelinesCreated: number; submits: number };
+  readonly stats: {
+    buffersCreated: number;
+    pipelinesCreated: number;
+    submits: number;
+  /**
+   * Wall spent inside `bindGroup`/`bindGroupSliced`, cumulative.
+   *
+   * Issue #182. `batch()`'s own timers said a browser forward spent 6 ms
+   * recording, 61 ms waiting on the queue outside the passes and 0 ms reading
+   * back — leaving 1653 ms of a 3645 ms forward in none of them, and therefore
+   * *between* batches. Bind groups are the one thing built per dispatch there,
+   * 3,238 of them a forward, and on this backend each one awaits a
+   * `popErrorScope`. Whether that is where the time is is a measurement, which
+   * is what this field is for.
+   */
+  bindGroupMs: number;
+  /** How many were built, so the cost per bind group can be read off. */
+  bindGroups: number;
+  };
   /** Whether this device negotiated the `timestamp-query` feature — issue #131's `BatchProfile.sink.gpuEntries` is only ever populated when this is `true`; a caller on a device where it is `false` still gets `submitToDoneMs`/`readbackMs` (those need no GPU feature), just no per-dispatch GPU breakdown, and should say so rather than reporting an empty breakdown as "GPU took 0ms" (rule 9). */
   readonly timestampsSupported: boolean;
   createStorageBuffer(bytes: number, usage?: number): GPUBuffer;
@@ -203,7 +233,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     },
   });
 
-  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0 };
+  const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
   const modules = new Map<string, GPUShaderModule>();
 
@@ -275,6 +305,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
   ): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -282,10 +313,13 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -293,6 +327,8 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`resident bind group is not valid: ${invalid.message}`);
+    stats.bindGroupMs += performance.now() - t0;
+    stats.bindGroups += 1;
     return group;
   }
 
@@ -308,6 +344,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // a label on a `"copy"` op is meaningless (copies never run inside a
     // pass) and silently ignored, not an error, since `BatchProfile.labels`
     // is positional against `ops` as a whole for the caller's convenience.
+    const encodeT0 = profile ? performance.now() : 0;
     const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
     const labeledSlots: string[] = [];
     if (wantsGpuTiming) {
@@ -386,6 +423,9 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     }
 
     try {
+      // Before `submit`, so this is recording alone — `submitToDoneMs` below
+      // starts where this stops and the two do not overlap.
+      if (profile) profile.sink.encodeMs = performance.now() - encodeT0;
       device.queue.submit([encoder.finish()]);
       stats.submits += 1;
 

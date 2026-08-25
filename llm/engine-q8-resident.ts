@@ -140,6 +140,8 @@ export interface ForwardProfile {
    * building this layer's nine bind groups.
    */
   layerSetupMs: number;
+  /** Set once `device.batch(...)` resolves: the wall spent recording the command buffer, before anything waits on the GPU (issue #182 — without it a forward's wall clock has a hole in it that reads as GPU work). `null` until `batch()` writes it. */
+  encodeMs: number | null;
   /** Set once `device.batch(...)` resolves: GPU submit-to-completion wait and the readback `mapAsync` phase, timed separately (`BatchProfileSink`'s own doc) — issue #131 item 4's CPU-visible half. `null` until `batch()` writes them. */
   submitToDoneMs: number | null;
   readbackMs: number | null;
@@ -160,6 +162,7 @@ export function createForwardProfile(): ForwardProfile {
     bindGroupMs: 0,
     bindGroupCalls: 0,
     layerSetupMs: 0,
+    encodeMs: null,
     submitToDoneMs: null,
     readbackMs: null,
     gpuEntries: [],

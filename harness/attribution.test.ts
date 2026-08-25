@@ -96,7 +96,7 @@ describe("per-dispatch attribution", () => {
       });
       labels.push("busy");
     }
-    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const sink: BatchProfileSink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     await device.batch(ops, [], { labels, sink });
     device.destroy();
 
@@ -109,6 +109,21 @@ describe("per-dispatch attribution", () => {
     expect(sink.gpuEntries.length).toBe(COPIES);
     expect(attributed).toBeGreaterThan(expected * 0.5);
     expect(attributed).toBeLessThan(expected * 2.0);
+
+    // Issue #182: every CPU-side field a caller can read has to be *written*,
+    // not merely declared. `readbackMs` existed for months and was discarded
+    // one level up, which left half a browser forward with no name. A field
+    // that is never populated reads as "this phase costs nothing".
+    expect(sink.encodeMs, "encodeMs was never written").not.toBeNull();
+    expect(sink.submitToDoneMs, "submitToDoneMs was never written").not.toBeNull();
+    expect(sink.readbackMs, "readbackMs was never written").not.toBeNull();
+    // Recording this many dispatches cannot be free, and the wait for a batch
+    // this long cannot be zero. Both would be zero if the timers straddled the
+    // wrong statements.
+    expect(sink.encodeMs!).toBeGreaterThan(0);
+    expect(sink.submitToDoneMs!).toBeGreaterThan(0);
+    // `encodeMs` stops before `submit()`, so it cannot contain the GPU wait.
+    expect(sink.encodeMs!).toBeLessThan(sink.submitToDoneMs! + sink.encodeMs!);
   }, 120_000);
 
   it("does not move one dispatch's time onto its neighbour", async () => {
@@ -164,7 +179,7 @@ describe("per-dispatch attribution", () => {
         labels.push(label);
       }
     }
-    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const sink: BatchProfileSink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     await device.batch(ops, [], { labels, sink });
     device.destroy();
 
