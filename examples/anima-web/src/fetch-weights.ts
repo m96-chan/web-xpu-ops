@@ -22,7 +22,7 @@
 import { bf16ToF32 } from "../../zimage/src/bf16.js";
 import { dequantizeQ8 } from "../../zimage/src/weights.js";
 import type { AnimaManifest, AnimaTensor } from "../../anima/src/manifest.js";
-import type { ByteSource } from "./byte-source.js";
+import type { ByteSource } from "../../web-common/src/byte-source.js";
 
 let store: Cache | null | undefined;
 async function cacheStore(): Promise<Cache | null> {
