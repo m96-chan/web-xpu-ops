@@ -140,10 +140,18 @@ ${stageQ}
 export function stageTile(shape: FlashShape, baseExpr: string, bufExpr: string, indent: string): string {
   // `v` stays scalar whatever `k` does: the accumulate walks it by channel
   // across threads, not by row, so there is no group of four to fold.
+  const linear = shape.stageAddressing === "linear";
+
+  // The vec4 path keeps its division whichever addressing is chosen: `d4n` is
+  // `ceil(D / 4)`, so `(e / d4n) * D + (e % d4n) * 4` only collapses to `4 * e`
+  // when `D` is a multiple of four, and `D` is a runtime uniform. What
+  // `"linear"` buys here is the *second* division: the row index was computed
+  // once for `j` and again for the store, and the modulo follows from it.
   const stageK = shape.scoreReads === "vec4"
     ? `${indent}for (var e = tid; e < TILE_S * d4n; e = e + THREADS) {
-${indent}  let j = (${baseExpr}) + e / d4n;
-${indent}  let unit = e % d4n;
+${indent}  let row = e / d4n;
+${indent}  let unit = ${linear ? "e - row * d4n" : "e % d4n"};
+${indent}  let j = (${baseExpr}) + row;
 ${indent}  let c0 = unit * 4u;
 ${indent}  var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 ${indent}  if (j < params.S) {
@@ -152,21 +160,42 @@ ${indent}      let d = c0 + c;
 ${indent}      if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
 ${indent}    }
 ${indent}  }
-${indent}  sk[(${bufExpr}) * K_STRIDE + (e / d4n) * ROW + unit] = val;
+${indent}  sk[(${bufExpr}) * K_STRIDE + row * ROW + unit] = val;
 ${indent}}`
-    : `${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
+    : linear
+      // Scalar staging divides by `params.D` itself, so the cancellation is
+      // exact: `(base + e / D) * D + e % D == base * D + e`.
+      ? `${indent}let k_at = k_head + (${baseExpr}) * params.D;
+${indent}let k_live = select(0u, (params.S - (${baseExpr})) * params.D, params.S > (${baseExpr}));
+${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
+${indent}  sk[(${bufExpr}) * K_STRIDE + (e / params.D) * ROW + e % params.D] = select(0.0, k[k_at + e], e < k_live);
+${indent}}`
+      : `${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.D;
 ${indent}  let d = e % params.D;
 ${indent}  sk[(${bufExpr}) * K_STRIDE + (e / params.D) * ROW + d] = select(0.0, k[k_head + j * params.D + d], j < params.S);
 ${indent}}`;
-  return `${indent}// D and Dv can differ; k and v are staged with their own strides rather
-${indent}// than one shared constant.
-${stageK}
+
+  // `v` is where this matters. `sv` is indexed by the flat `e`, so nothing
+  // downstream needs the row or the channel — the division and the modulo exist
+  // only to build an address that equals `v_head + base * Dv + e`. The bound
+  // check goes with them: `base + e / Dv < S` is `e < (S - base) * Dv`.
+  const stageV = linear
+    ? `${indent}let v_at = v_head + (${baseExpr}) * params.Dv;
+${indent}let v_live = select(0u, (params.S - (${baseExpr})) * params.Dv, params.S > (${baseExpr}));
 ${indent}for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
+${indent}  sv[(${bufExpr}) * V_STRIDE + e] = select(0.0, v[v_at + e], e < v_live);
+${indent}}`
+    : `${indent}for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.Dv;
 ${indent}  let d = e % params.Dv;
 ${indent}  sv[(${bufExpr}) * V_STRIDE + e] = select(0.0, v[v_head + j * params.Dv + d], j < params.S);
 ${indent}}`;
+
+  return `${indent}// D and Dv can differ; k and v are staged with their own strides rather
+${indent}// than one shared constant.
+${stageK}
+${stageV}`;
 }
 
 /** `BQ * TILE_S` scores, spread over every thread, both operands from workgroup memory. */

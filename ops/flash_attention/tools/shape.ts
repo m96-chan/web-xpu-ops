@@ -73,6 +73,29 @@ export interface FlashShape {
    * device behaves like one that has them.
    */
   padRows: boolean;
+  /**
+   * How the staging loops turn a flat index into a global address.
+   *
+   * `"divide"` writes what the arithmetic says: row `base + e / Dv`, channel
+   * `e % Dv`, address `v_head + j * Dv + d`. Readable, and it costs an integer
+   * division and a modulo per element — **a GPU has no integer divide
+   * instruction**, so each is a short sequence the compiler emits inline, and
+   * `Dv` is a uniform so it cannot fold them.
+   *
+   * `"linear"` uses the fact that they cancel:
+   *
+   *     (base + e / Dv) * Dv + e % Dv  ==  base * Dv + e
+   *
+   * which is exact for unsigned integers, not an approximation. The bound check
+   * `j < S` becomes `e < (S - base) * Dv`, so nothing divides at all.
+   *
+   * Measured, because "fewer instructions" is not "faster": `tools/where.ts`
+   * priced the `v` staging at **16%** of the self shape against **6%** for `k`,
+   * which stages the same 4 KB per tile with the same coalescing but runs its
+   * loop a quarter as many times. The division count is the difference between
+   * them, and this is the field that tests whether that is the reason.
+   */
+  stageAddressing: "divide" | "linear";
 }
 
 /**

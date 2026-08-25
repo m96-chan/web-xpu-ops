@@ -75,6 +75,7 @@ export const FLASH_TILE = {
   prefetch: "direct",
   scoreReads: "vec4",
   padRows: true,
+  stageAddressing: "linear",
   maxHeadDim: 128,
   maxValueDim: 128,
 } as const;

@@ -42,31 +42,77 @@ const SHAPES = [
 const base = shippedKernels().fa2;
 const digest = (s: string): string => createHash("md5").update(s).digest("hex").slice(0, 8);
 
-/** A replacement that must land, or the run stops. */
+/**
+ * A replacement that must land **exactly once**, or the run stops.
+ *
+ * `includes` was the whole check once, and it is not enough: `String.replace`
+ * with a string argument takes the first match, so an anchor that became
+ * ambiguous would silently edit a different loop and still produce a distinct
+ * digest. A changed digest proves an edit happened, not that the intended edit
+ * happened — so the count is asserted, not the presence.
+ */
 function edit(code: string, from: string, to: string, why: string): string {
-  if (!code.includes(from)) {
-    console.error(`the edit for "${why}" did not match — the kernel has changed shape under this tool`);
+  const hits = code.split(from).length - 1;
+  if (hits !== 1) {
+    console.error(
+      `the edit for "${why}" matched ${hits} times, expected 1 — the kernel has changed shape under this tool`,
+    );
     process.exit(3);
   }
   return code.replace(from, to);
 }
 
-const SCORE_LOOP = `        for (var d = 0u; d < params.D; d = d + 1u) {
-          dot_ = fma(sq[r * params.D + d], sk[(0u) * K_STRIDE + slot * params.D + d], dot_);
+const SCORE_LOOP = `        for (var dv = 0u; dv < d4n; dv = dv + 1u) {
+          acc4 = fma(sq[r * ROW + dv], sk[(0u) * K_STRIDE + slot * ROW + dv], acc4);
         }`;
 const ACC_LOOP = `        for (var r = 0u; r < BQ; r = r + 1u) {
           acc[r][p] = fma(ss[r * TILE_S + slot], value, acc[r][p]);
         }`;
 
+/**
+ * The stages *outside* the two inner loops.
+ *
+ * Added after the first run with the loops alone: deleting both of them left
+ * **51%** of the kernel standing, on both shapes. The issue's remaining scope
+ * was register-tiling the score loop, which the same run priced at 27% — so the
+ * larger half had never been partitioned at all. These four cut it up.
+ */
+const STAGE_K = `      if (j < params.S) {
+        for (var c = 0u; c < 4u; c = c + 1u) {
+          let d = c0 + c;
+          if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
+        }
+      }`;
+const STAGE_V = `      sv[(0u) * V_STRIDE + e] = select(0.0, v[v_head + j * params.Dv + d], j < params.S);`;
+const SOFTMAX = `      var best = MASKED;
+      for (var slot = 0u; slot < TILE_S; slot = slot + 1u) { best = max(best, ss[tid * TILE_S + slot]); }
+      let m_new = max(smax[tid], best);
+      let corr = select(exp(smax[tid] - m_new), 0.0, smax[tid] == MASKED);
+      var sum = 0.0;
+      for (var slot = 0u; slot < TILE_S; slot = slot + 1u) {
+        let s = ss[tid * TILE_S + slot];
+        let w = select(exp(s - m_new), 0.0, s == MASKED);
+        ss[tid * TILE_S + slot] = w;
+        sum = sum + w;
+      }
+      ssum[tid] = ssum[tid] * corr + sum;
+      scorr[tid] = corr;
+      smax[tid] = m_new;`;
+const RESCALE = `    for (var r = 0u; r < BQ; r = r + 1u) {
+      let corr = scorr[r];
+      for (var p = 0u; p < SWEEPS; p = p + 1u) { acc[r][p] = acc[r][p] * corr; }
+    }`;
+
 const VARIANTS: { label: string; code: string; correct: boolean }[] = [
   { label: "full (shipped)", code: base, correct: true },
 
-  // The one honest candidate here. `params.D` is a uniform, so the score loop's
-  // bound is a runtime value and no compiler can unroll or vectorise it. The
-  // kernel is generated, so the bound it was generated for is known.
+  // The one honest candidate here. `d4n` is derived from `params.D`, a uniform,
+  // so the score loop's bound is a runtime value and no compiler can unroll it.
+  // The kernel is generated, so the bound it was generated for is known —
+  // `D = 128` means 32 `vec4` units.
   {
     label: "D fixed at 128 (compile-time bound)",
-    code: edit(base, "for (var d = 0u; d < params.D; d = d + 1u) {", "for (var d = 0u; d < 128u; d = d + 1u) {", "const D"),
+    code: edit(base, "for (var dv = 0u; dv < d4n; dv = dv + 1u) {", "for (var dv = 0u; dv < 32u; dv = dv + 1u) {", "const D"),
     correct: true,
   },
 
@@ -74,7 +120,7 @@ const VARIANTS: { label: string; code: string; correct: boolean }[] = [
   // cannot be optimised away with the loop.
   {
     label: "WRONG: score dot deleted",
-    code: edit(base, SCORE_LOOP, "        dot_ = sq[r * params.D] * sk[slot * params.D];", "no score dot"),
+    code: edit(base, SCORE_LOOP, "        acc4 = sq[r * ROW] * sk[slot * ROW];", "no score dot"),
     correct: false,
   },
   {
@@ -85,11 +131,45 @@ const VARIANTS: { label: string; code: string; correct: boolean }[] = [
   {
     label: "WRONG: both inner loops deleted",
     code: edit(
-      edit(base, SCORE_LOOP, "        dot_ = sq[r * params.D] * sk[slot * params.D];", "no score dot"),
+      edit(base, SCORE_LOOP, "        acc4 = sq[r * ROW] * sk[slot * ROW];", "no score dot"),
       ACC_LOOP,
       "        acc[0][p] = acc[0][p] + value * ss[slot];",
       "no accumulate",
     ),
+    correct: false,
+  },
+
+  // The other half. Each keeps whatever the stage produced *reachable* — a
+  // constant that still depends on the loop variable — so the compiler cannot
+  // delete the surrounding loop along with the body and hand back a time for a
+  // kernel that does nothing at all.
+  // Two k variants, because the first pair was not a comparison. `v` had its
+  // address replaced with an invariant one -- no DRAM traffic at all -- while
+  // `k` kept 1 real read of its 4, so k's 4% and v's 19% were measuring
+  // different things. `k invariant` is the one to read against `v invariant`.
+  {
+    label: "WRONG: k staging cut to 1 read of 4 (drops 3 reads and the bound check)",
+    code: edit(base, STAGE_K, "      val = vec4<f32>(k[k_head + j * params.D], 0.0, 0.0, 0.0);", "k 1 of 4"),
+    correct: false,
+  },
+  {
+    label: "WRONG: k staging read from one invariant address (comparable to v below)",
+    code: edit(base, STAGE_K, "      val = vec4<f32>(k[k_head] + f32(j), 0.0, 0.0, 0.0);", "k invariant"),
+    correct: false,
+  },
+  {
+    label: "WRONG: v staging read from one invariant address (comparable to k above)",
+    code: edit(base, STAGE_V, "      sv[(0u) * V_STRIDE + e] = v[v_head] + f32(j + d);", "no v staging"),
+    correct: false,
+  },
+  {
+    label: "WRONG: softmax deleted (runs on 32 of 128 threads, per tile)",
+    code: edit(base, SOFTMAX, "      ssum[tid] = 1.0; scorr[tid] = 1.0; smax[tid] = 0.0;", "no softmax"),
+    correct: false,
+  },
+  {
+    label: "WRONG: acc rescale deleted (BQ multiplies per thread, per tile)",
+    code: edit(base, RESCALE, "    acc[0][0] = acc[0][0] * scorr[0];", "no rescale"),
     correct: false,
   },
 ];
