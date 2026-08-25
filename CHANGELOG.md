@@ -21,6 +21,58 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+### Fixed
+
+- **The Anima demo's cache buster had never fired** (issue #177). The server
+  stamps the bundle's mtime onto the `<script src>` because `Cache-Control:
+  no-store` was measured not to be enough — a tab that had loaded the page
+  before the header existed kept running the bundle it already had. It replaced
+  the literal `"./dist/bundle.js"`, and that page's tag says
+  `"/dist/bundle.js"`, so the rewrite matched nothing and returned its input.
+  Nothing failed: the request was logged, 200 was returned, and the stale tab
+  went on running an old bundle while the server reported serving a new one.
+
+  Found while confirming a browser would actually run a newly tuned kernel,
+  which is exactly the measurement it would have corrupted. Both demo servers
+  now match by pattern and **throw when the rewrite does not fire**, since a
+  no-op string replacement is otherwise invisible.
+
+- **Flash attention ships as two kernels, FA2 and FA3, and runs 5.4x faster**
+  (issue #177). The generations are separate programs with separate schedules
+  rather than one program with a switch, because they are separate algorithms;
+  both are held to `ops/flash_attention/reference.ts` by the same tests, and
+  `tools/generate.ts` writes both so a generator edited without regenerating
+  fails a test instead of shipping the old kernel quietly.
+
+  **Neither generation was the problem, and finding that out is what made this
+  work.** FA2 and FA3 measured within a few percent of each other, and two
+  shapes moving 4x different amounts of data landed on the same 240 GB/s. So
+  `tools/where.ts` deletes each inner loop in turn and times what is left: full
+  16.45 ms, minus the accumulate 15.23, minus the score dot 5.28, minus both
+  2.76. **The score dot product is 76% of the kernel**, and FA1/FA2/FA3 differ
+  only in how the tile loop is scheduled around it.
+
+  Two changes to that loop, which compose better than they multiply:
+  `vec4` reads take it from two workgroup loads per multiply-add to two per
+  four, and **one element of padding per staged row** stops adjacent threads —
+  which differ by key slot, so they read `slot * D` apart, a multiple of the
+  bank count at D=128 — from serialising on one memory bank. Alone they measure
+  0.81 and 0.78; together 0.35.
+
+  Anima's forward at 832x1216 goes from **4.90 s to 1.78 s**, measured against
+  `origin/main` in a worktree in the same session so the clock could not move
+  between them, with `matmulQ8` reading 882 ms on both as the control.
+  Attention reaches **21% of this device's measured 50.4 TFLOP/s**, from 7.7%.
+  That is 39% of what its arithmetic intensity allows — at 16 FLOP per byte of
+  k/v against a measured crossover of 29.6, bandwidth caps this kernel at 54% of
+  compute peak whatever else is done to it.
+
+  Two things were tried and measured worse, and are recorded rather than
+  quietly dropped: FlashAttention-3's ping-pong scheduling (a tie — its other
+  two ideas need asynchronous copy and an FP8 dtype that WGSL and this adapter
+  do not have), and fixing `D` to a compile-time 128 so the score loop could
+  unroll (1.06).
+
 - **The kernels are tuned** (issue #177). `ops/matmul` reaches 70-72% of an RTX
   5090's measured roofline where it reached 1.4-3.0%, `matmulQ8` 42-49% where it
   reached 1.1-2.3%, and `ops/flash_attention` 8.8-9.1% where it reached 3.4%.

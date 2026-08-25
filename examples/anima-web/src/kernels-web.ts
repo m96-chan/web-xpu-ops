@@ -28,7 +28,11 @@ import ropeAxesKernel from "../../../ops/rope/wgsl/axes.wgsl";
 import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
 import scoresKernel from "../../../ops/attention/wgsl/scores.wgsl";
 import contextKernel from "../../../ops/attention/wgsl/context.wgsl";
-import flashAttentionKernel from "../../../ops/flash_attention/wgsl/kernel.wgsl";
+// Both generations ship; `FLASH_GENERATION` says which one is dispatched, and
+// the bundler needs each import to be static.
+import { FLASH_GENERATION } from "../../../ops/flash_attention/index.js";
+import fa2Kernel from "../../../ops/flash_attention/wgsl/fa2.wgsl";
+import fa3Kernel from "../../../ops/flash_attention/wgsl/fa3.wgsl";
 import gqaScoresKernel from "../../../ops/gqa/wgsl/scores.wgsl";
 import gqaContextKernel from "../../../ops/gqa/wgsl/context.wgsl";
 
@@ -44,7 +48,7 @@ export const ditKernels: DitKernels = {
   permute: permuteKernel,
   scores: scoresKernel,
   context: contextKernel,
-  flashAttention: flashAttentionKernel,
+  flashAttention: FLASH_GENERATION === "fa3" ? fa3Kernel : fa2Kernel,
 };
 
 export const encoderKernels: EncoderKernels = {

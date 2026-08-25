@@ -128,7 +128,13 @@ function resolve(urlPath) {
 function indexWithStamp(file) {
   const bundle = path.join(here, "dist/bundle.js");
   const stamp = existsSync(bundle) ? statSync(bundle).mtimeMs.toFixed(0) : "0";
-  return readFileSync(file, "utf8").replace("./dist/bundle.js", `./dist/bundle.js?v=${stamp}`);
+  const html = readFileSync(file, "utf8");
+  // Checked to have landed: anima-web's copy of this silently matched nothing
+  // because its tag said "/dist/bundle.js", and a no-op cache buster is worse
+  // than none — it reads as a guarantee.
+  const stamped = html.replace(/(src=")(\.?\/dist\/bundle\.js)(")/, `$1$2?v=${stamp}$3`);
+  if (stamped === html) throw new Error(`${file}: no <script src=".../dist/bundle.js"> to stamp — the cache buster would be a no-op`);
+  return stamped;
 }
 
 const server = http.createServer((req, res) => {

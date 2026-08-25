@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRunner, params, type Dispatch } from "../../../harness/wgsl.js";
+import { FLASH_GENERATION } from "../../flash_attention/index.js";
 import { measureRoofline } from "../../../harness/roofline.js";
 
 const arg = (name: string, fallback: number): number => {
@@ -37,7 +38,22 @@ const repeats = arg("--repeats", 3);
 const read = (name: string): string =>
   readFileSync(fileURLToPath(new URL(`../wgsl/${name}.wgsl`, import.meta.url)), "utf8");
 const readFlash = (): string =>
-  readFileSync(fileURLToPath(new URL("../../flash_attention/wgsl/kernel.wgsl", import.meta.url)), "utf8");
+  readFileSync(fileURLToPath(new URL(`../../flash_attention/wgsl/${FLASH_GENERATION}.wgsl`, import.meta.url)), "utf8");
+
+/**
+ * Brings the clocks up before anything is timed.
+ *
+ * An idle RTX 5090 sits at 195 MHz against 2850 under load, and a sweep that
+ * starts cold measures the ramp rather than the kernel: an unchanged shipped
+ * kernel read 9.56 ms warm and 83.69 ms cold in this very tool, which is a
+ * factor of nine attributable to nothing in the code.
+ *
+ * Untimed on purpose. The point is not to measure this dispatch but to be past
+ * the ramp before measuring the next one.
+ */
+async function warmUp(runner: { run: (d: Dispatch) => Promise<unknown> }, dispatch: Dispatch, rounds = 8): Promise<void> {
+  for (let i = 0; i < rounds; i += 1) await runner.run(dispatch);
+}
 
 const runner = await createRunner();
 if (!runner) {

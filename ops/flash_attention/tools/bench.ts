@@ -13,7 +13,16 @@ import { measureRoofline } from "../../../harness/roofline.js";
 import { flashAttention } from "../reference.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { flashStorageBytes, rejectReason, tiledFlash, type FlashShape } from "./tiled.wgsl.js";
+import { rejectReason, type FlashShape, type Generation } from "./shape.js";
+import { fa2Flash } from "./fa2.wgsl.js";
+import { fa3Flash } from "./fa3.wgsl.js";
+import { FLASH_GENERATION, FLASH_TILE } from "../index.js";
+import { describeSweep, sweep } from "../../../harness/sweep.js";
+
+const arg = (name: string): string | undefined => {
+  const at = process.argv.indexOf(name);
+  return at >= 0 ? process.argv[at + 1] : undefined;
+};
 
 const D = 128;
 const SHAPES = [
@@ -21,27 +30,68 @@ const SHAPES = [
   { name: "cross", L: 3952, S: 512, heads: 16 },
 ].filter((s) => process.argv.includes(`--${s.name}`) || (!process.argv.includes("--self") && !process.argv.includes("--cross")));
 
-function candidates(): FlashShape[] {
-  const out: FlashShape[] = [];
-  for (const bq of [1, 2, 4, 8, 16, 32]) {
-    for (const tileS of [8, 16, 32, 64]) {
-      for (const threads of [128, 256, 512]) {
-        const shape = { bq, tileS, threads };
-        if (rejectReason(shape, D) === null) out.push(shape);
+/** A candidate is a generation and a shape — the two are swept together. */
+interface Candidate {
+  generation: Generation;
+  shape: FlashShape;
+}
+
+/** The WGSL a candidate compiles to. Each generation is its own kernel. */
+const codeFor = ({ generation, shape }: Candidate): string =>
+  generation === "fa3" ? fa3Flash(shape, D) : fa2Flash(shape, D);
+
+/**
+ * Every generation crossed with every shape this device can dispatch.
+ *
+ * `prefetch` only changes fa3 — fa2 does not overlap anything — so pairing it
+ * with fa2 would time the same program twice and report the pair's noise as a
+ * difference between them.
+ */
+/**
+ * `--quick` restricts the grid to the neighbourhood of the shipped shape.
+ *
+ * The full grid is 156 pairs and every one is checked against the reference
+ * before it is timed, which is the right default and too slow to iterate on.
+ * Narrowing is a claim that the answer is nearby — true only just after a full
+ * sweep said so, which is why it is a flag and not the default.
+ */
+const quick = process.argv.includes("--quick");
+
+function candidates(): Candidate[] {
+  const out: Candidate[] = [];
+  for (const generation of ["fa2", "fa3"] as const) {
+    const prefetches = generation === "fa3" ? (["direct", "registers"] as const) : (["direct"] as const);
+    for (const bq of quick ? [16, 32] : [1, 2, 4, 8, 16, 32, 64, 128]) {
+      for (const tileS of quick ? [8] : [4, 8, 16, 32, 64]) {
+        for (const threads of quick ? [128, 256] : [128, 256, 512, 1024]) {
+          for (const accumulate of quick ? (["key"] as const) : (["row", "key"] as const)) {
+            for (const prefetch of prefetches) {
+              for (const scoreReads of ["scalar", "vec4"] as const) {
+                for (const padRows of [false, true]) {
+                  const shape = { bq, tileS, threads, accumulate, prefetch, scoreReads, padRows };
+                  if (rejectReason(shape, D, generation) === null) out.push({ generation, shape });
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
   return out;
 }
 
-const label = (s: FlashShape): string => `BQ=${s.bq}, TILE_S=${s.tileS}, ${s.threads} threads`;
+const label = ({ generation, shape: s }: Candidate): string =>
+  `${generation.toUpperCase()} BQ=${s.bq} TILE_S=${s.tileS} ${s.threads}t ${s.accumulate}-outer` +
+  (generation === "fa3" ? ` ${s.prefetch}` : "") + ` ${s.scoreReads}${s.padRows ? "+pad" : ""}`;
+
 
 const runner = await createRunner();
 if (!runner) { console.error("bench: no adapter"); process.exit(2); }
 const roof = await measureRoofline(runner);
 if (roof) console.log(`measured roofline: ${(roof.compute / 1e12).toFixed(1)} TFLOP/s`);
 
-const shipped = readFileSync(fileURLToPath(new URL("../wgsl/kernel.wgsl", import.meta.url)), "utf8");
+const shipped = readFileSync(fileURLToPath(new URL(`../wgsl/${FLASH_GENERATION}.wgsl`, import.meta.url)), "utf8");
 const uniforms = (H: number, L: number, S: number): ArrayBuffer =>
   params([
     ["u32", H], ["u32", L], ["u32", S], ["u32", D], ["u32", D],
@@ -74,16 +124,16 @@ const want = flashAttention({
 }).output;
 
 const all = candidates();
-console.log(`\n${all.length} shapes fit this device's limits`);
+console.log(`\n${all.length} generation/shape pairs fit this device's limits`);
 console.log("checking each against ops/flash_attention's reference on a ragged 13x37 …");
-const correct: FlashShape[] = [];
-for (const shape of all) {
-  const [got] = await runner.run(dispatchFor(tiledFlash(shape, D), cq, ck, cv, CH, CL, CS, shape.bq));
+const correct: Candidate[] = [];
+for (const candidate of all) {
+  const [got] = await runner.run(dispatchFor(codeFor(candidate), cq, ck, cv, CH, CL, CS, candidate.shape.bq));
   const out = got as Float32Array;
   let worst = 0;
   for (let i = 0; i < want.length; i += 1) worst = Math.max(worst, Math.abs(out[i]! - want[i]!));
-  if (worst < 1e-4) correct.push(shape);
-  else console.log(`  WRONG: ${label(shape)} (worst ${worst.toExponential(2)})`);
+  if (worst < 1e-4) correct.push(candidate);
+  else console.log(`  WRONG: ${label(candidate)} (worst ${worst.toExponential(2)})`);
 }
 console.log(`  ${correct.length}/${all.length} compute attention\n`);
 
@@ -92,28 +142,24 @@ for (const { name, L, S, heads } of SHAPES) {
   const flops = 2 * 2 * heads * L * S * D;
   console.log(`${name}  L=${L} S=${S} heads=${heads}  (${(flops / 1e9).toFixed(1)} GFLOP)`);
 
-  const baseline = await runner.time(dispatchFor(shipped, q, k, v, heads, L, S));
-  if (baseline !== null) {
-    const share = roof ? ` (${((flops / baseline / roof.compute) * 100).toFixed(1)}%)` : "";
-    console.log(`  shipped:  ${(baseline * 1000).toFixed(2)} ms, ${(flops / baseline / 1e12).toFixed(2)} TFLOP/s${share}`);
+  // `FLASH_TILE.bq`, not 1. The shipped kernel takes BQ queries per workgroup,
+  // and dispatching one per query gives it sixteen times the work — which is
+  // what made a baseline read 83.93 ms against its real 8.43, and would have
+  // made every candidate look like a triumph.
+  const reference = dispatchFor(shipped, q, k, v, heads, L, S, FLASH_TILE.bq);
+  const entries = correct.map((candidate) => ({
+    candidate,
+    label: label(candidate),
+    dispatch: dispatchFor(codeFor(candidate), q, k, v, heads, L, S, candidate.shape.bq),
+  }));
+
+  const report = await sweep(runner, reference, entries);
+  if (!report) {
+    console.log("  the device declined to time it\n");
+    continue;
   }
-  const scored: { shape: FlashShape; seconds: number }[] = [];
-  for (const shape of correct) {
-    const seconds = await runner.time(dispatchFor(tiledFlash(shape, D), q, k, v, heads, L, S, shape.bq));
-    if (seconds !== null) scored.push({ shape, seconds });
-  }
-  scored.sort((a, b) => a.seconds - b.seconds);
-  console.log("  best 5:");
-  for (const { shape, seconds } of scored.slice(0, 5)) {
-    const achieved = flops / seconds;
-    const share = roof ? `${((achieved / roof.compute) * 100).toFixed(1)}%` : "n/a";
-    const speedup = baseline !== null ? `${(baseline / seconds).toFixed(1)}x` : "n/a";
-    console.log(
-      `    ${label(shape).padEnd(26)} ${(seconds * 1000).toFixed(2).padStart(7)} ms  ` +
-        `${(achieved / 1e12).toFixed(2).padStart(6)} TFLOP/s  ${share.padStart(6)}  ${speedup.padStart(5)}  ` +
-        `${(flashStorageBytes(shape, D) / 1024).toFixed(1)} KB`,
-    );
-  }
+  for (const line of describeSweep(report, flops, roof?.compute ?? null, Number(arg("--top") ?? 6))) console.log(line);
   console.log();
 }
+
 runner.destroy();
