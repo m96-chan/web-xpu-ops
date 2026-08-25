@@ -530,6 +530,13 @@ async function main(): Promise<void> {
     const shape = { T: 1, H: latentH, W: latentW };
     const x0 = noiseScaling(sigmas[0]!, gaussianNoise(LATENT.channels * latentH * latentW, seed), null);
     const held = new Map<string, GPUBuffer>();
+    /**
+     * Set once a forward has run to completion with `held`.
+     *
+     * Not `held.size > 0`: that is true partway through the first forward,
+     * while the prefixes it has not reached yet still need preloading.
+     */
+    let weightsResident = false;
     const predictions: Float32Array[] = [];
     let out = x0;
     const samplingStart = performance.now();
@@ -565,10 +572,28 @@ async function main(): Promise<void> {
         const forwardStart = wanted ? performance.now() : 0;
         const result = await animaForwardResident(
           residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
-          // Hydrates the heap a block at a time, from the disk cache. Only the
-          // first forward does any work here: after it the weights live on the
-          // device and `held` answers instead.
+          // Hydrates the heap a block at a time, from the disk cache, for the
+          // first forward only — the guard below is what makes that true. It
+          // used to be an unchecked claim in this comment, and it was false.
           async (prefix) => {
+            // **Only while the device does not already hold the weights.**
+            // `weightBuffer()` and `project()` both check `held` before asking
+            // the source for anything — "Already on the device: dispatch
+            // without asking the source for anything" — so from the second
+            // forward on, this pulled tensors off disk that nothing would
+            // read. Measured at 1346 ms of a 3769 ms forward, ~36%, and every
+            // millisecond of it wasted; the heap holds 192 packed tensors
+            // against 898 in the model, so the LRU cannot even make the
+            // re-read cheap.
+            //
+            // **`held.size > 0` is the wrong test, and running it is how that
+            // was found.** `held` fills *during* the first forward, so it is
+            // non-empty from the first prefix onward and every later prefix
+            // was skipped on the very forward that needed them:
+            // `"net.t_embedder.1.linear_1.weight" was read before it was
+            // preloaded`. The condition is "a forward has finished", which
+            // nothing about `held` expresses partway through one.
+            if (weightsResident) return;
             const t0 = performance.now();
             await dit.preloadPrefix(prefix);
             const t1 = performance.now();
@@ -584,6 +609,9 @@ async function main(): Promise<void> {
           },
           wanted ? profile ?? undefined : undefined,
         );
+        // Every weight the DiT touches is on the device now, so nothing after
+        // this needs the source.
+        weightsResident = true;
         if (wanted && stats) {
           profiledWallSeconds = (performance.now() - forwardStart) / 1000;
           profiledDispatches = stats.dispatches;
