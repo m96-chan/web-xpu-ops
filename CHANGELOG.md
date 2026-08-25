@@ -9,6 +9,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **Z-Image runs from a folder too, and is published** (issue #194). The same
+  gate, the same receipt, the same offline-after-the-first-download. 14.4 GB in
+  total — and **8.04 GB of it comes straight from
+  [`Tongyi-MAI/Z-Image`](https://huggingface.co/Tongyi-MAI/Z-Image)**, because
+  the text encoder is Qwen3-4B unmodified and copying it into a second
+  repository would redistribute what its own publisher already serves. Only the
+  6.4 GB this repository converted is at
+  [`m96-chan/Z-Image-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Z-Image-q8-web-xpu-ops),
+  Apache-2.0 like its source.
+
+  `byte-source.ts`, `provision.ts`, `bound-folder.ts` and the gate moved to
+  `examples/web-common/src` rather than being copied: three copies of "is this
+  folder complete?" is three places for the check to drift, and that check
+  decides whether a half-downloaded folder produces an error or a wrong picture.
+
+- **Every converter records where the weights came from** (issue #190). Tracing
+  Anima's licence took an hour because its manifest named a repository that
+  declared none and deferred to an upstream it did not name. The repository,
+  the licence and — for Anima — the whole chain now live in the manifest the
+  converter writes.
+
 - **The Anima demo runs from a folder you pick, and is published** (issues #180,
   #192). Point it at an empty folder; the weights are downloaded into it once
   from

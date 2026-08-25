@@ -180,6 +180,61 @@ describe("anima-web / provisioning a folder", () => {
     expect(await readReceipt(dir)).toBeNull();
   });
 
+  it("reads ahead rather than one chunk at a time", async () => {
+    // Measured on Hugging Face, 512 MB each way: one request at a time is
+    // 3.2 MB/s and eight at once is 25.8 MB/s. A single stream is
+    // latency-bound, not bandwidth-bound. Without this test the change that
+    // bought 8x is not held by anything.
+    const dir = fakeDir();
+    let live = 0;
+    let peak = 0;
+    const slow: ByteSource = {
+      describe: "fake://weights",
+      async size(file) {
+        return SIZES[file as keyof typeof SIZES];
+      },
+      async read(_file, _offset, length) {
+        live += 1;
+        peak = Math.max(peak, live);
+        await new Promise((r) => setTimeout(r, 1));
+        live -= 1;
+        return new ArrayBuffer(length);
+      },
+    };
+    await provision(dir, slow, { files: ["a.bin"] });
+    // `a.bin` is 20 MB + 7 bytes: three 8 MB chunks, so three can overlap.
+    expect(peak, "chunks should overlap").toBeGreaterThan(1);
+  });
+
+  it("waits out the reads it started when one of them fails", async () => {
+    // A read that rejects while the loop is awaiting an earlier one would
+    // otherwise settle after `provision` has returned -- an unhandled rejection,
+    // which is a console error in a browser and a dead process in Node.
+    const dir = fakeDir();
+    let settledAfterThrow = 0;
+    let threw = false;
+    const flaky: ByteSource = {
+      describe: "fake://weights",
+      async size(file) {
+        return SIZES[file as keyof typeof SIZES];
+      },
+      async read(_file, offset, length) {
+        await new Promise((r) => setTimeout(r, offset === 0 ? 1 : 5));
+        if (threw) settledAfterThrow += 1;
+        if (offset === 0) {
+          threw = true;
+          throw new Error("first chunk went away");
+        }
+        return new ArrayBuffer(length);
+      },
+    };
+    await expect(provision(dir, flaky, { files: ["a.bin"] })).rejects.toThrow(/went away/);
+    // Anything still running has finished by the time the rejection surfaces.
+    const seen = settledAfterThrow;
+    await new Promise((r) => setTimeout(r, 30));
+    expect(settledAfterThrow, "no read should settle after provision returned").toBe(seen);
+  });
+
   it("rejects a receipt from a future version rather than guessing at it", async () => {
     const dir = fakeDir();
     const receipt: Receipt = { version: 2 as 1, source: "x", completedAt: "", sizes: {} };

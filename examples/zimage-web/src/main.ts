@@ -16,6 +16,10 @@
  *   | sampler       | exact       |
  *   | VAE decoder   | 1.085e-5    |
  */
+import type { ByteSource } from "../../web-common/src/byte-source.js";
+import {
+  requireBoundFolder, wireChangeFolder, type GateElements, type GateOptions,
+} from "../../web-common/src/gate.js";
 import { createBrowserRunner } from "../../llm-demo/src/browser-runtime.js";
 import { type BpeVocab, ByteLevelBpeTokenizer } from "../../../llm/tokenizer-bpe.js";
 import { type DecoderConfig } from "../../zimage-vae/src/decoder.js";
@@ -47,6 +51,21 @@ const bar = $<HTMLDivElement>("bar").firstElementChild as HTMLElement;
 const logBox = $<HTMLDivElement>("log");
 const form = $<HTMLFormElement>("form");
 const go = $<HTMLButtonElement>("go");
+const gateDialog = $<HTMLDialogElement>("gate");
+const bindButton = $<HTMLButtonElement>("bind");
+const folderRow = $<HTMLDivElement>("folder-row");
+const folderState = $<HTMLSpanElement>("folder-state");
+const gateElements: GateElements = {
+  dialog: gateDialog,
+  title: $<HTMLHeadingElement>("gate-title"),
+  body: $<HTMLParagraphElement>("gate-body"),
+  action: $<HTMLButtonElement>("gate-action"),
+  dismiss: $<HTMLButtonElement>("gate-dismiss"),
+  progress: $<HTMLParagraphElement>("gate-progress"),
+  bar: $<HTMLDivElement>("gate-bar"),
+  barFill: $<HTMLDivElement>("gate-bar").firstElementChild as HTMLDivElement,
+  why: $<HTMLParagraphElement>("gate-why"),
+};
 
 // On the page, not only in the log. Four rounds of this session were spent
 // telling a fixed build from a cached one by counting line numbers in a pasted
@@ -102,9 +121,43 @@ function draw(planes: Float32Array, H: number, W: number): void {
 /** Replaced at bundle time — see `build.mjs`. */
 declare const BUILD_STAMP: string;
 
-const DIT_BASE = "/weights/dit";
-const ENCODER_BASE = "/weights/text_encoder";
-const VAE_BASE = "/weights/vae";
+/**
+ * Where the weights come from, and where they are kept.
+ *
+ * Issue #194, the shape #180 gave `examples/anima-web`. `?weights=` overrides
+ * the base for a local copy or a dev server; the default is the published
+ * conversion, whose licence is Apache-2.0 and **is not this repository's MIT**.
+ *
+ * **One base, one repository.** An earlier version left the 8.04 GB text
+ * encoder at its own publisher and fetched it from there, on the argument that
+ * copying it was redistributing what the original host already served. That
+ * argument is sound and the trade is not: two hosts is two things that can move
+ * or disappear, and a folder that fills from one place is one thing to explain.
+ */
+const DEFAULT_WEIGHTS = "https://huggingface.co/m96-chan/Z-Image-q8-web-xpu-ops/resolve/main";
+const WEIGHTS_BASE = new URLSearchParams(location.search).get("weights") ?? DEFAULT_WEIGHTS;
+const DIT_BASE = WEIGHTS_BASE;
+const ENCODER_BASE = WEIGHTS_BASE;
+const VAE_BASE = WEIGHTS_BASE;
+/** Everything a folder must hold. */
+const ENCODER_SHARDS = [
+  "config.json",
+  "model.safetensors.index.json",
+  "model-00001-of-00003.safetensors",
+  "model-00002-of-00003.safetensors",
+  "model-00003-of-00003.safetensors",
+];
+const WEIGHT_FILES = [
+  "dit.manifest.json",
+  "dit.q8.bin",
+  "dit.q8scales.bin",
+  "dit.f32.bin",
+  "manifest.json",
+  "decoder.bin",
+  ...ENCODER_SHARDS,
+];
+/** The vocabularies are this repository's files, so they travel with the page. */
+const TOKENIZER_BASE = new URL("weights/tokenizer", `${location.origin}${location.pathname}`).href;
 
 /**
  * The DiT's weights, on the GPU, for as long as the page lives.
@@ -115,7 +168,29 @@ const VAE_BASE = "/weights/vae";
  */
 const heldWeights = new Map<string, GPUBuffer>();
 
+/** A JSON file out of the bound folder. Everything the page reads is in there. */
+async function readJson(source: ByteSource, name: string): Promise<unknown> {
+  const bytes = await source.read(name, 0, await source.size(name));
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+}
+
 async function main(): Promise<void> {
+  // Before anything is fetched. The gate reports which requirement is missing
+  // -- HTTPS, WebGPU, the File System Access API, a folder -- rather than
+  // failing at the first tensor read with something it knew at the outset.
+  const gateOptions: GateOptions = {
+    elements: gateElements,
+    files: WEIGHT_FILES,
+    weightsBase: WEIGHTS_BASE,
+    downloadSize: "14.4 GB",
+    licence: "Apache-2.0 — commercial use permitted; see the model's licence.",
+  };
+  const source = await requireBoundFolder(gateOptions);
+  if (!source) return;
+  folderRow.hidden = false;
+  folderState.textContent = source.describe;
+  wireChangeFolder(gateOptions, bindButton, source);
+
   let runner: Awaited<ReturnType<typeof createBrowserRunner>>;
   let resident: Awaited<ReturnType<typeof createBrowserResidentDevice>>;
   try {
@@ -125,7 +200,9 @@ async function main(): Promise<void> {
     // through it, and the one this replaces.
     resident = await createBrowserResidentDevice();
   } catch (error) {
-    status("WebGPU is unavailable in this browser.");
+    // The gate already established that WebGPU is here, so this is a device
+    // that could not be created rather than an API that is missing.
+    status("The GPU device could not be created.");
     log(String(error));
     return;
   }
@@ -137,22 +214,22 @@ async function main(): Promise<void> {
   // answer. It cost an hour once.
   status("Reading manifests…");
   const [dit, encoderIndex, encoderConfig, vaeManifest, vocab] = await Promise.all([
-    FetchedDitWeights.open(DIT_BASE, 48),
-    fetch(`${ENCODER_BASE}/model.safetensors.index.json`).then((r) => (r.ok ? r.json() : null)),
-    fetch(`${ENCODER_BASE}/config.json`).then((r) => r.json()),
-    fetch(`${VAE_BASE}/manifest.json`).then((r) => r.json()),
-    fetch("/weights/tokenizer/qwen-qwen3-4b.bpe-vocab.json").then((r) => r.json()),
+    FetchedDitWeights.open(DIT_BASE, 48, source),
+    readJson(source, "model.safetensors.index.json"),
+    readJson(source, "config.json"),
+    readJson(source, "manifest.json"),
+    fetch(`${TOKENIZER_BASE}/qwen-qwen3-4b.bpe-vocab.json`).then((r) => r.json()),
   ]);
 
   const tokenizer = new ByteLevelBpeTokenizer(vocab as BpeVocab);
   const encoder = encoderIndex
-    ? new FetchedShards(ENCODER_BASE, (encoderIndex as { weight_map: Record<string, string> }).weight_map)
-    : await FetchedSafetensors.open(`${ENCODER_BASE}/model.safetensors`);
+    ? new FetchedShards(ENCODER_BASE, (encoderIndex as { weight_map: Record<string, string> }).weight_map, source)
+    : await FetchedSafetensors.open(`${ENCODER_BASE}/model.safetensors`, source, "model.safetensors");
 
   // The VAE decoder is 198 MB and every layer of it is used, so it is fetched
   // whole rather than by tensor — the only weight here that is.
   status("Fetching the VAE decoder (198 MB)…");
-  const vaeBlob = new Float32Array(await (await fetch(`${VAE_BASE}/decoder.bin`)).arrayBuffer());
+  const vaeBlob = new Float32Array(await source.read("decoder.bin", 0, await source.size("decoder.bin")));
   const vaeTable = (vaeManifest as { decoder: { name: string; offset: number; length: number }[] }).decoder;
   const vaeWeight = (name: string): Float32Array => {
     const e = vaeTable.find((t) => t.name === name);

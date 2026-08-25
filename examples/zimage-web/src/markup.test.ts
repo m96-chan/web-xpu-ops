@@ -22,7 +22,7 @@ const defined = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!))
 /** Ids the script asks for, through its own `$` helper. */
 const used = [...main.matchAll(/\$<[^>]+>\("([^"]+)"\)/g)].map((m) => m[1]!);
 
-describe("anima-web / markup", () => {
+describe("zimage-web / markup", () => {
   it("finds both sides", () => {
     expect(defined.size).toBeGreaterThan(10);
     expect(used.length).toBeGreaterThan(10);

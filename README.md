@@ -2211,6 +2211,7 @@ Anima, which `examples/anima/` runs, is the sharpest case: it is
 | `circlestone-labs/Anima` and anything derived from it, including `lylogummy/Anima-3.8B` and any conversion of it | [CircleStone Labs Non-Commercial License v1.2](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md) | **non-commercial and non-production use only** |
 | its base, `nvidia/Cosmos-Predict2-2B-Text2Image` | [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license) | commercially usable, but stacked under the above; requires a "Built on NVIDIA Cosmos" attribution |
 | the text encoder and VAE, upstream `Qwen/Qwen3-0.6B-Base` and `Qwen/Qwen-Image` | Apache-2.0 | distributed inside the CircleStone repo, whose §9 keeps third-party terms in force |
+| Z-Image, which `examples/zimage/` runs — `Tongyi-MAI/Z-Image`, transformer, text encoder and VAE alike | [Apache-2.0](https://huggingface.co/Tongyi-MAI/Z-Image) | commercial use permitted; a converted copy is at [`m96-chan/Z-Image-q8-web-xpu-ops`](https://huggingface.co/m96-chan/Z-Image-q8-web-xpu-ops) under the same terms |
 
 Two licences apply to the Anima weights at once, and **the more restrictive one
 governs**: NVIDIA permits commercial use, CircleStone does not, so the answer is
