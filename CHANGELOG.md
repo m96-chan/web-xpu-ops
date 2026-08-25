@@ -72,6 +72,20 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **A browser page that decodes video** (issue #200). `examples/h3-video-web`,
+  on the same folder-bound, server-free footing as the other demos: a latent in,
+  frames on a canvas, with a transport to play them at 24 fps.
+
+  **9.69 GB of f32 stays on the GPU**, which is the honest requirement and the
+  page says it. Quantising to int8 would be 2.4 GB and is not done: `matmulQ8`
+  exists, but what int8 costs this decoder has not been measured.
+
+  **The in-browser decode is unmeasured.** Everything quoted is Node against the
+  same `VideoDecoderGpu` class the page instantiates; the page adds the folder
+  read, the browser device and the canvas, prints its own decode time, and the
+  README says so rather than quoting the Node number as though it were the
+  browser's.
+
 - **MiniMax-H3's visual VAE decoder runs, end to end, on the GPU** (issue #200).
   A latent in, video frames out: 36 transformer blocks over 2048 channels, the
   embedding, the projection and the two reshapes that turn tokens back into

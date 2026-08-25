@@ -113,22 +113,52 @@ export class VideoDecoderGpu {
   private readonly lent: GPUBuffer[] = [];
   private readonly lentUniforms: GPUBuffer[] = [];
 
-  constructor(
+  private constructor(
     private readonly device: ResidentDevice,
     private readonly kernels: VideoKernels,
     private readonly manifest: VideoDecoderManifest,
-    read: (offset: number, count: number) => Float32Array,
-  ) {
+  ) {}
+
+  /**
+   * Uploads the weights **one tensor at a time**, awaiting each.
+   *
+   * A factory rather than a constructor because the browser reads them from a
+   * folder and a constructor cannot await — but the syntax is not the reason it
+   * matters. Pre-reading the file into JavaScript would put 9.69 GB in the heap
+   * before the first byte reached the device, and a single `Float32Array` over
+   * it would be 2.4 billion elements, past what a typed array is guaranteed to
+   * hold. Each tensor is uploaded and dropped.
+   *
+   * `onProgress` is how a page shows the half-minute this takes; without it the
+   * tab looks frozen.
+   */
+  static async create(
+    device: ResidentDevice,
+    kernels: VideoKernels,
+    manifest: VideoDecoderManifest,
+    read: (offset: number, count: number) => Float32Array | Promise<Float32Array>,
+    onProgress?: (doneBytes: number, totalBytes: number) => void | Promise<void>,
+  ): Promise<VideoDecoderGpu> {
+    const self = new VideoDecoderGpu(device, kernels, manifest);
+    let done = 0;
     for (const entry of manifest.tensors) {
-      const data = read(entry.offset, entry.count);
+      const data = await read(entry.offset, entry.count);
       if (data.length !== entry.count) {
         throw new Error(`${entry.name}: read ${data.length} f32 where the manifest says ${entry.count}`);
       }
       const buffer = device.createStorageBuffer(data.byteLength);
       device.upload(buffer, 0, data);
-      this.weights.set(entry.name, buffer);
+      self.weights.set(entry.name, buffer);
+      done += entry.count * 4;
+      if (onProgress) await onProgress(done, manifest.elements * 4);
     }
+    self.addConstants();
+    return self;
+  }
 
+  /** The buffers the checkpoint has no tensor for. */
+  private addConstants(): void {
+    const { device, manifest } = this;
     // Two constants the checkpoint has no tensor for. `qk_norm_affine: false`
     // means the QK norms have no weights, and a vector of ones multiplies
     // without rounding in f32 -- one code path instead of two. `axis_dims` is
@@ -143,10 +173,12 @@ export class VideoDecoderGpu {
     device.upload(axisBuffer, 0, axisDims);
     this.weights.set("rope.axisDims", axisBuffer);
 
-    // `ops/flash_attention` takes an additive mask whatever the geometry. One
-    // row of zeros serves for "no mask", which is this decoder's case.
-    const noMask = device.createStorageBuffer(4 * 4096);
-    this.weights.set("attn.noMask", noMask);
+    // `ops/flash_attention` takes an additive mask whatever the geometry, and
+    // reads `S` entries of it. A row of zeros serves for "no mask", which is
+    // this decoder's case -- but it has to be long enough. A read past the end
+    // returns zero on this device, which is the right answer by accident and
+    // would be the wrong one somewhere else.
+    this.ensureMask(4096);
   }
 
   private maskBytes = 0;

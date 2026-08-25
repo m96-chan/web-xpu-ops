@@ -72,7 +72,7 @@ if (!device) {
 }
 
 const uploadStart = performance.now();
-const decoder = new VideoDecoderGpu(device, videoKernels(), manifest, read);
+const decoder = await VideoDecoderGpu.create(device, videoKernels(), manifest, read);
 closeSync(fd);
 console.log(`uploaded in ${((performance.now() - uploadStart) / 1000).toFixed(1)} s`);
 
