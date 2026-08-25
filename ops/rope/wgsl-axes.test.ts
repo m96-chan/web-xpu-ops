@@ -24,7 +24,7 @@ const code = kernel(import.meta.url, "axes");
 const ZIMAGE = { axisDims: [32, 48, 48], thetaBase: 256, N: 5, numHeads: 3 } as const;
 const zimage = axesScenario(code, {
   ...ZIMAGE,
-  positions: Int32Array.from([0, 0, 0, 1, 0, 1, 2, 3, 5, 7, 1, 0, 3, 11, 4]),
+  positions: Float32Array.from([0, 0, 0, 1, 0, 1, 2, 3, 5, 7, 1, 0, 3, 11, 4]),
 });
 
 // Unequal axes, and negative positions on two of them. Both halves are
@@ -37,7 +37,7 @@ const uneven = axesScenario(code, {
   thetaBase: 256,
   N: 9,
   numHeads: 8,
-  positions: Int32Array.from(
+  positions: Float32Array.from(
     Array.from({ length: 9 }, (_, token) => [token, -3 * token, 40 - token]).flat(),
   ),
 });
@@ -51,7 +51,7 @@ const ONE = { axisDims: [16], thetaBase: 10000, N: 9, numHeads: 8 } as const;
 const oneAxisInput = Float32Array.from({ length: 9 * 8 * 16 }, (_, i) => Math.sin(i * 0.29) * 2);
 const oneAxis = axesScenario(
   code,
-  { ...ONE, positions: Int32Array.from({ length: 9 }, (_, token) => token + 200) },
+  { ...ONE, positions: Float32Array.from({ length: 9 }, (_, token) => token + 200) },
   oneAxisInput,
   rope({ input: oneAxisInput, N: 9, numHeads: 8, headDim: 16, posOffset: 200, thetaBase: 10000 }),
 );
@@ -65,7 +65,7 @@ const oneAxis = axesScenario(
 const still = Float32Array.from({ length: 5 * 3 * 128 }, (_, i) => Math.sin(i * 0.29) * 2 + 3);
 const identity = axesScenario(
   code,
-  { ...ZIMAGE, positions: new Int32Array(5 * 3) },
+  { ...ZIMAGE, positions: new Float32Array(5 * 3) },
   still,
 );
 
