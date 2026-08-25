@@ -72,6 +72,32 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **MiniMax-H3's audio decoder runs, and it needed no new kernel** (issue #200).
+  H3 generates video with **native stereo audio**, and the audio half is a
+  BigVGAN vocoder over a 32-channel latent at 40 Hz — a DAC-lineage codec, which
+  is the same shape as the one `conv_transpose1d` (#87), `group_norm` (#91),
+  `snake_beta` (#90) and `istft`'s `"same"` (#93) were added for. Those landed
+  for VoxShot. Every one of them is what this model's decoder wants.
+
+  `examples/h3-audio` has the decoder twice: a reference that calls this
+  library's own references, and a GPU version that is the same file with
+  dispatches. Both are held to a waveform produced by **the model's own Python**
+  on a fixed latent, not to each other — agreeing with a port only says the two
+  share a mistake.
+
+  Measured, RTX 5090 / driver 610.57.04 / Dawn `webgpu@0.4.0` / f32, on a
+  6,400-sample golden: the reference is **1.788e-6** worst element against
+  torch's output and takes 21 s; the GPU version is **5.007e-6** and takes
+  **432 ms**.
+
+  Two things that would otherwise have needed a new kernel are folded instead.
+  The `ratio *` after the anti-aliasing upsample rides on the filter's twelve
+  taps, since a convolution is linear in its weight. And the slice after it is
+  the transposed convolution's `padding` — the two trims are equal for this
+  filter, and a symmetric crop is what `padding` means there. The port throws
+  if a future filter makes them differ rather than quietly dropping a sample,
+  which is a phase error no unit test hears.
+
 - **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
   pad op, not a convolution argument. MiniMax-H3 is the model that makes that
   separation load-bearing: its visual VAE pads `reflect` on the spatial axes
