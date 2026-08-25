@@ -8,7 +8,7 @@
  *
  *     npx tsx examples/h3-video/src/verify-decode.ts --dir ~/h3-video-web
  */
-import { readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { createResidentDevice } from "../../../harness/resident.js";
 import { VideoDecoderGpu, denormalise, type VideoDecoderManifest } from "./decoder-gpu.js";
 import { videoKernels } from "./kernels-node.js";
@@ -28,7 +28,12 @@ const f32 = (path: string): Float32Array => {
   return new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
 };
 
-const manifest = JSON.parse(readFileSync(`${dir}/decoder.manifest.json`, "utf8")) as VideoDecoderManifest;
+const manifest = JSON.parse(
+  readFileSync(
+    existsSync(`${dir}/decoder.q8.manifest.json`) ? `${dir}/decoder.q8.manifest.json` : `${dir}/decoder.manifest.json`,
+    "utf8",
+  ),
+) as VideoDecoderManifest;
 
 /**
  * `--bench T,H,W` times a random latent instead of comparing to a golden.
@@ -55,14 +60,16 @@ const golden = bench
 // Read the 9.69 GB one tensor at a time rather than mapping it whole: a single
 // `Float32Array` over it would be 2.4 billion elements, past what a typed array
 // is guaranteed to hold, and every tensor is uploaded and then dropped anyway.
-const bin = `${dir}/decoder.bin`;
-console.log(`weights ${(statSync(bin).size / 1e9).toFixed(2)} GB, ${manifest.tensors.length} tensors`);
+const bin = `${dir}/${manifest.dtype === "q8" ? "decoder.q8.bin" : "decoder.bin"}`;
+console.log(`weights ${(statSync(bin).size / 1e9).toFixed(2)} GB, ${manifest.tensors.length} tensors, ${manifest.dtype}`);
 const fd = openSync(bin, "r");
-const read = (offset: number, count: number): Float32Array => {
-  const bytes = Buffer.allocUnsafe(count * 4);
-  const got = readSync(fd, bytes, 0, count * 4, offset * 4);
-  if (got !== count * 4) throw new Error(`decoder.bin: read ${got} bytes where ${count * 4} were wanted`);
-  return new Float32Array(bytes.buffer, bytes.byteOffset, count);
+// Bytes: a `q8` tensor is packed int8 in u32 words, and nothing here should
+// interpret them.
+const read = (offsetBytes: number, byteLength: number): Uint8Array => {
+  const bytes = Buffer.allocUnsafe(byteLength);
+  const got = readSync(fd, bytes, 0, byteLength, offsetBytes);
+  if (got !== byteLength) throw new Error(`${bin}: read ${got} bytes where ${byteLength} were wanted`);
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, byteLength);
 };
 
 const device = await createResidentDevice();
@@ -134,7 +141,29 @@ if (repeat !== 0) {
   process.exit(1);
 }
 
-const shown = denormalise(got, manifest.config.out_channels, manifest.pixelMean, manifest.pixelStd);
+// The same difference in the units a viewer sees.
+//
+// A worst element in the model's normalised space says nothing on its own: the
+// denormalisation multiplies by a per-channel std of about 0.22, and the result
+// is shown as 8-bit levels. **Quoting the normalised number alone is how a
+// quantisation gets called accurate or inaccurate without either being
+// established.**
+const shownGot = denormalise(got, manifest.config.out_channels, manifest.pixelMean, manifest.pixelStd);
+const shownWant = denormalise(want, manifest.config.out_channels, manifest.pixelMean, manifest.pixelStd);
+let worstLevels = 0;
+let sumLevels = 0;
+for (let i = 0; i < shownGot.length; i += 1) {
+  const a = Math.max(0, Math.min(255, Math.round(shownGot[i]! * 255)));
+  const b = Math.max(0, Math.min(255, Math.round(shownWant[i]! * 255)));
+  const d = Math.abs(a - b);
+  sumLevels += d * d;
+  if (d > worstLevels) worstLevels = d;
+}
+console.log(
+  `as 8-bit pixels: worst ${worstLevels} levels of 255, RMS ${Math.sqrt(sumLevels / shownGot.length).toFixed(3)}`,
+);
+
+const shown = shownGot;
 let low = Infinity;
 let high = -Infinity;
 for (const v of shown) {

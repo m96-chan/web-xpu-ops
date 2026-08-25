@@ -86,6 +86,26 @@ Entries record **why** a change was needed. What changed is in the diff.
   `blocksPerSubmit` is a field rather than a constant so that measurement can be
   repeated on other hardware.
 
+- **The video decoder runs in int8, and the page uses it** (issue #200).
+  `--quant q8` writes **2.43 GB** where f32 writes 9.69, and `matmulQ8` takes
+  `nn.Linear`'s `[out, in]` layout untransposed with one absmax scale per output
+  row — the opposite of the f32 path, whose kernel reads `[in, out]`.
+
+  What it costs, measured against the model's own pixels **in the units a viewer
+  sees**: **2 levels of 255**, RMS 0.564 levels, against f32's 1 and 0.007. In
+  the model's normalised space that is 3.606e-2 — a number that says nothing on
+  its own, since the denormalisation multiplies by a per-channel std of ~0.22.
+
+  Two levels of 255 for a quarter of the size, and a faster load: 292 ms against
+  636 ms for the first decode.
+
+  Two quantiser mutations are strongly observable (the scale taken as `absmax`
+  rather than `absmax / 127` costs 230 levels; reversing the byte order inside
+  each u32 costs 196) and two are not: quantising per *tensor* rather than per
+  output row costs only 5 levels, and widening the clamp to `-128` changes
+  nothing at all — which is structural, since an absmax scale never produces
+  -128. All four are written down, including the ones that barely show.
+
 - **A browser page that decodes video** (issue #200). `examples/h3-video-web`,
   on the same folder-bound, server-free footing as the other demos: a latent in,
   frames on a canvas, with a transport to play them at 24 fps.

@@ -40,9 +40,11 @@ import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, flashGrid } from "../../../ops/flash_attention/index.js";
+import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry: string }[] = [
   { key: "matmul", op: "matmul", entry: "kernel" },
+  { key: "matmulQ8", op: "matmul", entry: "q8" },
   { key: "rmsnorm", op: "rmsnorm", entry: "kernel" },
   { key: "layernorm", op: "layernorm", entry: "kernel" },
   { key: "activation", op: "activation", entry: "kernel" },
@@ -55,6 +57,7 @@ export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry:
 
 export interface VideoKernels {
   matmul: string;
+  matmulQ8: string;
   rmsnorm: string;
   layernorm: string;
   activation: string;
@@ -79,6 +82,8 @@ export interface VideoDecoderManifest {
     rope_theta: number;
     rope_dim_ratio: number;
   };
+  /** `"f32"` or `"q8"` — which layout the weight matrices are in. */
+  dtype: string;
   dim: number;
   ffnHidden: number;
   ropeAxisDims: number[];
@@ -144,15 +149,20 @@ export class VideoDecoderGpu {
     device: ResidentDevice,
     kernels: VideoKernels,
     manifest: VideoDecoderManifest,
-    read: (offset: number, count: number) => Float32Array | Promise<Float32Array>,
+    read: (offsetBytes: number, byteLength: number) => Uint8Array | Promise<Uint8Array>,
     onProgress?: (doneBytes: number, totalBytes: number) => void | Promise<void>,
   ): Promise<VideoDecoderGpu> {
     const self = new VideoDecoderGpu(device, kernels, manifest);
     let done = 0;
     for (const entry of manifest.tensors) {
-      const data = await read(entry.offset, entry.count);
-      if (data.length !== entry.count) {
-        throw new Error(`${entry.name}: read ${data.length} f32 where the manifest says ${entry.count}`);
+      // **Bytes, not floats.** A `q8` tensor is packed int8 in `u32` words, and
+      // reading those through a `Float32Array` would run every word through
+      // f32's NaN canonicalisation on the way to the device -- a corruption
+      // that only shows on the bit patterns that happen to be signalling NaNs,
+      // which is to say on some weights and not others.
+      const data = await read(entry.offset * 4, entry.count * 4);
+      if (data.byteLength !== entry.count * 4) {
+        throw new Error(`${entry.name}: read ${data.byteLength} bytes where the manifest says ${entry.count * 4}`);
       }
       const buffer = device.createStorageBuffer(data.byteLength);
       device.upload(buffer, 0, data);
@@ -296,12 +306,27 @@ export class VideoDecoderGpu {
     ops.push({ kind: "dispatch", pipeline, bindGroup: await this.device.bindGroup(pipeline, buffers), workgroups });
   }
 
-  /** `a @ b` with `b` stored `[K, N]`, then `+ bias` broadcast over rows. */
-  private async linear(ops: ResidentOp[], a: Mat, weight: GPUBuffer, bias: GPUBuffer | null, N: number): Promise<Mat> {
+  /**
+   * `a @ W`, then `+ bias` broadcast over rows.
+   *
+   * The two quantisations want **opposite layouts**, which is why the weight is
+   * named rather than passed: `ops/matmul` reads `b` as `[K, N]`, so the f32
+   * conversion transposes; `matmulQ8` reads `[M, K/4]` with one scale per `M`,
+   * which is `nn.Linear`'s own `[out, in]` untransposed. The converter emits
+   * whichever the manifest says, and this picks the kernel to match.
+   */
+  private async linear(ops: ResidentOp[], a: Mat, name: string, bias: GPUBuffer | null, N: number): Promise<Mat> {
     const out = this.take(a.rows * N);
-    await this.dispatch(ops, this.kernels.matmul, [a.buffer, weight, out, this.uniform([
-      ["u32", a.rows], ["u32", N], ["u32", a.cols],
-    ])], [Math.ceil(N / MM_BN), Math.ceil(a.rows / MM_BM), 1]);
+    if (this.manifest.dtype === "q8") {
+      await this.dispatch(ops, this.kernels.matmulQ8, [
+        a.buffer, this.w(name), this.w(`${name}.scale`), out,
+        this.uniform([["u32", a.rows], ["u32", N], ["u32", a.cols]]),
+      ], matmulQ8Grid(a.rows, N));
+    } else {
+      await this.dispatch(ops, this.kernels.matmul, [a.buffer, this.w(name), out, this.uniform([
+        ["u32", a.rows], ["u32", N], ["u32", a.cols],
+      ])], [Math.ceil(N / MM_BN), Math.ceil(a.rows / MM_BM), 1]);
+    }
     if (!bias) return { buffer: out, rows: a.rows, cols: N };
     const biased = this.take(a.rows * N);
     await this.dispatch(ops, this.kernels.rows, [out, bias, biased, this.uniform([
@@ -351,9 +376,9 @@ export class VideoDecoderGpu {
     const p = `blocks.${index}.`;
 
     const normed = await this.norm(ops, x, this.w(`${p}norm1.weight`), c.eps);
-    let q = await this.linear(ops, normed, this.w(`${p}q.weight`), this.w(`${p}q.bias`), width);
-    let k = await this.linear(ops, normed, this.w(`${p}k.weight`), this.w(`${p}k.bias`), width);
-    const v = await this.linear(ops, normed, this.w(`${p}v.weight`), this.w(`${p}v.bias`), width);
+    let q = await this.linear(ops, normed, `${p}q.weight`, this.w(`${p}q.bias`), width);
+    let k = await this.linear(ops, normed, `${p}k.weight`, this.w(`${p}k.bias`), width);
+    const v = await this.linear(ops, normed, `${p}v.weight`, this.w(`${p}v.bias`), width);
 
     // QK-norm over each head's channels, with no weights (`qk_norm_affine:
     // false`). `groups` is what makes one dispatch normalise `seq * heads` rows
@@ -381,7 +406,7 @@ export class VideoDecoderGpu {
 
     const merged = await this.swapLeading(ops, attended, c.heads, seq, c.dim_head);
     const projected = await this.linear(
-      ops, { buffer: merged, rows: seq, cols: width }, this.w(`${p}out.weight`), this.w(`${p}out.bias`), dim,
+      ops, { buffer: merged, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
     );
     // LayerScale: a per-channel parameter that multiplies the branch before it
     // is added back. Initialised to zero, so dropping it is a block that starts
@@ -390,8 +415,8 @@ export class VideoDecoderGpu {
     let hidden = await this.pointwise(ops, x, scaled, ELEMENTWISE.add);
 
     const normed2 = await this.norm(ops, hidden, this.w(`${p}norm2.weight`), c.eps);
-    const gate = await this.linear(ops, normed2, this.w(`${p}gate.weight`), this.w(`${p}gate.bias`), ffnHidden);
-    const up = await this.linear(ops, normed2, this.w(`${p}up.weight`), this.w(`${p}up.bias`), ffnHidden);
+    const gate = await this.linear(ops, normed2, `${p}gate.weight`, this.w(`${p}gate.bias`), ffnHidden);
+    const up = await this.linear(ops, normed2, `${p}up.weight`, this.w(`${p}up.bias`), ffnHidden);
 
     const activated = this.take(seq * ffnHidden);
     await this.dispatch(ops, this.kernels.activation, [gate.buffer, activated, this.uniform([
@@ -401,7 +426,7 @@ export class VideoDecoderGpu {
     const gated = await this.pointwise(
       ops, { buffer: activated, rows: seq, cols: ffnHidden }, up, ELEMENTWISE.multiply,
     );
-    const ff = await this.linear(ops, gated, this.w(`${p}w2.weight`), this.w(`${p}w2.bias`), dim);
+    const ff = await this.linear(ops, gated, `${p}w2.weight`, this.w(`${p}w2.bias`), dim);
     const scaled2 = await this.rows(ops, ff, this.w(`${p}scale2`), ELEMENTWISE.multiply);
     hidden = await this.pointwise(ops, hidden, scaled2, ELEMENTWISE.add);
     return hidden;
@@ -455,10 +480,9 @@ export class VideoDecoderGpu {
     // `post_quant_conv` is a 1x1x1 Conv3d, which is a per-token linear.
     const quantised = await this.linear(
       ops, { buffer: input, rows: patches, cols: c.in_channels },
-      this.w("post_quant.weight"), this.w("post_quant.bias"), c.in_channels,
+      "post_quant.weight", this.w("post_quant.bias"), c.in_channels,
     );
-    const embedded = await this.linear(
-      ops, quantised, this.w("x_embedder.weight"), this.w("x_embedder.bias"), dim,
+    const embedded = await this.linear(ops, quantised, "x_embedder.weight", this.w("x_embedder.bias"), dim,
     );
 
     // The suffix: four learned register tokens and one **zero** cls token,
@@ -504,7 +528,7 @@ export class VideoDecoderGpu {
 
     const patchDim = c.out_channels * c.patch_size_t * c.patch_size * c.patch_size;
     const projected = await this.linear(
-      ops, { buffer: normed, rows: seq, cols: dim }, this.w("proj_out.weight"), this.w("proj_out.bias"), patchDim,
+      ops, { buffer: normed, rows: seq, cols: dim }, "proj_out.weight", this.w("proj_out.bias"), patchDim,
     );
 
     // Only the patches are read back: the suffix tokens exist to give the

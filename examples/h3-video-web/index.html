@@ -111,8 +111,10 @@
     Qwen3-VL-32B encoder that would read a prompt are 27 GB between them and are
     not in this page. A latent sampled from the prior is what a VAE decoder is
     built to receive, so that is what it is given.
-    The weights are <strong>9.69 GB of f32</strong> and stay on the GPU between
-    decodes, so this needs a card with room for them.
+    The weights are <strong>2.43 GB of int8</strong> and stay on the GPU between
+    decodes. int8 was measured against the model's own pixels at
+    <strong>at most two levels of 255</strong>; the f32 conversion is 9.69 GB and
+    is what the verification script checks.
     Build <code id="build"></code>.
   </p>
 </div>

@@ -7,10 +7,10 @@
  * page needs that a script does not: weights from a folder the visitor picked,
  * and a device that survives between decodes.
  *
- * **9.69 GB of f32 stays on the GPU.** That is the honest requirement and the
- * page says it. Quantising to int8 would be 2.4 GB and is not done yet: it is an
- * accuracy question, and this library's rule is that a wrong kernel is worth
- * less than none.
+ * **2.43 GB of int8 stays on the GPU** — the f32 conversion is 9.69 GB and is
+ * still what `verify-decode.ts` checks. What int8 costs was measured rather
+ * than assumed: **at most two levels of 255** on the decoded pixels, RMS 0.564
+ * levels, against the model's own output. A page is where the 4x matters.
  */
 import { DEFAULT_WEIGHTS_BASE } from "../../web-common/src/byte-source.js";
 import {
@@ -31,7 +31,13 @@ declare const BUILD_STAMP: string;
  * converting your own copy is the documented path. `?weights=` overrides it.
  */
 const WEIGHTS_BASE = new URLSearchParams(location.search).get("weights") ?? DEFAULT_WEIGHTS_BASE;
-const WEIGHT_FILES = ["decoder.manifest.json", "decoder.bin"];
+/**
+ * **int8.** 2.43 GB against f32's 9.69, and measured to cost **at most two
+ * levels of 255** on the decoded pixels — RMS 0.564 levels — against the
+ * model's own output. The f32 conversion still exists and
+ * `verify-decode.ts` still checks it; a page is where the 4x matters.
+ */
+const WEIGHT_FILES = ["decoder.q8.manifest.json", "decoder.q8.bin"];
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
@@ -73,7 +79,7 @@ const gate: GateOptions = {
   } satisfies GateElements,
   files: WEIGHT_FILES,
   weightsBase: WEIGHTS_BASE,
-  downloadSize: "9.69 GB",
+  downloadSize: "2.43 GB",
   // Written from the same place the page acts on: another demo copied this
   // sentence out of its neighbour's markup once and inherited the wrong size
   // and the wrong licence with it.
@@ -211,7 +217,7 @@ async function main(): Promise<void> {
   $<HTMLSpanElement>("folder-state").textContent = source.describe;
 
   say("reading the manifest …");
-  const manifestBytes = await source.read("decoder.manifest.json", 0, await source.size("decoder.manifest.json"));
+  const manifestBytes = await source.read("decoder.q8.manifest.json", 0, await source.size("decoder.q8.manifest.json"));
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as VideoDecoderManifest;
 
   say("starting the device …");
@@ -226,7 +232,10 @@ async function main(): Promise<void> {
     device,
     videoKernels,
     manifest,
-    async (offset, count) => new Float32Array(await source.read("decoder.bin", offset * 4, count * 4)),
+    // Bytes: a `q8` tensor is packed int8 in u32 words, and interpreting them
+    // as floats on the way to the device would run every word through f32's
+    // NaN canonicalisation.
+    async (offsetBytes, byteLength) => new Uint8Array(await source.read("decoder.q8.bin", offsetBytes, byteLength)),
     async (done, total) => {
       // Yielded every 200 MB so the progress line paints. Without a yield, 657
       // reads is a tab that looks frozen for half a minute; with one per

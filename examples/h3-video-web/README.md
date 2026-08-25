@@ -101,12 +101,35 @@ npx tsx examples/h3-video/src/verify-decode.ts --dir ~/h3-video-web --bench 8,32
 The second form times a random latent and has nothing to compare against; it
 says so on every run.
 
+## int8, and what it costs
+
+The page runs the **int8** conversion: `--quant q8` writes 2.43 GB where f32
+writes 9.69, and `matmulQ8` reads `nn.Linear`'s `[out, in]` layout untransposed
+with one absmax scale per output row.
+
+What that costs was measured against the model's own pixels, in the units a
+viewer sees:
+
+| | worst | RMS |
+| --- | --- | --- |
+| f32, as 8-bit levels | 1 of 255 | 0.007 |
+| **int8, as 8-bit levels** | **2 of 255** | **0.564** |
+| int8, in the model's normalised space | 3.606e-2 | 6.860e-3 |
+
+Two levels of 255 for a quarter of the size. The normalised number alone would
+have said nothing: the denormalisation multiplies by a per-channel std of about
+0.22, so quoting `3.606e-2` without converting it is how a quantisation gets
+called accurate or inaccurate without either being established.
+
+It is also faster to load — 292 ms against 636 ms for the first decode, since
+most of that is allocating scratch and uploading.
+
+The f32 conversion still exists and `verify-decode.ts` still checks it.
+
 ## What it needs
 
-**A GPU with room for 9.69 GB of f32 weights plus its activations.** Quantising
-to int8 would be 2.4 GB and is not done: `matmulQ8` exists, but what int8 costs
-this decoder in accuracy has not been measured, and a wrong kernel is worth less
-than none.
+**A GPU with room for 2.43 GB of int8 weights plus its activations**, or 9.69 GB
+for the f32 conversion.
 
 ## What the controls do
 

@@ -48,8 +48,8 @@ describe("h3-video-web / markup", () => {
     // Another demo copied this sentence out of its neighbour's markup and
     // inherited the wrong size and the wrong licence. The number the gate shows
     // comes from `GateOptions`, so the page's own prose has to agree with it.
-    expect(main).toMatch(/downloadSize: "9\.69 GB"/);
-    expect(html).toMatch(/9\.69 GB/);
+    expect(main).toMatch(/downloadSize: "2\.43 GB"/);
+    expect(html).toMatch(/2\.43 GB/);
   });
 
   for (const id of [...new Set(used)]) {
