@@ -72,6 +72,16 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **A browser page for it** (issue #200). `examples/h3-audio-web`, on the same
+  folder-bound, server-free footing as the other demos: 260 MB into a folder
+  you pick, read from it every time after.
+
+  **There is no prompt box, and the page says why.** The transformer that would
+  write the latent is 20B and the encoder that would read a prompt is
+  Qwen3-VL-32B — 27 GB between them at the smallest published quantisation,
+  against 260 MB for the decoder. A latent sampled from the prior is what a VAE
+  decoder is built to receive, so that is what it gets.
+
 - **MiniMax-H3's audio decoder runs, and it needed no new kernel** (issue #200).
   H3 generates video with **native stereo audio**, and the audio half is a
   BigVGAN vocoder over a 32-channel latent at 40 Hz — a DAC-lineage codec, which
@@ -118,6 +128,15 @@ Entries record **why** a change was needed. What changed is in the diff.
   `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
 
 ### Changed
+
+- **The browser `ResidentDevice` lives in one place** (issue #200).
+  `anima-web` and `zimage-web` each had a copy, and they had already drifted:
+  one carried the profiling half and the other carried a comment saying a stub
+  that reported nothing would be worse than its absence — which is precisely the
+  state the first one had reached and then fixed. It is
+  `examples/web-common/src/browser-resident.ts` now. One fewer `requestDevice`
+  is one fewer place to forget a limit, which
+  `harness/device-limits.test.ts` counts.
 
 - **Flash attention stages `k` and `v` without dividing** (issue #177). The
   staging loops turned a flat index into an address the way the arithmetic reads

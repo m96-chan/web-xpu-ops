@@ -29,7 +29,7 @@ import { DEFAULT_WEIGHTS_BASE } from "../../web-common/src/byte-source.js";
 import {
   requireBoundFolder, wireChangeFolder, type GateElements, type GateOptions,
 } from "../../web-common/src/gate.js";
-import { createBrowserResidentDevice } from "./browser-resident.js";
+import { createBrowserResidentDevice } from "../../web-common/src/browser-resident.js";
 import { FetchedAnimaWeights, FetchedSafetensors } from "./fetch-weights.js";
 import { ditKernels, encoderKernels, vaeKernels } from "./kernels-web.js";
 import { type BpeVocab } from "../../../llm/tokenizer-bpe.js";

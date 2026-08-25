@@ -27,7 +27,7 @@ import { decodeGpu } from "../../zimage-vae/src/decoder-gpu.js";
 import { type DitConfig } from "../../zimage/src/dit.js";
 import { type PackedWeightSource } from "../../zimage/src/dit-gpu.js";
 import { ditForwardResident, releaseDitWeights, type ResidentDitStats } from "../../zimage/src/dit-resident.js";
-import { createBrowserResidentDevice } from "./browser-resident.js";
+import { createBrowserResidentDevice } from "../../web-common/src/browser-resident.js";
 import {
   DEFAULT_FLOW_SHIFT,
   NUM_TRAIN_TIMESTEPS,
