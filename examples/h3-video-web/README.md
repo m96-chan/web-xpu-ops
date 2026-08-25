@@ -94,9 +94,35 @@ permutation, which `permuteForRope` does for Anima.
 
 ## Running it
 
-The weights are **not in this repository and are not redistributed by it**. The
-model is under the MiniMax H3 Community License Agreement, which is not this
-code's MIT — see issue #190. Convert your own copy:
+## The licence, read rather than assumed
+
+The weights are **not in this repository and are not redistributed by it** — and
+that was a safe default until now rather than a finding. The MiniMax H3
+Community License Agreement (dated 2 August 2026) was read on 26 August 2026,
+and it settles it:
+
+- **Redistribution is permitted**, with a copy of the agreement and a NOTICE
+  file, **within the "Applicable Territory"**.
+- The Applicable Territory is *worldwide except* **the European Union, the
+  United Kingdom, the Republic of Korea and the United States of America**.
+- Any product using the model must display **"Powered by MiniMax H3"**, and a
+  commercial one must show "MiniMax H3" prominently in its interface.
+- Commercial use past **$20 M/year** in revenue needs separate written
+  authorisation from MiniMax.
+- Derivative works are owned by whoever makes them, but must still comply.
+
+**A public mirror cannot honour the territory clause** — anyone can fetch it, in
+any of the four excluded jurisdictions — so Anima and Z-Image's arrangement
+(convert once, publish to a model host, let the page download it) is not
+available here. Converting your own copy is the only path, and that is why the
+page has no default `?weights=` base.
+
+This is a reading, not legal advice; the agreement is at
+`https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE`. See issue #190.
+
+## Running it
+
+Convert your own copy:
 
 ```bash
 # the video_vae/ directory from MiniMaxAI/MiniMax-H3 (as a package, with an
