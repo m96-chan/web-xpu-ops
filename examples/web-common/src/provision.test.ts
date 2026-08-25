@@ -180,6 +180,39 @@ describe("anima-web / provisioning a folder", () => {
     expect(await readReceipt(dir)).toBeNull();
   });
 
+  it("fetches a file from its own base when it names one", async () => {
+    // Z-Image's text encoder is 8 GB that upstream already publishes,
+    // unmodified and Apache-2.0. Copying it into a second repository to keep
+    // one base URL would be redistributing what the original host serves, so a
+    // file may name where it comes from.
+    const dir = fakeDir();
+    const asked: string[] = [];
+    const elsewhere: ByteSource = {
+      describe: "other://host",
+      async size(file) {
+        asked.push(`size ${file}`);
+        return SIZES[file as keyof typeof SIZES];
+      },
+      async read(_file, _offset, length) {
+        asked.push("read");
+        return new ArrayBuffer(length);
+      },
+    };
+    await provision(
+      dir,
+      fakeSource(SIZES),
+      { files: ["a.bin", { name: "b.bin", base: "other://host" }] },
+      undefined,
+      () => elsewhere,
+    );
+    expect(asked, "b.bin should have come from its own base, and only b.bin").toContain("size b.bin");
+    expect(asked.filter((a) => a.startsWith("size"))).toEqual(["size b.bin"]);
+    expect(dir.files.get("b.bin")!.byteLength).toBe(SIZES["b.bin"]);
+    // And a.bin still came from the default, so naming one base does not
+    // redirect everything.
+    expect(dir.files.get("a.bin")![7], "a.bin from the default source").toBe(7 % 251);
+  });
+
   it("rejects a receipt from a future version rather than guessing at it", async () => {
     const dir = fakeDir();
     const receipt: Receipt = { version: 2 as 1, source: "x", completedAt: "", sizes: {} };
