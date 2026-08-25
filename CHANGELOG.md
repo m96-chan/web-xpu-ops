@@ -70,6 +70,27 @@ Entries record **why** a change was needed. What changed is in the diff.
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
 
+### Added
+
+- **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
+  pad op, not a convolution argument. MiniMax-H3 is the model that makes that
+  separation load-bearing: its visual VAE pads `reflect` on the spatial axes
+  and, in time, **causally** — `2 * padding` frames before the data and none
+  after, so the frame at `t` cannot see `t + 1`. No symmetric `padding`
+  argument can say that, whatever its mode.
+
+  `constant` (with a value), `reflect` and `replicate`, with `before` and
+  `after` separate. **`reflect` does not repeat the edge element and
+  `replicate` does** — measured against torch rather than described, because
+  swapping the two gives a tensor of the right shape whose entire interior is
+  correct.
+
+  It pads **one** axis, viewed as `[outer, L, inner]`; three axes means three
+  calls. That is measured to give what torch's single multi-axis call gives,
+  element for element — not obvious, since a reflection reads neighbours that
+  are themselves reflections. One kernel then serves the audio VAE's 1D
+  `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
+
 ### Changed
 
 - **Flash attention stages `k` and `v` without dividing** (issue #177). The
