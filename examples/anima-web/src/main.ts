@@ -146,7 +146,13 @@ function draw(image: Float32Array, H: number, W: number): void {
  * profiling itself costs passes, so the absolute numbers are larger than the
  * shipping ones and the proportions are what carry over.
  */
-function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: number): void {
+function reportProfile(
+  profile: AnimaProfile,
+  wallSeconds: number,
+  dispatches: number,
+  preloadMs: number,
+  yieldMs: number,
+): void {
   if (!profile.supported) {
     profileOut.innerHTML =
       '<p class="note">This device has no <code>timestamp-query</code>, so there is no GPU breakdown — ' +
@@ -192,6 +198,10 @@ function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: n
     `<td>${profile.bindGroups}</td></tr>` +
     `<tr><td>the caller's callbacks</td><td>${ms(acct.hostCallbackMs)}</td><td>${pct(acct.hostCallbackMs)}</td>` +
     "<td></td></tr>" +
+    `<tr><td>&nbsp;&nbsp;— re-reading weights (preloadPrefix)</td><td>${ms(preloadMs)}</td><td>${pct(preloadMs)}</td>` +
+    "<td></td></tr>" +
+    `<tr><td>&nbsp;&nbsp;— yielding to the event loop</td><td>${ms(yieldMs)}</td><td>${pct(yieldMs)}</td>` +
+    "<td>55</td></tr>" +
     `<tr><td>unattributed</td><td>${ms(acct.unattributedMs)}</td><td>${pct(acct.unattributedMs)}</td><td></td></tr>` +
     "</table>" +
     `<p class="note">Of the ${ms(acct.inPassesMs)} inside compute passes, by kernel:</p><table>` +
@@ -466,6 +476,8 @@ async function main(): Promise<void> {
     let profile: AnimaProfile | null = null;
     let profiledWallSeconds = 0;
     let profiledDispatches = 0;
+    let profiledPreloadMs = 0;
+    let profiledYieldMs = 0;
     profileOut.innerHTML = "";
     // The profiled forward is the **second** step: the first uploads 3.63 GB
     // and hydrates the heap, so its timings are the loading cost. One step
@@ -477,8 +489,22 @@ async function main(): Promise<void> {
         "so the second is the one measured.</p>";
     }
 
-    /** Cumulative across every forward; a forward's share is a difference. */
+    /**
+     * Cumulative across every forward; a forward's share is a difference.
+     *
+     * Split, because the callback does two things and they have different
+     * fixes. `preloadPrefix` re-reads from the Cache API — the heap holds at
+     * most `48 * 4 = 192` packed tensors against 898 in the model, so the LRU
+     * thrashes and every forward re-reads what the last one evicted, even
+     * though the weights have been resident on the device since the first.
+     * The `setTimeout(0)` yield is 55 turns of the event loop a forward
+     * against a browser's clamp. Which of the two costs 1370 ms is a
+     * measurement, and reading the code is how the last four guesses were
+     * made.
+     */
     let hostCallbackMsTotal = 0;
+    let preloadMsTotal = 0;
+    let yieldMsTotal = 0;
 
     const started = performance.now();
 
@@ -533,6 +559,8 @@ async function main(): Promise<void> {
         // Device counters are cumulative; a forward's share is the difference.
         const bindGroupsBefore = residentDevice.stats.bindGroupMs;
         const hostCallbackBefore = hostCallbackMsTotal;
+        const preloadBefore = preloadMsTotal;
+        const yieldBefore = yieldMsTotal;
         const bindGroupCountBefore = residentDevice.stats.bindGroups;
         const forwardStart = wanted ? performance.now() : 0;
         const result = await animaForwardResident(
@@ -543,8 +571,11 @@ async function main(): Promise<void> {
           async (prefix) => {
             const t0 = performance.now();
             await dit.preloadPrefix(prefix);
+            const t1 = performance.now();
             // Yield, so a 52-block first forward does not freeze the tab.
             await new Promise((resolve) => setTimeout(resolve, 0));
+            preloadMsTotal += t1 - t0;
+            yieldMsTotal += performance.now() - t1;
             // Into a counter that runs for every forward, never straight into
             // `profile`: this callback fires on all eighty and `profile`
             // outlives the one being measured, so `+= into profile` summed the
@@ -560,6 +591,8 @@ async function main(): Promise<void> {
             profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
             profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
             profile.hostCallbackMs = hostCallbackMsTotal - hostCallbackBefore;
+            profiledPreloadMs = preloadMsTotal - preloadBefore;
+            profiledYieldMs = yieldMsTotal - yieldBefore;
           }
         }
         return result;
@@ -628,7 +661,9 @@ async function main(): Promise<void> {
         `then ${perStep.toFixed(2)}s each), ` +
         `decode ${decodeSeconds.toFixed(1)}s`,
     );
-    if (profile) reportProfile(profile, profiledWallSeconds, profiledDispatches);
+    if (profile) {
+      reportProfile(profile, profiledWallSeconds, profiledDispatches, profiledPreloadMs, profiledYieldMs);
+    }
     else if (wantProfile && steps >= 2) {
       profileOut.innerHTML =
         '<p class="note">Profiling was requested and produced nothing, which should not happen — ' +
