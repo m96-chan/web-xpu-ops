@@ -48,20 +48,26 @@ The split is approximate in one direction: every `batch` awaits
 `onSubmittedWorkDone`, so what is labelled queue time includes the GPU actually
 running.
 
-Three things were tried and measured:
+Four candidates were tried and **all four are ruled out**, which is worth
+recording so nobody repeats them:
 
-- **Grouping blocks into fewer submits is slower** — 628 ms at one block per
-  submit, 725 ms at all thirty-six, monotone the wrong way with identical
-  output. So the submit count is not the cost.
-- **Pooling the uniform buffers** took the first decode from 293 ms to 264 and
-  left the steady state where it was.
-- **Warming the scratch pool** is worth about 130 ms: the first decode allocates
-  every intermediate.
+| tried | result |
+| --- | --- |
+| grouping blocks into fewer submits | **slower** — 628 ms at one per submit, 725 at all thirty-six, identical output |
+| pooling the uniform buffers | first decode 293 → 264 ms, steady state unchanged |
+| keying the pipeline cache without a concatenation | 0.1 µs a call either way |
+| removing `bindGroup`'s validation error scope | 136 → 135 ms, inside the run-to-run spread |
 
-What the remaining 136 ms of recording is has **not** been established. Bind
-groups price at 10 µs each, uniforms at 3 µs, pipeline lookups at 0.1 µs — about
-15 ms for 1,122 dispatches, not 136. That is a number to improve, not a
-throughput to quote.
+**Warming the scratch pool** is the one thing that helps, and only on the first
+decode: it is worth about 130 ms.
+
+A CPU profile puts the decode's own JavaScript at about 55 ms — bind groups 19,
+pipeline lookups 14, `createBuffer` 14, `unpackPatches` 9 — and the rest under
+`processImmediate`, which is Node pumping Dawn's event loop. So what is left is
+**event-loop turns rather than work**, and reducing it means fewer awaits in the
+dispatch path rather than faster JavaScript. That has not been attempted.
+
+That is a number to improve, not a throughput to quote.
 
 One attribution here was wrong once and is worth the warning: timing each
 `await` inside the dispatch path blamed `pipelineFor` for 502 ms, and a tight
