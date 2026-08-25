@@ -52,11 +52,19 @@ const DEMOS = [
       ["examples/anima/fixtures/t5.unigram-vocab.json", "weights/tokenizer/t5.unigram-vocab.json"],
     ],
   },
+  {
+    dir: "examples/zimage-web",
+    slug: "zimage",
+    title: "Z-Image",
+    blurb:
+      "A 6B diffusion transformer with a Qwen3-4B text encoder, in WGSL. Downloads 14.4 GB into a folder " +
+      "you pick, once — 8.0 GB of it straight from the model's own publisher.",
+    extra: [["llm/data/qwen-qwen3-4b.bpe-vocab.json", "weights/tokenizer/qwen-qwen3-4b.bpe-vocab.json"]],
+  },
 ];
 
-/** Listed, not published: they cannot work without a dev server beside them. */
+/** Listed, not published: it cannot work without a dev server beside it. */
 const NEEDS_A_CLONE = [
-  ["examples/zimage-web", "Z-Image", "fetches <code>/weights/…</code> from its own server"],
   ["examples/llm-demo", "Sarashina2.2-1B", "fetches <code>/weights/…</code> from its own server"],
 ];
 
