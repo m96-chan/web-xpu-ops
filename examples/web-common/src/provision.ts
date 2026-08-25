@@ -29,24 +29,9 @@
  */
 import type { ByteSource } from "./byte-source.js";
 
-/**
- * A file to fetch, and where from when that is not the default source.
- *
- * Z-Image needs three converted files and an **unmodified** 8 GB text encoder
- * that upstream already publishes under Apache-2.0. Copying those 8 GB into a
- * second repository to keep one base URL would be redistributing what the
- * original host already serves, for no reason but the shape of this interface.
- * So a file may name its own base.
- */
-export interface PlannedFile {
-  name: string;
-  /** Overrides the plan's default source. Absolute, no trailing slash. */
-  base?: string;
-}
-
 /** What a filled folder must contain. Sizes come from the source, not from here. */
 export interface ProvisionPlan {
-  files: (string | PlannedFile)[];
+  files: string[];
 }
 
 /**
@@ -122,20 +107,13 @@ export async function provision(
   source: ByteSource,
   plan: ProvisionPlan,
   onProgress?: (p: ProvisionProgress) => void,
-  /** Builds a source for a file that names its own base. Injected so this stays testable in Node. */
-  sourceFor: (base: string) => ByteSource = () => source,
 ): Promise<Receipt> {
-  const planned = plan.files.map((f) => (typeof f === "string" ? { name: f } : f));
-  const sourceOf = (f: PlannedFile): ByteSource => (f.base ? sourceFor(f.base) : source);
-
   const sizes: Record<string, number> = {};
-  for (const f of planned) sizes[f.name] = await sourceOf(f).size(f.name);
+  for (const file of plan.files) sizes[file] = await source.size(file);
   const bytesTotal = Object.values(sizes).reduce((a, b) => a + b, 0);
 
   let bytesDone = 0;
-  for (const [index, planEntry] of planned.entries()) {
-    const file = planEntry.name;
-    const from = sourceOf(planEntry);
+  for (const [index, file] of plan.files.entries()) {
     const want = sizes[file]!;
 
     // Already there at the right length: skip it. The receipt is what makes a
@@ -149,7 +127,7 @@ export async function provision(
     }
     if (existing === want) {
       bytesDone += want;
-      onProgress?.({ file, fileIndex: index, fileCount: planned.length, bytesDone, bytesTotal });
+      onProgress?.({ file, fileIndex: index, fileCount: plan.files.length, bytesDone, bytesTotal });
       continue;
     }
 
@@ -161,9 +139,9 @@ export async function provision(
     try {
       for (let at = 0; at < want; at += CHUNK) {
         const n = Math.min(CHUNK, want - at);
-        await writable.write(await from.read(file, at, n));
+        await writable.write(await source.read(file, at, n));
         bytesDone += n;
-        onProgress?.({ file, fileIndex: index, fileCount: planned.length, bytesDone, bytesTotal });
+        onProgress?.({ file, fileIndex: index, fileCount: plan.files.length, bytesDone, bytesTotal });
       }
       await writable.close();
     } catch (error) {

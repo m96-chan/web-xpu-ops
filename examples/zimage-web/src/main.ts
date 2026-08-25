@@ -127,18 +127,18 @@ declare const BUILD_STAMP: string;
  * the base for a local copy or a dev server; the default is the published
  * conversion, whose licence is Apache-2.0 and **is not this repository's MIT**.
  *
- * The text encoder is **not** in that repository. It is Qwen3-4B, unmodified,
- * 8.04 GB, and `Tongyi-MAI/Z-Image` already publishes it — copying it into a
- * second repository would redistribute what the original host serves.
+ * **One base, one repository.** An earlier version left the 8.04 GB text
+ * encoder at its own publisher and fetched it from there, on the argument that
+ * copying it was redistributing what the original host already served. That
+ * argument is sound and the trade is not: two hosts is two things that can move
+ * or disappear, and a folder that fills from one place is one thing to explain.
  */
 const DEFAULT_WEIGHTS = "https://huggingface.co/m96-chan/Z-Image-q8-web-xpu-ops/resolve/main";
-const UPSTREAM = "https://huggingface.co/Tongyi-MAI/Z-Image/resolve/main";
 const WEIGHTS_BASE = new URLSearchParams(location.search).get("weights") ?? DEFAULT_WEIGHTS;
-const ENCODER_UPSTREAM = new URLSearchParams(location.search).get("encoder") ?? `${UPSTREAM}/text_encoder`;
 const DIT_BASE = WEIGHTS_BASE;
-const ENCODER_BASE = ENCODER_UPSTREAM;
+const ENCODER_BASE = WEIGHTS_BASE;
 const VAE_BASE = WEIGHTS_BASE;
-/** Everything a folder must hold. The encoder shards name their own source. */
+/** Everything a folder must hold. */
 const ENCODER_SHARDS = [
   "config.json",
   "model.safetensors.index.json",
@@ -153,7 +153,7 @@ const WEIGHT_FILES = [
   "dit.f32.bin",
   "manifest.json",
   "decoder.bin",
-  ...ENCODER_SHARDS.map((name) => ({ name, base: ENCODER_UPSTREAM })),
+  ...ENCODER_SHARDS,
 ];
 /** The vocabularies are this repository's files, so they travel with the page. */
 const TOKENIZER_BASE = new URL("weights/tokenizer", `${location.origin}${location.pathname}`).href;
