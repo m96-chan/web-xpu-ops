@@ -299,12 +299,14 @@ function reportProfile(
 const gateElements: GateElements = {
   dialog: gateDialog, title: gateTitle, body: gateBody, action: gateAction,
   dismiss: gateDismiss, progress: gateProgress, bar: gateBar, barFill: gateBarFill,
+  why: $<HTMLParagraphElement>("gate-why"),
 };
 const gateOptions: GateOptions = {
   elements: gateElements,
   files: WEIGHT_FILES,
   weightsBase: WEIGHTS_BASE,
   downloadSize: "5.0 GB",
+  licence: "They are <strong>non-commercial</strong> — see the model's licence.",
 };
 
 async function main(): Promise<void> {

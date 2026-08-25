@@ -61,9 +61,12 @@ if (!root) {
 
 /** URL prefix to the directory behind it. Longest prefix wins. */
 const mounts = [
-  ["/weights/dit/", ditDir],
-  ["/weights/text_encoder/", path.join(root, "text_encoder")],
-  ["/weights/vae/", path.join(repoRoot, "examples/zimage-vae/fixtures-small")],
+  // Flat, matching the published layout, so `?weights=/weights` reaches the
+  // same names here as the default base does on Hugging Face. When the two
+  // differ, local development exercises a path production never takes.
+  ["/weights/", ditDir],
+  ["/weights/", path.join(root, "text_encoder")],
+  ["/weights/", path.join(repoRoot, "examples/zimage-vae/fixtures-small")],
   ["/weights/tokenizer/", path.join(repoRoot, "llm/data")],
   ["/dist/", path.join(here, "dist")],
   ["/", here],

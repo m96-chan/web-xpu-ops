@@ -64,6 +64,7 @@ const gateElements: GateElements = {
   progress: $<HTMLParagraphElement>("gate-progress"),
   bar: $<HTMLDivElement>("gate-bar"),
   barFill: $<HTMLDivElement>("gate-bar").firstElementChild as HTMLDivElement,
+  why: $<HTMLParagraphElement>("gate-why"),
 };
 
 // On the page, not only in the log. Four rounds of this session were spent
@@ -182,6 +183,7 @@ async function main(): Promise<void> {
     files: WEIGHT_FILES,
     weightsBase: WEIGHTS_BASE,
     downloadSize: "14.4 GB",
+    licence: "Apache-2.0 — commercial use permitted; see the model's licence.",
   };
   const source = await requireBoundFolder(gateOptions);
   if (!source) return;

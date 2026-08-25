@@ -35,6 +35,8 @@ export interface GateElements {
   progress: HTMLElement;
   bar: HTMLElement;
   barFill: HTMLElement;
+  /** The standing explanation under the buttons, written from `GateOptions`. */
+  why: HTMLElement;
 }
 
 export interface GateOptions {
@@ -45,15 +47,26 @@ export interface GateOptions {
   weightsBase: string;
   /** How much, in words, so the dialog can say before it starts. */
   downloadSize: string;
+  /**
+   * What the model's licence permits, in one clause.
+   *
+   * Here rather than in each page's HTML because the first version put it in
+   * the markup and the markup was copied: `zimage-web` inherited "5.0 GB" and
+   * "non-commercial" from Anima, and both were wrong -- Z-Image is 14.4 GB and
+   * Apache-2.0. A number a page states about itself has to come from the same
+   * place the page acts on.
+   */
+  licence: string;
 }
 
 /** Shows the dialog. `required` blocks Escape and hides the dismiss button. */
 export function openGate(
-  e: GateElements,
+  o: GateOptions,
   title: string,
   body: string,
   { required = true, action = "" } = {},
 ): void {
+  const e = o.elements;
   e.title.textContent = title;
   e.body.textContent = body;
   e.action.hidden = action === "";
@@ -62,6 +75,10 @@ export function openGate(
   e.dismiss.hidden = required;
   e.progress.textContent = "";
   e.bar.style.display = "none";
+  e.why.innerHTML =
+    `The weights are ${o.downloadSize}. Kept in a folder you choose, they are downloaded once and live ` +
+    "outside the browser's own storage, where nothing evicts them and you can delete them yourself. " +
+    `${o.licence}`;
   if (!e.dialog.open) e.dialog.showModal();
   e.dialog.oncancel = (event) => {
     if (required) event.preventDefault();
@@ -113,7 +130,7 @@ export async function requireBoundFolder(o: GateOptions): Promise<ByteSource | n
   // is a state a real visitor lands in.
   if (!isSecureContext) {
     openGate(
-      e,
+      o,
       "Sorry — this page needs HTTPS",
       `WebGPU is only available in a secure context, and this page was loaded over ${location.protocol}. ` +
         "The same address over https works.",
@@ -122,7 +139,7 @@ export async function requireBoundFolder(o: GateOptions): Promise<ByteSource | n
   }
   if (!navigator.gpu) {
     openGate(
-      e,
+      o,
       "Sorry — no WebGPU here",
       "This browser has no WebGPU, and nothing on this page can run without it. " +
         "Chrome 113+ or Edge 113+, on a machine with a GPU.",
@@ -131,7 +148,7 @@ export async function requireBoundFolder(o: GateOptions): Promise<ByteSource | n
   }
   if (!directoryBindingSupported()) {
     openGate(
-      e,
+      o,
       "Sorry — this browser cannot bind a folder",
       `Keeping ${o.downloadSize} outside the browser's own storage needs the File System Access API, ` +
         "which only Chromium-based browsers have.",
@@ -147,7 +164,7 @@ export async function requireBoundFolder(o: GateOptions): Promise<ByteSource | n
   }
 
   openGate(
-    e,
+    o,
     remembered ? "This folder needs permission again" : "A folder is required",
     remembered
       ? `The browser drops folder permission between sessions. One click restores it for "${remembered.name}" — ` +
@@ -201,7 +218,7 @@ export function wireChangeFolder(o: GateOptions, button: HTMLButtonElement, curr
   const e = o.elements;
   button.onclick = () => {
     openGate(
-      e,
+      o,
       "Change folder",
       `The weights are read from ${current.describe}. A different folder is filled from scratch ` +
         "unless it already holds a complete copy.",
