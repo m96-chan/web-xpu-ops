@@ -107,6 +107,9 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--dims", default="2,3,4", help="latent T,H,W for the golden")
     parser.add_argument("--skip-golden", action="store_true")
+    # For a second golden at a different size without rewriting 9.69 GB that
+    # would come out byte-identical.
+    parser.add_argument("--skip-weights", action="store_true")
     args = parser.parse_args()
 
     bundle = pathlib.Path(args.bundle).expanduser().resolve()
@@ -127,7 +130,7 @@ def main() -> int:
 
     entries, offset = [], 0
     written = out / "decoder.bin"
-    with written.open("wb") as sink:
+    with (written.open("wb") if not args.skip_weights else open("/dev/null", "wb")) as sink:
         def add(name, tensor, transpose=False):
             """Appends one tensor, optionally as `[in, out]` rather than `[out, in]`.
 
@@ -192,8 +195,11 @@ def main() -> int:
         "ropePermutation": perm,
         "dtype": "f32", "weightLayout": "[in, out]", "tensors": entries, "elements": offset,
     }
-    (out / "decoder.manifest.json").write_text(json.dumps(manifest, indent=1))
-    print(f"wrote {written}  {offset * 4 / 1e9:.2f} GB, {len(entries)} tensors")
+    if not args.skip_weights:
+        (out / "decoder.manifest.json").write_text(json.dumps(manifest, indent=1))
+        print(f"wrote {written}  {offset * 4 / 1e9:.2f} GB, {len(entries)} tensors")
+    else:
+        print(f"skipped the weights; {len(entries)} tensors would have been {offset * 4 / 1e9:.2f} GB")
 
     if args.skip_golden:
         return 0
@@ -233,7 +239,8 @@ def main() -> int:
     print(f"latent {tuple(latent.shape)} -> pixels {tuple(pixels.shape)}")
     print(f"  range [{pixels.min():.4f}, {pixels.max():.4f}]  mean {pixels.mean():.4f}")
 
-    fixtures = out
+    fixtures = out / f"golden-{T}x{H}x{W}" if args.skip_weights else out
+    fixtures.mkdir(parents=True, exist_ok=True)
     latent.numpy().astype(np.float32).tofile(fixtures / "latent.bin")
     pixels.numpy().astype(np.float32).tofile(fixtures / "pixels.bin")
     (fixtures / "golden.json").write_text(json.dumps({

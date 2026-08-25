@@ -149,6 +149,17 @@ export class VideoDecoderGpu {
     this.weights.set("attn.noMask", noMask);
   }
 
+  private maskBytes = 0;
+
+  /** Grows the zero mask to cover a sequence of `seq` keys. */
+  private ensureMask(seq: number): void {
+    const bytes = seq * 4;
+    if (bytes <= this.maskBytes) return;
+    this.weights.get("attn.noMask")?.destroy();
+    this.weights.set("attn.noMask", this.device.createStorageBuffer(bytes));
+    this.maskBytes = bytes;
+  }
+
   private w(name: string): GPUBuffer {
     const buffer = this.weights.get(name);
     // Named rather than undefined: a missing weight otherwise becomes a
@@ -158,21 +169,48 @@ export class VideoDecoderGpu {
   }
 
   private take(elements: number): GPUBuffer {
-    const bytes = 2 ** Math.ceil(Math.log2(Math.max(4, elements) * 4));
+    // Rounded to a multiple of 4 MB rather than to a power of two. The
+    // decoder's widths are `dim`, `ffnHidden` and `heads * dim_head` times a
+    // token count, so a power of two wastes up to half of every buffer -- at
+    // 16,384 tokens that is 537 MB asked for and 1 GB allocated, thirty-one
+    // times over, and the run fails where the multiple fits.
+    const GRAIN = 4 << 20;
+    const bytes = Math.max(GRAIN, Math.ceil((Math.max(4, elements) * 4) / GRAIN) * GRAIN);
     const buffer = this.pool.get(bytes)?.pop() ?? this.device.createStorageBuffer(bytes);
     this.lent.push(buffer);
     return buffer;
   }
 
-  private release(): void {
+  private release(keep: GPUBuffer[] = []): void {
     for (const buffer of this.lent) {
+      if (keep.includes(buffer)) continue;
       const free = this.pool.get(buffer.size) ?? [];
       free.push(buffer);
       this.pool.set(buffer.size, free);
     }
     this.lent.length = 0;
+    this.lent.push(...keep);
     for (const buffer of this.lentUniforms) buffer.destroy();
     this.lentUniforms.length = 0;
+  }
+
+  /**
+   * Submits what has been recorded and returns the scratch, keeping `keep`.
+   *
+   * **One submit per block, not one per decode.** Every buffer a recorded
+   * dispatch reads has to stay untouched until the command buffer runs, so
+   * nothing inside a batch can be reused — and a 36-block decode records about
+   * a thousand intermediates. At 24 tokens they are small enough not to notice;
+   * at 1,029 the run allocated 464 buffers before Dawn started handing back
+   * invalid ones, which is how this was found.
+   *
+   * `dit-resident.ts` splits Anima's forward the same way for the same reason.
+   */
+  private async flush(ops: ResidentOp[], keep: GPUBuffer[]): Promise<void> {
+    if (ops.length === 0) return;
+    await this.device.batch(ops, []);
+    ops.length = 0;
+    this.release(keep);
   }
 
   destroy(): void {
@@ -339,6 +377,7 @@ export class VideoDecoderGpu {
     }
 
     const ops: ResidentOp[] = [];
+    this.ensureMask(seq);
 
     // `_pack_tensors_3d(z, 1, 1)` is a channels-last flatten: the latent
     // arrives `[C, T, H, W]` and the decoder wants `[T*H*W, C]`. Done on the
@@ -382,6 +421,9 @@ export class VideoDecoderGpu {
     let hidden: Mat = { buffer: withSuffix, rows: seq, cols: dim };
     for (let i = 0; i < c.num_layers; i += 1) {
       hidden = await this.block(ops, hidden, i, positions, this.w("attn.noMask"));
+      // `positions` is read by every block, so it is kept alongside the
+      // residual stream; everything else goes back to the pool.
+      await this.flush(ops, [hidden.buffer, positions]);
     }
 
     // `norm_out` is a LayerNorm -- weight **and** bias -- where every norm

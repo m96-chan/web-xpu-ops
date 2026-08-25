@@ -29,12 +29,28 @@ const f32 = (path: string): Float32Array => {
 };
 
 const manifest = JSON.parse(readFileSync(`${dir}/decoder.manifest.json`, "utf8")) as VideoDecoderManifest;
-const golden = JSON.parse(readFileSync(`${dir}/golden.json`, "utf8")) as {
-  dims: [number, number, number];
-  frames: number;
-  height: number;
-  width: number;
-};
+
+/**
+ * `--bench T,H,W` times a random latent instead of comparing to a golden.
+ *
+ * The arithmetic does not depend on the shape — that is what the comparison
+ * establishes — but the *time* does, and a demo should not offer a size nobody
+ * has run. Reported as a time, never as a correctness claim: this mode has
+ * nothing to compare against and says so.
+ */
+const bench = arg("--bench");
+const golden = bench
+  ? (() => {
+      const [T, H, W] = bench.split(",").map(Number) as [number, number, number];
+      const c = manifest.config;
+      return { dims: [T, H, W] as [number, number, number], frames: T * c.patch_size_t, height: H * c.patch_size, width: W * c.patch_size };
+    })()
+  : (JSON.parse(readFileSync(`${dir}/golden.json`, "utf8")) as {
+      dims: [number, number, number];
+      frames: number;
+      height: number;
+      width: number;
+    });
 
 // Read the 9.69 GB one tensor at a time rather than mapping it whole: a single
 // `Float32Array` over it would be 2.4 billion elements, past what a typed array
@@ -60,14 +76,24 @@ const decoder = new VideoDecoderGpu(device, videoKernels(), manifest, read);
 closeSync(fd);
 console.log(`uploaded in ${((performance.now() - uploadStart) / 1000).toFixed(1)} s`);
 
-const latent = f32(`${dir}/latent.bin`);
-const want = f32(`${dir}/pixels.bin`);
+const [T, H, W] = golden.dims;
+const latent = bench
+  ? Float32Array.from({ length: manifest.config.in_channels * T * H * W }, (_, i) => Math.sin(i * 0.37) * 0.5)
+  : f32(`${dir}/latent.bin`);
+const want = bench ? null : f32(`${dir}/pixels.bin`);
 
 const started = performance.now();
 const got = await decoder.decode(latent, golden.dims);
 const took = performance.now() - started;
 
 console.log(`latent ${golden.dims.join("x")} -> ${golden.frames}x${golden.height}x${golden.width} in ${took.toFixed(0)} ms`);
+
+if (!want) {
+  console.log(`(--bench: nothing to compare against — this is a time, not a correctness claim)`);
+  decoder.destroy();
+  device.destroy();
+  process.exit(0);
+}
 
 if (got.length !== want.length) {
   console.error(`length ${got.length} against ${want.length}`);
