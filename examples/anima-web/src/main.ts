@@ -34,8 +34,7 @@ import { qwen3EncodeGpu, type Qwen3GpuWeights } from "../../zimage/src/text-enco
 import type { AnimaConfig, AnimaInput } from "../../anima/src/dit.js";
 import {
   animaForwardResident, releaseAnimaWeights,
-  type AnimaProfile, type AnimaWeightSource,
-} from "../../anima/src/dit-resident.js";
+  type AnimaProfile, type AnimaWeightSource, accountForForward } from "../../anima/src/dit-resident.js";
 import { permuteForRope } from "../../anima/src/block.js";
 import {
   ADAPTER,
@@ -163,17 +162,29 @@ function reportProfile(profile: AnimaProfile, wallSeconds: number, dispatches: n
   const rows = [...profile.byKernel.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
   const total = rows.reduce((sum, [, v]) => sum + v.seconds, 0);
   const counted = rows.reduce((n, [, v]) => n + v.dispatches, 0);
-  const coverage = (total / wallSeconds) * 100;
+  const acct = accountForForward(profile, wallSeconds);
+  const ms = (v: number): string => `${v.toFixed(0)} ms`;
+  const pct = (v: number): string => `${((v / acct.wallMs) * 100).toFixed(0)}%`;
   // Coverage is what caught the last wrong answer: a profile that timed 78% of
   // the forward reported shares of a partial total as though they were shares
-  // of the whole. Under about 90% here, the table is not a breakdown of this
-  // forward and should not be read as one.
-  const warn = coverage < 90
-    ? ' <strong>Under 90% — this is not a breakdown of the whole forward.</strong>'
+  // of the whole. It is now a share of the *named* wall clock rather than of
+  // GPU alone, so a browser forward that spends half its time outside every
+  // dispatch says so instead of reading as a 52% mystery.
+  const warn = acct.coverage < 90
+    ? ' <strong>Under 90% — some of this forward is still unaccounted for.</strong>'
     : "";
   profileOut.innerHTML =
-    `<p class="note">One forward, ${(total * 1000).toFixed(0)} ms of GPU across ${counted} of ` +
-    `${dispatches} dispatches — ${coverage.toFixed(0)}% of that step's ${(wallSeconds * 1000).toFixed(0)} ms.${warn}</p><table>` +
+    `<p class="note">One forward, ${ms(acct.wallMs)} wall — ${acct.coverage.toFixed(0)}% accounted for.${warn}</p>` +
+    "<table>" +
+    `<tr><td>inside compute passes</td><td>${ms(acct.inPassesMs)}</td><td>${pct(acct.inPassesMs)}</td>` +
+    `<td>${counted} of ${dispatches}</td></tr>` +
+    `<tr><td>queue and driver, outside the passes</td><td>${ms(acct.aroundPassesMs)}</td>` +
+    `<td>${pct(acct.aroundPassesMs)}</td><td></td></tr>` +
+    `<tr><td>recording the commands</td><td>${ms(acct.encodeMs)}</td><td>${pct(acct.encodeMs)}</td><td></td></tr>` +
+    `<tr><td>reading results back</td><td>${ms(acct.readbackMs)}</td><td>${pct(acct.readbackMs)}</td><td></td></tr>` +
+    `<tr><td>unattributed</td><td>${ms(acct.unattributedMs)}</td><td>${pct(acct.unattributedMs)}</td><td></td></tr>` +
+    "</table>" +
+    `<p class="note">Of the ${ms(acct.inPassesMs)} inside compute passes, by kernel:</p><table>` +
     rows.map(([name, v]) =>
       `<tr><td>${name}</td><td>${(v.seconds * 1000).toFixed(1)} ms</td>` +
       `<td>${((v.seconds / total) * 100).toFixed(1)}%</td><td>${v.dispatches}</td></tr>`).join("") +
@@ -501,7 +512,7 @@ async function main(): Promise<void> {
         // the steady-state one.
         const wanted = wantProfile && first && step === 1;
         if (wanted && !profile) {
-          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, submitToDoneMs: 0 };
+          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0 };
         }
         const stats = wanted
           ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }

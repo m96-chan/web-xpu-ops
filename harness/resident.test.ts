@@ -249,7 +249,7 @@ describe("resident device / BatchProfile (issue #131)", () => {
     const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
     const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
 
-    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const sink: BatchProfileSink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     const [result] = await device.batch(
       [
         { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
@@ -291,7 +291,7 @@ describe("resident device / BatchProfile (issue #131)", () => {
     const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
     const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
 
-    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const sink: BatchProfileSink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     await device.batch(
       [
         { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },
@@ -319,7 +319,7 @@ describe("resident device / BatchProfile (issue #131)", () => {
     const mulGroup = await device.bindGroup(pipeline, [sum, a, product, mulParams]);
     const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
 
-    const sink: BatchProfileSink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    const sink: BatchProfileSink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     await device.batch(
       [
         { kind: "dispatch", pipeline, bindGroup: addGroup, workgroups: [1] },

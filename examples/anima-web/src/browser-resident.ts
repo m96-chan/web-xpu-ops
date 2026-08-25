@@ -162,6 +162,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     // dispatch needs a pass of its own — and so does an *untimed* one next to
     // it, or a timed pass would span work outside the dispatch it names. That
     // is why this is opt-in: it turns one pass per batch into one per dispatch.
+    const encodeT0 = profile ? performance.now() : 0;
     const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
     const labeledSlots: string[] = [];
     if (wantsGpuTiming) {
@@ -237,6 +238,9 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       encoder.copyBufferToBuffer(resolved, 0, queryReadable, 0, queryCount * 8);
     }
 
+    // Before `submit`, so recording is timed alone and does not overlap the
+    // wait below. Issue #182.
+    if (profile) profile.sink.encodeMs = performance.now() - encodeT0;
     device.pushErrorScope("validation");
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;

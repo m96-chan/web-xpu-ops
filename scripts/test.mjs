@@ -41,7 +41,12 @@ const LLM = "llm";
 // composition check for issue #163 — the one place that asserts the ops add up
 // to a real model rather than to their own references. Left out of the runner,
 // it would be green in an editor and absent from CI.
-const EXAMPLES_TESTED = ["examples/zimage/src", "examples/zimage-vae/src"];
+// `examples/anima/src` was missing from this list while `vitest.config.ts`
+// globbed it, so its 86 tests -- the sampler schedule, the two tokenizers --
+// were green in an editor and absent from every CI run, which is precisely what
+// the paragraph above warns about. `harness/test-discovery.test.ts` now asserts
+// this list covers what vitest collects, so the two cannot drift again.
+const EXAMPLES_TESTED = ["examples/zimage/src", "examples/zimage-vae/src", "examples/anima/src"];
 
 /** Every `*.test.ts` under `dir`, recursing into subdirectories. */
 function testFilesRecursive(dir) {

@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { createResidentDevice } from "../../../harness/resident.js";
 import { ditKernels } from "../../zimage/src/kernels-node.js";
 import type { AnimaConfig } from "./dit.js";
-import { type AnimaProfile, animaForwardResident, releaseAnimaWeights } from "./dit-resident.js";
+import { accountForForward, type AnimaProfile, animaForwardResident, releaseAnimaWeights } from "./dit-resident.js";
 import { LATENT } from "./sampler.js";
 import { loadAnimaSubset, withRopePermutation } from "./weights-node.js";
 
@@ -109,7 +109,7 @@ await animaForwardResident(device, ditKernels(), cfg, dit, input, undefined, hel
 const warmSeconds = (Date.now() - warmStart) / 1000;
 console.log(`unprofiled forward: ${warmSeconds.toFixed(2)}s\n`);
 
-const profile: AnimaProfile = { byKernel: new Map(), supported: device.timestampsSupported, submitToDoneMs: 0 };
+const profile: AnimaProfile = { byKernel: new Map(), supported: device.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0 };
 const stats = { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 };
 const profStart = Date.now();
 await animaForwardResident(device, ditKernels(), cfg, dit, input, stats, held, undefined, undefined, undefined, profile);
@@ -134,12 +134,27 @@ console.log(`  profiling inflates it ${(profSeconds / warmSeconds).toFixed(1)}x 
 // straight into `ops`, bypassing the labelling in `record`. Attention was
 // invisible entirely. A share of a partial total is a wrong number, so the
 // coverage is stated rather than assumed.
-console.log(`  ${counted} of ${dispatchCount} dispatches timed, ` +
-  `${(total / warmSeconds * 100).toFixed(0)}% of the unprofiled forward's wall clock accounted for\n`);
+// Against the *profiled* wall, because that is the run these numbers came
+// from; comparing them to the unprofiled one mixes two forwards.
+const acct = accountForForward(profile, profSeconds);
+console.log(`  ${counted} of ${dispatchCount} dispatches timed; ${acct.coverage.toFixed(0)}% of this forward's wall accounted for`);
+if (acct.coverage < 90) console.log("  **under 90% — some of this forward is still unattributed**");
+console.log("\n  where the wall went          ms      share");
+for (const [name, value] of [
+  ["inside compute passes", acct.inPassesMs],
+  ["queue/driver, outside", acct.aroundPassesMs],
+  ["recording the commands", acct.encodeMs],
+  ["reading results back", acct.readbackMs],
+  ["unattributed", acct.unattributedMs],
+] as const) {
+  console.log(`  ${name.padEnd(26)} ${value.toFixed(0).padStart(6)} ${((value / acct.wallMs) * 100).toFixed(1).padStart(8)}%`);
+}
+console.log();
 const permuted = [...dense.keys()].filter((n) => /\.self_attn\.(q|k)_proj\.weight$/.test(n));
 const unquantized = [...dense.keys()].filter((n) => !/\.self_attn\.(q|k)_proj\.weight$/.test(n));
 console.log(`  ${dense.size} weights take the dense path: ${permuted.length} refused by the rope ` +
   `permutation, ${unquantized.length} never quantized (${unquantized.join(", ") || "none"})\n`);
+console.log(`  of the ${acct.inPassesMs.toFixed(0)} ms inside compute passes, by kernel:`);
 console.log("  kernel        total ms    share   dispatches   ms each");
 for (const [name, v] of rows) {
   console.log(

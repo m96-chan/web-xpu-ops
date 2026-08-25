@@ -68,8 +68,8 @@ export interface ResidentReadback {
  * so nothing about its own encoding changes.
  *
  * `sink` is written into once `batch()` resolves, not returned separately —
- * the caller constructs it (typically `{ submitToDoneMs: null, readbackMs:
- * null, gpuEntries: [] }`) and passes the same object in, so a driving
+ * the caller constructs it (typically `{ encodeMs: null,
+ * submitToDoneMs: null, readbackMs: null, gpuEntries: [] }`) and passes the same object in, so a driving
  * script can read it straight off the object it already holds.
  */
 export interface BatchProfile {
@@ -78,6 +78,18 @@ export interface BatchProfile {
 }
 
 export interface BatchProfileSink {
+  /**
+   * `performance.now()` elapsed from the top of `batch()` to the instant
+   * before `queue.submit()` — recording the command buffer, and nothing that
+   * waits on the GPU.
+   *
+   * Issue #182. Without it a forward's wall clock has a hole in it that reads
+   * as GPU work: a browser forward summed 2014 ms of pass timestamps against
+   * 3841 ms of wall, and the two fields below could not say where the rest
+   * went because neither of them covers the encode. `null` until `batch()`
+   * writes it.
+   */
+  encodeMs: number | null;
   /** `performance.now()` elapsed between `queue.submit()` and `queue.onSubmittedWorkDone()` resolving — the GPU-side wait `batch()` would otherwise fold silently into the readback `mapAsync` call below. `null` until `batch()` writes it. */
   submitToDoneMs: number | null;
   /** `performance.now()` elapsed across every `readback` entry's `mapAsync`+copy, timed *after* `onSubmittedWorkDone` above has already resolved — so this is the readback round trip on its own, not padded with GPU completion wait. `null` until `batch()` writes it. */
@@ -308,6 +320,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // a label on a `"copy"` op is meaningless (copies never run inside a
     // pass) and silently ignored, not an error, since `BatchProfile.labels`
     // is positional against `ops` as a whole for the caller's convenience.
+    const encodeT0 = profile ? performance.now() : 0;
     const wantsGpuTiming = !!(profile?.labels && timestampsSupported);
     const labeledSlots: string[] = [];
     if (wantsGpuTiming) {
@@ -386,6 +399,9 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     }
 
     try {
+      // Before `submit`, so this is recording alone — `submitToDoneMs` below
+      // starts where this stops and the two do not overlap.
+      if (profile) profile.sink.encodeMs = performance.now() - encodeT0;
       device.queue.submit([encoder.finish()]);
       stats.submits += 1;
 

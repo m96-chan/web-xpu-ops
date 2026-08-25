@@ -39,11 +39,75 @@ interface Slot {
   bytes: number;
 }
 
-/** Per-kernel GPU seconds for one forward — see `animaForwardResident`'s `profile`. */
+/**
+ * Where one forward's wall clock went — see `animaForwardResident`'s `profile`.
+ *
+ * **The time fields do not overlap in the breakdown, and that is the point**
+ * (issue #182). `submitToDoneMs` contains the GPU execution that `byKernel`
+ * sums, so adding the two would double-count and produce a breakdown reaching
+ * past 100% — which reads as authoritative and is not. `accountForForward`
+ * below is the decomposition that adds up.
+ */
 export interface AnimaProfile {
   byKernel: Map<string, { seconds: number; dispatches: number }>;
   supported: boolean;
+  /** Summed over every `batch()` this forward made: recording the command buffers. */
+  encodeMs: number;
+  /** Summed over every `batch()`. Contains the GPU time `byKernel` breaks down. */
   submitToDoneMs: number;
+  /** Summed over every `batch()`. Timed after the GPU wait, so it is the round trip alone. */
+  readbackMs: number;
+}
+
+/**
+ * The non-overlapping decomposition of one forward's wall clock.
+ *
+ * Issue #182. `submitToDoneMs` **contains** the GPU execution that `byKernel`
+ * sums, so the two are not additive; subtracting gives the queue and driver
+ * work that happens around the passes rather than inside them. Everything left
+ * over is named `unattributed` and printed, because a breakdown that quietly
+ * drops the remainder is how a 52%-covered table gets read as a whole one.
+ *
+ *     inside compute passes        sum of byKernel
+ *     queue and driver, outside    submitToDoneMs - sum of byKernel
+ *     recording the commands       encodeMs
+ *     reading results back         readbackMs
+ *     unattributed                 wall - the four above
+ */
+export interface ForwardAccounting {
+  /** Summed pass timestamps — time inside compute passes. */
+  inPassesMs: number;
+  /** `submitToDone` minus the above: queue and driver, outside the passes. Never below zero. */
+  aroundPassesMs: number;
+  /** Recording the command buffers. */
+  encodeMs: number;
+  /** The readback round trip. */
+  readbackMs: number;
+  /** Wall clock the phases above do not explain. */
+  unattributedMs: number;
+  /** Wall clock this decomposes. */
+  wallMs: number;
+  /** How much of `wallMs` is named, as a percentage. Never above 100. */
+  coverage: number;
+}
+
+export function accountForForward(profile: AnimaProfile, wallSeconds: number): ForwardAccounting {
+  const wallMs = wallSeconds * 1000;
+  const inPassesMs = [...profile.byKernel.values()].reduce((sum, v) => sum + v.seconds, 0) * 1000;
+  // Clamped: timestamps and `performance.now()` are different clocks, so the
+  // sum of passes can exceed the wait they happened inside. A negative row
+  // would read as a measurement rather than as the artefact it is.
+  const aroundPassesMs = Math.max(0, profile.submitToDoneMs - inPassesMs);
+  const named = inPassesMs + aroundPassesMs + profile.encodeMs + profile.readbackMs;
+  return {
+    inPassesMs,
+    aroundPassesMs,
+    encodeMs: profile.encodeMs,
+    readbackMs: profile.readbackMs,
+    unattributedMs: Math.max(0, wallMs - named),
+    wallMs,
+    coverage: wallMs > 0 ? (Math.min(named, wallMs) / wallMs) * 100 : 0,
+  };
 }
 
 export interface AnimaResidentStats {
@@ -250,12 +314,14 @@ export async function animaForwardResident(
   let sink: BatchProfileSink | null = null;
   const batchProfile = (): BatchProfile | undefined => {
     if (!labels || !profile) return undefined;
-    sink = { submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
+    sink = { encodeMs: null, submitToDoneMs: null, readbackMs: null, gpuEntries: [] };
     return { labels: [...labels], sink };
   };
   const collect = (): void => {
     if (!sink || !profile) return;
+    profile.encodeMs += sink.encodeMs ?? 0;
     profile.submitToDoneMs += sink.submitToDoneMs ?? 0;
+    profile.readbackMs += sink.readbackMs ?? 0;
     for (const entry of sink.gpuEntries) {
       const seen = profile.byKernel.get(entry.label) ?? { seconds: 0, dispatches: 0 };
       seen.seconds += entry.seconds;
