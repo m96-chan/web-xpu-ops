@@ -95,7 +95,11 @@ const got = await decoder.decode(latent, golden.dims);
 const took = performance.now() - started;
 
 console.log(`latent ${golden.dims.join("x")} -> ${golden.frames}x${golden.height}x${golden.width} in ${took.toFixed(0)} ms`);
-console.log(`  ${decoder.dispatches} dispatches: ${decoder.submitMs.toFixed(0)} ms in the queue, ${decoder.recordMs.toFixed(0)} ms recording them (${(decoder.recordMs / decoder.dispatches * 1000).toFixed(0)} us each)`);
+console.log(
+  `  ${decoder.dispatches} dispatches: ${decoder.submitMs.toFixed(0)} ms in the queue, ` +
+    `${decoder.readbackMs.toFixed(0)} ms in the final submit and readback, ` +
+    `${decoder.recordMs.toFixed(0)} ms recording (${((decoder.recordMs / decoder.dispatches) * 1000).toFixed(0)} us each)`,
+);
 
 if (!want) {
   console.log(`(--bench: nothing to compare against — this is a time, not a correctness claim)`);

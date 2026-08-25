@@ -72,6 +72,25 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The video decoder's time accounting, corrected twice** (issue #200). At 8
+  frames of 128x128 in int8: **40 ms in the block submits, 81 ms in the final
+  submit and its readback, 136 ms of host-side recording** over 1,122
+  dispatches — 264 ms in total, 131 ms once the scratch pool is warm.
+
+  The first version timed only `flush`'s batches, so the final submit and its
+  `mapAsync` landed in the unexplained remainder. The version before that timed
+  each `await` inside the dispatch path and blamed `pipelineFor` for **502 ms**,
+  which a tight loop then priced at **0.1 µs** — a `performance.now()` pair
+  straddling an `await` charges whatever else the event loop runs to whatever is
+  awaited.
+
+  Three things measured rather than assumed: **grouping blocks into fewer
+  submits is slower** (628 ms at one per submit against 725 at all thirty-six,
+  identical output), **pooling the uniform buffers** takes the first decode from
+  293 ms to 264 and leaves the steady state alone, and **the scratch pool** is
+  worth about 130 ms on the first decode. What the remaining 136 ms is has not
+  been established, and the README says so.
+
 - **The video decoder reports where its time goes, and it is not the GPU**
   (issue #200). At 8 frames of 128x128: **647 ms the first decode, 152 ms the
   second, 4 ms in the GPU queue**. The first pays about 520 ms of `createBuffer`

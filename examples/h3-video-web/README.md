@@ -34,23 +34,39 @@ resident:
 | 64 frames, 512x512 | 665 ms |
 
 The times barely move with the token count because **almost none of it is
-compute**. Split, at 8 frames of 128x128:
+compute**. At 8 frames of 128x128 in int8, the first decode splits as:
 
 | | |
 | --- | --- |
-| first decode | 647 ms |
-| ...of which the GPU queue | **4 ms** |
-| **second decode**, pool warm | **152 ms** |
+| the block submits | 40 ms |
+| the final submit and its readback | 81 ms |
+| host-side recording, 1,122 dispatches | 136 ms |
+| **total** | **264 ms** |
+| **second decode**, scratch pool warm | **131 ms** |
 
-So the first decode is paying for its scratch buffers — about 520 ms of
-`createBuffer` — and every decode after it is 150 ms of host-side recording
-against 3 ms of GPU. Grouping blocks into fewer submits was tried and is
-**slower** (628 ms at one block per submit, 725 ms at all thirty-six), so the
-submit count is not the cost either. What the remaining 150 ms is has not been
-established; the parts that were priced individually — bind groups 10 µs,
-uniforms 3 µs, pipeline lookups 0.1 µs — do not add up to it.
+The split is approximate in one direction: every `batch` awaits
+`onSubmittedWorkDone`, so what is labelled queue time includes the GPU actually
+running.
 
-That is a number to improve, not a throughput to quote.
+Three things were tried and measured:
+
+- **Grouping blocks into fewer submits is slower** — 628 ms at one block per
+  submit, 725 ms at all thirty-six, monotone the wrong way with identical
+  output. So the submit count is not the cost.
+- **Pooling the uniform buffers** took the first decode from 293 ms to 264 and
+  left the steady state where it was.
+- **Warming the scratch pool** is worth about 130 ms: the first decode allocates
+  every intermediate.
+
+What the remaining 136 ms of recording is has **not** been established. Bind
+groups price at 10 µs each, uniforms at 3 µs, pipeline lookups at 0.1 µs — about
+15 ms for 1,122 dispatches, not 136. That is a number to improve, not a
+throughput to quote.
+
+One attribution here was wrong once and is worth the warning: timing each
+`await` inside the dispatch path blamed `pipelineFor` for 502 ms, and a tight
+loop then priced the same call at 0.1 µs. A `performance.now()` pair straddling
+an `await` charges whatever else the event loop runs to whatever is awaited.
 
 **The in-browser decode is unmeasured.** Everything above is Node against the
 same `VideoDecoderGpu` class the page instantiates; what the page adds is the

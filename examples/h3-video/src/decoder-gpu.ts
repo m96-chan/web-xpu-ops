@@ -97,6 +97,14 @@ const WG = 256;
 /** `ops/matmul`'s tile: `BM = 64`, `BN = 128`, 512 threads. */
 const MM_BM = 64;
 const MM_BN = 128;
+/**
+ * One size for every uniform this decoder writes.
+ *
+ * `params` rounds to a multiple of 16 bytes and the widest struct dispatched
+ * here is `ops/conv`'s twenty-four words; giving them all the same size is what
+ * lets one pool serve every kernel.
+ */
+const UNIFORM_BYTES = 128;
 
 /** A device-side matrix: a buffer and the shape that is live in it. */
 interface Mat {
@@ -117,6 +125,8 @@ export class VideoDecoderGpu {
   private readonly pool = new Map<number, GPUBuffer[]>();
   private readonly lent: GPUBuffer[] = [];
   private readonly lentUniforms: GPUBuffer[] = [];
+  /** Uniform buffers returned by a previous flush. Every one is `UNIFORM_BYTES`. */
+  private readonly freeUniforms: GPUBuffer[] = [];
   /**
    * Blocks recorded into one command buffer.
    *
@@ -240,7 +250,12 @@ export class VideoDecoderGpu {
     }
     this.lent.length = 0;
     this.lent.push(...keep);
-    for (const buffer of this.lentUniforms) buffer.destroy();
+    // Uniforms go back to their own pool, kept apart from the storage one:
+    // sharing a size-keyed pool would hand a later dispatch a buffer of the
+    // wrong usage. A uniform bound into a recorded dispatch cannot be rewritten
+    // before the submit, so they are reusable **across** flushes -- which is
+    // exactly when this runs.
+    this.freeUniforms.push(...this.lentUniforms);
     this.lentUniforms.length = 0;
   }
 
@@ -268,6 +283,7 @@ export class VideoDecoderGpu {
 
   /** Where a decode's wall clock went. Reset at the top of `decode`. */
   submitMs = 0;
+  readbackMs = 0;
   recordMs = 0;
   dispatches = 0;
 
@@ -276,11 +292,15 @@ export class VideoDecoderGpu {
     for (const list of this.pool.values()) for (const buffer of list) buffer.destroy();
     for (const buffer of this.lent) buffer.destroy();
     for (const buffer of this.lentUniforms) buffer.destroy();
+    for (const buffer of this.freeUniforms) buffer.destroy();
   }
 
   private uniform(values: Parameters<typeof params>[0]): GPUBuffer {
     const data = params(values);
-    const buffer = this.device.createUniformBuffer(data.byteLength);
+    // One size for every uniform in this decoder, so a pooled buffer always
+    // fits: `params` rounds to a multiple of 16 and the widest struct dispatched
+    // here is `ops/conv`'s twenty-four words.
+    const buffer = this.freeUniforms.pop() ?? this.device.createUniformBuffer(UNIFORM_BYTES);
     this.device.upload(buffer, 0, new Uint8Array(data));
     this.lentUniforms.push(buffer);
     return buffer;
@@ -461,6 +481,7 @@ export class VideoDecoderGpu {
 
     const ops: ResidentOp[] = [];
     this.submitMs = 0;
+    this.readbackMs = 0;
     this.dispatches = 0;
     const decodeStart = performance.now();
     this.ensureMask(seq);
@@ -537,15 +558,22 @@ export class VideoDecoderGpu {
     const staging = this.device.createStorageBuffer(
       patches * patchDim * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     );
+    // Timed apart from the block loop's submits: this one carries the readback,
+    // and folding it into `submitMs` would have hidden it inside a number
+    // labelled "the queue". The first version of this accounting did exactly
+    // that -- it timed only `flush`'s batches, so the final submit and its
+    // `mapAsync` landed in the unexplained remainder.
+    const finalAt = performance.now();
     const [tokens] = await this.device.batch(ops, [
       { staging, source: projected.buffer, sourceOffset: 0, length: patches * patchDim, type: "f32" },
     ]);
+    this.readbackMs = performance.now() - finalAt;
     staging.destroy();
     this.release();
     // Everything that is not the queue: building bind groups, writing uniforms,
     // and the host-side reshapes. Named rather than left in the gap, because a
     // gap reads as GPU time.
-    this.recordMs = performance.now() - decodeStart - this.submitMs;
+    this.recordMs = performance.now() - decodeStart - this.submitMs - this.readbackMs;
 
     return unpackPatches(tokens as Float32Array, dims, c.out_channels, c.patch_size_t, c.patch_size);
   }
