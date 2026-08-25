@@ -24,7 +24,7 @@
  * against a DiT that is 3,952 tokens at 2048, and moving them would be work
  * with nothing measurable behind it.
  */
-import { createBrowserRunner } from "../../llm-demo/src/browser-runtime.js";
+import { createBrowserRunner, type RunnerStats } from "../../llm-demo/src/browser-runtime.js";
 import { createBrowserResidentDevice } from "./browser-resident.js";
 import { FetchedAnimaWeights, FetchedSafetensors } from "./fetch-weights.js";
 import { ditKernels, encoderKernels, vaeKernels } from "./kernels-web.js";
@@ -146,6 +146,48 @@ function draw(image: Float32Array, H: number, W: number): void {
  * profiling itself costs passes, so the absolute numbers are larger than the
  * shipping ones and the proportions are what carry over.
  */
+/**
+ * The two phases that run on `runner.run` rather than on the resident device.
+ *
+ * The same rule as the DiT's table: the rows are a decomposition of the wall
+ * clock, the remainder is named rather than dropped, and no row overlaps
+ * another — each is a span timed inside `run` and they run in sequence. What
+ * this cannot see is time between `run` calls, which is what `unattributed`
+ * is: the JS the encoder and the VAE do on their own.
+ */
+function reportPhases(phases: [string, number, RunnerStats][]): string {
+  const ms = (v: number) => `${v.toFixed(0)} ms`;
+  let html = "";
+  for (const [name, seconds, run] of phases) {
+    const wall = seconds * 1000;
+    const rows: [string, number, string][] = [
+      ["creating pipelines", run.pipelineMs, `${run.dispatches} dispatches`],
+      ["creating buffers and uploading", run.uploadMs, `${(run.uploadedBytes / 1e9).toFixed(2)} GB, ${run.buffersCreated} buffers`],
+      ["building bind groups", run.bindGroupMs, ""],
+      ["encoding and submitting", run.submitMs, `${run.dispatches} submits`],
+      ["reading results back", run.readbackMs, ""],
+      ["destroying buffers", run.destroyMs, ""],
+    ];
+    const named = rows.reduce((sum, [, v]) => sum + v, 0);
+    rows.push(["unattributed (between run() calls)", Math.max(0, wall - named), ""]);
+    const coverage = wall > 0 ? (Math.min(named, wall) / wall) * 100 : 0;
+    const over = Math.max(0, named - wall);
+    const warn = over > 0
+      ? ` <strong>The rows name ${ms(over)} more than the phase lasted — a counter is wrong.</strong>`
+      : coverage < 90
+        ? " <strong>Under 90% here — the rest is between <code>run()</code> calls, " +
+          "which the stage table below names for conditioning.</strong>"
+        : "";
+    html +=
+      `<p class="note">${name}, ${ms(wall)} — ${coverage.toFixed(0)}% accounted for.${warn}</p><table>` +
+      rows.map(([label, value, note]) =>
+        `<tr><td>${label}</td><td>${ms(value)}</td>` +
+        `<td>${wall > 0 ? ((value / wall) * 100).toFixed(0) : 0}%</td><td>${note}</td></tr>`).join("") +
+      "</table>";
+  }
+  return html;
+}
+
 function reportProfile(
   profile: AnimaProfile,
   wallSeconds: number,
@@ -506,23 +548,61 @@ async function main(): Promise<void> {
     let preloadMsTotal = 0;
     let yieldMsTotal = 0;
 
+    /**
+     * Snapshots of the per-dispatch runner's counters, so each phase's share
+     * is a difference (issue #188).
+     *
+     * Conditioning and decode go through `runner.run`, which does a pipeline,
+     * a set of buffers, an upload, a bind group, a submit, a readback and a
+     * round of `destroy()` **per kernel** — while the DiT runs batched on a
+     * resident device. Those two phases are 19% of a generation and have never
+     * been measured.
+     */
+    const snapshot = () => ({ ...runner.stats });
+    const sub = (after: RunnerStats, before: RunnerStats): RunnerStats =>
+      Object.fromEntries(
+        Object.entries(after).map(([k, v]) => [k, (v as number) - (before as unknown as Record<string, number>)[k]!]),
+      ) as unknown as RunnerStats;
+    let conditioningRun: RunnerStats | null = null;
+    let decodeRun: RunnerStats | null = null;
+
     const started = performance.now();
 
     // --- conditioning ---
+    const conditioningRunBefore = snapshot();
     say("conditioning …", "reading the encoder");
+    // Timed per step, because 76% of this phase turned out to be outside
+    // `runner.run` entirely and "between run() calls" is not an answer.
+    const conditioningParts = { tokenize: 0, encoder: 0, buildAdapter: 0, adapter: 0, pad: 0 };
     const conditioning = async (text: string): Promise<Float32Array> => {
+      let t = performance.now();
       const { qwenIds, t5Ids, t5Weights } = tokenizePrompt(tokenizers, text);
+      conditioningParts.tokenize += performance.now() - t;
+
+      t = performance.now();
       const source = await qwen3EncodeGpu(runner.run, encoderKernels, QWEN3_06B, encoderWeights, qwenIds, (index) => {
         say("conditioning …", `encoder layer ${index + 1}/${QWEN3_06B.numLayers}`);
       });
+      conditioningParts.encoder += performance.now() - t;
+
+      t = performance.now();
       await buildAdapter((message) => say("conditioning …", message));
+      conditioningParts.buildAdapter += performance.now() - t;
+
+      t = performance.now();
       const context = llmAdapterForward(adapterWeights, source, qwenIds.length, t5Ids);
-      return padContext(context, t5Ids.length, t5Weights);
+      conditioningParts.adapter += performance.now() - t;
+
+      t = performance.now();
+      const padded = padContext(context, t5Ids.length, t5Weights);
+      conditioningParts.pad += performance.now() - t;
+      return padded;
     };
 
     const positive = await conditioning(promptInput.value);
     const useCfg = cfgEnabled(guidance);
     const unconditional = useCfg ? await conditioning(negativeInput.value) : null;
+    conditioningRun = sub(snapshot(), conditioningRunBefore);
     const conditioningSeconds = (performance.now() - started) / 1000;
 
     // --- sampling ---
@@ -648,6 +728,7 @@ async function main(): Promise<void> {
 
     // --- decode ---
     const decodeStart = performance.now();
+    const decodeRunBefore = snapshot();
     say("decoding …", "reading the VAE");
     if (vaeCache.size === 0) {
       const names = ["conv2.weight", "conv2.bias", "decoder.conv1.weight", "decoder.conv1.bias",
@@ -674,6 +755,7 @@ async function main(): Promise<void> {
     );
     draw(image, height, width);
 
+    decodeRun = sub(snapshot(), decodeRunBefore);
     const decodeSeconds = (performance.now() - decodeStart) / 1000;
     const elapsed = (performance.now() - started) / 1000;
     const taken = sigmas.length - 1;
@@ -691,6 +773,27 @@ async function main(): Promise<void> {
     );
     if (profile) {
       reportProfile(profile, profiledWallSeconds, profiledDispatches, profiledPreloadMs, profiledYieldMs);
+    }
+    if (conditioningRun && decodeRun) {
+      profileOut.innerHTML += reportPhases([
+        ["conditioning", conditioningSeconds, conditioningRun],
+        ["decode", decodeSeconds, decodeRun],
+      ]);
+      const cw = conditioningSeconds * 1000;
+      profileOut.innerHTML +=
+        '<p class="note">conditioning, by stage — the encoder runs on the GPU, the adapter does not:</p><table>' +
+        ([
+          ["tokenize", conditioningParts.tokenize],
+          ["Qwen3-0.6B encoder (GPU)", conditioningParts.encoder],
+          ["building the adapter (CPU)", conditioningParts.buildAdapter],
+          ["llm_adapter forward (CPU)", conditioningParts.adapter],
+          ["padding the context (CPU)", conditioningParts.pad],
+        ] as [string, number][])
+          .map(([label, value]) =>
+            `<tr><td>${label}</td><td>${value.toFixed(0)} ms</td>` +
+            `<td>${cw > 0 ? ((value / cw) * 100).toFixed(0) : 0}%</td><td></td></tr>`)
+          .join("") +
+        "</table>";
     }
     else if (wantProfile && steps >= 2) {
       profileOut.innerHTML =

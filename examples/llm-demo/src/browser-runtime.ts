@@ -149,8 +149,40 @@ export function params(fields: ["u32" | "i32" | "f32", number][]): ArrayBuffer {
   return buffer;
 }
 
+/**
+ * Cumulative wall clock inside `run`, by phase, plus what it allocated.
+ *
+ * Issue #188. This runner does everything per dispatch — pipeline, buffers,
+ * upload, bind group, submit, readback, destroy — and it is what conditioning
+ * and decode use while the DiT runs batched on a resident device. Those two
+ * phases are 42.7 s of a 225 s generation and nothing has ever measured where
+ * inside them the time goes. A caller reads these as differences across the
+ * span it cares about; nothing here resets.
+ */
+export interface RunnerStats {
+  /** `run` calls. */
+  dispatches: number;
+  /** `createComputePipeline`, which this path does per call — only the shader *module* is cached. */
+  pipelineMs: number;
+  /** `createBuffer` plus `queue.writeBuffer` for every binding. */
+  uploadMs: number;
+  /** Bytes handed to `writeBuffer`. */
+  uploadedBytes: number;
+  /** `createBindGroup` and the `popErrorScope` that follows it. */
+  bindGroupMs: number;
+  /** Encoding the pass and `queue.submit`. */
+  submitMs: number;
+  /** `mapAsync` and the copy out. */
+  readbackMs: number;
+  /** `destroy()` on everything the call made. */
+  destroyMs: number;
+  /** Buffers created, so the per-dispatch churn is a number rather than an adjective. */
+  buffersCreated: number;
+}
+
 export interface BrowserRunner {
   run(dispatch: Dispatch): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
+  readonly stats: RunnerStats;
   destroy(): void;
 }
 
@@ -196,6 +228,10 @@ export async function createBrowserRunner(): Promise<BrowserRunner> {
 
   /** Compiled modules, keyed by source — the same one-await-per-distinct-shader cache `harness/wgsl.ts` keeps. */
   const compiled = new Map<string, GPUShaderModule>();
+  const stats: RunnerStats = {
+    dispatches: 0, pipelineMs: 0, uploadMs: 0, uploadedBytes: 0,
+    bindGroupMs: 0, submitMs: 0, readbackMs: 0, destroyMs: 0, buffersCreated: 0,
+  };
 
   async function run(spec: Dispatch): Promise<(Float32Array | Int32Array | Uint32Array)[]> {
     const { code, entry = "main", bindings, workgroups } = spec;
@@ -212,6 +248,8 @@ export async function createBrowserRunner(): Promise<BrowserRunner> {
       compiled.set(code, module);
     }
 
+    stats.dispatches += 1;
+    const uploadT0 = performance.now();
     const created: GPUBuffer[] = [];
     const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];
 
@@ -250,22 +288,29 @@ export async function createBrowserRunner(): Promise<BrowserRunner> {
       // (see that file's comment for why `as any` rather than naming
       // `BufferSource` explicitly).
       device.queue.writeBuffer(buffer, 0, bytes as any);
+      stats.uploadedBytes += bytes.byteLength;
       created.push(buffer);
       return buffer;
     });
+    stats.uploadMs += performance.now() - uploadT0;
 
     // Same reason `harness/wgsl.ts` pushes an error scope here: `layout:
     // "auto"` silently drops a binding an entry point never references, and
     // the bind group then fails validation rather than the pipeline.
     device.pushErrorScope("validation");
+    const pipelineT0 = performance.now();
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
+    const bindGroupT0 = performance.now();
+    stats.pipelineMs += bindGroupT0 - pipelineT0;
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: bound.map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     const invalid = await device.popErrorScope();
+    stats.bindGroupMs += performance.now() - bindGroupT0;
     if (invalid) throw new Error(`dispatch is not valid: ${invalid.message}`);
 
+    const submitT0 = performance.now();
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
@@ -283,7 +328,9 @@ export async function createBrowserRunner(): Promise<BrowserRunner> {
       return read;
     });
     device.queue.submit([encoder.finish()]);
+    stats.submitMs += performance.now() - submitT0;
 
+    const readbackT0 = performance.now();
     const results: (Float32Array | Int32Array | Uint32Array)[] = [];
     for (const [index, read] of staging.entries()) {
       await read.mapAsync(GPUMapMode.READ);
@@ -294,12 +341,18 @@ export async function createBrowserRunner(): Promise<BrowserRunner> {
         type === "i32" ? new Int32Array(bytes) : type === "u32" ? new Uint32Array(bytes) : new Float32Array(bytes),
       );
     }
+    stats.readbackMs += performance.now() - readbackT0;
+
+    const destroyT0 = performance.now();
+    stats.buffersCreated += created.length;
     for (const buffer of created) buffer.destroy();
+    stats.destroyMs += performance.now() - destroyT0;
     return results;
   }
 
   return {
     run,
+    stats,
     destroy() {
       device.destroy();
     },
