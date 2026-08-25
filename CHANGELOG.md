@@ -9,6 +9,18 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **`conv3d` and `pad` have a caller** (issue #200): one `ResnetBlock3D` of
+  MiniMax-H3's visual VAE **encoder**, checked against the model's own module at
+  **3.576e-7**. The VAE's decoder is a ViT and needs neither op; the encoder is a
+  3D convolutional stack, and an op nothing calls is a liability.
+
+  Three conventions the block settles, each measured rather than recalled:
+  **space reflects and time does not** — a causal convolution prepends
+  `2 * padding` zero frames and appends none, which is what `ops/pad` taking
+  `before` and `after` separately is for; **two frames, not one**, or the output
+  is a frame shorter; and **group norm is per frame**, not over the clip
+  (`use_t_isolated_gn`), which is worth 2.4 in the output when got wrong.
+
 - **Z-Image runs from a folder too, and is published** (issue #194). The same
   gate, the same receipt, the same offline-after-the-first-download. 14.4 GB in
   total — and **8.04 GB of it comes straight from

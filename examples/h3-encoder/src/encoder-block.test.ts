@@ -87,8 +87,13 @@ describe("h3 video vae / encoder resnet block", () => {
       if (d > worst) worst = d;
     }
     console.log(`h3 encoder resnet: worst ${worst.toExponential(3)}  rms ${Math.sqrt(sum / want.length).toExponential(3)}`);
-    // Set from the measurement in the PR, not widened until green.
-    expect(worst).toBeLessThan(1e-4);
+    // Measured: worst element **3.576e-7**, RMS 5.060e-8, over 128 channels of
+    // 3x8x8 — f32 rounding on a block whose values are order one. 3e-6 is eight
+    // times that. Every wrong convention tried against it moves values by 1e0:
+    // the temporal pad made symmetric, one causal frame instead of two, the
+    // spatial pad made constant instead of reflect, group norm pooled over the
+    // clip instead of per frame, the residual dropped, silu before the norm.
+    expect(worst).toBeLessThan(3e-6);
   });
 
   if (!have) {
