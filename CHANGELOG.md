@@ -72,6 +72,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **A transformer block of MiniMax-H3's DiT** (issue #200) — the *generator*
+  half of the model, against the visual VAE this repository already decodes
+  with. Fifty identical blocks over 5,376 channels; a port is right or wrong at
+  the block and the rest is a loop.
+
+  The checkpoint ships no code for the DiT — it names a diffusers class — so the
+  golden **imports** `MiniMaxH3TransformerBlock` from diffusers' main branch,
+  with only its relative import lines rewritten to absolute.
+
+  Worst element **5.859e-3** against an f32 golden and **1.953e-3** against an
+  f64 one, on a block output of order 350. A third of that gap is torch's own
+  f32 rounding over 5,376- and 14,336-term dot products; the rest is this port
+  storing intermediates in `Float32Array`, which is what an f32 port is.
+
+  **A permutation has to cover everything that reads the channels it moves.**
+  The RoPE permutation goes into the Q and K weights, as it does everywhere
+  here — but this block's QK-norm has *per-channel weights*, and permuting the
+  projection without permuting them scales the wrong channels. The visual VAE
+  has `qk_norm_affine: false` and no weights at all, so the same permutation is
+  complete there and incomplete here. The symptom was 8% error in attention with
+  the rope itself exact to 2.4e-7.
+
+  And **SwiGLU is `hidden * silu(gate)` with `hidden` first** here, the opposite
+  of the visual VAE's. Two files in one model with opposite conventions.
+
+  `h3RopePermutation` moved into `ops/rope`: both of H3's models rotate the same
+  way at different geometries, and the generated table now checks the function.
 - **The video decoder's time accounting, corrected twice** (issue #200). At 8
   frames of 128x128 in int8: **40 ms in the block submits, 81 ms in the final
   submit and its readback, 136 ms of host-side recording** over 1,122

@@ -23,7 +23,7 @@
  * would be a per-forward shuffle of every query and key.
  */
 import { describe, expect, it } from "vitest";
-import { ropeAxes } from "./index.js";
+import { h3RopePermutation, ropeAxes } from "./index.js";
 import { H3_ROPE_CASE, H3_ROPE_PERMUTATION } from "./h3-cases.js";
 
 const { numHeads, dimHead, rotDim, thetaBase } = H3_ROPE_CASE;
@@ -138,6 +138,21 @@ describe("rope / axes / MiniMax-H3", () => {
         expect(got[row * dimHead + c]).toBe(input[row * dimHead + c]);
       }
     }
+  });
+
+  it("`h3RopePermutation` reproduces the generated table", () => {
+    // The table in `h3-cases.ts` comes from the generator; the function is what
+    // the examples call, and the DiT needs it at a different geometry (96 of
+    // 128 rather than 48 of 64). One of the two being right is not the same as
+    // both agreeing.
+    expect(h3RopePermutation(dimHead, rotDim)).toEqual([...H3_ROPE_PERMUTATION]);
+  });
+
+  it("refuses a geometry it cannot split", () => {
+    // 50 channels over three axes is not two halves of three blocks, and a
+    // silently floored `perAxis` would rotate the wrong pairs.
+    expect(() => h3RopePermutation(64, 50)).toThrow(/halves/);
+    expect(() => h3RopePermutation(64, 96)).toThrow(/exceed/);
   });
 
   it("the permutation is a permutation", () => {
