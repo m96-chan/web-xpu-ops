@@ -59,6 +59,75 @@ timestep MLP without its activation (1.0e-1), the refiner's residual dropped
 is at timestep 0 — and moves the audio by 2.6e-2. Dropping the video head's
 bias does the reverse. A test that checked one head would have passed either.
 
+## On the GPU, at full size
+
+`src/model-gpu.ts` runs the released 50-layer checkpoint. RTX 5090 / driver
+610.57.04 / Dawn `webgpu@0.4.0`, int8 weights and f32 activations, 42 rows:
+
+| | |
+| --- | --- |
+| resident weights | **20.08 GB** int8 |
+| modulation tables (16 steps) | 0.58 GB |
+| upload | 12.0 s |
+| one step | 2078 ms — 2,063 dispatches, 6 ms in the queue, 460 ms in the final submit and readback, **1,611 ms recording** |
+
+As with `examples/h3-video`, almost none of that is the GPU. The host-side
+recording is the cost, and it has not been attacked.
+
+### 20.08 GB, not 33.12
+
+The checkpoint is **33.12 G parameters**, and `adaln_proj` is **13.01 G of them
+— 39.3%**. It exists to project `temb`, a *two-row* tensor whose value depends
+only on the timestep, into the `(timestep, modality)` modulation table. Two
+fifths of a video model, for 520 MFLOP a step.
+
+`tools/convert_dit.py` therefore **evaluates the tables at conversion time** and
+never ships those weights; `norm_out.linear` goes the same way. The cost is that
+a conversion runs only the step counts it was given, which the page has to say.
+
+### What int8 costs, measured three ways
+
+A port's accuracy cannot be read off a single number here, because the golden is
+**bf16** and the output is a small difference of large intermediates — peak 276
+after one block, peak 5.02 at the output, so relative error at the output is
+amplified about fiftyfold.
+
+At **one** block, video velocity, as a percentage of the golden's peak:
+
+| | |
+| --- | --- |
+| bf16 activations against f32, **no quantisation at all** | **0.55%** |
+| **this port** (int8 weights, f32 activations) against the bf16 golden | **0.88%** |
+| int8 weights *in torch* (bf16 activations) against the same golden | 7.59% |
+
+So the port sits just above the floor its golden can resolve, and torch's own
+int8 round-trip is eight times further away. Quoting the port's number without
+the floor beside it would claim a precision the comparison does not have.
+
+At **fifty** blocks the port is **13.80%** of peak on video and 27.67% on audio;
+torch's own int8 round-trip is **47.49%** and 42.72%. Most of the gap is
+quantisation and precision rather than the port — but **the split is not
+measured**, because an f32 fifty-block reference is 132 GB and the kernel kills
+it. What int8 does to a *generated video* is unmeasured too, and needs the text
+encoder.
+
+### One bug, and how it presented
+
+The rope call was written from memory instead of from
+`ops/rope/wgsl/axes.wgsl`: bindings 1 and 2 swapped, and a four-field uniform
+where the struct declares five. Every binding is `array<f32>` and a short
+uniform reads whatever follows it, so there was **no validation error** — just
+NaN, fifty blocks later.
+
+It was found by running with `--layers 0`, which was finite, so the fault was in
+a block; the refiner block shares everything with a DiT block *except* the
+modulation and the rope, and it was finite too.
+
+**The comparison said "worst 0.000e+0" on wholly-NaN output.**
+`Math.abs(NaN - x) > worst` is false, so the worst-difference loop never
+updates and prints a perfect score next to an RMS of NaN. `verify-forward.ts`
+counts non-finite values now and refuses before it reports anything.
+
 ## The packed sequence, and the schedule
 
 The transformer builds **neither**. `forward` takes the row order, the modality

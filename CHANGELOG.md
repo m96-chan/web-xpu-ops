@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The 50-layer DiT runs on the GPU** (issue #210). `examples/h3-dit`'s
+  `model-gpu.ts` plus `tools/convert_dit.py`: **20.08 GB** of int8 resident,
+  one step over 42 rows in 2,078 ms (RTX 5090, driver 610.57.04, Dawn
+  `webgpu@0.4.0`), of which 6 ms is queue time and **1,611 ms is host-side
+  recording**. No new kernel.
+
+  **20.08 GB, not 33.12.** `adaln_proj` is 13.01 G of the checkpoint's 33.12 G
+  parameters — **39.3%** — and it projects `temb`, a *two-row* tensor whose
+  value depends only on the timestep. The converter evaluates the modulation
+  tables instead of shipping the weights, which costs 0.58 GB of tables for 16
+  steps and means a conversion runs only the step counts it was given.
+
+  **What int8 costs, at one block, as a percentage of the golden's peak**:
+  0.55% for bf16 activations against f32 with *no quantisation at all*, **0.88%
+  for this port**, and 7.59% for int8 weights inside torch's own bf16 pipeline.
+  The port sits just above the floor its bf16 golden can resolve. At fifty
+  blocks the port is 13.80% and torch's own int8 round-trip is 47.49% — most of
+  the gap is precision rather than the port, but the split is **not measured**,
+  because an f32 fifty-block reference is 132 GB.
+
+  The rope call was written from memory rather than from
+  `ops/rope/wgsl/axes.wgsl` — bindings swapped, a four-field uniform against a
+  five-field struct — and since every binding is `array<f32>`, there was no
+  validation error, just NaN fifty blocks later. **The comparison reported
+  "worst 0.000e+0" on wholly-NaN output**, because `Math.abs(NaN - x) > worst`
+  is false; it counts non-finite values now and refuses before reporting.
+
 - **MiniMax-H3's packed sequence layout** (issue #210). The transformer builds
   none of it: row order, modality tags, per-row noise levels and the `(t, h, w)`
   rotary grid all arrive as arguments, so every one is a free choice and **not
