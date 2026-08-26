@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **Qwen3-VL's text decoder** (issue #212). `examples/h3-ref2v`'s conditioner
+  stack, held to `transformers`' own `Qwen3VLTextModel` at **3.576e-7** across
+  every hidden state, on a **committed** fixture — random weights at a tiny
+  geometry, 122 KB, no model licence.
+
+  **No new kernel.** `ops/gqa` takes the 64-query-over-8-key/value grouping,
+  `ops/rmsnorm` takes the layer norms and the per-head QK norms, and
+  `ops/rope`'s `ropeAxes` takes M-RoPE — through **64 axes of two channels**,
+  where `theta ** 0` is exactly 1 so the frequency can be folded into the
+  position (which is what #206's fractional positions were for), plus a channel
+  permutation applied to Q, K **and** the per-head norm weights.
+
+  **`mrope_section` does not name three contiguous blocks.**
+  `apply_interleaved_mrope` overwrites two *strided* slices of an all-time
+  array, so channel `c` is on axis `c % 3` while `c < 3 * section[1]` and on
+  time after. The chunked reading is what the field name suggests, produces a
+  working model, and is wrong — as is a per-axis frequency sweep, since every
+  channel keeps the frequency its **global** index gives it.
+
+  **The last hidden state carries the final norm.** `output_hidden_states=True`
+  returns `n + 1` entries whose last is `last_hidden_state`, so a port that
+  appends its raw last layer output matches every earlier entry and misses that
+  one by 0.53. It does not change what H3 reads — `hidden_states[50]` of 64 is
+  an ordinary layer input — which is exactly why it could have gone unnoticed.
+
+  Ten mutations, all caught.
+
 - **R2V's transformer converts with no new code** (issue #212).
   `transformer_ref/` is a second 66.28 GB partition and *is* different weights —
   measured at **2.0–2.2%** mean relative difference across the stack, a

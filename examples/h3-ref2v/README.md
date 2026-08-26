@@ -180,7 +180,52 @@ table onto each image's grid. `ops/upsample` is nearest-neighbour only — but t
 table is 2.6 M values and the resampling is per image on the host, so it does
 not need to be one.
 
+## The conditioner's text stack
+
+`src/text-encoder.ts`, held to `transformers`' `Qwen3VLTextModel` at
+**3.576e-7** across every hidden state. The fixture is **committed**: random
+weights at a tiny geometry — 122 KB, no model licence, runs in CI anywhere.
+
+**No new kernel**, as the inventory above said. `ops/gqa` takes the 64-over-8
+grouping, `ops/rmsnorm` takes both the layer norms and the per-head QK norms,
+and `ops/rope`'s `ropeAxes` takes M-RoPE — but only via two things that belong
+in the weights rather than in a kernel:
+
+- **Sixty-four axes of two channels each.** At `dim = 2` the pair index is 0, so
+  `theta ** 0` is exactly 1 and the angle is the position verbatim. The
+  frequency is then folded into the position, which is what #206's fractional
+  positions were added for.
+- **A channel permutation**, because Qwen rotates `c` against `c + headDim / 2`
+  and `ropeAxes` rotates adjacent pairs. Applied to Q, K **and** the per-head
+  norm weights — #208 records the 8% cost of moving only the first two.
+
+### The interleave, which is the part to read twice
+
+`mrope_section` looks like it names three contiguous blocks. It does not.
+`apply_interleaved_mrope` starts from an all-time array and overwrites two
+**strided** slices, so channel `c` belongs to axis `c % 3` while
+`c < 3 * section[1]`, and to time after that. At the released `[24, 20, 20]`
+that is `0,1,2,0,1,2,…` for sixty channels and then four more of time.
+
+The chunked reading — `[0..23] = t, [24..43] = h, [44..63] = w` — is what the
+field name suggests, produces a working model, and is wrong. And every channel
+keeps the frequency its **global** index gives it whichever axis it reads,
+which is why a per-axis frequency sweep is also wrong.
+
+### The last hidden state is not like the others
+
+`output_hidden_states=True` returns `numHiddenLayers + 1` entries, and the last
+is `last_hidden_state` — **with the final norm applied**. A port that appends
+its raw last layer output matches every earlier entry and disagrees with the
+golden by **0.53** on that one, which is what happened here.
+
+It does not change what MiniMax-H3 reads: `hidden_states[50]` of a 64-layer
+stack is an ordinary layer input. Which is precisely why the discrepancy could
+have sat unnoticed in a port that only ever indexed 50.
+
+Ten mutations, all caught.
+
 ## What is not here yet
 
-The transformer conversion, the Qwen3-VL text stack and vision tower, the
-`Qwen3VLProcessor`, and the page. See #212.
+The vision tower, the `Qwen3VLProcessor`, a GPU path for the text stack, and
+the page. See #212.
