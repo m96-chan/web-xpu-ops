@@ -72,6 +72,27 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **`conv3d`** (issue #200). MiniMax-H3's visual VAE compresses time as well as
+  space — `temporal_downsample_factors [1,2,2,1,1,1]`, 4x — so every convolution
+  in it spans frames and none of them decomposes into 2D plus a loop.
+  `ops/conv`'s own doc had listed 3D as *deliberately absent*; this is the model
+  that makes it necessary, and every convention 1D settled carries over
+  unchanged.
+
+  `[N, Cin, D, H, W]`, weight `[Cout, Cin/groups, KD, KH, KW]`, with
+  `stride` / `padding` / `dilation` taking `number | [D, H, W]`. **Still no
+  `padding_mode`**, and 3D is where that starts to cost something: H3 pads
+  `reflect` on the spatial axes and **causally** in time — `2 * padding` frames
+  before the data and none after — which is not a value any symmetric padding
+  argument can take. That is a pad op, and it is **`pad`**, below.
+
+  3D is also the first place the *axis order* is checkable. The tests use an
+  input whose elements name their own coordinate (`100d + 10h + w`) against a
+  corner-tap kernel, so an output element reads back the window it started on:
+  a swapped axis, a flipped kernel or an off-by-one pad shows up in the digits.
+  Goldens measured against torch 2.10.0+cu130, integers so they are exact in
+  f32.
+
 - **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
   pad op, not a convolution argument. MiniMax-H3 is the model that makes that
   separation load-bearing: its visual VAE pads `reflect` on the spatial axes
