@@ -9,6 +9,18 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's transformer converts with no new code** (issue #212).
+  `transformer_ref/` is a second 66.28 GB partition and *is* different weights —
+  measured at **2.0–2.2%** mean relative difference across the stack, a
+  fine-tune of the same base — but its config is **identical to
+  `transformer/`'s, field for field**. So `examples/h3-dit`'s `convert_dit.py`
+  and `model-gpu.ts` serve it unchanged: 20.08 GB resident in 96 s, held to the
+  model's own output at four blocks at **0.96%** of peak on video against the
+  `t2va` partition's 0.84%.
+
+  The fifty-block check is not run yet — it needs 20.66 GB and the card was
+  holding 27.1.
+
 - **R2V's presentation** (issue #212). How a `ref2va` request is announced to
   the conditioner: `"<Picture i>: "`, `"<Audio j>: "`, `"<Video k>: "`, numbered
   **per modality**, each followed by a vision block of pad tokens — which is

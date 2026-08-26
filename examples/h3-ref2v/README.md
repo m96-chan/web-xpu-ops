@@ -9,10 +9,27 @@ packed layout.
 
 ## Why R2V is not `t2va` with extra rows
 
-**A different transformer.** `transformer_ref/` is 66.28 GB and is not
-`transformer/` — `MiniMaxH3ModularPipeline.patch_size` reads whichever of the
-two a workflow loaded, because a workflow loads only its own. The conversion
-`examples/h3-dit` already has cannot serve this.
+**A different transformer — but not a different shape.** `transformer_ref/` is
+66.28 GB and is not `transformer/`: `MiniMaxH3ModularPipeline.patch_size` reads
+whichever of the two a workflow loaded, because a workflow loads only its own.
+
+The two configs were compared field by field and are **identical**. The weights
+are not: measured on three tensors spread across the stack, the mean absolute
+difference is **2.0–2.2% of the mean magnitude** — a fine-tune of the same base,
+not a copy and not a different architecture.
+
+Which means `examples/h3-dit`'s converter and `model-gpu.ts` serve it
+**unchanged**. Converted with the same script — 20.08 GB resident, 0.58 GB of
+tables, 96 s — and held to the model's own output at four blocks:
+
+| | worst | of peak |
+| --- | --- | --- |
+| video velocity | 1.132e+0 | **0.96%** |
+| audio velocity | 9.867e-1 | 2.72% |
+
+against the `t2va` partition's 0.84% and 2.44% on the same geometry. The
+fifty-block check is **not run yet**: it needs 20.66 GB and the card had 27.1 GB
+in use.
 
 **It cannot precompute the conditioner.** `examples/h3-dit-web` ships prompt
 embeddings baked offline, because the prompt list is fixed. Here **the reference
