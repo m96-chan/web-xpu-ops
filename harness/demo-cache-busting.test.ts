@@ -50,7 +50,7 @@ function stampPattern(source: string): RegExp | null {
 
 describe("demo servers / cache busting", () => {
   it("finds the demos", () => {
-    expect(demos.map((d) => d.name).sort()).toEqual(["anima-web", "zimage-web"]);
+    expect(demos.map((d) => d.name).sort()).toEqual(["anima-web", "h3-video-web", "zimage-web"]);
   });
 
   for (const demo of demos) {

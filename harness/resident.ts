@@ -234,7 +234,23 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   });
 
   const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
-  const pipelines = new Map<string, GPUComputePipeline>();
+  /**
+   * Pipelines, keyed by the **source string itself** and then by entry point.
+   *
+   * Not by `\`${entry} ${code}\``: a template literal builds a fresh
+   * multi-kilobyte string on every call, and a fresh string has no cached hash,
+   * so each lookup hashed the whole kernel. A caller passes the same string
+   * *object* for a given kernel, so keying on it reuses the hash V8 already put
+   * on it.
+   *
+   * **Measured at 0.1 µs a call either way**, so this is not a fix for
+   * anything — it was changed while chasing a 502 ms attribution that turned
+   * out to be a measurement error (a `performance.now()` pair straddling an
+   * `await` charges whatever else the event loop runs to whatever is being
+   * awaited). It stays because it is the cheaper shape and no longer allocates
+   * per call, not because it made a forward faster.
+   */
+  const pipelines = new Map<string, Map<string, GPUComputePipeline>>();
   const modules = new Map<string, GPUShaderModule>();
 
   /** Bytes handed out, so an allocation failure can say what was already in flight. */
@@ -273,8 +289,8 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   }
 
   async function pipelineFor(code: string, entry = "main"): Promise<GPUComputePipeline> {
-    const key = `${entry} ${code}`;
-    const cached = pipelines.get(key);
+    const byEntry = pipelines.get(code);
+    const cached = byEntry?.get(entry);
     if (cached) return cached;
     let module = modules.get(code);
     if (!module) {
@@ -296,7 +312,9 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`resident pipeline is not valid: ${invalid.message}`);
-    pipelines.set(key, pipeline);
+    const entries = pipelines.get(code) ?? new Map<string, GPUComputePipeline>();
+    entries.set(entry, pipeline);
+    pipelines.set(code, entries);
     stats.pipelinesCreated += 1;
     return pipeline;
   }

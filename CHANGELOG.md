@@ -112,6 +112,105 @@ Entries record **why** a change was needed. What changed is in the diff.
   are themselves reflections. One kernel then serves the audio VAE's 1D
   `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
 
+- **The video decoder's time accounting, corrected twice** (issue #200). At 8
+  frames of 128x128 in int8: **40 ms in the block submits, 81 ms in the final
+  submit and its readback, 136 ms of host-side recording** over 1,122
+  dispatches — 264 ms in total, 131 ms once the scratch pool is warm.
+
+  The first version timed only `flush`'s batches, so the final submit and its
+  `mapAsync` landed in the unexplained remainder. The version before that timed
+  each `await` inside the dispatch path and blamed `pipelineFor` for **502 ms**,
+  which a tight loop then priced at **0.1 µs** — a `performance.now()` pair
+  straddling an `await` charges whatever else the event loop runs to whatever is
+  awaited.
+
+  Three things measured rather than assumed: **grouping blocks into fewer
+  submits is slower** (628 ms at one per submit against 725 at all thirty-six,
+  identical output), **pooling the uniform buffers** takes the first decode from
+  293 ms to 264 and leaves the steady state alone, and **the scratch pool** is
+  worth about 130 ms on the first decode. What the remaining 136 ms is has not
+  been established, and the README says so.
+
+  `blocksPerSubmit` is a field rather than a constant so that the measurement can
+  be repeated on other hardware.
+
+- **The video decoder runs in int8, and the page uses it** (issue #200).
+  `--quant q8` writes **2.43 GB** where f32 writes 9.69, and `matmulQ8` takes
+  `nn.Linear`'s `[out, in]` layout untransposed with one absmax scale per output
+  row — the opposite of the f32 path, whose kernel reads `[in, out]`.
+
+  What it costs, measured against the model's own pixels **in the units a viewer
+  sees**: **2 levels of 255**, RMS 0.564 levels, against f32's 1 and 0.007. In
+  the model's normalised space that is 3.606e-2 — a number that says nothing on
+  its own, since the denormalisation multiplies by a per-channel std of ~0.22.
+
+  Two levels of 255 for a quarter of the size, and a faster load: 292 ms against
+  636 ms for the first decode.
+
+  Two quantiser mutations are strongly observable (the scale taken as `absmax`
+  rather than `absmax / 127` costs 230 levels; reversing the byte order inside
+  each u32 costs 196) and two are not: quantising per *tensor* rather than per
+  output row costs only 5 levels, and widening the clamp to `-128` changes
+  nothing at all — which is structural, since an absmax scale never produces
+  -128. All four are written down, including the ones that barely show.
+
+- **A browser page that decodes video** (issue #200). `examples/h3-video-web`,
+  on the same folder-bound, server-free footing as the other demos: a latent in,
+  frames on a canvas, with a transport to play them at 24 fps.
+
+  **9.69 GB of f32 stays on the GPU**, which is the honest requirement and the
+  page says it. Quantising to int8 would be 2.4 GB and is not done: `matmulQ8`
+  exists, but what int8 costs this decoder has not been measured.
+
+  **The in-browser decode is unmeasured.** Everything quoted is Node against the
+  same `VideoDecoderGpu` class the page instantiates; the page adds the folder
+  read, the browser device and the canvas, prints its own decode time, and the
+  README says so rather than quoting the Node number as though it were the
+  browser's.
+
+- **MiniMax-H3's visual VAE decoder runs, end to end, on the GPU** (issue #200).
+  A latent in, video frames out: 36 transformer blocks over 2048 channels, the
+  embedding, the projection and the two reshapes that turn tokens back into
+  pixels.
+
+  Checked against **the model's own `decode`**: worst element **4.530e-6**, RMS
+  9.051e-7, on a signal peaking at 1.64. **9.69 GB of f32 weights upload in 4.0
+  s and a 2x3x4 latent decodes to 8 frames of 48x64 in 640 ms** (RTX 5090,
+  driver 610.57.04, Dawn `webgpu@0.4.0`).
+
+  **No new kernel.** `matmul`, `rmsnorm`, `layernorm`, `flash_attention`,
+  `rope`'s axes entry, `activation`, `elementwise` and `permute` cover it. Three
+  things that would each be a strided copy per token happen once at conversion
+  instead: `to_qkv` split into three projections, `ff.w1` split into gate and
+  up, and every weight stored `[in, out]` because that is what `ops/matmul`
+  reads.
+
+  The verification decodes the same latent **twice** and requires the two to
+  agree exactly. Scratch buffers are pooled, so the second decode is the first
+  to see a *used* one — and the zero cls token, which the model builds as
+  `torch.zeros_like(...)`, is right the first time and wrong after if the clear
+  is dropped. A single-decode check stayed green through exactly that mutation.
+
+- **A transformer block of MiniMax-H3's visual VAE decoder** (issue #200). The
+  decoder is 36 identical blocks over 2048 channels — **9.69 GB of the
+  checkpoint's 10.42** — so a port is right or wrong at the block and the rest
+  is a loop. Built in the order `examples/zimage` and `examples/anima` were.
+
+  Held to **the model's own output**: `tools/gen_block_golden.py` imports
+  `TransformerBlock` and `RotaryEmbeddingND` from the bundle the checkpoint
+  ships and runs block 0 on a fixed input. Worst element **1.192e-7**, RMS
+  1.773e-9.
+
+  Three things it does that Z-Image's block does not, each of which returns a
+  well-formed tensor when got wrong: **Q, K and V come from one `to_qkv` and are
+  interleaved per head** (`view(B, L, -1, 3 * dim_head)`, not three separate
+  blocks); **QK-norm has no weights** (`qk_norm_affine: false`, passed as ones
+  rather than a second path); and the branches carry **LayerScale**, a
+  per-channel parameter that multiplies each before the residual.
+
+  No new kernel: `matmul`, `rmsnorm`, `attention`, `rope`'s axes entry,
+  `activation` and `elementwise` cover it.
+
 ### Changed
 
 - **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
