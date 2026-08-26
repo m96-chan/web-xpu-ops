@@ -132,6 +132,54 @@ sweep that only asks "did the mutant fail?" calls every mutation caught when
 the baseline fails too. Both sweeps refuse to start on a red baseline now. The
 two failures were a wrong assertion and the `0.15` bug above.
 
+## The conditioner, read rather than guessed
+
+The biggest open question in #212 was whether the vision tower needs a new
+kernel. It was answered by reading `transformers`' `modeling_qwen3_vl.py` and
+the checkpoint's own parameter shapes. **It does not.**
+
+### Qwen3-VL's text stack — 51 of 64 layers
+
+hidden 5120, head_dim 128, **64 query heads against 8 key/value heads**,
+intermediate 25600, RMSNorm at 1e-6, `rope_theta` **5,000,000**, no attention
+bias.
+
+| | this repository |
+| --- | --- |
+| `input_layernorm`, `post_attention_layernorm` | `ops/rmsnorm` |
+| `q_proj` / `k_proj` / `v_proj` / `o_proj` | `ops/matmul` |
+| 64 query heads over 8 KV heads | **`ops/gqa`**, which is what it is for |
+| `q_norm` / `k_norm`, `[128]` per head | `ops/rmsnorm` with groups — `examples/h3-dit`'s block already does exactly this |
+| `mlp` gate/up/down, silu | `ops/activation` + `ops/elementwise` |
+| M-RoPE, `mrope_section [24, 20, 20]` | **`ops/rope`'s `ropeAxes`** — three axes of 48/40/40 channels, which is the signature that op has |
+
+The one thing to read carefully is `mrope_interleaved: true`: the three sections
+are interleaved rather than concatenated, which is the same *kind* of thing as
+H3's own rope permutation and is solved the same way — fold a channel
+permutation into the Q and K weights at conversion. `h3RopePermutation`'s doc is
+about precisely that, and #208 records what it costs to permute the projection
+and forget the per-channel norm weights.
+
+### The vision tower — 27 blocks, 0.60 GB
+
+hidden 1152, 16 heads, patch 16, temporal patch 2, spatial merge 2, out 5120,
+deepstack taps at layers 8, 16 and 24.
+
+| | this repository |
+| --- | --- |
+| `patch_embed.proj`, a `Conv3d` with kernel and stride `(2, 16, 16)` | **`ops/conv`'s `conv3d`** — written for #201, and this is a second caller |
+| `norm1` / `norm2`, **with bias** | `ops/layernorm`, not `rmsnorm` |
+| `attn.qkv`, fused `[3456, 1152]` | split at conversion, as `examples/h3-video` splits `to_qkv` |
+| `mlp`, `gelu_pytorch_tanh` | `ops/activation`'s `gelu_tanh` |
+| `merger`, **exact** GELU | `ops/activation`'s `gelu` — a different entry, and the two are not the same function |
+| vision rope, two axes, `rotate_half`, `cat(freqs, freqs)` | `ops/rope`'s `ropeAxes` with `[36, 36]` and the same permutation |
+
+**One piece is genuinely new**, and it is not a kernel:
+`fast_pos_embed_interpolate` bilinearly resamples a learned `[2304, 1152]`
+table onto each image's grid. `ops/upsample` is nearest-neighbour only — but the
+table is 2.6 M values and the resampling is per image on the host, so it does
+not need to be one.
+
 ## What is not here yet
 
 The transformer conversion, the Qwen3-VL text stack and vision tower, the
