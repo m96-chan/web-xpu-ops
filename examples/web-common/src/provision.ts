@@ -88,7 +88,20 @@ export interface ProvisionProgress {
  * is evidence that a download finished, not that nothing has touched the folder
  * since.
  */
-export async function readReceipt(dir: FileSystemDirectoryHandle): Promise<Receipt | null> {
+export async function readReceipt(
+  dir: FileSystemDirectoryHandle,
+  /**
+   * What *this* caller needs, when it has an opinion.
+   *
+   * Without it a receipt only says "something finished filling this folder",
+   * which a folder filled for a **different model** answers with its own
+   * receipt — and the page then skipped filling, reloaded, and threw on its
+   * first read where nothing catches. With it, a receipt that does not cover
+   * every file in the plan means unfilled, and the folder gets filled: the
+   * cheap direction to be wrong in.
+   */
+  plan?: ProvisionPlan,
+): Promise<Receipt | null> {
   let text: string;
   try {
     text = await (await (await dir.getFileHandle(RECEIPT)).getFile()).text();
@@ -102,6 +115,9 @@ export async function readReceipt(dir: FileSystemDirectoryHandle): Promise<Recei
     return null;
   }
   if (receipt.version !== 1 || typeof receipt.sizes !== "object" || receipt.sizes === null) return null;
+  for (const wanted of plan?.files ?? []) {
+    if (!(wanted in receipt.sizes)) return null;
+  }
   for (const [name, size] of Object.entries(receipt.sizes)) {
     let actual: number;
     try {

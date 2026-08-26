@@ -115,6 +115,40 @@ describe("anima-web / provisioning a folder", () => {
     expect(await readReceipt(dir)).toEqual(receipt);
   });
 
+  /**
+   * **A folder filled for a different model is not a filled folder.**
+   *
+   * `readReceipt` checked that every file the receipt names is present at its
+   * recorded length, which a folder provisioned by another page passes with its
+   * own receipt. The page then skipped filling and reloaded into a folder with
+   * none of its files, and the first read threw where nothing catches — the
+   * gate had already remembered the folder, so reloading landed in the same
+   * place. Reported from a browser as `the folder "anima-3.8B" has no
+   * "model.safetensors.index.json"`.
+   *
+   * The plan is what makes it answerable: a receipt that does not cover every
+   * file *this* page needs means unfilled, which is the cheap direction to be
+   * wrong in — it fills the folder instead of failing after a reload.
+   */
+  it("treats a receipt from another model as unfilled", async () => {
+    const foreign: Receipt = {
+      version: 1,
+      source: "somewhere else",
+      sizes: { "other-model.bin": 4 },
+    };
+    const dir = fakeDir({
+      "other-model.bin": new Uint8Array(4),
+      "provisioned.json": new TextEncoder().encode(JSON.stringify(foreign)),
+    });
+    // Its own plan: still a receipt, still complete.
+    expect(await readReceipt(dir, { files: ["other-model.bin"] })).toEqual(foreign);
+    // This page's plan: it names files the receipt has never heard of.
+    expect(await readReceipt(dir, { files: ["a.bin", "b.bin"] })).toBeNull();
+    // And with no plan at all it still answers, for a caller that only wants to
+    // know whether *something* finished here.
+    expect(await readReceipt(dir)).toEqual(foreign);
+  });
+
   it("a folder with no receipt is not usable", async () => {
     const dir = fakeDir({ "a.bin": new Uint8Array(SIZES["a.bin"]) });
     expect(await readReceipt(dir)).toBeNull();

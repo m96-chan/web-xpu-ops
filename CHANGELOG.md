@@ -26,6 +26,34 @@ Entries record **why** a change was needed. What changed is in the diff.
   Its test asserts the array type, because a test that only checked the values
   passed the whole time.
 
+- **Changing folder to the wrong one left the page with no folder at all**
+  (issue #219). Reported from a browser: Z-Image's picker was pointed at Anima's
+  folder, and the page died with `the folder "anima-3.8B" has no
+  "model.safetensors.index.json"`. Reloading landed in the same place.
+
+  Three faults, and each alone would have been survivable.
+
+  A receipt was read without asking what the caller needs. A folder filled for
+  another model carries its own valid receipt, so `readReceipt` answered
+  "filled", the fill was skipped, and the page got a folder holding none of its
+  files. It takes the plan now, and a receipt that does not name every file the
+  caller wants means unfilled — which fills the folder rather than failing after
+  a reload, the cheap direction to be wrong in.
+
+  The folder was remembered before it was known to work, so a bad pick became
+  the page's permanent answer and no reload could escape it. `bindFolder` reads
+  every file out of the new folder first and stores the handle last.
+
+  And changing folder forgot the folder that worked. The old rule was "every
+  bind failure forgets the folder", which is right when there is nothing to fall
+  back on and wrong when there is. `gate.test.ts` asserted the two paths were
+  the same thing; it now asserts they differ, and says why, because that rule
+  was the bug.
+
+  Each page's `main()` also catches now, so a start-up failure reaches the
+  status line instead of being an unhandled rejection under a page that looks
+  like it is still loading.
+
 ### Added
 
 - **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole

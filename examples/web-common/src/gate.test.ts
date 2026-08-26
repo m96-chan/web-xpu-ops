@@ -68,15 +68,29 @@ describe("web-common / the gate", () => {
     expect(code).not.toContain("addEventListener");
   });
 
-  it("forgets a folder it could not fill", () => {
-    // Otherwise it is offered as usable on the next load and rejected every
-    // time, without ever saying why.
-    // Counted, not matched. There are two places a bind can fail -- the first
-    // bind and a later change of folder -- and a regex satisfied by either one
-    // passes while the other quietly stops forgetting.
-    const catches = code.match(/catch\s*\(/g) ?? [];
-    const forgets = code.match(/forgetFolder\(\)/g) ?? [];
-    expect(catches.length, "every catch that handles a bind failure must forget the folder").toBe(forgets.length);
-    expect(forgets.length).toBeGreaterThanOrEqual(2);
+  /**
+   * The two bind failures are **not** the same failure, and the rule that they
+   * were is what stranded a page.
+   *
+   * Opening the gate happens when there is no usable folder, so a bind that
+   * fails there leaves nothing behind and the folder must be forgotten —
+   * otherwise it is offered as usable on the next load and rejected every time
+   * without saying why.
+   *
+   * Changing folder happens when there **is** a working one. Forgetting on
+   * failure threw that away too, and a visitor who pointed the picker at
+   * another model's folder was left with no folder at all. Reported from a
+   * browser: `the folder "anima-3.8B" has no "model.safetensors.index.json"`.
+   */
+  it("forgets a folder it could not fill, and only when there is no other", () => {
+    const at = code.indexOf("export function wireChangeFolder");
+    expect(at, "wireChangeFolder must exist for this to mean anything").toBeGreaterThan(0);
+    const opening = code.slice(0, at);
+    const changing = code.slice(at);
+    expect(opening.match(/forgetFolder\(\)/g) ?? [], "the gate's own bind failure forgets").toHaveLength(1);
+    expect(changing).not.toContain("forgetFolder()");
+    // And the working folder is only replaced once the new one has been read
+    // from, so there is something to fall back to at all.
+    expect(code).toMatch(/source\.size\(file\)[\s\S]*?await rememberFolder\(handle\)/);
   });
 });
