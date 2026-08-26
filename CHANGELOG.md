@@ -9,6 +9,32 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **Three limits a real reference hit, and one of them was silent**
+  (issues #212, #211). Running R2V on an actual video and image reference — 8
+  frames of 256x448 and a 256x352 still, 1,424 packed rows — found all three:
+
+  - **`qkNorm` dispatched one workgroup per head-row**, so the grid was
+    `seq * heads`. At 56 heads that passes 65,535 at **1,171 tokens**, which is
+    a 256x256 clip with two references. It is split on head-row boundaries now.
+  - **The vision tower never flushed.** Every one of its 27 blocks' buffers
+    stayed lent for the whole tower, which at 2,144 patches is gigabytes beside
+    25.78 GB of weights.
+  - **A dispatch past the grid limit is reported as an invalid *command
+    buffer*.** That takes every dispatch recorded beside it with it, so the run
+    completed — fifteen sampling steps at 91 ms instead of 1,400, and frames
+    written from pool debris. `ResidentDevice.batch` refuses now, naming the op
+    and the kernel, and the kernel is named from its own WGSL header because
+    every entry point here is `main`.
+
+- **R2V takes more than one reference, and takes video** (issue #212).
+  `--reference image:PATH:W:H` and `--reference video:PATH:W:H:FRAMES`,
+  repeatable, in packed order. A video is one vision block per merged frame
+  group with its own timestamp, its rotary clock advances per block, and its
+  latent geometry comes back from the encoder rather than being assumed — the
+  causal temporal compression is on the way. The layout is built *after* the
+  encoder for that reason.
+
+
 - **The DiT's latent space is not the decoder's, and nothing was converting
   between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
   pipeline "encodes with `(latent - latents_mean) / latents_std` and decodes

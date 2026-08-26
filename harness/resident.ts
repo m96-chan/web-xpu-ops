@@ -263,6 +263,13 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
    */
   const pipelines = new Map<string, Map<string, GPUComputePipeline>>();
   const modules = new Map<string, GPUShaderModule>();
+  /**
+   * A short name per pipeline, so a dispatch that fails validation can say
+   * *which kernel* rather than only which index in the batch. Taken from the
+   * WGSL's first `fn` — the source is the only identity a pipeline has here,
+   * since `GPUComputePipeline` carries no label through this binding.
+   */
+  const pipelineNames = new WeakMap<GPUComputePipeline, string>();
 
   /** Bytes handed out, so an allocation failure can say what was already in flight. */
   let allocated = 0;
@@ -326,6 +333,11 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     const entries = pipelines.get(code) ?? new Map<string, GPUComputePipeline>();
     entries.set(entry, pipeline);
     pipelines.set(code, entries);
+    // The WGSL's own first line — every kernel in this repository opens with a
+    // comment naming what it is, and the entry point is `main` in all of them,
+    // so the source header is the only thing that tells them apart.
+    const header = code.split("\n").find((line) => line.trim().length > 0)?.replace(/^\/\/\s*/, "").trim() ?? "";
+    pipelineNames.set(pipeline, `${header.slice(0, 60)}${header.length > 60 ? "…" : ""} [${entry}]`);
     stats.pipelinesCreated += 1;
     return pipeline;
   }
@@ -395,6 +407,22 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     let queryCursor = 0;
     for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
+        // **A dispatch past the device's grid limit is always a bug**, and
+        // WebGPU reports it as an invalid *command buffer* — so every dispatch
+        // recorded beside it is dropped too and the caller gets plausible
+        // numbers computed from whatever the pool held. Issue #211's failures
+        // all arrived that way. Named here, with the op's index, because by
+        // the time `Submit` complains there is nothing left to point at.
+        const ceiling = device.limits.maxComputeWorkgroupsPerDimension;
+        for (const [axis, count] of op.workgroups.entries()) {
+          if (count > ceiling) {
+            throw new Error(
+              `batch: op ${i} (${pipelineNames.get(op.pipeline) ?? "unnamed"}) dispatches ` +
+                `${op.workgroups.join("x")} workgroups and this device allows ${ceiling} per dimension ` +
+                `(axis ${axis} is ${count}) — see issue #211`,
+            );
+          }
+        }
         const label = profile?.labels ? (profile.labels[i] ?? null) : null;
         // PR #141 review, item 3: gated on `wantsGpuTiming` (device negotiated
         // `timestamp-query` *and* the caller asked for a breakdown), not on

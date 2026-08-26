@@ -60,8 +60,9 @@ import { videoKernels } from "../../h3-video/src/kernels-node.js";
 import { ConditionerGpu, type ConditionerManifest } from "./conditioner-gpu.js";
 import { conditionerKernels } from "./kernels-node.js";
 import { buildRef2vaRowTimesteps, buildRef2vaSequence } from "./layout.js";
-import { buildPresentation, type VisionSpecials } from "./presentation.js";
+import { buildPresentation, sampleVideoConditionFrames, type VisionSpecials } from "./presentation.js";
 import { patchify, visionTokenCount, type ProcessorConfig } from "./processor.js";
+import type { Reference } from "./layout.js";
 import { qwen3vlPositionGrid } from "./text-encoder.js";
 
 /** `MiniMaxH3ModularPipeline.keyframe_noise_aug` — 0.999, just short of clean. */
@@ -81,16 +82,54 @@ const encoderDir = arg("--encoder");
 const ditDir = arg("--dit");
 const vaeDir = arg("--vae");
 const vaeConfigPath = arg("--vae-config");
-const referencePath = arg("--reference");
 const outDir = arg("--out") ?? "h3-out-r2v";
-if (!conditionerDir || !encoderDir || !ditDir || !vaeDir || !vaeConfigPath || !referencePath) {
+
+/**
+ * `--reference image:PATH:W:H` or `--reference video:PATH:W:H:FRAMES`,
+ * repeatable, **in packed order**.
+ *
+ * Raw `uint8` RGB, already at a size `smartResize` would have asked for —
+ * `patchify` refuses anything else rather than cropping it quietly, and a
+ * browser would do the resampling with `drawImage`. A video's frames are the
+ * ones the conditioner reads, sampled at `videoSampleFps`.
+ */
+interface ReferenceInput {
+  kind: "image" | "video";
+  path: string;
+  width: number;
+  height: number;
+  /** 1 for a still; the sampled count for a video. */
+  frames: number;
+}
+const referenceInputs: ReferenceInput[] = [];
+for (let i = 0; i < process.argv.length; i += 1) {
+  if (process.argv[i] !== "--reference") continue;
+  const spec = process.argv[i + 1] ?? "";
+  // Split from the right: a path may contain colons, and every field after it
+  // is a number.
+  const parts = spec.split(":");
+  const kind = parts.shift();
+  if (kind !== "image" && kind !== "video") {
+    console.error(`--reference must start with image: or video:, not "${spec}"`);
+    process.exit(2);
+  }
+  const numbers = kind === "image" ? 2 : 3;
+  if (parts.length < numbers + 1) {
+    console.error(`--reference ${kind}:PATH:W:H${kind === "video" ? ":FRAMES" : ""} — got "${spec}"`);
+    process.exit(2);
+  }
+  const tail = parts.splice(parts.length - numbers, numbers).map(Number);
+  referenceInputs.push({
+    kind, path: parts.join(":"),
+    width: tail[0]!, height: tail[1]!, frames: kind === "video" ? tail[2]! : 1,
+  });
+}
+if (!conditionerDir || !encoderDir || !ditDir || !vaeDir || !vaeConfigPath || referenceInputs.length === 0) {
   console.error(
-    "generate-r2v: --conditioner, --encoder, --dit, --vae, --vae-config and --reference are all required",
+    "generate-r2v: --conditioner, --encoder, --dit, --vae, --vae-config and at least one --reference are required",
   );
   process.exit(2);
 }
-
-const referenceSize = number("--reference-size", 256);
 const prompt = arg("--prompt") ?? "the reference, moving";
 const frames = alignNumFrames(number("--frames", 22));
 const height = number("--height", 256);
@@ -172,7 +211,9 @@ const rms = (x: Float32Array): number => {
 
 const conditionerManifest = JSON.parse(
   readFileSync(`${conditionerDir}/conditioner.manifest.json`, "utf8"),
-) as ConditionerManifest & { processor: ProcessorConfig; specials: VisionSpecials };
+) as ConditionerManifest & {
+  processor: ProcessorConfig; specials: VisionSpecials; videoSampleFps: number;
+};
 const ditManifest = JSON.parse(readFileSync(`${ditDir}/dit.manifest.json`, "utf8")) as DitManifest;
 const encoderManifest = JSON.parse(
   readFileSync(`${encoderDir}/encoder.manifest.json`, "utf8"),
@@ -201,12 +242,20 @@ if (height % (vaeStride * c.patch_size[1]) || width % (vaeStride * c.patch_size[
   process.exit(2);
 }
 
-const pixelBytes = readFileSync(referencePath);
-const pixels = new Uint8Array(pixelBytes.buffer, pixelBytes.byteOffset, pixelBytes.byteLength);
-if (pixels.length !== referenceSize * referenceSize * 3) {
-  console.error(`the reference is ${pixels.length} bytes and ${referenceSize}x${referenceSize} RGB is ${referenceSize * referenceSize * 3}`);
-  process.exit(2);
-}
+/** Every reference's frames, and what the tower made of them. */
+const references = referenceInputs.map((input) => {
+  const raw = readFileSync(input.path);
+  const bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  const perFrame = input.width * input.height * 3;
+  if (bytes.length !== perFrame * input.frames) {
+    console.error(
+      `${input.path} holds ${bytes.length} bytes and ${input.frames}x${input.width}x${input.height} RGB is ${perFrame * input.frames}`,
+    );
+    process.exit(2);
+  }
+  const frames = Array.from({ length: input.frames }, (_, f) => bytes.subarray(f * perFrame, (f + 1) * perFrame));
+  return { input, frames, bytes };
+});
 
 // The tokenizer this repository already has: Qwen's byte-level BPE, held to
 // H3's own on every segment a presentation can produce — `tokenizer.test.ts`.
@@ -215,43 +264,45 @@ const tokenizer = new ByteLevelBpeTokenizer(JSON.parse(readFileSync(
 )) as BpeVocab);
 
 const processor = conditionerManifest.processor;
-const patches = patchify([pixels], referenceSize, referenceSize, processor);
 const merge = processor.mergeSize;
+const towered = references.map(({ input, frames }) =>
+  ({ input, ...patchify(frames, input.height, input.width, processor) }));
+for (const t of towered) {
+  console.log(`  ${t.input.kind} ${t.input.path.split("/").pop()}: ${t.input.frames} frame(s) of ` +
+    `${t.input.width}x${t.input.height} -> grid ${t.grid.join("x")}, ` +
+    `${visionTokenCount(t.grid, merge)} vision tokens`);
+}
+
+const packedReferences: Reference[] = towered.map((t) => ({ kind: t.input.kind, hasAudio: false }));
+// **A video is one vision block per merged frame group**, each with its own
+// timestamp, so its token count is one group's worth and not the whole clip's.
+// The frames here are already the ones the conditioner reads, so the sampler is
+// asked for a stride of one and only its block timestamps are used.
+const videoBlocks = towered.filter((t) => t.input.kind === "video").map((t) =>
+  sampleVideoConditionFrames(
+    t.input.frames, conditionerManifest.videoSampleFps, conditionerManifest.videoSampleFps,
+    processor.temporalPatchSize,
+  ).blockTimestamps);
+
 const presentation = buildPresentation({
   tokenize: (text) => tokenizer.encode(text),
   specials: conditionerManifest.specials,
   prompt,
-  references: [{ kind: "image", hasAudio: false }],
-  imageTokenCounts: [visionTokenCount(patches.grid, merge)],
-  videoBlockTokenCounts: [],
-  videoBlockTimestamps: [],
+  references: packedReferences,
+  imageTokenCounts: towered.filter((t) => t.input.kind === "image").map((t) => visionTokenCount(t.grid, merge)),
+  videoBlockTokenCounts: towered.filter((t) => t.input.kind === "video")
+    .map((t) => visionTokenCount([1, t.grid[1], t.grid[2]], merge)),
+  videoBlockTimestamps: videoBlocks,
 });
 
 const latentFrames = videoLatentNumFrames(frames);
 const latentHeight = height / vaeStride;
 const latentWidth = width / vaeStride;
 const audioLatents = audioLatentNumFrames(frames);
-// One still image is one latent frame, at the encoder's own 16x spatial ratio.
-const referenceGeometry: [number, number, number][] = [[1, referenceSize / vaeStride, referenceSize / vaeStride]];
-
-const layout = buildRef2vaSequence({
-  numTextTokens: presentation.tokenIds.length,
-  textTokenTags: presentation.tokenTags,
-  references: [{ kind: "image", hasAudio: false }],
-  visualGeometry: referenceGeometry,
-  audioRowCounts: [],
-  numLatentFrames: latentFrames,
-  latentHeight,
-  latentWidth,
-  numAudioLatents: audioLatents,
-  patchSize: c.patch_size,
-});
-
 console.log(
-  `"${prompt}" + a ${referenceSize}x${referenceSize} reference\n` +
-    `  presentation ${presentation.tokenIds.length} tokens, vision grid ${patches.grid.join("x")}\n` +
-    `  ${frames} frames of ${width}x${height} -> latent ${latentFrames}x${latentHeight}x${latentWidth}, ` +
-    `${layout.seq} packed rows of which ${layout.numReferenceVideoRows} are the reference, ${steps} steps`,
+  `"${prompt}" + ${towered.length} reference(s)\n` +
+    `  presentation ${presentation.tokenIds.length} tokens\n` +
+    `  ${frames} frames of ${width}x${height} -> latent ${latentFrames}x${latentHeight}x${latentWidth}, ${steps} steps`,
 );
 
 const device = await createResidentDevice();
@@ -276,7 +327,7 @@ async function handOver(label: string, resident: ResidentDevice): Promise<void> 
 // ------------------------------------------------- stage 1: the VAE encoder
 
 let referenceLatents: Float32Array;
-let referenceLatentShape: [number, number, number];
+const referenceGeometry: [number, number, number][] = [];
 {
   const weights = openReader(`${encoderDir}/encoder.bin`);
   let at = performance.now();
@@ -284,20 +335,27 @@ let referenceLatentShape: [number, number, number];
   weights.close();
   console.log(`  VAE encoder uploaded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
 
-  // `encode_vae_condition`: ImageNet-normalised `u8 / 255`, channel-major.
-  const normalised = new Float32Array(3 * referenceSize * referenceSize);
-  const plane = referenceSize * referenceSize;
-  for (let i = 0; i < plane; i += 1) {
-    for (let ch = 0; ch < 3; ch += 1) {
-      normalised[ch * plane + i] = (pixels[i * 3 + ch]! / 255 - PIXEL_MEAN[ch]!) / PIXEL_STD[ch]!;
+  const packed: Float32Array[] = [];
+  for (const { input, bytes } of references) {
+    // `encode_vae_condition`: ImageNet-normalised `u8 / 255`, channel-major
+    // over the whole clip.
+    const plane = input.width * input.height;
+    const voxels = plane * input.frames;
+    const normalised = new Float32Array(3 * voxels);
+    for (let f = 0; f < input.frames; f += 1) {
+      for (let i = 0; i < plane; i += 1) {
+        for (let ch = 0; ch < 3; ch += 1) {
+          normalised[(ch * input.frames + f) * plane + i] =
+            (bytes[(f * plane + i) * 3 + ch]! / 255 - PIXEL_MEAN[ch]!) / PIXEL_STD[ch]!;
+        }
+      }
     }
-  }
-  at = performance.now();
-  const moments = await encoder.encode(normalised, 1, referenceSize, referenceSize);
-  console.log(
-    `  reference encoded in ${((performance.now() - at) / 1000).toFixed(2)} s -> ` +
-      `moments ${moments.C}x${moments.D}x${moments.H}x${moments.W}`,
-  );
+    at = performance.now();
+    const moments = await encoder.encode(normalised, input.frames, input.height, input.width);
+    console.log(
+      `  ${input.kind} encoded in ${((performance.now() - at) / 1000).toFixed(2)} s -> ` +
+        `moments ${moments.C}x${moments.D}x${moments.H}x${moments.W}`,
+    );
 
   // `DiagonalGaussianDistribution(moments).sample()`: mean is the first half of
   // the channels and log-variance the second, and the conditioning is
@@ -327,26 +385,51 @@ let referenceLatentShape: [number, number, number];
   // **The anchors are noised.** `scale_noise(x, 0.999, noise)` is
   // `0.999 * x + 0.001 * noise` in H3's `t` convention, and the draw comes
   // first, before the target's.
-  const anchorNoise = draw(normalisedLatents.length);
-  const noised = scaleNoise(normalisedLatents, KEYFRAME_NOISE_AUG, anchorNoise);
-  referenceLatentShape = [moments.D, moments.H, moments.W];
-  referenceLatents = patchifyVideoLatents(
-    noised, z, moments.D, moments.H, moments.W, c.patch_size);
-  console.log(
-    `  reference latents: moments rms ${rms(moments.data).toFixed(4)}, ` +
-      `sampled ${rms(sampled).toFixed(4)}, normalised ${rms(normalisedLatents).toFixed(4)}, ` +
-      `noised ${rms(noised).toFixed(4)}`,
-  );
-  if (referenceLatents.length !== layout.numReferenceVideoRows * z * c.patch_size[0] * c.patch_size[1] * c.patch_size[2]) {
-    console.error(
-      `the layout reserved ${layout.numReferenceVideoRows} reference rows and the encoder produced ` +
-        `${referenceLatents.length / (z * c.patch_size[0] * c.patch_size[1] * c.patch_size[2])}`,
+    const anchorNoise = draw(normalisedLatents.length);
+    const noised = scaleNoise(normalisedLatents, KEYFRAME_NOISE_AUG, anchorNoise);
+    referenceGeometry.push([moments.D, moments.H, moments.W]);
+    packed.push(patchifyVideoLatents(noised, z, moments.D, moments.H, moments.W, c.patch_size));
+    console.log(
+      `    moments rms ${rms(moments.data).toFixed(4)}, sampled ${rms(sampled).toFixed(4)}, ` +
+        `normalised ${rms(normalisedLatents).toFixed(4)}, noised ${rms(noised).toFixed(4)}`,
     );
-    process.exit(1);
   }
+  const total = packed.reduce((n, x) => n + x.length, 0);
+  referenceLatents = new Float32Array(total);
+  let at2 = 0;
+  for (const x of packed) { referenceLatents.set(x, at2); at2 += x.length; }
   encoder.destroy();
   await handOver("VAE encoder", device);
 }
+
+// **The layout is built from what the encoder produced**, not from what the
+// caller asked for: a reference's rows are its own latent geometry, which only
+// the encoder knows — a video's frame count goes through the causal temporal
+// compression on the way.
+const layout = buildRef2vaSequence({
+  numTextTokens: presentation.tokenIds.length,
+  textTokenTags: presentation.tokenTags,
+  references: packedReferences,
+  visualGeometry: referenceGeometry,
+  audioRowCounts: [],
+  numLatentFrames: latentFrames,
+  latentHeight,
+  latentWidth,
+  numAudioLatents: audioLatents,
+  patchSize: c.patch_size,
+});
+const perRowLatents = c.in_channels * c.patch_size[0] * c.patch_size[1] * c.patch_size[2];
+if (referenceLatents.length !== layout.numReferenceVideoRows * perRowLatents) {
+  console.error(
+    `the layout reserved ${layout.numReferenceVideoRows} reference rows and the encoder produced ` +
+      `${referenceLatents.length / perRowLatents}`,
+  );
+  process.exit(1);
+}
+console.log(
+  `  ${layout.seq} packed rows, of which ${layout.numReferenceVideoRows} are the references ` +
+    `(${referenceGeometry.map((g) => g.join("x")).join(", ")})`,
+);
 
 // ------------------------------------------------- stage 2: the conditioner
 
@@ -401,14 +484,42 @@ let conditioning: Float32Array;
     while (i < modalities.length && modalities[i] !== 0) i += 1;
     runs.push([start, i - start]);
   }
-  const positions = qwen3vlPositionGrid(modalities, [{ grid: patches.grid, modality: 1 }], merge);
+  /**
+   * One entry per **visual run**, not per reference.
+   *
+   * An image is one block; a video is one block per merged frame group, each
+   * separated by its own `<|vision_start|>` and `<|vision_end|>`. The rotary
+   * clock advances per block, so the grid the position builder is given has to
+   * be a block's, `[1, h, w]`, and there have to be as many of them as there
+   * are runs.
+   */
+  const blocks: { grid: [number, number, number]; modality: 1 | 2 }[] = [];
+  for (const t of towered) {
+    if (t.input.kind === "image") {
+      blocks.push({ grid: t.grid, modality: 1 });
+    } else {
+      for (let f = 0; f < t.grid[0]; f += 1) blocks.push({ grid: [1, t.grid[1], t.grid[2]], modality: 2 });
+    }
+  }
+  if (blocks.length !== runs.length) {
+    console.error(`the presentation has ${runs.length} vision blocks and the references make ${blocks.length}`);
+    process.exit(1);
+  }
+  const positions = qwen3vlPositionGrid(modalities, blocks, merge);
+
+  // The tower takes every reference's patches at once, in packed order, and
+  // its pooled tokens come back in the same order — merge-block order is
+  // frame-major, so a video's groups land in the order its blocks were emitted.
+  const allPatches = new Float32Array(towered.reduce((n, t) => n + t.pixelValues.length, 0));
+  let patchAt = 0;
+  for (const t of towered) { allPatches.set(t.pixelValues, patchAt); patchAt += t.pixelValues.length; }
 
   at = performance.now();
   conditioning = await conditioner.forward({
     tokenIds: Int32Array.from(presentation.tokenIds),
     positions,
-    patches: patches.pixelValues,
-    grids: [patches.grid],
+    patches: allPatches,
+    grids: towered.map((t) => t.grid),
     visualRuns: runs,
   });
   console.log(
@@ -579,8 +690,8 @@ writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffs
 writeFileSync(`${outDir}/frames.json`, `${JSON.stringify({
   workflow: "ref2va",
   prompt,
-  reference: referencePath,
-  referenceLatent: referenceLatentShape,
+  references: referenceInputs.map((r) => ({ kind: r.kind, path: r.path, frames: r.frames, width: r.width, height: r.height })),
+  referenceLatents: referenceGeometry,
   referenceRows: layout.numReferenceVideoRows,
   packedRows: layout.seq,
   frames: outFrames,

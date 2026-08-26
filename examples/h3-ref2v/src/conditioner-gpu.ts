@@ -542,6 +542,13 @@ export class ConditionerGpu {
 
       const tap = v.deepstack_visual_indexes.indexOf(i);
       if (tap >= 0) deepstack.push(await this.merger(ops, `visual.deepstack_merger_list.${tap}`, x, tokens, true));
+      // **Once a block, not once a tower.** Everything a block allocates stays
+      // lent until something flushes, and at a real reference's token count
+      // that is twenty-seven blocks of intermediates alive at the same time —
+      // gigabytes, beside 25.78 GB of weights, on a card with about six spare.
+      // The first two-reference run failed here with an invalid buffer, which
+      // is what this device returns when it is out of memory.
+      await this.flush(ops, [x.buffer, rotaryBuffer, ...deepstack.map((d) => d.buffer)]);
     }
     return { pooled: await this.merger(ops, "visual.merger", x, tokens, false), deepstack };
   }

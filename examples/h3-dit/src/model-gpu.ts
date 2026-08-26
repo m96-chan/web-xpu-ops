@@ -572,14 +572,40 @@ export class DitGpu {
     return this.linear(ops, gated, `${prefix}ff.net.2.weight`, null, c.hidden_size);
   }
 
-  /** RMS-norm over each head's channels, with the checkpoint's per-channel weights. */
+  /**
+   * RMS-norm over each head's channels, with the checkpoint's per-channel
+   * weights.
+   *
+   * **One workgroup per head-row**, so the grid is `seq * heads` — at 56 heads
+   * that passes 65,535 at **1,171 tokens**, which a 256x256 clip with two
+   * references already is. Split on head-row boundaries: each is
+   * `attention_head_dim` floats, 512 bytes at 128, so every slice is 256-byte
+   * aligned without rounding.
+   *
+   * The failure it replaces was an invalid *command buffer*, which takes every
+   * dispatch recorded beside it with it — fifteen steps of plausible timings
+   * and a velocity computed from pool debris. Issue #211.
+   */
   private async qkNorm(ops: ResidentOp[], x: Mat, seq: number, weight: GPUBuffer): Promise<Mat> {
     const c = this.manifest.config;
-    const out = this.take(seq * c.num_attention_heads * c.attention_head_dim);
-    await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, weight, out, this.uniform([
-      ["u32", seq * c.num_attention_heads], ["u32", c.attention_head_dim], ["f32", c.qk_norm_eps], ["u32", 1],
-    ])], [seq * c.num_attention_heads]);
-    return { buffer: out, rows: seq, cols: c.num_attention_heads * c.attention_head_dim };
+    const dim = c.attention_head_dim;
+    const rows = seq * c.num_attention_heads;
+    const out = this.take(rows * dim);
+    const rowBytes = dim * 4;
+    const perChunk = Math.min(rows, this.maxWorkgroupsPerDimension);
+    for (let start = 0; start < rows; start += perChunk) {
+      const count = Math.min(perChunk, rows - start);
+      await this.dispatchSliced(ops, this.kernels.rmsnorm, [
+        { buffer: x.buffer, offset: start * rowBytes, size: count * rowBytes },
+        { buffer: weight, offset: 0, size: weight.size },
+        { buffer: out, offset: start * rowBytes, size: count * rowBytes },
+        {
+          buffer: this.uniform([["u32", count], ["u32", dim], ["f32", c.qk_norm_eps], ["u32", 1]]),
+          offset: 0, size: UNIFORM_BYTES,
+        },
+      ], [count]);
+    }
+    return { buffer: out, rows: seq, cols: c.num_attention_heads * dim };
   }
 
   /**
