@@ -62,6 +62,47 @@ gap: this port had been filling in `TEXT_TAG` for every text row, and
 `text_token_tags` is an argument upstream takes precisely because a reference's
 vision block is not text.
 
+## The presentation, and the timestamp that is not a tie
+
+Before a reference's pixels reach anything, the reference is *announced*:
+`"<Picture i>: "`, `"<Audio j>: "`, `"<Video k>: "`, numbered **per modality**,
+each followed by a vision block of pad tokens. That announcement is what
+produces the text tags the layout takes. `src/presentation.ts`, held to
+`MiniMaxH3Ref2VATextEncoderStep`.
+
+The fixture records the token ids **and a map from each text segment to its
+ids**, so the assembly is held to upstream without a BPE implementation in the
+way. The tokenizer is a separate concern with its own golden to come.
+
+**A video that carries sound is labelled `<Audio j>` before `<Video k>`**,
+mirroring the order its rows are packed in. A video gets **one timestamped
+vision block per merged frame group**, not one block.
+
+### `"{:.1f}"` is round-half-to-even, and the tie is not where it looks
+
+The mean of a 2 fps pair is exactly `0.25`, which Python renders `"0.2"` and
+`(0.25).toFixed(1)` renders `"0.3"` — a different token, a different embedding,
+no other symptom.
+
+Detecting the tie by multiplying by ten is **also wrong**, and that is the more
+interesting half. `0.15` is really `0.1499999999999999944…`, so Python renders
+`"0.1"` — but `0.15 * 10` rounds to exactly `1.5`, which reads as a tie and
+gives `"0.2"`. This port did that until the fixture grew a case where a
+reference read at 30 fps put a `0.15` in front of it. The tie is detected on
+`toFixed(20)` now, the exact decimal expansion.
+
+### Ten mutations, all caught — after two fixture gaps and a red baseline
+
+The sweep first reported **7 of 10**, and again the survivors were the fixture:
+every image came before every video, so a counter that summed the modalities
+agreed everywhere; and every stride was 12, so the frame deduplication never
+had a duplicate to remove.
+
+Then it reported **10 of 10 while two tests were already failing** — because a
+sweep that only asks "did the mutant fail?" calls every mutation caught when
+the baseline fails too. Both sweeps refuse to start on a red baseline now. The
+two failures were a wrong assertion and the `0.15` bug above.
+
 ## What is not here yet
 
 The transformer conversion, the Qwen3-VL text stack and vision tower, the

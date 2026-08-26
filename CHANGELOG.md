@@ -9,6 +9,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's presentation** (issue #212). How a `ref2va` request is announced to
+  the conditioner: `"<Picture i>: "`, `"<Audio j>: "`, `"<Video k>: "`, numbered
+  **per modality**, each followed by a vision block of pad tokens — which is
+  what produces the text tags the layout takes, because a vision block's rows
+  are tagged **video** while sitting among the text rows. A video that carries
+  sound is announced `<Audio>` **before** `<Video>`, and gets one timestamped
+  block per merged frame group.
+
+  **The timestamp is rendered with Python's round-half-to-even, and the tie is
+  not where it looks.** The mean of a 2 fps pair is exactly `0.25`, which
+  renders `"0.2"` where `toFixed(1)` gives `"0.3"`. But detecting the tie by
+  multiplying by ten is also wrong: `0.15` is really `0.1499999999999999944…`
+  and renders `"0.1"`, while `0.15 * 10` rounds to exactly `1.5` and reads as a
+  tie. The tie is detected on `toFixed(20)` — the exact decimal expansion —
+  and the bug was found by a fixture case at 30 fps, not by reasoning.
+
+  The fixture carries the token ids **and a map from each text segment to its
+  ids**, so the assembly is held to upstream without a BPE implementation in
+  the way.
+
 - **R2V's packed layout** (issue #212). `examples/h3-ref2v`: MiniMax-H3's
   `ref2va` sequence, `[text | reference blocks | target audio | target video]`,
   held to `build_ref2va_packed_sequence` exactly on a committed fixture.
