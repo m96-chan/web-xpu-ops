@@ -402,3 +402,234 @@ export function conv2d({
   }
   return output;
 }
+
+export type Conv3dSpatial = number | readonly [number, number, number];
+
+/**
+ * Reads a spatial argument into `[D, H, W]`.
+ *
+ * The same refusal `spatialPair` makes, with one extra reason to make it. A 3D
+ * config that arrives as `[H, W]` — two entries where three are wanted — is the
+ * exact shape a caller ported from `conv2d` produces, and "use the first two"
+ * would silently convolve the wrong axes. `[D, H, W]` is torch's order and the
+ * order `MiniMax-H3`'s `patch_size [1, 2, 2]` is written in: time first.
+ */
+function spatialTriple(value: Conv3dSpatial, name: string): [number, number, number] {
+  if (typeof value === "number") return [value, value, value];
+  if (
+    !Array.isArray(value) ||
+    value.length !== 3 ||
+    typeof value[0] !== "number" ||
+    typeof value[1] !== "number" ||
+    typeof value[2] !== "number"
+  ) {
+    throw new Error(`conv3d(): ${name} must be a number or [D, H, W], got ${JSON.stringify(value)}`);
+  }
+  return [value[0]!, value[1]!, value[2]!];
+}
+
+export interface Conv3dArgs {
+  /** `[N, Cin, D, H, W]`, row-major — NCDHW, the layout `conv2d`'s `[N, Cin, H, W]` extends to. */
+  input: Float32Array;
+  /** `[Cout, Cin / groups, KD, KH, KW]`, row-major. */
+  weight: Float32Array;
+  /** `[Cout]`. Omitted is PyTorch's `bias=None`: nothing is added. */
+  bias?: Float32Array;
+  /** Batch. */
+  N: number;
+  /** Input channels. */
+  Cin: number;
+  /** Output channels. */
+  Cout: number;
+  /** Input depth — **frames**, in the video this exists for. */
+  D: number;
+  /** Input height (rows). */
+  H: number;
+  /** Input width (columns). */
+  W: number;
+  /** Kernel depth. */
+  KD: number;
+  /** Kernel height. */
+  KH: number;
+  /** Kernel width. */
+  KW: number;
+  /** Window advance per output element. Default 1. */
+  stride?: Conv3dSpatial;
+  /**
+   * Zeros added to *both* ends of each axis. Default 0.
+   *
+   * Both ends, always, and that is the whole reason `ops/pad` has to exist
+   * beside this. H3's convolutions are **causal in time**: they pad
+   * `2 * padding` frames before the data and none after, so the output at frame
+   * `t` cannot see frame `t + 1`. That is not a value this argument can take —
+   * it is a different padding, and it is applied *before* the convolution, with
+   * `padding=0` here. See `video_vae/conv.py`'s `_apply_temporal_padding` in
+   * the model's own source, and issue #200.
+   */
+  padding?: Conv3dSpatial;
+  /** Spacing between kernel taps. Default 1. */
+  dilation?: Conv3dSpatial;
+  /** Default 1. */
+  groups?: number;
+}
+
+/**
+ * `conv1dOutputLength` on each of the three axes — the `[D, H, W]`
+ * `torch.nn.functional.conv3d` returns.
+ *
+ * The 1D function three times rather than the arithmetic written out again,
+ * for the reason `conv2dOutputSize` gives: a convention gets chosen once, and
+ * a copy that drifts produces a tensor that is the right shape on two axes and
+ * wrong on the third — which reads as a stutter in the video, not as a crash.
+ */
+export function conv3dOutputSize({
+  D,
+  H,
+  W,
+  KD,
+  KH,
+  KW,
+  stride = 1,
+  padding = 0,
+  dilation = 1,
+}: {
+  D: number;
+  H: number;
+  W: number;
+  KD: number;
+  KH: number;
+  KW: number;
+  stride?: Conv3dSpatial;
+  padding?: Conv3dSpatial;
+  dilation?: Conv3dSpatial;
+}): { Dout: number; Hout: number; Wout: number } {
+  const [strideD, strideH, strideW] = spatialTriple(stride, "stride");
+  const [padD, padH, padW] = spatialTriple(padding, "padding");
+  const [dilationD, dilationH, dilationW] = spatialTriple(dilation, "dilation");
+  return {
+    Dout: conv1dOutputLength({ L: D, K: KD, stride: strideD, padding: padD, dilation: dilationD }),
+    Hout: conv1dOutputLength({ L: H, K: KH, stride: strideH, padding: padH, dilation: dilationH }),
+    Wout: conv1dOutputLength({ L: W, K: KW, stride: strideW, padding: padW, dilation: dilationW }),
+  };
+}
+
+/**
+ * 3D convolution over `[N, Cin, D, H, W]`, matching
+ * `torch.nn.functional.conv3d(input, weight, bias, stride, padding, dilation, groups)`.
+ *
+ * The definition of correct, on the same terms as `conv1d` and `conv2d` above:
+ * the slowest, plainest expression of the maths, eight nested loops, no attempt
+ * at anything else.
+ *
+ * ## Why 3D exists now
+ *
+ * `conv2d`'s doc listed 3D as *deliberately absent*, and it was right to: no
+ * model this library ran had a temporal axis. MiniMax-H3's visual VAE does —
+ * `temporal_downsample_factors [1,2,2,1,1,1]`, a 4x compression in time — so
+ * every convolution in it is 3D and none of them decomposes into 2D plus a
+ * loop, because the kernel spans frames. Issue #200.
+ *
+ * ## What it inherits, and the one thing 3D can check that 2D cannot
+ *
+ * Every convention is the one `conv1d` settled: **no kernel flip** (this is a
+ * cross-correlation), **zero padding on both ends of each axis**, **bias added
+ * once per output element**, **`groups` splitting both channel axes**, and
+ * **throwing** where PyTorch raises.
+ *
+ * They are re-measured rather than assumed, and 3D is where the *axis order*
+ * becomes checkable. In 1D there is one axis; in 2D a transposed result is
+ * still a plausible image. In 3D, `[D, H, W]` read as `[W, H, D]` gives a
+ * differently-shaped tensor for almost any real kernel, and `conv3d.reference.test.ts`
+ * uses an input whose elements name their own coordinate (`100d + 10h + w`) so
+ * an output element reads back the window it started on.
+ *
+ * Deliberately absent, for the reasons `conv1d` already gives: `padding_mode`
+ * (a pad op, not a conv op — and H3 needs three of them, `reflect` on the
+ * spatial axes and a **causal** constant pad in time, which is why it must be
+ * separate), and `conv_transpose3d`.
+ */
+export function conv3d({
+  input,
+  weight,
+  bias,
+  N,
+  Cin,
+  Cout,
+  D,
+  H,
+  W,
+  KD,
+  KH,
+  KW,
+  stride = 1,
+  padding = 0,
+  dilation = 1,
+  groups = 1,
+}: Conv3dArgs): Float32Array {
+  const [strideD, strideH, strideW] = spatialTriple(stride, "stride");
+  const [padD, padH, padW] = spatialTriple(padding, "padding");
+  const [dilationD, dilationH, dilationW] = spatialTriple(dilation, "dilation");
+
+  if (Cin % groups !== 0 || Cout % groups !== 0) {
+    // PyTorch: "expected weight to be divisible by groups at dimension 0".
+    throw new Error(`conv3d(): Cin=${Cin} and Cout=${Cout} must both be divisible by groups=${groups}`);
+  }
+  const { Dout, Hout, Wout } = conv3dOutputSize({ D, H, W, KD, KH, KW, stride, padding, dilation });
+  if (Dout <= 0 || Hout <= 0 || Wout <= 0) {
+    // PyTorch: "Kernel size can't be greater than actual input size". Any one
+    // axis failing is enough — and in video it is usually the temporal one,
+    // which is the shortest.
+    throw new Error(
+      `conv3d(): kernel size ${KD}x${KH}x${KW} (dilated ${dilationD * (KD - 1) + 1}x` +
+        `${dilationH * (KH - 1) + 1}x${dilationW * (KW - 1) + 1}) exceeds padded input size ` +
+        `${D + 2 * padD}x${H + 2 * padH}x${W + 2 * padW}`,
+    );
+  }
+  if (input.length !== N * Cin * D * H * W) {
+    throw new Error(`conv3d(): expected ${N * Cin * D * H * W} input elements, got ${input.length}`);
+  }
+  if (weight.length !== Cout * (Cin / groups) * KD * KH * KW) {
+    throw new Error(
+      `conv3d(): expected ${Cout * (Cin / groups) * KD * KH * KW} weight elements, got ${weight.length}`,
+    );
+  }
+
+  const inPerGroup = Cin / groups;
+  const outPerGroup = Cout / groups;
+  const output = new Float32Array(N * Cout * Dout * Hout * Wout);
+
+  for (let n = 0; n < N; n += 1) {
+    for (let oc = 0; oc < Cout; oc += 1) {
+      const group = Math.floor(oc / outPerGroup);
+      for (let od = 0; od < Dout; od += 1) {
+        for (let oh = 0; oh < Hout; oh += 1) {
+          for (let ow = 0; ow < Wout; ow += 1) {
+            let acc = bias ? bias[oc]! : 0;
+            for (let icLocal = 0; icLocal < inPerGroup; icLocal += 1) {
+              const ic = group * inPerGroup + icLocal;
+              for (let kd = 0; kd < KD; kd += 1) {
+                // No flip, on any of the three axes: tap (kd, kh, kw) reads
+                // forward in time, down and right from the window's corner.
+                const id = od * strideD + kd * dilationD - padD;
+                if (id < 0 || id >= D) continue; // the zero pad, before and after
+                for (let kh = 0; kh < KH; kh += 1) {
+                  const ih = oh * strideH + kh * dilationH - padH;
+                  if (ih < 0 || ih >= H) continue; // the zero pad, top and bottom
+                  for (let kw = 0; kw < KW; kw += 1) {
+                    const iw = ow * strideW + kw * dilationW - padW;
+                    if (iw < 0 || iw >= W) continue; // the zero pad, left and right
+                    acc +=
+                      input[(((n * Cin + ic) * D + id) * H + ih) * W + iw]! *
+                      weight[(((oc * inPerGroup + icLocal) * KD + kd) * KH + kh) * KW + kw]!;
+                  }
+                }
+              }
+            }
+            output[(((n * Cout + oc) * Dout + od) * Hout + oh) * Wout + ow] = acc;
+          }
+        }
+      }
+    }
+  }
+  return output;
+}
