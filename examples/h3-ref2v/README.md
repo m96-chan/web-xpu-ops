@@ -571,6 +571,46 @@ here, and the subject actually wears the reference's printed shirt and performs
 the described arm raise. A six-word prompt is not a small version of that
 input; it is a different input.
 
+### It flickers, and that is R2V's own (issue #216)
+
+The measurement this README did not have for a long time, and the one a video
+model lives on. Mean absolute frame-to-frame difference at 24 fps, 256x256:
+
+| | frame-to-frame |
+| --- | --- |
+| the reference video itself | **4.17** |
+| `t2va`'s output | **7.14** |
+| **R2V's output**, same latent length | **19.19** |
+
+Everything else in this README was measured per frame — chroma, seams — and
+per frame R2V looks like `t2va`. It does not move like it.
+
+Bisected:
+
+- **Not the VAE's temporal upsample.** One latent frame becomes four, so a
+  period-4 artefact was the first guess; the difference by position is
+  22.95 / 24.58 / 25.32 / 28.34, which is no period at all.
+- **Not the latent's smoothness.** At the same length R2V's latent is
+  *smoother* than `t2va`'s, in time (0.300 against 0.324) and in space (0.269
+  against 0.328).
+- **The latent is 31% hotter** — rms 1.173 against 0.894 — and that is worth
+  about half of it: scaling `t2va`'s own latent by 1.31 takes its flicker from
+  7.14 to 11.34.
+- **It scales with how much reference is in the sequence.** No references
+  0.894/7.14, one image 0.993/14.84, an image and a video 1.173/19.19. The
+  anchors are pushing the target off distribution.
+
+What is ruled out: the transformer's arithmetic (0.68% of peak at four blocks,
+5.38% at fifty), the anchors' own magnitude (rms 1.09, the same order as the
+target's), that they drift (exactly zero after fifteen steps), the layout and
+the row timesteps (both exact against upstream).
+
+What is left is the anchors' *content* — the posterior sample, the float16
+round, the `latents_mean`/`latents_std` normalisation — or something in the
+sampling loop that **one forward's comparison cannot see**. A single forward
+matching the model to 0.68% and fifteen of them matching are different claims,
+and only one of them has been checked.
+
 ### How long a clip is worth asking for
 
 `17n + 5` frames in, `(5n + 2) * 4` out, so the length is a ladder. Measured on
