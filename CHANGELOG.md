@@ -9,6 +9,22 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **Anima and Z-Image's resident paths drew one flat colour** (regression from
+  #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
+  `array<f32>` when it learned fractional positions; `examples/zimage/src/
+  dit-gpu.ts` was updated in that commit and the two **resident** DiTs were not.
+
+  Nothing errors. WebGPU copies the bytes, and a small integer's bit pattern
+  read as a float is a denormal — so every rope angle became zero, every token
+  got the identity rotation, and the DiT returned a well-formed latent whose
+  every channel is constant. Bisected: `597d567` is the first bad commit, and
+  the latent's per-channel standard deviation goes 1.02 → 0.038 across it.
+
+  `ropeAxisPositionBuffer` in `ops/rope` is where the type lives now, with the
+  slack the kernel expects, and both resident paths build their buffer with it.
+  Its test asserts the array type, because that is the thing that was wrong.
+
+
 - **Changing folder to the wrong one stranded the page** (reported from a
   browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
   `Uncaught (in promise) Error: the folder "anima-3.8B" has no
