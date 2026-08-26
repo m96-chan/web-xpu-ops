@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **A browser page that generates video** (issue #210).
+  `examples/h3-dit-web`: a prompt, a size, a step count and a seed in; the DiT
+  samples and the VAE decodes, both on WebGPU, and the frames play on a canvas.
+
+  **It uploads and it does not yet run.** 23.10 GB in 20.9 s, prompts and step
+  counts populated, and then the first generation fails with
+  `Entry-point uses workgroup_size(512, 1, 1) that exceeds the maximum allowed
+  (256, 256, 64)`. The adapter a **headless** Chrome 151 hands out reports
+  `maxComputeWorkgroupSizeX = 256`, and `ops/matmul`'s two entry points declare
+  512. Issue #211, with the four limits measured.
+
+  **Whether that is headless Chrome or every Chrome is unresolved, and it
+  matters**: `examples/zimage-web` dispatches the same kernel and is recorded as
+  running end to end in a browser, which cannot both be true of one device. No
+  X display was reachable from where this was measured, so it was not settled
+  rather than guessed. `examples/h3-video-web`'s "the in-browser decode is
+  unmeasured" is consistent with nobody having run it either.
+
+  `?serve=<base>` reads the weights over HTTP instead of from a picked folder —
+  not a convenience: `showDirectoryPicker` needs a user gesture and a native
+  dialog, so a headless browser cannot otherwise reach the page's work, which is
+  exactly why these pages keep ending "unmeasured".
+
+  The page reports what it **uploaded**, not what the device took. WebGPU
+  exposes no way to ask, and `nvidia-smi` never moved while the page had
+  uploaded 23.10 GB.
+
 - **The 50-layer DiT runs on the GPU** (issue #210). `examples/h3-dit`'s
   `model-gpu.ts` plus `tools/convert_dit.py`: **20.08 GB** of int8 resident,
   one step over 42 rows in 2,078 ms (RTX 5090, driver 610.57.04, Dawn

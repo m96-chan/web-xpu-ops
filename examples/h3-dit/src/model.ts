@@ -322,7 +322,10 @@ export function h3DitForward(
 
   const bcfg = blockConfig(cfg, seq);
   const positions = ropePositions(layout.positionIds, seq);
-  let x = hidden;
+  // Annotated rather than inferred: `new Float32Array(...)` infers
+  // `Float32Array<ArrayBuffer>`, the ops return `Float32Array<ArrayBufferLike>`,
+  // and under the DOM lib those are not the same type.
+  let x: Float32Array = hidden;
   for (let i = 0; i < cfg.numLayers; i += 1) {
     x = h3DitBlock(bcfg, w.blocks[i]!, x, temb, adalnIndices, positions);
     onBlock?.(i);
