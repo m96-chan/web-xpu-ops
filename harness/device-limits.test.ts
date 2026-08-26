@@ -55,10 +55,17 @@ describe("device limits", () => {
   const callers = sourceFiles(root).filter((file) => /adapter\.requestDevice\(/.test(readFileSync(file, "utf8")));
 
   it("finds every runtime rather than trusting a remembered count", () => {
-    // Six at the time of writing. The number is asserted so that adding a
-    // seventh is a decision someone makes here, with the list in front of them,
-    // rather than a file that quietly never asks for anything.
-    expect(callers.length).toBeGreaterThanOrEqual(6);
+    // **Five**, down from six, and the drop is the point of writing it here.
+    // `anima-web` and `zimage-web` each carried a copy of the browser
+    // `ResidentDevice`; the two had already drifted — one had the profiling
+    // half and the other had a comment explaining why it did not — so they were
+    // merged into `examples/web-common/src/browser-resident.ts` (issue #200).
+    // One fewer `requestDevice` is one fewer place to forget a limit.
+    //
+    // The number is asserted so that adding a sixth is a decision someone makes
+    // here, with the list in front of them, rather than a file that quietly
+    // never asks for anything.
+    expect(callers.length).toBeGreaterThanOrEqual(5);
   });
 
   for (const file of callers) {

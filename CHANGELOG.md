@@ -93,6 +93,42 @@ Entries record **why** a change was needed. What changed is in the diff.
   Goldens measured against torch 2.10.0+cu130, integers so they are exact in
   f32.
 
+- **A browser page for it** (issue #200). `examples/h3-audio-web`, on the same
+  folder-bound, server-free footing as the other demos: 260 MB into a folder
+  you pick, read from it every time after.
+
+  **There is no prompt box, and the page says why.** The transformer that would
+  write the latent is 20B and the encoder that would read a prompt is
+  Qwen3-VL-32B — 27 GB between them at the smallest published quantisation,
+  against 260 MB for the decoder. A latent sampled from the prior is what a VAE
+  decoder is built to receive, so that is what it gets.
+
+- **MiniMax-H3's audio decoder runs, and it needed no new kernel** (issue #200).
+  H3 generates video with **native stereo audio**, and the audio half is a
+  BigVGAN vocoder over a 32-channel latent at 40 Hz — a DAC-lineage codec, which
+  is the same shape as the one `conv_transpose1d` (#87), `group_norm` (#91),
+  `snake_beta` (#90) and `istft`'s `"same"` (#93) were added for. Those landed
+  for VoxShot. Every one of them is what this model's decoder wants.
+
+  `examples/h3-audio` has the decoder twice: a reference that calls this
+  library's own references, and a GPU version that is the same file with
+  dispatches. Both are held to a waveform produced by **the model's own Python**
+  on a fixed latent, not to each other — agreeing with a port only says the two
+  share a mistake.
+
+  Measured, RTX 5090 / driver 610.57.04 / Dawn `webgpu@0.4.0` / f32, on a
+  6,400-sample golden: the reference is **1.788e-6** worst element against
+  torch's output and takes 21 s; the GPU version is **5.007e-6** and takes
+  **432 ms**.
+
+  Two things that would otherwise have needed a new kernel are folded instead.
+  The `ratio *` after the anti-aliasing upsample rides on the filter's twelve
+  taps, since a convolution is linear in its weight. And the slice after it is
+  the transposed convolution's `padding` — the two trims are equal for this
+  filter, and a symmetric crop is what `padding` means there. The port throws
+  if a future filter makes them differ rather than quietly dropping a sample,
+  which is a phase error no unit test hears.
+
 - **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
   pad op, not a convolution argument. MiniMax-H3 is the model that makes that
   separation load-bearing: its visual VAE pads `reflect` on the spatial axes
@@ -260,6 +296,17 @@ Entries record **why** a change was needed. What changed is in the diff.
   permutation converts one to the other **in the weights**, as `permuteForRope`
   does for Anima — and `rope_dim_ratio: 0.75` is covered by a fourth axis pinned
   at position 0, which is the identity. Worst element **2.384e-7**.
+
+### Changed
+
+- **The browser `ResidentDevice` lives in one place** (issue #200).
+  `anima-web` and `zimage-web` each had a copy, and they had already drifted:
+  one carried the profiling half and the other carried a comment saying a stub
+  that reported nothing would be worse than its absence — which is precisely the
+  state the first one had reached and then fixed. It is
+  `examples/web-common/src/browser-resident.ts` now. One fewer `requestDevice`
+  is one fewer place to forget a limit, which
+  `harness/device-limits.test.ts` counts.
 
 - **Flash attention stages `k` and `v` without dividing** (issue #177). The
   staging loops turned a flat index into an address the way the arithmetic reads
