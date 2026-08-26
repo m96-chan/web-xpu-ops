@@ -23,44 +23,51 @@ the modulation tables instead of shipping the weights — and a step count with 
 table has no modulation at all. The `<select>` is built from
 `manifest.stepCounts`, so the page cannot offer a button that throws.
 
-## Status: it uploads, and it does not yet run
+## Status: it runs in a headed browser
 
-Measured on this machine — RTX 5090, driver 610.57.04, **headless** Chrome
-151.0.7922.71 over Vulkan, another browser already holding 11.4 GB of the card:
+**22 frames at 256x256 generates.** Measured in a headed Chrome on an RTX 5090:
+23–27 GB uploaded, the sampling loop runs, the frames land on the canvas.
 
-| | |
-| --- | --- |
-| DiT + tables + decoder uploaded | **23.10 GB in 20.9 s** |
-| prompts and step counts populated | yes |
-| first generation | **fails** |
+**Headless Chrome cannot run it, and that turned out to be headless-specific.**
+The adapter a headless Chrome 151 hands out reports
+`maxComputeWorkgroupSizeX = 256` — measured, with
+`maxComputeInvocationsPerWorkgroup` 256,
+`maxComputeWorkgroupStorageSize` 32,768 and `maxBufferSize` 1 GB — while
+`ops/matmul` declares `@compute @workgroup_size(512)`. A headed Chrome on the
+same machine allows 512 and gets past it. The page reads the limits and refuses
+in the first second rather than uploading 23 GB to find out; issue #211.
 
-The failure is specific:
+That resolves an ambiguity worth recording: `examples/zimage-web` dispatches the
+same 512-thread kernel and is recorded as running in a browser, which is
+consistent now — the two adapters really are different.
+
+### The size that failed, and why
+
+**576x320 hit a second ceiling**, after 24.49 GB had been uploaded:
 
 ```
-pipeline is not valid: Entry-point uses workgroup_size(512, 1, 1)
-that exceeds the maximum allowed (256, 256, 64)
+batch is not valid: Dispatch workgroup count X (72240) exceeds
+max compute workgroups per dimension (65535)
 ```
 
-`ops/matmul`'s `kernel` and `q8` entry points both declare
-`@compute @workgroup_size(512)`, and **the adapter this headless Chrome hands
-out reports `maxComputeWorkgroupSizeX = 256`** — measured, along with
-`maxComputeInvocationsPerWorkgroup` 256, `maxComputeWorkgroupStorageSize`
-32,768 and `maxBufferSize` 1 GB. `createBrowserResidentDevice` already asks for
-the adapter's own ceiling on all four; the ceiling *is* 256 there. The same
-error, escalating to a lost device, is what killed the GPU process on the first
-attempt before the smaller conversion made it legible.
+One thread per element and `ceil(n / 256)` workgroups runs out of grid at
+**16,776,960 elements** — and 65,535 is what Dawn Node *and* Chrome both report,
+neither raising it when asked. A 14,336-wide feed-forward reaches it at 1,170
+rows. A 22-frame 256x256 clip is 538 packed rows and fits; **576x320 is 1,350
+and does not**, which is the second size anybody picks.
 
-**Whether that is headless Chrome or every Chrome is not resolved here, and it
-matters.** `examples/zimage-web` dispatches the same 512-thread kernel and the
-CHANGELOG records it running end to end in a browser with numbers, which cannot
-both be true of the same device — so either the limit is headless-specific, or
-that record is about a run nobody repeated. A headed Chrome would settle it in
-a minute; there is no X display reachable from where this was measured, so it
-has not been settled.
+Every flat dispatch is split on **row** boundaries now — rows, not elements,
+because `ops/elementwise`'s rows entry recovers its column with `idx % D` and a
+chunk starting mid-row reads the wrong scalar for all of it. Held to the model's
+own output at a lowered ceiling: 223 dispatches unchunked and 231 chunked, and
+**the same worst element to four digits**.
 
-`examples/h3-video-web`'s README ends with "the in-browser decode is
-unmeasured", and it dispatches the same kernel. That is consistent with nobody
-having run it.
+One dispatch cannot be split: `swapLeading`'s transpose writes strided, so a
+slice of the input has no slice of the output to land in. At 56 heads of 128 it
+runs out of grid at **2,340 tokens**, past every size this page offers, and it
+refuses with that number rather than letting `batch is not valid` arrive from
+inside a command buffer. Splitting it needs a second grid dimension in
+`ops/permute`.
 
 ## Running it
 

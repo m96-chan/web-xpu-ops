@@ -35,6 +35,12 @@ const manifest = JSON.parse(readFileSync(`${dir}/dit.manifest.json`, "utf8")) as
 // generated with the same `--layers`.
 const layersArg = arg("--layers");
 if (layersArg) manifest.layers = Number(layersArg);
+// `--max-workgroups N` lowers the grid ceiling so the chunking runs at a
+// sequence length that fits in memory. Issue #211: 576x320 needs 75,600
+// workgroups for one feed-forward dispatch and the device allows 65,535, but
+// reproducing that honestly needs 1,350 rows and 24 GB of weights. Squeezing
+// the ceiling instead exercises the same split against the same golden.
+const maxWorkgroupsArg = arg("--max-workgroups");
 const golden = JSON.parse(readFileSync(`${goldenDir}/golden.json`, "utf8")) as {
   layers: number;
   steps: number;
@@ -117,6 +123,10 @@ const tables = openReader(`${dir}/adaln.bin`);
 
 const uploadStart = performance.now();
 const dit = await DitGpu.create(device, ditKernels(), manifest, weights.read, tables.read);
+if (maxWorkgroupsArg) {
+  dit.maxWorkgroupsPerDimension = Number(maxWorkgroupsArg);
+  console.log(`grid ceiling lowered to ${dit.maxWorkgroupsPerDimension} workgroups — the chunked path`);
+}
 weights.close();
 tables.close();
 console.log(`uploaded in ${((performance.now() - uploadStart) / 1000).toFixed(1)} s`);

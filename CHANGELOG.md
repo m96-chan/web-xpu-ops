@@ -9,6 +9,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **Flat dispatches are split to fit the device's grid** (issue #211). One
+  thread per element and `ceil(n / 256)` workgroups runs out of grid at
+  **16,776,960 elements** — 65,535 workgroups, which Dawn Node and Chrome both
+  report and neither raises when asked. A 14,336-wide feed-forward reaches it
+  at **1,170 rows**.
+
+  A 22-frame 256x256 clip is 538 packed rows and fits. **576x320 is 1,350 and
+  does not**, which is the second size anybody picks, and it arrived as
+  `Dispatch workgroup count X (72240) exceeds max compute workgroups per
+  dimension (65535)` after 24.49 GB had been uploaded.
+
+  Split on **row** boundaries, not element ones: `ops/elementwise`'s rows entry
+  recovers its column with `idx % D`, so a chunk starting mid-row would read
+  the wrong scalar for every element of it — a well-formed tensor, quietly
+  wrong. Chunks are rounded to keep every slice 256-byte aligned.
+
+  Held to the model's own output through a lowered ceiling: **223 dispatches
+  unchunked, 231 chunked, the same worst element to four digits.**
+
+  `swapLeading`'s transpose is the one that cannot be split — it writes
+  strided, so a slice of the input has no slice of the output to land in. It
+  runs out at **2,340 tokens**, past every size the page offers, and refuses
+  with that number rather than letting `batch is not valid` arrive from inside
+  a command buffer.
+
+  This resolves the ambiguity #211 opened with: a **headed** Chrome allows
+  `workgroup_size(512)` and a headless one does not, so `examples/zimage-web`'s
+  record of running in a browser and this page's refusal are both true of their
+  own adapters.
+
 - **A lost WebGPU device says why now** (issue #211). Once a device is lost,
   **every later call reports the same thing**: `popErrorScope` rejects with
   `OperationError: Instance dropped in popErrorScope`, once per buffer, with a

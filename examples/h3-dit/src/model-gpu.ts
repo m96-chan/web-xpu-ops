@@ -309,6 +309,80 @@ export class DitGpu {
     ops.push({ kind: "dispatch", pipeline, bindGroup: await this.device.bindGroupSliced(pipeline, slices), workgroups });
   }
 
+  /**
+   * The device's grid ceiling. **65,535 on every device measured** — the spec's
+   * default, reported by Dawn Node and by Chrome alike, and not raised by
+   * asking.
+   *
+   * A field rather than a constant so a test can lower it and exercise the
+   * chunking without a 17-million-element buffer.
+   */
+  maxWorkgroupsPerDimension = 65535;
+
+  /**
+   * Row ranges no dispatch of `cols`-wide rows can exceed.
+   *
+   * One thread per element and `ceil(n / 256)` workgroups means a flat dispatch
+   * runs out of grid at **16,776,960 elements** — which a 5,376-wide residual
+   * stream reaches at 3,120 tokens and a 14,336-wide feed-forward reaches at
+   * 1,170. A 576x320 clip is 1,350 packed rows, so this is not a corner: it is
+   * the second size anybody picks.
+   *
+   * Split on **row** boundaries rather than element ones, because
+   * `elementwise`'s rows entry recovers its column with `idx % D` and a chunk
+   * that starts mid-row would read the wrong scalar. The count is rounded down
+   * to keep every slice 256-byte aligned, which `bindGroupSliced` requires.
+   */
+  private rowChunks(rows: number, cols: number): { start: number; count: number }[] {
+    const perDispatch = this.maxWorkgroupsPerDimension * WG;
+    let perChunk = Math.floor(perDispatch / cols);
+    if (perChunk >= rows) return [{ start: 0, count: rows }];
+    if (perChunk < 1) {
+      throw new Error(`rowChunks: a single ${cols}-wide row needs ${Math.ceil(cols / WG)} workgroups, past the limit`);
+    }
+    // `start * cols * 4` has to be a multiple of 256 for every chunk.
+    const rowBytes = cols * 4;
+    const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+    const step = 256 / gcd(rowBytes, 256);
+    perChunk = Math.floor(perChunk / step) * step;
+    if (perChunk < 1) {
+      throw new Error(`rowChunks: ${cols}-wide rows cannot be split on a 256-byte boundary under the grid limit`);
+    }
+    const chunks: { start: number; count: number }[] = [];
+    for (let start = 0; start < rows; start += perChunk) {
+      chunks.push({ start, count: Math.min(perChunk, rows - start) });
+    }
+    return chunks;
+  }
+
+  /**
+   * A flat, per-element kernel over `[rows, cols]`, split to fit the grid.
+   *
+   * `sliced` names the buffers that are indexed by element and must be offset
+   * with the chunk; `whole` names the ones that are not — a bias or a
+   * modulation vector, read at `idx % D`.
+   */
+  private async dispatchFlat(
+    ops: ResidentOp[],
+    code: string,
+    rows: number,
+    cols: number,
+    layout: { buffer: GPUBuffer; sliced: boolean }[],
+    uniform: (count: number) => Parameters<typeof params>[0],
+  ): Promise<void> {
+    for (const chunk of this.rowChunks(rows, cols)) {
+      const byteOffset = chunk.start * cols * 4;
+      const byteLength = chunk.count * cols * 4;
+      await this.dispatchSliced(ops, code, [
+        ...layout.map(({ buffer, sliced }) =>
+          sliced
+            ? { buffer, offset: byteOffset, size: byteLength }
+            : { buffer, offset: 0, size: buffer.size }),
+        { buffer: this.uniform(uniform(chunk.count)), offset: 0, size: UNIFORM_BYTES },
+      ], [Math.ceil((chunk.count * cols) / WG)]);
+    }
+  }
+
   private async linear(ops: ResidentOp[], a: Mat, name: string, bias: GPUBuffer | null, N: number): Promise<Mat> {
     const out = this.take(a.rows * N);
     if (this.manifest.dtype === "q8") {
@@ -323,9 +397,9 @@ export class DitGpu {
     }
     if (!bias) return { buffer: out, rows: a.rows, cols: N };
     const biased = this.take(a.rows * N);
-    await this.dispatch(ops, this.kernels.rows, [out, bias, biased, this.uniform([
-      ["u32", a.rows], ["u32", N], ["u32", ELEMENTWISE.add],
-    ])], [Math.ceil((a.rows * N) / WG)]);
+    await this.dispatchFlat(ops, this.kernels.rows, a.rows, N, [
+      { buffer: out, sliced: true }, { buffer: bias, sliced: false }, { buffer: biased, sliced: true },
+    ], (count) => [["u32", count], ["u32", N], ["u32", ELEMENTWISE.add]]);
     return { buffer: biased, rows: a.rows, cols: N };
   }
 
@@ -339,9 +413,9 @@ export class DitGpu {
 
   private async pointwise(ops: ResidentOp[], a: Mat, b: Mat, kind: number): Promise<Mat> {
     const out = this.take(a.rows * a.cols);
-    await this.dispatch(ops, this.kernels.elementwise, [a.buffer, b.buffer, out, this.uniform([
-      ["u32", a.rows * a.cols], ["u32", kind],
-    ])], [Math.ceil((a.rows * a.cols) / WG)]);
+    await this.dispatchFlat(ops, this.kernels.elementwise, a.rows, a.cols, [
+      { buffer: a.buffer, sliced: true }, { buffer: b.buffer, sliced: true }, { buffer: out, sliced: true },
+    ], (count) => [["u32", count * a.cols], ["u32", kind]]);
     return { buffer: out, rows: a.rows, cols: a.cols };
   }
 
@@ -367,18 +441,37 @@ export class DitGpu {
     const rowBytes = hidden * 4;
     for (const run of runs) {
       const vectorOffset = ((stepOffsetRows + run.tableRow) * chunksPerRow + chunk) * rowBytes;
-      await this.dispatchSliced(ops, this.kernels.rows, [
-        { buffer: x.buffer, offset: run.start * rowBytes, size: run.length * rowBytes },
-        { buffer: table, offset: vectorOffset, size: rowBytes },
-        { buffer: into, offset: run.start * rowBytes, size: run.length * rowBytes },
-        { buffer: this.uniform([["u32", run.length], ["u32", hidden], ["u32", kind]]), offset: 0, size: UNIFORM_BYTES },
-      ], [Math.ceil((run.length * hidden) / WG)]);
+      // Chunked for the same reason `dispatchFlat` is: a run of a 5,376-wide
+      // stream runs out of grid at 3,120 rows.
+      for (const chunk of this.rowChunks(run.length, hidden)) {
+        const at = (run.start + chunk.start) * rowBytes;
+        await this.dispatchSliced(ops, this.kernels.rows, [
+          { buffer: x.buffer, offset: at, size: chunk.count * rowBytes },
+          { buffer: table, offset: vectorOffset, size: rowBytes },
+          { buffer: into, offset: at, size: chunk.count * rowBytes },
+          { buffer: this.uniform([["u32", chunk.count], ["u32", hidden], ["u32", kind]]), offset: 0, size: UNIFORM_BYTES },
+        ], [Math.ceil((chunk.count * hidden) / WG)]);
+      }
     }
     return { buffer: into, rows: x.rows, cols: hidden };
   }
 
   /** `[rows, heads, headDim]` <-> `[heads, rows, headDim]`. */
   private async swapLeading(ops: ResidentOp[], x: GPUBuffer, dim0: number, dim1: number, D: number): Promise<GPUBuffer> {
+    // **The one flat dispatch here that cannot be chunked.** A transpose writes
+    // strided, so a slice of the input has no slice of the output to land in;
+    // splitting it needs a second grid dimension in the kernel, which is an
+    // `ops/permute` change. At 56 heads of 128 this runs out of grid at 2,340
+    // tokens -- a 576x320 clip is 1,350, so it is close. Refused with the
+    // number rather than left to arrive as `batch is not valid`.
+    const workgroups = Math.ceil((dim0 * dim1 * D) / WG);
+    if (workgroups > this.maxWorkgroupsPerDimension) {
+      throw new Error(
+        `swapLeading: ${dim0}x${dim1}x${D} needs ${workgroups} workgroups and the device allows ` +
+          `${this.maxWorkgroupsPerDimension}. ops/permute has no second grid dimension, so this sequence ` +
+          `length cannot run yet — see issue #211.`,
+      );
+    }
     const out = this.take(dim0 * dim1 * D);
     await this.dispatch(ops, this.kernels.permute, [x, out, this.uniform([
       ["u32", dim0], ["u32", dim1], ["u32", D],
@@ -389,19 +482,35 @@ export class DitGpu {
   private async rope(ops: ResidentOp[], x: Mat, seq: number, positions: GPUBuffer): Promise<Mat> {
     const c = this.manifest.config;
     const out = this.take(seq * c.num_attention_heads * c.attention_head_dim);
+    const width = c.num_attention_heads * c.attention_head_dim;
+    // Chunked by **token**, which rope is separable over. `positions` is
+    // `[N, 4]`, so its slices are 16 bytes a token and a chunk has to be a
+    // multiple of 16 tokens to stay 256-byte aligned — a tighter step than the
+    // activations alone would need.
+    const perDispatch = this.maxWorkgroupsPerDimension * WG;
+    const tokensPerChunk = Math.max(16, Math.floor(perDispatch / (width / 2) / 16) * 16);
     // Binding order and struct read off `ops/rope/wgsl/axes.wgsl`, not
     // remembered: `axis_dims` is binding 1 and `positions` is binding 2, and
     // Params has **five** fields. Written from memory this had them swapped and
     // one field short, which is a silent NaN rather than a validation error —
     // the shapes are all `array<f32>` and a short uniform reads garbage.
-    await this.dispatch(ops, this.kernels.ropeAxes, [
-      x.buffer, this.w("rope.axisDims"), positions, out,
-      this.uniform([
-        ["u32", seq], ["u32", c.num_attention_heads], ["u32", c.attention_head_dim],
-        ["u32", 4], ["f32", c.rope_theta],
-      ]),
-    ], [Math.ceil((seq * c.num_attention_heads * (c.attention_head_dim / 2)) / WG)]);
-    return { buffer: out, rows: seq, cols: c.num_attention_heads * c.attention_head_dim };
+    for (let start = 0; start < seq; start += tokensPerChunk) {
+      const count = Math.min(tokensPerChunk, seq - start);
+      await this.dispatchSliced(ops, this.kernels.ropeAxes, [
+        { buffer: x.buffer, offset: start * width * 4, size: count * width * 4 },
+        { buffer: this.w("rope.axisDims"), offset: 0, size: this.w("rope.axisDims").size },
+        { buffer: positions, offset: start * 4 * 4, size: count * 4 * 4 },
+        { buffer: out, offset: start * width * 4, size: count * width * 4 },
+        {
+          buffer: this.uniform([
+            ["u32", count], ["u32", c.num_attention_heads], ["u32", c.attention_head_dim],
+            ["u32", 4], ["f32", c.rope_theta],
+          ]),
+          offset: 0, size: UNIFORM_BYTES,
+        },
+      ], [Math.ceil((count * width / 2) / WG)]);
+    }
+    return { buffer: out, rows: seq, cols: width };
   }
 
   private async attention(ops: ResidentOp[], q: Mat, k: Mat, v: Mat, seq: number): Promise<Mat> {
@@ -441,9 +550,9 @@ export class DitGpu {
     const value = await this.linear(ops, x, `${prefix}ff.hidden.weight`, null, c.ffn_dim);
     const gate = await this.linear(ops, x, `${prefix}ff.gate.weight`, null, c.ffn_dim);
     const activated = this.take(seq * c.ffn_dim);
-    await this.dispatch(ops, this.kernels.activation, [gate.buffer, activated, this.uniform([
-      ["u32", seq * c.ffn_dim], ["u32", ACTIVATION.silu], ["f32", 1],
-    ])], [Math.ceil((seq * c.ffn_dim) / WG)]);
+    await this.dispatchFlat(ops, this.kernels.activation, seq, c.ffn_dim, [
+      { buffer: gate.buffer, sliced: true }, { buffer: activated, sliced: true },
+    ], (count) => [["u32", count * c.ffn_dim], ["u32", ACTIVATION.silu], ["f32", 1]]);
     const gated = await this.pointwise(
       ops, value, { buffer: activated, rows: seq, cols: c.ffn_dim }, ELEMENTWISE.multiply,
     );
