@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MiniMax-H3 R2V on WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 2rem; font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+    background: #14161a; color: #e6e8ec;
+    display: grid; grid-template-columns: minmax(320px, 26rem) 1fr; gap: 2rem; align-items: start;
+  }
+  @media (max-width: 980px) { body { grid-template-columns: 1fr; } }
+  h1 { margin: 0 0 .25rem; font-size: 1.3rem; font-weight: 600; }
+  .sub { margin: 0 0 1.5rem; color: #98a1b3; font-size: .85rem; }
+  label { display: block; margin: 0 0 1rem; font-size: .8rem; color: #98a1b3; }
+  select, input, textarea {
+    width: 100%; margin-top: .3rem; padding: .5rem .6rem; box-sizing: border-box;
+    background: #1c1f26; color: #e6e8ec; border: 1px solid #2c313b; border-radius: 6px;
+    font: inherit; font-size: .9rem;
+  }
+  textarea { resize: vertical; min-height: 3.4em; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  button {
+    width: 100%; padding: .7rem; margin-top: .5rem; border: 0; border-radius: 6px;
+    background: #4f7cff; color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #2c313b; color: #6b7383; cursor: default; }
+  #status { margin: 1rem 0 .2rem; font-weight: 600; }
+  #detail { margin: 0; color: #98a1b3; font-size: .85rem; min-height: 1.6em; }
+  #limits { margin: .3rem 0 0; color: #6b7383; font-size: .74rem; font-variant-numeric: tabular-nums; }
+  #progress { height: 4px; border-radius: 2px; background: #2c313b; margin-top: .6rem; overflow: hidden; }
+  #progress > div { height: 100%; width: 0; background: #4f7cff; transition: width .2s ease; }
+  canvas { max-width: 100%; height: auto; border-radius: 8px; background: #1c1f26; display: block; image-rendering: pixelated; }
+  .note { margin-top: 1.5rem; color: #6b7383; font-size: .78rem; }
+  code { background: #1c1f26; padding: .1rem .3rem; border-radius: 3px; }
+  #timing table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .75rem; }
+  #timing td { padding: .2rem .4rem; border-top: 1px solid #2c313b; }
+  #timing td:nth-child(2) { text-align: right; color: #98a1b3; font-variant-numeric: tabular-nums; }
+  #transport { display: flex; align-items: center; gap: .75rem; margin-top: .75rem; }
+  #transport button { width: auto; margin: 0; padding: .35rem .8rem; font-size: .85rem; }
+  #frame-slider { flex: 1; margin: 0; }
+
+  /* The references the request is conditioned on. */
+  #drop {
+    border: 1px dashed #2c313b; border-radius: 8px; padding: 1rem; text-align: center;
+    color: #6b7383; font-size: .82rem; cursor: pointer; margin-bottom: 1rem;
+  }
+  #drop.over { border-color: #4f7cff; color: #98a1b3; }
+  #references { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+  #references figure { margin: 0; width: 5.2rem; }
+  #references img, #references video { width: 5.2rem; height: 5.2rem; object-fit: cover; border-radius: 6px; background: #1c1f26; }
+  #references figcaption { font-size: .68rem; color: #6b7383; margin-top: .2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #gate::backdrop { background: rgba(10, 12, 15, .72); backdrop-filter: blur(3px); }
+  #gate {
+    border: 1px solid #2c313b; border-radius: 12px; padding: 2rem;
+    background: #171a20; color: #e6e8ec; max-width: 30rem; width: calc(100% - 4rem);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  }
+  #gate h2 { margin: 0 0 .5rem; font-size: 1.1rem; font-weight: 600; }
+  #gate p { margin: 0 0 1rem; color: #98a1b3; font-size: .87rem; }
+  #gate .why { margin: 1.25rem 0 0; color: #6b7383; font-size: .78rem; }
+  #gate-progress { margin: .75rem 0 0; color: #98a1b3; font-size: .82rem; min-height: 1.4em; font-variant-numeric: tabular-nums; }
+  #gate-bar { height: 4px; border-radius: 2px; background: #2c313b; margin-top: .5rem; overflow: hidden; display: none; }
+  #gate-bar > div { height: 100%; width: 0; background: #4f7cff; transition: width .2s ease; }
+  #gate-dismiss { background: transparent; color: #98a1b3; font-weight: 400; }
+  #folder-row { display: flex; align-items: center; gap: .6rem; margin-top: .75rem; font-size: .78rem; color: #6b7383; }
+  #folder-row button { width: auto; margin: 0; padding: .3rem .6rem; font-size: .78rem; font-weight: 400; background: #2c313b; color: #98a1b3; }
+</style>
+
+<dialog id="gate">
+  <h2 id="gate-title">A folder is required</h2>
+  <p id="gate-body"></p>
+  <button id="gate-action">Choose a folder</button>
+  <button id="gate-dismiss" hidden>Keep the current folder</button>
+  <p id="gate-progress"></p>
+  <div id="gate-bar"><div></div></div>
+  <p class="why" id="gate-why"></p>
+</dialog>
+
+<div>
+  <h1>MiniMax-H3, from references</h1>
+  <p class="sub">
+    R2V: images and video in, video out. The conditioner reads the references
+    themselves, so unlike a prompt they cannot be baked in advance — every
+    stage runs here.
+  </p>
+
+  <div id="drop">Drop images or video here, or click to choose</div>
+  <input id="files" type="file" accept="image/*,video/*" multiple hidden>
+  <div id="references"></div>
+
+  <label>Prompt
+    <textarea id="prompt" placeholder="what the references should become">the reference, moving</textarea>
+  </label>
+  <label>Size
+    <select id="size">
+      <option value="22,256,256" selected>22 frames, 256 x 256</option>
+      <option value="22,320,576">22 frames, 576 x 320</option>
+      <option value="39,256,256">39 frames, 256 x 256</option>
+    </select>
+  </label>
+  <div class="row">
+    <label>Steps <select id="steps"></select></label>
+    <label>Seed <input id="seed" type="number" value="42"></label>
+  </div>
+  <button id="go" disabled>Generate</button>
+
+  <div id="folder-row" hidden>
+    <span id="folder-state"></span>
+    <button id="bind">Change folder</button>
+  </div>
+
+  <p id="status">starting …</p>
+  <p id="detail"></p>
+  <p id="limits"></p>
+  <div id="progress"><div></div></div>
+  <div id="timing"></div>
+
+  <p class="note">
+    <strong>Three models run in sequence, not together.</strong> The conditioner
+    is <strong>26.25 GB</strong> of int8, the DiT <strong>20.08 GB</strong> and
+    the VAE decoder 2.43 — 48.7 GB, which does not fit at once on any card this
+    page will meet. Each is uploaded, used, and dropped before the next, so a
+    generation pays about three uploads.
+  </p>
+  <p class="note">
+    <strong>The reference is resized by the browser, not by PIL.</strong>
+    Upstream resamples with PIL's bicubic and this page has
+    <code>drawImage</code>. Everything downstream of that — the patchify, the
+    tower, the layout, the sampler — is held to the model's own output; what the
+    resampler itself costs is <strong>unmeasured</strong>.
+    Build <code id="build"></code>.
+  </p>
+  <p class="note">
+    <strong>Powered by MiniMax H3.</strong> The model is licensed under the
+    MiniMax H3 Community License Agreement, which is not this page's MIT.
+    Nothing here redistributes the weights: the agreement permits redistribution
+    only within an <em>Applicable Territory</em> that excludes the European
+    Union, the United Kingdom, the Republic of Korea and the United States of
+    America, and a public mirror cannot honour that.
+  </p>
+</div>
+
+<div>
+  <canvas id="frames" width="256" height="256"></canvas>
+  <div id="transport">
+    <button id="play">Play</button>
+    <input id="frame-slider" type="range" min="0" max="0" value="0">
+    <span id="frame-label">—</span>
+  </div>
+</div>
+
+<!-- Relative, not "/dist/…": on GitHub Pages this page lives under a
+     subdirectory, and an absolute path resolves to the site root. -->
+<script type="module" src="./dist/bundle.js"></script>

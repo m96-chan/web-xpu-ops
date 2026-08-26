@@ -9,6 +9,31 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's image processor and its browser page** (issue #212).
+  `examples/h3-ref2v/src/processor.ts` reproduces
+  `Qwen2VLImageProcessor` **exactly** — worst difference **0**, once the two f32
+  roundings upstream does were matched rather than collapsed into one.
+  `smartResize`'s banker's rounding, its two different clamp rules (`floor`
+  above the pixel ceiling, `ceil` below the floor), the temporal repeat of a
+  still image, and the merge-block patchify. Ten mutations, all caught.
+
+  **The resize itself is not ported**, and that is stated rather than hidden:
+  upstream resamples with PIL's bicubic and a browser has `drawImage`. What that
+  costs is unmeasured.
+
+  **The tokenizer was already in this repository.** `llm/tokenizer-bpe.ts` is
+  Qwen's byte-level BPE with its vocabulary committed, and it reproduces **all
+  fourteen** text segments H3's own tokenizer produced plus all four vision
+  token ids — measured in `examples/h3-ref2v/src/tokenizer.test.ts`, not
+  assumed.
+
+  `examples/h3-ref2v-web` takes dropped images and video, patchifies them,
+  assembles and tokenises the presentation, and builds the packed sequence —
+  every step held to the model. **It does not generate**: the conditioner and
+  the vision tower have CPU references and no GPU path, and no converter has
+  written a `conditioner.q8.bin`. The page says which of the three models is
+  missing rather than failing vaguely.
+
 - **Qwen3-VL's vision tower** (issue #212). Held to `transformers`' own
   `Qwen3VLVisionModel` at **1.192e-7** on the tower's output and **7.451e-9** on
   the pooled vision tokens and every deepstack feature. Committed fixture,

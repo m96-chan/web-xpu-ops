@@ -272,7 +272,42 @@ Two of the survivors were also **mutations that changed nothing** — moving an
 index lookup, and an `x = x === before ? x : x`. A no-op that "survives" says
 nothing, and both were replaced by ones that bite.
 
+## The image processor
+
+`src/processor.ts` reproduces `Qwen2VLImageProcessor` **exactly** — worst
+difference **0**. `smartResize` with Python's banker's rounding and its **two
+different clamp rules** (`floor` above the pixel ceiling, `ceil` below the
+floor), the temporal repeat that turns one still image into two frames, and the
+`(0, 3, 6, 4, 7, 2, 1, 5, 8)` patchify that lands tokens in the merge-block
+order `vision.ts` reads.
+
+Exact took matching **two f32 roundings**: upstream is `rescale` writing a
+float32 and then `normalize` reading it, not one expression. Doing both in f64
+and narrowing once is off by 5.9e-8 — small, and the difference between a check
+that can assert equality and one that needs a tolerance nobody can justify.
+
+**The resize is not ported.** Upstream resamples with PIL's bicubic; a browser
+has `drawImage`. `patchify` refuses pixels that do not already conform rather
+than cropping them quietly, and what a browser's resampler costs is
+**unmeasured**.
+
+Ten mutations, all caught — after a fixture gap: the only above-the-ceiling
+case was 5000x5000, where `height / beta / factor` is exactly 128.0 and `floor`
+and `ceil` agree. 3000x6000 gives 90.5, where they do not.
+
+## The tokenizer was already here
+
+`ref2va`'s presentation needs Qwen2's byte-level BPE, and `llm/tokenizer-bpe.ts`
+is exactly that with its vocabulary committed. Whether it agrees with H3's own
+tokenizer is measured, not assumed: `src/tokenizer.test.ts` runs **all fourteen**
+text segments the presentation can produce and **all four** vision token ids.
+They agree.
+
 ## What is not here yet
 
-The `Qwen3VLProcessor` — pixels into `pixel_values` and `image_grid_thw` —
-GPU paths for the conditioner, and the page. See #212.
+**GPU paths for the conditioner.** The text stack and the vision tower have CPU
+references held to the model; neither has a resident version, and no converter
+has written a `conditioner.q8.bin`. That is the one model of three that
+`examples/h3-ref2v-web` is missing.
+
+See #212.

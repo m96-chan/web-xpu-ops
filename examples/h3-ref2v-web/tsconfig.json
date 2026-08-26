@@ -1,0 +1,13 @@
+{
+  // A separate program from the root `tsconfig.json`, for the reason
+  // `examples/zimage-web/tsconfig.json` gives: this demo needs `DOM` and
+  // `@webgpu/types`' `navigator.gpu`, and the root config deliberately carries
+  // neither so a browser API cannot leak into an op's reference implementation.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types"],
+    "noEmit": true
+  },
+  "include": ["src"]
+}

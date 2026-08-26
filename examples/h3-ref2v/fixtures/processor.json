@@ -1,0 +1,107 @@
+{
+ "source": "transformers Qwen2VLImageProcessor (the class Qwen3VLProcessor uses)",
+ "note": "Pixels and their patches. No weights, no model licence. `do_resize=False`.",
+ "patchSize": 16,
+ "mergeSize": 2,
+ "temporalPatchSize": 2,
+ "factor": 32,
+ "minPixels": 65536,
+ "maxPixels": 16777216,
+ "imageMean": [
+  0.5,
+  0.5,
+  0.5
+ ],
+ "imageStd": [
+  0.5,
+  0.5,
+  0.5
+ ],
+ "smartResize": [
+  {
+   "height": 480,
+   "width": 640,
+   "resized": [
+    480,
+    640
+   ]
+  },
+  {
+   "height": 1080,
+   "width": 1920,
+   "resized": [
+    1088,
+    1920
+   ]
+  },
+  {
+   "height": 64,
+   "width": 64,
+   "resized": [
+    256,
+    256
+   ]
+  },
+  {
+   "height": 100,
+   "width": 50,
+   "resized": [
+    384,
+    192
+   ]
+  },
+  {
+   "height": 37,
+   "width": 4000,
+   "resized": [
+    32,
+    4000
+   ]
+  },
+  {
+   "height": 48,
+   "width": 48,
+   "resized": [
+    256,
+    256
+   ]
+  },
+  {
+   "height": 5000,
+   "width": 5000,
+   "resized": [
+    4096,
+    4096
+   ]
+  },
+  {
+   "height": 10,
+   "width": 4000,
+   "error": "absolute aspect ratio must be smaller than 200, got 400.0"
+  },
+  {
+   "height": 3000,
+   "width": 6000,
+   "resized": [
+    2880,
+    5792
+   ]
+  }
+ ],
+ "image": {
+  "height": 64,
+  "width": 96,
+  "channels": 3,
+  "bytes": 18432
+ },
+ "patches": {
+  "rows": 24,
+  "cols": 1536,
+  "offset": 18432
+ },
+ "grid": [
+  1,
+  4,
+  6
+ ]
+}
