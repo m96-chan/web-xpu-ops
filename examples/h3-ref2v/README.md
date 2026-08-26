@@ -27,9 +27,21 @@ tables, 96 s — and held to the model's own output at four blocks:
 | video velocity | 1.132e+0 | **0.96%** |
 | audio velocity | 9.867e-1 | 2.72% |
 
-against the `t2va` partition's 0.84% and 2.44% on the same geometry. The
-fifty-block check is **not run yet**: it needs 20.66 GB and the card had 27.1 GB
-in use.
+and at **all fifty**, once the card was free:
+
+| | worst | of peak |
+| --- | --- | --- |
+| video velocity | 7.605e-1 | **12.28%** |
+| audio velocity | 4.499e-1 | 17.18% |
+
+against the `t2va` partition's 0.84%/2.44% at four blocks and 13.80%/27.67% at
+fifty. The same story, and the same cause: int8 compounding over fifty blocks
+on an output that is a small difference of large intermediates. See
+`examples/h3-dit`'s README for the three ways that was measured.
+
+One step over 42 rows takes **2,175 ms** — 2,063 dispatches, 6 ms of it in the
+queue and **1,642 ms recording on the host**, which is where every model here
+spends its time.
 
 **It cannot precompute the conditioner.** `examples/h3-dit-web` ships prompt
 embeddings baked offline, because the prompt list is fixed. Here **the reference
