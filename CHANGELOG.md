@@ -72,6 +72,47 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **`conv3d`** (issue #200). MiniMax-H3's visual VAE compresses time as well as
+  space — `temporal_downsample_factors [1,2,2,1,1,1]`, 4x — so every convolution
+  in it spans frames and none of them decomposes into 2D plus a loop.
+  `ops/conv`'s own doc had listed 3D as *deliberately absent*; this is the model
+  that makes it necessary, and every convention 1D settled carries over
+  unchanged.
+
+  `[N, Cin, D, H, W]`, weight `[Cout, Cin/groups, KD, KH, KW]`, with
+  `stride` / `padding` / `dilation` taking `number | [D, H, W]`. **Still no
+  `padding_mode`**, and 3D is where that starts to cost something: H3 pads
+  `reflect` on the spatial axes and **causally** in time — `2 * padding` frames
+  before the data and none after — which is not a value any symmetric padding
+  argument can take. That is a pad op, and it is **`pad`**, below.
+
+  3D is also the first place the *axis order* is checkable. The tests use an
+  input whose elements name their own coordinate (`100d + 10h + w`) against a
+  corner-tap kernel, so an output element reads back the window it started on:
+  a swapped axis, a flipped kernel or an off-by-one pad shows up in the digits.
+  Goldens measured against torch 2.10.0+cu130, integers so they are exact in
+  f32.
+
+- **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
+  pad op, not a convolution argument. MiniMax-H3 is the model that makes that
+  separation load-bearing: its visual VAE pads `reflect` on the spatial axes
+  and, in time, **causally** — `2 * padding` frames before the data and none
+  after, so the frame at `t` cannot see `t + 1`. No symmetric `padding`
+  argument can say that, whatever its mode.
+
+  `constant` (with a value), `reflect` and `replicate`, with `before` and
+  `after` separate. **`reflect` does not repeat the edge element and
+  `replicate` does** — measured against torch rather than described, because
+  swapping the two gives a tensor of the right shape whose entire interior is
+  correct.
+
+  It pads **one** axis, viewed as `[outer, L, inner]`; three axes means three
+  calls. That is measured to give what torch's single multi-axis call gives,
+  element for element — not obvious, since a reflection reads neighbours that
+  are themselves reflections. One kernel then serves the audio VAE's 1D
+  `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
+
+
 - **A transformer block of MiniMax-H3's DiT** (issue #200) — the *generator*
   half of the model, against the visual VAE this repository already decodes
   with. Fifty identical blocks over 5,376 channels; a port is right or wrong at
@@ -118,19 +159,8 @@ Entries record **why** a change was needed. What changed is in the diff.
   worth about 130 ms on the first decode. What the remaining 136 ms is has not
   been established, and the README says so.
 
-- **The video decoder reports where its time goes, and it is not the GPU**
-  (issue #200). At 8 frames of 128x128: **647 ms the first decode, 152 ms the
-  second, 4 ms in the GPU queue**. The first pays about 520 ms of `createBuffer`
-  for its scratch; the pool amortises it. Grouping blocks into fewer submits was
-  measured and is **slower** (628 ms at one block per submit against 725 ms at
-  all thirty-six), so the submit count is not the cost either.
-
-  What the remaining 150 ms is has **not** been established. The parts priced
-  individually — bind groups 10 µs, uniforms 3 µs, pipeline lookups 0.1 µs — do
-  not add up to it, and the README says so rather than naming a suspect.
-
-  `blocksPerSubmit` is a field rather than a constant so that measurement can be
-  repeated on other hardware.
+  `blocksPerSubmit` is a field rather than a constant so that the measurement can
+  be repeated on other hardware.
 
 - **The video decoder runs in int8, and the page uses it** (issue #200).
   `--quant q8` writes **2.43 GB** where f32 writes 9.69, and `matmulQ8` takes
