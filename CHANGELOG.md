@@ -53,6 +53,14 @@ Entries record **why** a change was needed. What changed is in the diff.
   The anchors are checked rather than assumed: after fifteen steps they differ
   from what went in by exactly zero, and the run refuses to write frames if not.
 
+  Two apparent faults were measured until they were not. An "inverted tone" was
+  the *prompt* — "warm light" in it, and the correlation with the reference is
+  -0.06, so not a negative of anything. A "colour drift across frames" is not
+  `ref2va`'s: the per-frame chroma of an R2V run and a `t2va` run are the same
+  curve, with troughs exactly at the frames that sit at position 0 of a latent
+  frame. What remains is the DiT's int8, which a reference encoded and decoded
+  straight back does not have and only DiT-produced latents do.
+
 
 - **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s
   CPU version is a reference and stays one — it is a single-threaded loop over

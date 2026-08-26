@@ -572,6 +572,10 @@ if (high - low < 1e-6) {
 }
 mkdirSync(outDir, { recursive: true });
 writeFileSync(`${outDir}/frames.rgb`, Buffer.from(bytes));
+// The latent as well as the frames: a drift that is already in the latent is
+// the sampler's and one that appears at the decode is the decoder's, and only
+// having both says which.
+writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffset, latent.byteLength));
 writeFileSync(`${outDir}/frames.json`, `${JSON.stringify({
   workflow: "ref2va",
   prompt,

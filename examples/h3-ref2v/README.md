@@ -500,16 +500,34 @@ from what went in by **exactly zero**, and it refuses to write frames otherwise.
 A drifted anchor is a generation conditioned on something the reference never
 said, and it looks fine.
 
-### What is not settled
+### What the output looks like, and what was chased down to nothing
 
-**How the output should look.** With an in-distribution reference the shape
-transfers — the subject's silhouette and the water texture come through — but
-the tone is inverted and the colour drifts across frames. That drift is *not*
-`ref2va`: running `transformer_ref` through the plain `t2va` sampler shows the
-same thing, a clean first frame and colour that wanders by frame 20. Whether
-that is the checkpoint being asked for 256x256 at sixteen steps, or something
-still wrong downstream of a forward that matches the model to 0.68%, is
-**unmeasured**.
+**It generates.** With an in-distribution reference the subject transfers: a
+paper boat reference gives a paper boat, on water, lit the way the reference is.
+R2V conditions on a *reference*, not a keyframe, so it is not meant to reproduce
+it and does not.
+
+Two things looked like faults on the way and were measured until they were not:
+
+- **"The tone is inverted."** It was the prompt. `"the reference, moving — slow
+  pan, warm light"` produced a dark subject on a bright ground; the same seed
+  with `"the reference, moving"` produces a light boat on dark water, matching
+  the reference. Correlation with the reference frame is **-0.06** — not a
+  photometric negative, just a different scene.
+- **"The colour drifts across frames."** Not `ref2va`'s. The per-frame chroma of
+  an R2V run and a `t2va` run are the *same curve* — troughs at frames 0, 16, 24
+  and peaks at 9, 18, 25, within a point of each other. The troughs are the
+  frames at position 0 of a latent frame, which is the temporal upsample the VAE
+  does from one latent frame to four.
+
+What is left is a red/cyan fringe that grows with the DiT's own error: a
+reference encoded and decoded straight back has **none** of it, and only latents
+the DiT produced do. That is the int8 this README already measures at 12.28% of
+peak over fifty blocks, seen rather than summarised.
+
+Still unmeasured: **what it costs against the same request run in `diffusers`.**
+Every stage here is held to the model, but no end-to-end generation has been
+compared with one.
 
 ## What is not here yet
 
