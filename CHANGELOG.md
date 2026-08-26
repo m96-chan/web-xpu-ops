@@ -32,6 +32,28 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V runs end to end on the GPU** (issue #212). `generate-r2v.ts`: a
+  reference and a prompt in, frames out, over four models one at a time —
+  encoder 0.47 s, conditioner 2.0 s, `transformer_ref` 15 steps at ~1.4 s,
+  decoder 0.65 s, with `reclaim()` at each boundary.
+
+  Held to the model at every joint, and the last one needed a new golden:
+  `t2va` cannot exercise the reference rows, the third noise level, or a vision
+  block tagged video among the text rows, because all three are downstream of
+  `num_condition_video_rows` being nonzero. One forward of `transformer_ref` on
+  a real `ref2va` sequence is **0.68% of peak** on the video velocity and 1.61%
+  on the audio, at four blocks and int8.
+
+  Two things the conversion had to learn. `convert_dit.py --workflow ref2va`
+  evaluates modulation tables for **four** noise levels instead of two — a
+  `t2va` conversion runs fourteen steps and then hands back a bind group whose
+  offset is past the end of its own table. And `maxLevels` comes from the
+  manifest now rather than being the constant 2 it was.
+
+  The anchors are checked rather than assumed: after fifteen steps they differ
+  from what went in by exactly zero, and the run refuses to write frames if not.
+
+
 - **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s
   CPU version is a reference and stays one — it is a single-threaded loop over
   `ops/conv`'s scalar `conv3d` and takes **120.5 s on an 8x32x32 clip**, which

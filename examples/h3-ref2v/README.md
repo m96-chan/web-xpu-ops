@@ -460,6 +460,57 @@ made someone read the slices. Same shape as the tag-order mutation above.
 port that stepped every row would drift the references away over sixteen steps
 and produce something that looks conditioned and is not.
 
+## R2V end to end, on the GPU
+
+`src/generate-r2v.ts`. Four models, one at a time, on an RTX 5090 with 32 GB —
+**48.9 GB together**, so each is uploaded, used, dropped and *reclaimed* before
+the next:
+
+| | | |
+| --- | --- | --- |
+| the VAE **encoder** | 0.72 GB | the reference becomes latents, **0.47 s** |
+| the **conditioner** | 25.78 GB | `hidden_states[50]`, 2.0 s |
+| `transformer_ref` | 20.66 GB | 15 steps at ~1.4 s |
+| the VAE **decoder** | 2.43 GB | 0.65 s |
+
+`destroy()` schedules the freeing rather than doing it, so `device.reclaim()`
+sits at every boundary — issue #213, and 0.13 s each.
+
+### Held to the model, at every joint
+
+| | against | |
+| --- | --- | --- |
+| the packed layout | `build_ref2va_packed_sequence` | exact |
+| the per-row noise levels | `build_row_timesteps` | exact |
+| **one forward of `transformer_ref`** | the model's own velocity | **0.68% of peak** |
+| the conditioner | `hidden_states[50]`, int8 reference | 1.12% median row |
+| the VAE encoder | `EncoderFCN3D` + `quant_conv` | 9.537e-6 |
+
+`tools/gen_real_ref2va_forward_golden.py` and `src/verify-ref2va-forward.ts` are
+the third row, and they exist because **`t2va` cannot exercise anything that
+only `ref2va` does**: the reference rows, the third noise level, and a vision
+block tagged video among the text rows are all downstream of
+`num_condition_video_rows` being nonzero.
+
+### The anchor is checked, not assumed
+
+The reference rows are re-imposed by never being written. `generate-r2v.ts`
+measures that rather than trusting it: after fifteen steps the anchors differ
+from what went in by **exactly zero**, and it refuses to write frames otherwise.
+A drifted anchor is a generation conditioned on something the reference never
+said, and it looks fine.
+
+### What is not settled
+
+**How the output should look.** With an in-distribution reference the shape
+transfers — the subject's silhouette and the water texture come through — but
+the tone is inverted and the colour drifts across frames. That drift is *not*
+`ref2va`: running `transformer_ref` through the plain `t2va` sampler shows the
+same thing, a clean first frame and colour that wanders by frame 20. Whether
+that is the checkpoint being asked for 256x256 at sixteen steps, or something
+still wrong downstream of a forward that matches the model to 0.68%, is
+**unmeasured**.
+
 ## What is not here yet
 
 The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,
