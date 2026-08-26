@@ -4,17 +4,30 @@
  * Issue #210. The sampling loop over `examples/h3-dit`'s DiT, then
  * `examples/h3-video`'s VAE decoder on the latent it produced.
  *
- * **The two models do not fit on the device at once**, and `destroy()` is not
- * enough to make them: 20.08 GB of DiT plus 0.58 GB of tables plus 2.43 GB of
- * decoder is 23.1 GB before any scratch, on a 32 GB card a browser may already
- * be using a third of. Destroying the DiT and uploading the decoder in the same
- * process **failed** -- Dawn handed back invalid buffers, which is what this
- * device does when it is out of memory.
+ * **The two models do not fit on the device at once**, and `destroy()` alone is
+ * not enough to make them: 20.08 GB of DiT plus 0.58 GB of tables plus 2.43 GB
+ * of decoder is 23.1 GB before any scratch, on a 32 GB card a browser may
+ * already be using a third of. Destroying the DiT and uploading the decoder in
+ * the same process **failed** -- Dawn handed back invalid buffers, which is
+ * what this device does when it is out of memory.
  *
- * So the phases are separate **processes**: `--phase sample` writes the latent
- * and exits, `--phase decode` reads it back. Process exit is the only release
- * this measured as reliable. `--phase both` runs them in one process and is
- * what a machine with the card to itself can use.
+ * **`destroy()` schedules the freeing; it does not do it.** Dawn releases on
+ * its next tick and it ticks on GPU work, not on a timer, so the fix is to ask
+ * it for some: `device.reclaim()` submits four round trips and the memory is
+ * back. `harness/reclaim.ts` has the measurement and `harness/verify-reclaim.ts`
+ * runs both halves of it. Issue #213.
+ *
+ * The phases can still be run as separate **processes** -- `--phase sample`
+ * writes the latent and exits, `--phase decode` reads it back -- which is what
+ * this file did before there was a release it could rely on.
+ *
+ * **`--phase both` at 256x256 over 22 frames does not exercise that**, and the
+ * measurement says so: 20.66 GB of DiT and 2.43 GB of decoder is 23.1 GB, which
+ * fits on this card at once. Removing the `reclaim()` below and re-running it
+ * changed nothing -- the mutation does not bite here. What it guards is the
+ * geometry where the two do not fit and the case the paragraph above hit, and
+ * the thing that measures it is `harness/verify-reclaim.ts`, which runs both
+ * halves at 25.78 GB and fails without the call.
  *
  * **There is no text encoder here.** Qwen3-VL-32B is 66.7 GB and runs offline,
  * in `tools/encode_prompt.py`; this takes the embedding it wrote. A prompt
@@ -213,6 +226,9 @@ if (phase === "decode") {
   }
   const sampleMs = performance.now() - at;
   dit.destroy();
+  // **Not enough on its own** -- see this file's own doc. Unmeasurable at this
+  // geometry, where both models fit at once; load-bearing where they do not.
+  await device.reclaim();
   console.log(
     `  sampled in ${(sampleMs / 1000).toFixed(1)} s ` +
       `(${(sampleMs / video.timesteps.length).toFixed(0)} ms a step)`,
@@ -231,7 +247,7 @@ if (phase === "decode") {
   }
 }
 
-// Phase 2: decode. The DiT is gone by now — see this file's own doc.
+// Phase 2: decode. The DiT is gone and reclaimed by now — see this file's own doc.
 const vaeManifest = JSON.parse(readFileSync(`${vaeDir!}/decoder.q8.manifest.json`, "utf8")) as VideoDecoderManifest;
 const vaeWeights = openReader(`${vaeDir!}/decoder.q8.bin`);
 let decodeAt = performance.now();

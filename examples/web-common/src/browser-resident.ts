@@ -30,6 +30,12 @@
 import type {
   BatchProfile, ResidentDevice, ResidentOp, ResidentReadback,
 } from "../../../harness/resident.js";
+// **A value import, and deliberately from a different file.** `resident.ts`
+// pulls in the native `webgpu` addon at module scope, which is the whole reason
+// this browser copy exists; `reclaim.ts` imports nothing at runtime, so both
+// halves can share the one piece of behaviour neither can afford to get
+// differently. Its doc has the measurement.
+import { reclaimByRoundTrips } from "../../../harness/reclaim.js";
 import { explainFailure, type DeviceLoss } from "./device-lost.js";
 
 export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
@@ -343,6 +349,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     bindGroup,
     bindGroupSliced,
     batch,
+    reclaim: () => reclaimByRoundTrips(batch, createStorageBuffer),
     destroy: () => device.destroy(),
   };
 }

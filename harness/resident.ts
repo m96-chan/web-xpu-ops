@@ -1,5 +1,6 @@
 import { create, globals } from "webgpu";
 import { compilationFailure, type Binding, type Dispatch, type Runner } from "./wgsl.js";
+import { reclaimByRoundTrips } from "./reclaim.js";
 
 /**
  * A lower-level counterpart to `harness/wgsl.ts#createRunner`, built for issue
@@ -187,6 +188,16 @@ export interface ResidentDevice {
    * (intermediate activations, the KV-cache copies) stays device-side.
    */
   batch(ops: ResidentOp[], readback: ResidentReadback[], profile?: BatchProfile): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
+  /**
+   * Wait until the card actually has back what `destroy()` was called on.
+   *
+   * **`destroy()` schedules the freeing; it does not do it.** Dawn releases a
+   * destroyed buffer when it next ticks, and it ticks on GPU work, not on a
+   * timer. A stage that destroys 25 GB and immediately allocates 20 GB gets an
+   * *invalid* buffer back, which does not throw. `harness/reclaim.ts` has the
+   * measurement and the round-trip count. Issue #213.
+   */
+  reclaim(): Promise<void>;
   destroy(): void;
 }
 
@@ -517,11 +528,13 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     bindGroup,
     bindGroupSliced,
     batch,
+    reclaim: () => reclaimByRoundTrips(batch, createStorageBuffer),
     destroy() {
       device.destroy();
     },
   };
 }
+
 
 /**
  * A `Runner["run"]` built on top of an already-created `ResidentDevice`,

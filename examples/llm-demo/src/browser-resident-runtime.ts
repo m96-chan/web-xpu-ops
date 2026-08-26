@@ -32,6 +32,9 @@
  * than merely checked.
  */
 import type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
+// Runtime-importable because `reclaim.ts` imports nothing at runtime, unlike
+// `resident.ts` with its native `webgpu` addon. See its doc.
+import { reclaimByRoundTrips } from "../../../harness/reclaim.js";
 
 export type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback };
 
@@ -263,6 +266,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     bindGroup,
     bindGroupSliced,
     batch,
+    reclaim: () => reclaimByRoundTrips(batch, createStorageBuffer),
     destroy() {
       device.destroy();
     },

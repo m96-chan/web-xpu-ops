@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **`ResidentDevice.reclaim()`** (issue #213). `destroy()` schedules the freeing
+  of a buffer's memory; it does not do it. Dawn releases on its next tick and
+  **ticks on GPU work, not on a timer** — so a stage that destroys 25 GB and
+  immediately allocates 20 GB gets an *invalid* buffer back, which does not
+  throw. `examples/h3-dit/src/generate.ts` ran its two phases as separate
+  processes because of this, having measured process exit as the only reliable
+  release; `examples/h3-ref2v-web` needs three stages in one browser tab, which
+  has no process to exit.
+
+  Measured on an RTX 5090 (32 GB, Dawn/Vulkan), 25.78 GB destroyed and 20.66 GB
+  asked for: nothing works (3 of 3 fail), `setTimeout` up to 2 s works at no
+  delay, one submit-and-readback is *marginal* (1 of 3 failed), two or more
+  worked 8 times out of 8. `reclaim()` submits four.
+
+  **Judged by a readback, not by an error flag.** An out-of-memory
+  `createBuffer` reports asynchronously, and two earlier versions of that
+  measurement read their own staleness instead of the card — one called every
+  stage a success, the other reported a 2.08 GB ceiling that was a leftover
+  rejection from the round before. `harness/verify-reclaim.ts` runs the four
+  stages and has a `--without` half that must fail; it does, at the second
+  stage.
+
+  `generate.ts --phase both` calls it now, and the entry says what that is
+  worth: at 256x256 over 22 frames the two models are 23.1 GB and fit at once,
+  so **removing the call changes nothing there**. It is load-bearing at the
+  geometry where they do not fit.
+
 - **R2V's conditioner converts, runs on the GPU, and reproduces the model**
   (issue #212). **25.78 GB** of int8 in 86 s — 0.61 GB of vision tower, 50 text
   layers, no `lm_head` and no layers 50..63. 76 tokens in 2.0 s over 8,182
