@@ -362,7 +362,7 @@ export function decodeAudio(latent: Float32Array, T: number, manifest: AudioVaeM
     for (let j = 0; j < kernels.length; j += 1) {
       const block = ampBlock(x, weights, i * kernels.length + j, kernels[j]!, manifest.resblockDilations[j]!, manifest, filter);
       if (summed === null) summed = block.data.slice();
-      else for (let k = 0; k < summed.length; k += 1) summed[k] += block.data[k]!;
+      else for (let k = 0; k < summed.length; k += 1) summed[k] = summed[k]! + block.data[k]!;
     }
     x = { data: Float32Array.from(summed!, (v) => v / kernels.length), C: x.C, L: x.L };
   }

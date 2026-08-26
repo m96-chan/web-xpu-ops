@@ -4,11 +4,17 @@
  * Issue #210. The sampling loop over `examples/h3-dit`'s DiT, then
  * `examples/h3-video`'s VAE decoder on the latent it produced.
  *
- * **The two models do not fit on the device at once**, or not with room to
- * spare: 20.08 GB of DiT plus 0.58 GB of tables plus 2.43 GB of decoder is
- * 23.1 GB before any scratch, on a 32 GB card that a browser may already be
- * using half of. So this runs in **two phases** and destroys the DiT before it
- * uploads the decoder. The latent between them is a few megabytes.
+ * **The two models do not fit on the device at once**, and `destroy()` is not
+ * enough to make them: 20.08 GB of DiT plus 0.58 GB of tables plus 2.43 GB of
+ * decoder is 23.1 GB before any scratch, on a 32 GB card a browser may already
+ * be using a third of. Destroying the DiT and uploading the decoder in the same
+ * process **failed** -- Dawn handed back invalid buffers, which is what this
+ * device does when it is out of memory.
+ *
+ * So the phases are separate **processes**: `--phase sample` writes the latent
+ * and exits, `--phase decode` reads it back. Process exit is the only release
+ * this measured as reliable. `--phase both` runs them in one process and is
+ * what a machine with the card to itself can use.
  *
  * **There is no text encoder here.** Qwen3-VL-32B is 66.7 GB and runs offline,
  * in `tools/encode_prompt.py`; this takes the embedding it wrote. A prompt
@@ -50,8 +56,13 @@ const ditDir = arg("--dit");
 const vaeDir = arg("--vae");
 const promptsDir = arg("--prompts");
 const outDir = arg("--out") ?? "h3-out";
-if (!ditDir || !vaeDir || !promptsDir) {
-  console.error("generate: --dit, --vae and --prompts are required");
+const phase = arg("--phase") ?? "both";
+if (!["sample", "decode", "both"].includes(phase)) {
+  console.error(`generate: --phase must be sample, decode or both, not ${phase}`);
+  process.exit(2);
+}
+if ((phase !== "decode" && (!ditDir || !promptsDir)) || (phase !== "sample" && !vaeDir)) {
+  console.error("generate: --dit and --prompts are required to sample, --vae to decode");
   process.exit(2);
 }
 
@@ -107,8 +118,8 @@ function gaussianNoise(count: number, seedValue: number): Float32Array {
   return out;
 }
 
-const ditManifest = JSON.parse(readFileSync(`${ditDir}/dit.manifest.json`, "utf8")) as DitManifest;
-const prompts = JSON.parse(readFileSync(`${promptsDir}/prompts.json`, "utf8")) as {
+const ditManifest = JSON.parse(readFileSync(`${ditDir!}/dit.manifest.json`, "utf8")) as DitManifest;
+const prompts = JSON.parse(readFileSync(`${promptsDir!}/prompts.json`, "utf8")) as {
   layer: number;
   prompts: { prompt: string; file: string; tokens: number; dim: number }[];
 };
@@ -160,64 +171,77 @@ if (!device) {
 }
 
 // Phase 1: sample.
-const video = setTimesteps(steps, 12);
-const audio = setTimesteps(steps, 3);
-if (video.timesteps.length !== ditManifest.schedules[String(steps)]!.video.length) {
-  console.error("the schedule this port builds is a different length from the one the tables were built for");
-  process.exit(1);
-}
+let latent: Float32Array;
+if (phase === "decode") {
+  latent = f32(`${outDir}/latent.bin`);
+  console.log(`  read ${outDir}/latent.bin, ${latent.length} values`);
+} else {
+  const video = setTimesteps(steps, 12);
+  const audio = setTimesteps(steps, 3);
+  if (video.timesteps.length !== ditManifest.schedules[String(steps)]!.video.length) {
+    console.error("the schedule this port builds is a different length from the one the tables were built for");
+    process.exit(1);
+  }
 
-const patchDim = c.in_channels * c.patch_size[0] * c.patch_size[1] * c.patch_size[2];
-let videoRows = patchifyVideoLatents(
-  gaussianNoise(c.in_channels * latentFrames * latentHeight * latentWidth, seed),
-  c.in_channels, latentFrames, latentHeight, latentWidth, c.patch_size,
-);
-let audioRows = gaussianNoise(audioLatents * AUDIO_CHANNELS * c.audio_in_channels, seed + 1);
-const text = f32(`${promptsDir}/${chosen.file}`).slice(0, chosen.tokens * c.text_dim);
-
-const weights = openReader(`${ditDir}/${ditManifest.dtype === "q8" ? "dit.q8.bin" : "dit.bin"}`);
-const tables = openReader(`${ditDir}/adaln.bin`);
-let at = performance.now();
-const dit = await DitGpu.create(device, ditKernels(), ditManifest, weights.read, tables.read);
-weights.close();
-tables.close();
-console.log(`  DiT uploaded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
-
-at = performance.now();
-for (let i = 0; i < video.timesteps.length; i += 1) {
-  const { timestepIndices } = buildRowTimesteps(layout, video.timesteps[i]!, audio.timesteps[i]!);
-  layout.timestepIndices = timestepIndices;
-  const stepStart = performance.now();
-  const velocity = await dit.forward({ video: videoRows, audio: audioRows, text, layout, steps, stepIndex: i });
-  videoRows = schedulerStep(video, velocity.video, video.timesteps[i]!, videoRows, i);
-  audioRows = schedulerStep(audio, velocity.audio, audio.timesteps[i]!, audioRows, i);
-  console.log(
-    `  step ${i + 1}/${video.timesteps.length}  t=${video.timesteps[i]!.toFixed(4)}  ` +
-      `${(performance.now() - stepStart).toFixed(0)} ms`,
+  let videoRows = patchifyVideoLatents(
+    gaussianNoise(c.in_channels * latentFrames * latentHeight * latentWidth, seed),
+    c.in_channels, latentFrames, latentHeight, latentWidth, c.patch_size,
   );
-}
-const sampleMs = performance.now() - at;
-dit.destroy();
-console.log(`  sampled in ${(sampleMs / 1000).toFixed(1)} s (${(sampleMs / video.timesteps.length).toFixed(0)} ms a step)`);
+  let audioRows = gaussianNoise(audioLatents * AUDIO_CHANNELS * c.audio_in_channels, seed + 1);
+  const text = f32(`${promptsDir!}/${chosen.file}`).slice(0, chosen.tokens * c.text_dim);
 
-const latent = unpatchifyVideoLatents(
-  videoRows, c.in_channels, latentFrames, latentHeight, latentWidth, c.patch_size,
-);
-mkdirSync(outDir, { recursive: true });
-writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffset, latent.byteLength));
-writeFileSync(`${outDir}/audio-latent.bin`, Buffer.from(audioRows.buffer, audioRows.byteOffset, audioRows.byteLength));
+  const weights = openReader(`${ditDir!}/${ditManifest.dtype === "q8" ? "dit.q8.bin" : "dit.bin"}`);
+  const tables = openReader(`${ditDir!}/adaln.bin`);
+  let at = performance.now();
+  const dit = await DitGpu.create(device, ditKernels(), ditManifest, weights.read, tables.read);
+  weights.close();
+  tables.close();
+  console.log(`  DiT uploaded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
+
+  at = performance.now();
+  for (let i = 0; i < video.timesteps.length; i += 1) {
+    const { timestepIndices } = buildRowTimesteps(layout, video.timesteps[i]!, audio.timesteps[i]!);
+    layout.timestepIndices = timestepIndices;
+    const stepStart = performance.now();
+    const velocity = await dit.forward({ video: videoRows, audio: audioRows, text, layout, steps, stepIndex: i });
+    videoRows = schedulerStep(video, velocity.video, video.timesteps[i]!, videoRows, i);
+    audioRows = schedulerStep(audio, velocity.audio, audio.timesteps[i]!, audioRows, i);
+    console.log(
+      `  step ${i + 1}/${video.timesteps.length}  t=${video.timesteps[i]!.toFixed(4)}  ` +
+        `${(performance.now() - stepStart).toFixed(0)} ms`,
+    );
+  }
+  const sampleMs = performance.now() - at;
+  dit.destroy();
+  console.log(
+    `  sampled in ${(sampleMs / 1000).toFixed(1)} s ` +
+      `(${(sampleMs / video.timesteps.length).toFixed(0)} ms a step)`,
+  );
+
+  latent = unpatchifyVideoLatents(
+    videoRows, c.in_channels, latentFrames, latentHeight, latentWidth, c.patch_size,
+  );
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffset, latent.byteLength));
+  writeFileSync(`${outDir}/audio-latent.bin`, Buffer.from(audioRows.buffer, audioRows.byteOffset, audioRows.byteLength));
+  if (phase === "sample") {
+    console.log(`  wrote ${outDir}/latent.bin — run again with --phase decode`);
+    device.destroy();
+    process.exit(0);
+  }
+}
 
 // Phase 2: decode. The DiT is gone by now — see this file's own doc.
-const vaeManifest = JSON.parse(readFileSync(`${vaeDir}/decoder.q8.manifest.json`, "utf8")) as VideoDecoderManifest;
-const vaeWeights = openReader(`${vaeDir}/decoder.q8.bin`);
-at = performance.now();
+const vaeManifest = JSON.parse(readFileSync(`${vaeDir!}/decoder.q8.manifest.json`, "utf8")) as VideoDecoderManifest;
+const vaeWeights = openReader(`${vaeDir!}/decoder.q8.bin`);
+let decodeAt = performance.now();
 const decoder = await VideoDecoderGpu.create(device, videoKernels(), vaeManifest, vaeWeights.read);
 vaeWeights.close();
-console.log(`  VAE uploaded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
+console.log(`  VAE uploaded in ${((performance.now() - decodeAt) / 1000).toFixed(1)} s`);
 
-at = performance.now();
+decodeAt = performance.now();
 const pixels = await decoder.decode(latent, [latentFrames, latentHeight, latentWidth]);
-console.log(`  decoded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
+console.log(`  decoded in ${((performance.now() - decodeAt) / 1000).toFixed(1)} s`);
 
 const shown = denormalise(pixels, vaeManifest.config.out_channels, vaeManifest.pixelMean, vaeManifest.pixelStd);
 const outFrames = latentFrames * vaeManifest.config.patch_size_t;

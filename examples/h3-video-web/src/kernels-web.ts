@@ -7,6 +7,7 @@
  */
 import type { VideoKernels } from "../../h3-video/src/decoder-gpu.js";
 import matmulKernel from "../../../ops/matmul/wgsl/kernel.wgsl";
+import matmulQ8Kernel from "../../../ops/matmul/wgsl/q8.wgsl";
 import rmsnormKernel from "../../../ops/rmsnorm/wgsl/kernel.wgsl";
 import layernormKernel from "../../../ops/layernorm/wgsl/kernel.wgsl";
 import activationKernel from "../../../ops/activation/wgsl/kernel.wgsl";
@@ -22,6 +23,9 @@ import fa3Kernel from "../../../ops/flash_attention/wgsl/fa3.wgsl";
 
 export const videoKernels: VideoKernels = {
   matmul: matmulKernel,
+  // The page runs the **q8** conversion, so this is the kernel every one of
+  // its matmuls dispatches. Missing, it was `undefined` at the first one.
+  matmulQ8: matmulQ8Kernel,
   rmsnorm: rmsnormKernel,
   layernorm: layernormKernel,
   activation: activationKernel,
