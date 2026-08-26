@@ -332,7 +332,11 @@ async function ropeAxes(
 
   const padded = new Float32Array(slots);
   padded.set(input);
-  const positionSlack = new Int32Array(positions.length + axisDims.length * 4).fill(9999);
+  // f32, matching `axes.wgsl`'s binding. Z-Image's own positions are whole
+  // numbers and stay exact here; the kernel takes floats because MiniMax-H3's
+  // visual VAE has fractional ones (issue #200), and one kernel with the more
+  // general binding beats two that differ by a line.
+  const positionSlack = new Float32Array(positions.length + axisDims.length * 4).fill(9999);
   positionSlack.set(positions);
 
   const [out] = await run({

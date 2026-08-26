@@ -513,8 +513,21 @@ export interface RoPEAxesArgs {
   /**
    * `[N, axisDims.length]`, token-major: `positions[token * axes + axis]`.
    * Upstream's `ids`, flattened.
+   *
+   * **Not necessarily integers.** Z-Image indexes tokens by their grid
+   * coordinate, so its positions are whole numbers; MiniMax-H3's visual VAE
+   * normalises each axis to `(-1, 1)` — `2 * (i + 0.5) / n - 1` — so its are
+   * fractional and its angles are those times `2π` (issue #200). A rotation by
+   * a fractional angle is the same rotation; nothing in the arithmetic below
+   * ever needed the position to be whole, and requiring it would have meant a
+   * second kernel that differs by a binding type.
+   *
+   * `Float32Array` is the general one and `Int32Array` still fits: every
+   * integer up to 2^24 is exact in f32, and no model here indexes that far. A
+   * negative position stays negative and turns the rotation the other way,
+   * which is the property the `i32` binding was chosen for.
    */
-  positions: Int32Array;
+  positions: Float32Array | Int32Array;
   /** Shared by every axis. Z-Image uses 256; 1-D RoPE conventionally 10000. */
   thetaBase: number;
 }

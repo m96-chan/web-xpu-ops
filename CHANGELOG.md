@@ -114,6 +114,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Changed
 
+- **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
+  by their grid coordinate, so its positions are whole numbers and the binding
+  was `i32`. MiniMax-H3's visual VAE normalises each axis to `(-1, 1)` —
+  `2 * (i + 0.5) / n - 1` — and multiplies the angle by `2π`, so its are
+  fractional. A rotation by a fractional angle is the same rotation; nothing in
+  the arithmetic ever needed a whole number, and the alternative was a second
+  kernel differing by one binding type.
+
+  `Float32Array` is the general one and integers still fit exactly. Existing
+  callers pass `Int32Array` unchanged — the reference takes either — and the one
+  GPU caller (`examples/zimage/src/dit-gpu.ts`) uploads f32 now.
+
+  `ops/rope/h3-axes.test.ts` pins the whole mapping onto H3's rope, not just the
+  capability: the **frequencies already agree** (both are
+  `θ^-[0, ⅛, …, ⅞]`), the pairing does not — H3 tiles `[t8,h8,w8]` twice and
+  rotates halves where `ropeAxes` pairs adjacent channels, so a generated
+  permutation converts one to the other **in the weights**, as `permuteForRope`
+  does for Anima — and `rope_dim_ratio: 0.75` is covered by a fourth axis pinned
+  at position 0, which is the identity. Worst element **2.384e-7**.
+
 - **Flash attention stages `k` and `v` without dividing** (issue #177). The
   staging loops turned a flat index into an address the way the arithmetic reads
   — row `base + e / Dv`, channel `e % Dv` — and **a GPU has no integer divide
