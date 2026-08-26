@@ -477,18 +477,24 @@ export class DitGpu {
     // `ops/permute` change. At 56 heads of 128 this runs out of grid at 2,340
     // tokens -- a 576x320 clip is 1,350, so it is close. Refused with the
     // number rather than left to arrive as `batch is not valid`.
+    // **Tiled, since #214 gave `ops/permute` a second grid dimension.** It
+    // folds `y` back in from `num_workgroups`, so the host only chooses the
+    // tiling and a one-dimensional caller is unaffected. Before that this threw
+    // here, and 56 heads of 128 runs out of one row of workgroups at 2,340
+    // tokens — a 25-second reference read at 2 fps is well past it.
     const workgroups = Math.ceil((dim0 * dim1 * D) / WG);
-    if (workgroups > this.maxWorkgroupsPerDimension) {
+    const x0 = Math.min(workgroups, this.maxWorkgroupsPerDimension);
+    const y0 = Math.ceil(workgroups / x0);
+    if (y0 > this.maxWorkgroupsPerDimension) {
       throw new Error(
-        `swapLeading: ${dim0}x${dim1}x${D} needs ${workgroups} workgroups and the device allows ` +
-          `${this.maxWorkgroupsPerDimension}. ops/permute has no second grid dimension, so this sequence ` +
-          `length cannot run yet — see issue #211.`,
+        `swapLeading: ${dim0}x${dim1}x${D} needs ${workgroups} workgroups and two dimensions of ` +
+          `${this.maxWorkgroupsPerDimension} are not enough — see issue #211`,
       );
     }
     const out = this.take(dim0 * dim1 * D);
     await this.dispatch(ops, this.kernels.permute, [x, out, this.uniform([
       ["u32", dim0], ["u32", dim1], ["u32", D],
-    ])], [Math.ceil((dim0 * dim1 * D) / WG)]);
+    ])], [x0, y0]);
     return out;
   }
 

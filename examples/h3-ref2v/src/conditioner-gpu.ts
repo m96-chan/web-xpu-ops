@@ -329,19 +329,58 @@ export class ConditionerGpu {
     return { buffer: biased, rows: a.rows, cols: N };
   }
 
+  /**
+   * RMSNorm, **one workgroup per row**, split when there are more rows than the
+   * grid allows.
+   *
+   * The per-head QK norms pass `seq * numHeads` rows, so at 64 heads the limit
+   * arrives at **1,024 tokens** — a presentation with a video reference in it.
+   * Rows are `headDim` floats, 512 bytes at 128, so every slice is already
+   * 256-byte aligned.
+   */
   private async rms(ops: ResidentOp[], x: Mat, weight: GPUBuffer, eps: number, rows = x.rows, cols = x.cols): Promise<Mat> {
     const out = this.take(rows * cols);
-    await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, weight, out, this.uniform([
-      ["u32", rows], ["u32", cols], ["f32", eps], ["u32", 1],
-    ])], [rows]);
+    const rowBytes = cols * 4;
+    if (rowBytes % 256 !== 0 && rows > MAX_WORKGROUPS) {
+      throw new Error(`rms: ${rows} rows of ${cols} cannot be split on a 256-byte boundary — see issue #211`);
+    }
+    const perChunk = Math.min(rows, MAX_WORKGROUPS);
+    for (let start = 0; start < rows; start += perChunk) {
+      const count = Math.min(perChunk, rows - start);
+      await this.dispatchSliced(ops, this.kernels.rmsnorm, [
+        { buffer: x.buffer, offset: start * rowBytes, size: count * rowBytes },
+        { buffer: weight, offset: 0, size: weight.size },
+        { buffer: out, offset: start * rowBytes, size: count * rowBytes },
+        {
+          buffer: this.uniform([["u32", count], ["u32", cols], ["f32", eps], ["u32", 1]]),
+          offset: 0, size: UNIFORM_BYTES,
+        },
+      ], [count]);
+    }
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
+  /** LayerNorm, one workgroup per row, split the same way `rms` is. */
   private async layer(ops: ResidentOp[], x: Mat, weight: GPUBuffer, bias: GPUBuffer, rows: number, cols: number): Promise<Mat> {
     const out = this.take(rows * cols);
-    await this.dispatch(ops, this.kernels.layernorm, [x.buffer, weight, bias, out, this.uniform([
-      ["u32", rows], ["u32", cols], ["f32", LAYERNORM_EPS],
-    ])], [rows]);
+    const rowBytes = cols * 4;
+    if (rowBytes % 256 !== 0 && rows > MAX_WORKGROUPS) {
+      throw new Error(`layer: ${rows} rows of ${cols} cannot be split on a 256-byte boundary — see issue #211`);
+    }
+    const perChunk = Math.min(rows, MAX_WORKGROUPS);
+    for (let start = 0; start < rows; start += perChunk) {
+      const count = Math.min(perChunk, rows - start);
+      await this.dispatchSliced(ops, this.kernels.layernorm, [
+        { buffer: x.buffer, offset: start * rowBytes, size: count * rowBytes },
+        { buffer: weight, offset: 0, size: weight.size },
+        { buffer: bias, offset: 0, size: bias.size },
+        { buffer: out, offset: start * rowBytes, size: count * rowBytes },
+        {
+          buffer: this.uniform([["u32", count], ["u32", cols], ["f32", LAYERNORM_EPS]]),
+          offset: 0, size: UNIFORM_BYTES,
+        },
+      ], [count]);
+    }
     return { buffer: out, rows, cols };
   }
 
@@ -392,14 +431,18 @@ export class ConditionerGpu {
   }
 
   private async swapLeading(ops: ResidentOp[], x: GPUBuffer, dim0: number, dim1: number, D: number): Promise<GPUBuffer> {
+    // Tiled: `ops/permute` folds a second grid dimension back in (#214), and a
+    // long reference video passes one row of workgroups in the tower.
     const workgroups = Math.ceil((dim0 * dim1 * D) / WG);
-    if (workgroups > MAX_WORKGROUPS) {
+    const x0 = Math.min(workgroups, MAX_WORKGROUPS);
+    const y0 = Math.ceil(workgroups / x0);
+    if (y0 > MAX_WORKGROUPS) {
       throw new Error(`swapLeading: ${dim0}x${dim1}x${D} needs ${workgroups} workgroups — see issue #211`);
     }
     const out = this.take(dim0 * dim1 * D);
     await this.dispatch(ops, this.kernels.permute, [x, out, this.uniform([
       ["u32", dim0], ["u32", dim1], ["u32", D],
-    ])], [workgroups]);
+    ])], [x0, y0]);
     return out;
   }
 

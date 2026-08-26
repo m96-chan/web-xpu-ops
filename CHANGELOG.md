@@ -19,6 +19,15 @@ Entries record **why** a change was needed. What changed is in the diff.
   - **The vision tower never flushed.** Every one of its 27 blocks' buffers
     stayed lent for the whole tower, which at 2,144 patches is gigabytes beside
     25.78 GB of weights.
+  - **The per-row norms had the same shape of limit** — one workgroup per row,
+    so `seq * heads` rows. The conditioner's QK norms reach 65,535 at **1,024
+    tokens** at 64 heads and the DiT's at **1,171** at 56, which is any
+    presentation with a video reference in it. Both split on row boundaries
+    now, and both are `headDim` floats wide, so the slices were already
+    aligned.
+  - **`swapLeading` refused instead of tiling.** Its own comment said splitting
+    needed a second grid dimension in `ops/permute`, which #214 added; it tiles
+    now, in the DiT and in the conditioner's tower.
   - **A dispatch past the grid limit is reported as an invalid *command
     buffer*.** That takes every dispatch recorded beside it with it, so the run
     completed — fifteen sampling steps at 91 ms instead of 1,400, and frames
