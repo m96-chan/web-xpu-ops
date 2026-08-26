@@ -58,11 +58,20 @@ struct Params {
 // Channels per axis, in order. Axis `a`'s block starts after every earlier
 // axis's, which is what upstream's `torch.cat(result, dim=-1)` builds.
 @group(0) @binding(1) var<storage, read> axis_dims: array<u32>;
-// [N, num_axes], token-major. i32 rather than u32 for the reason `gather`'s
-// indices are: a negative position stays negative — it turns the rotation the
-// other way — instead of becoming a huge positive one nothing can tell from a
-// real position.
-@group(0) @binding(2) var<storage, read> positions: array<i32>;
+// [N, num_axes], token-major.
+//
+// **f32, and not because a float index is convenient.** Z-Image indexes tokens
+// by their grid coordinate, so its positions are whole numbers; MiniMax-H3's
+// visual VAE normalises each axis to (-1, 1) and multiplies by 2*pi, so its are
+// fractional (issue #200). A rotation by a fractional angle is the same
+// rotation -- nothing below ever needed a whole number -- and the alternative
+// was a second kernel differing only in this line, which is two conventions
+// waiting to drift.
+//
+// Not u32, for the reason `gather`'s indices are not: a negative position stays
+// negative and turns the rotation the other way, instead of becoming a huge
+// positive one nothing can tell from a real position.
+@group(0) @binding(2) var<storage, read> positions: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -115,7 +124,7 @@ fn main(
 
   // f32(axis_dims[axis]), not f32(params.head_dim) — see the note above.
   let inv_freq = pow(params.theta_base, -2.0 * f32(pair_in_axis) / f32(axis_dims[axis]));
-  let theta = f32(pos) * inv_freq;
+  let theta = pos * inv_freq;
   let cos_theta = cos(theta);
   let sin_theta = sin(theta);
 

@@ -1,0 +1,7 @@
+{
+ "T": 8,
+ "latentChannels": 32,
+ "samples": 6400,
+ "seed": 20260826,
+ "torch": "2.10.0+cu130"
+}

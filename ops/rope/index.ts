@@ -1,5 +1,6 @@
 export {
   rope,
+  h3RopePermutation,
   ropeAxes,
   ropeCache,
   ropeFrequencyParams,
