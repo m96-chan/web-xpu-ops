@@ -84,7 +84,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   `padding_mode`**, and 3D is where that starts to cost something: H3 pads
   `reflect` on the spatial axes and **causally** in time — `2 * padding` frames
   before the data and none after — which is not a value any symmetric padding
-  argument can take. That is a pad op, and it is not written yet.
+  argument can take. That is a pad op, and it is **`pad`**, below.
 
   3D is also the first place the *axis order* is checkable. The tests use an
   input whose elements name their own coordinate (`100d + 10h + w`) against a
@@ -92,6 +92,25 @@ Entries record **why** a change was needed. What changed is in the diff.
   a swapped axis, a flipped kernel or an off-by-one pad shows up in the digits.
   Goldens measured against torch 2.10.0+cu130, integers so they are exact in
   f32.
+
+- **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
+  pad op, not a convolution argument. MiniMax-H3 is the model that makes that
+  separation load-bearing: its visual VAE pads `reflect` on the spatial axes
+  and, in time, **causally** — `2 * padding` frames before the data and none
+  after, so the frame at `t` cannot see `t + 1`. No symmetric `padding`
+  argument can say that, whatever its mode.
+
+  `constant` (with a value), `reflect` and `replicate`, with `before` and
+  `after` separate. **`reflect` does not repeat the edge element and
+  `replicate` does** — measured against torch rather than described, because
+  swapping the two gives a tensor of the right shape whose entire interior is
+  correct.
+
+  It pads **one** axis, viewed as `[outer, L, inner]`; three axes means three
+  calls. That is measured to give what torch's single multi-axis call gives,
+  element for element — not obvious, since a reflection reads neighbours that
+  are themselves reflections. One kernel then serves the audio VAE's 1D
+  `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
 
 ### Changed
 
