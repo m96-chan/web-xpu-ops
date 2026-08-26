@@ -472,11 +472,64 @@ const referenceGeometry: [number, number, number][] = [];
   weights.close();
   console.log(`  VAE encoder uploaded in ${((performance.now() - at) / 1000).toFixed(1)} s`);
 
+  /**
+   * How much the references are shrunk **before the VAE**, and why there is a
+   * knob for it at all.
+   *
+   * The tower's view of a reference and its anchor rows are separate things:
+   * one is vision tokens in the presentation, the other is latents in the
+   * packed sequence. Only the second competes with the target for the
+   * transformer's attention, and at the model's own geometry it barely does —
+   * five seconds at a short edge of 768 is 38,184 target rows against a few
+   * hundred of reference, **about 2%**. At 256x256 over 22 frames the target is
+   * 448 rows and the same references are 552, which is **123%**: the references
+   * are some fifty times more dominant than anything the model was trained on.
+   *
+   * `--anchor-scale N` box-filters the reference by N before encoding it, so a
+   * small target can be given a proportionate anchor without giving up what the
+   * tower sees.
+   */
+  const anchorScale = Math.max(1, Math.round(number("--anchor-scale", 1)));
+  const shrink = (bytes: Uint8Array, w: number, h: number, f: number, n: number): {
+    bytes: Uint8Array; width: number; height: number;
+  } => {
+    if (n === 1) return { bytes, width: w, height: h };
+    const W = Math.max(BLOCK, Math.floor(w / n / BLOCK) * BLOCK);
+    const H = Math.max(BLOCK, Math.floor(h / n / BLOCK) * BLOCK);
+    const sx = w / W;
+    const sy = h / H;
+    const out = new Uint8Array(f * W * H * 3);
+    for (let t = 0; t < f; t += 1) {
+      for (let y = 0; y < H; y += 1) {
+        const y0 = Math.floor(y * sy);
+        const y1 = Math.max(y0 + 1, Math.floor((y + 1) * sy));
+        for (let x = 0; x < W; x += 1) {
+          const x0 = Math.floor(x * sx);
+          const x1 = Math.max(x0 + 1, Math.floor((x + 1) * sx));
+          for (let c = 0; c < 3; c += 1) {
+            let sum = 0;
+            let n2 = 0;
+            for (let yy = y0; yy < y1; yy += 1) {
+              for (let xx = x0; xx < x1; xx += 1) {
+                sum += bytes[((t * h + yy) * w + xx) * 3 + c]!;
+                n2 += 1;
+              }
+            }
+            out[((t * H + y) * W + x) * 3 + c] = Math.round(sum / n2);
+          }
+        }
+      }
+    }
+    return { bytes: out, width: W, height: H };
+  };
+
   const packed: Float32Array[] = [];
-  for (const { input, bytes } of references) {
+  for (const { input, bytes: raw } of references) {
+    const small = shrink(raw, input.width, input.height, input.frames, anchorScale);
+    const bytes = small.bytes;
     // `encode_vae_condition`: ImageNet-normalised `u8 / 255`, channel-major
     // over the whole clip.
-    const plane = input.width * input.height;
+    const plane = small.width * small.height;
     const voxels = plane * input.frames;
     const normalised = new Float32Array(3 * voxels);
     for (let f = 0; f < input.frames; f += 1) {
@@ -488,7 +541,7 @@ const referenceGeometry: [number, number, number][] = [];
       }
     }
     at = performance.now();
-    const moments = await encoder.encode(normalised, input.frames, input.height, input.width);
+    const moments = await encoder.encode(normalised, input.frames, small.height, small.width);
     console.log(
       `  ${input.kind} encoded in ${((performance.now() - at) / 1000).toFixed(2)} s -> ` +
         `moments ${moments.C}x${moments.D}x${moments.H}x${moments.W}`,
@@ -548,9 +601,14 @@ const referenceGeometry: [number, number, number][] = [];
 // caller asked for: a reference's rows are its own latent geometry, which only
 // the encoder knows — a video's frame count goes through the causal temporal
 // compression on the way.
+// `--flat-text-tags` is a bisect handle for issue #216: it marks every text row
+// as text, where the presentation marks a reference's vision block as *video*.
+// Upstream does the latter and this port agrees with it exactly, so a
+// difference here is a fact about the model, not a fix.
+const flatTags = process.argv.includes("--flat-text-tags");
 const layout = buildRef2vaSequence({
   numTextTokens: presentation.tokenIds.length,
-  textTokenTags: presentation.tokenTags,
+  textTokenTags: flatTags ? presentation.tokenTags.map(() => 1) : presentation.tokenTags,
   references: packedReferences,
   visualGeometry: referenceGeometry,
   audioRowCounts: [],

@@ -31,6 +31,7 @@ import torch
 
 from diffusers import MiniMaxH3Scheduler, MiniMaxH3Transformer3DModel
 from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+    MiniMaxH3PrepareLayoutStep,
     MiniMaxH3Ref2VAPrepareLayoutStep,
     MiniMaxH3SetTimestepsStep,
     patchify_video_latents,
@@ -63,6 +64,8 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=0, help="run only the first N blocks (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--no-reference", action="store_true",
+                        help="build the t2va layout instead, so the two can be compared with nothing else changed")
     args = parser.parse_args()
 
     started = time.time()
@@ -84,16 +87,28 @@ def main() -> None:
         1, c.in_channels, args.reference_frames, args.reference_size, args.reference_size)
     condition.normal_(generator=generator)
 
-    (
-        position_ids, token_tags, video_indices, audio_indices, text_indices, cond_video, cond_audio,
-    ) = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
-        tags,
-        [MiniMaxH3ImageReference(image=np.zeros((8, 8, 3), dtype=np.uint8))],
-        [condition],
-        [],
-        args.latent_frames, args.latent_size, args.latent_size, args.audio_latents,
-        tuple(c.patch_size), MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_AUDIO_TAG, MINIMAX_H3_VIDEO_TAG,
-    )
+    if args.no_reference:
+        # The `t2va` layout: the same target, no conditioning rows, and the text
+        # rows all text. Everything else in this script is unchanged, so the two
+        # runs differ only in whether the sequence has anchors in it.
+        tags = torch.full((args.text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        (
+            position_ids, token_tags, video_indices, audio_indices, text_indices, cond_video, cond_audio,
+        ) = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+            tags, args.latent_frames, args.latent_size, args.latent_size, args.audio_latents,
+            tuple(c.patch_size), MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_AUDIO_TAG, MINIMAX_H3_VIDEO_TAG, (),
+        )
+    else:
+        (
+            position_ids, token_tags, video_indices, audio_indices, text_indices, cond_video, cond_audio,
+        ) = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
+            tags,
+            [MiniMaxH3ImageReference(image=np.zeros((8, 8, 3), dtype=np.uint8))],
+            [condition],
+            [],
+            args.latent_frames, args.latent_size, args.latent_size, args.audio_latents,
+            tuple(c.patch_size), MINIMAX_H3_AUDIO_CHANNELS, MINIMAX_H3_AUDIO_TAG, MINIMAX_H3_VIDEO_TAG,
+        )
 
     # **The conditioning noise is drawn first**, one draw per reference, before
     # the target's — upstream's order, and its own doc says that order is part
@@ -105,7 +120,7 @@ def main() -> None:
     video_scheduler.set_timesteps(args.steps)
     audio_scheduler.set_timesteps(args.steps)
     noised_condition = video_scheduler.scale_noise(condition, KEYFRAME_NOISE_AUG, condition_noise)
-    condition_rows = patchify_video_latents(noised_condition, tuple(c.patch_size))
+    condition_rows = patchify_video_latents(noised_condition, tuple(c.patch_size))[:cond_video]
     assert condition_rows.shape[0] == cond_video, (condition_rows.shape, cond_video)
 
     patch_dim = c.in_channels * c.patch_size[0] * c.patch_size[1] * c.patch_size[2]
@@ -166,7 +181,7 @@ def main() -> None:
     (out_dir / "golden.json").write_text(json.dumps({
         "source": "MiniMaxAI/MiniMax-H3 transformer_ref, sampled by diffusers MiniMaxH3Scheduler",
         "note": "Activations only. No weights are redistributed by this file.",
-        "workflow": "ref2va",
+        "workflow": "t2va" if args.no_reference else "ref2va",
         "seed": args.seed,
         "steps": args.steps,
         "layers": int(len(model.transformer_blocks)),

@@ -194,6 +194,47 @@ console.log(`anchor drift: ${anchorDrift.toExponential(3)}`);
 
 const got = { video: videoRows, audio: audioRows };
 
+/**
+ * The temporal roughness of the generated rows, in this port and in upstream's
+ * own output.
+ *
+ * Issue #216: R2V's frames flicker at 2.7x `t2va`'s, and upstream's own output
+ * does *not* get rougher when a reference is added — measured at -2.3%. So the
+ * number to compare is not the worst element, it is how much the latent moves
+ * between frames.
+ */
+{
+  const perRowValues = perRow;
+  const generated = (x: Float32Array): number[] => {
+    const rows = (x.length - anchored) / perRowValues;
+    const frames = golden.layout.numLatentFrames;
+    const perFrame = (rows / frames) * perRowValues;
+    const out: number[] = [];
+    for (let f = 1; f < frames; f += 1) {
+      let sum = 0;
+      for (let i = 0; i < perFrame; i += 1) {
+        sum += Math.abs(x[anchored + f * perFrame + i]! - x[anchored + (f - 1) * perFrame + i]!);
+      }
+      out.push(sum / perFrame);
+    }
+    return out;
+  };
+  const rmsOf = (x: Float32Array): number => {
+    let s = 0;
+    for (let i = anchored; i < x.length; i += 1) s += x[i]! * x[i]!;
+    return Math.sqrt(s / (x.length - anchored));
+  };
+  const wantVideo = f32(`${goldenDir}/output.video.bin`);
+  const mine = generated(videoRows);
+  const theirs = generated(wantVideo);
+  const mean = (a: number[]): number => a.reduce((s, v) => s + v, 0) / a.length;
+  console.log(
+    `latent frame-to-frame: this port ${(mean(mine) / rmsOf(videoRows)).toFixed(4)} relative, ` +
+      `upstream ${(mean(theirs) / rmsOf(wantVideo)).toFixed(4)} ` +
+      `(${((mean(mine) / rmsOf(videoRows)) / (mean(theirs) / rmsOf(wantVideo)) * 100 - 100).toFixed(1)}%)`,
+  );
+}
+
 function compare(name: string, gotValues: Float32Array, want: Float32Array): number {
   if (gotValues.length !== want.length) {
     console.error(`${name}: ${gotValues.length} values against ${want.length}`);
