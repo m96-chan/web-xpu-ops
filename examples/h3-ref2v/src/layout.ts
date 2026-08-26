@@ -32,6 +32,17 @@
 import type { PackedLayout } from "../../h3-dit/src/model.js";
 import { AUDIO_CHANNELS, AUDIO_TAG, TEXT_TAG, VIDEO_TAG } from "../../h3-dit/src/layout.js";
 
+/**
+ * The `t` a visual conditioning anchor is held at — `keyframe_noise_aug`.
+ *
+ * 0.999, "just short of clean": the released model was trained with its anchors
+ * very slightly noised, so conditioning on exactly `t = 1.0` is off
+ * distribution. Upstream's own words, in `MiniMaxH3ModularPipeline`.
+ */
+const KEYFRAME_NOISE_AUG = 0.999;
+/** The audio reference rows' level, which upstream passes as a literal 1.0. */
+const CONDITION_AUDIO_TIMESTEP = 1.0;
+
 /** `[0, 32)` on the long axis, and 24 fps against the audio's 40 latents/s. */
 const ROPE_SPATIAL_SCALE = 32;
 const ROPE_FRAME_RESCALE = 5 / 3;
@@ -315,5 +326,59 @@ export function buildRef2vaSequence(args: Ref2vaArgs): Ref2vaLayout {
     textIndices,
     numReferenceVideoRows,
     numReferenceAudioRows,
+  };
+}
+
+/**
+ * A noise level per row of a `ref2va` sequence, reduced to the transformer's
+ * `(timestep, timestepIndices)` pair.
+ *
+ * `examples/h3-dit`'s `buildRowTimesteps` knows **two** levels: the video
+ * schedule and the audio one, which differ because H3 runs them at `shift = 12`
+ * and `shift = 3`. `ref2va` adds the two the *conditioning* rows sit at, and
+ * they are not zero:
+ *
+ * - **The visual anchors sit at `max(t, 0.999)`.** `keyframe_noise_aug` is
+ *   0.999 rather than 1.0 because the released model was trained with its
+ *   anchors very slightly noised, so conditioning on exactly clean is off
+ *   distribution. The `max` matters at the top of the schedule, where the
+ *   generated rows are noisier than the anchor and the two levels collapse — a
+ *   port that writes the constant agrees everywhere else.
+ * - **The audio reference rows sit at exactly 1.0.**
+ *
+ * The four assignments are in upstream's order, and **that order cannot
+ * matter**: the two audio slices are `[n:]` and `[:n]`, disjoint by
+ * construction, and the video slice touches rows neither of them does. Written
+ * down because a mutation that reordered them survived the sweep and looked
+ * like a gap in the tests until the slices were read — the same shape as the
+ * tag-order mutation this file's README already records.
+ *
+ * Text rows never reach an output head and inherit the video timestep.
+ */
+export function buildRef2vaRowTimesteps(
+  layout: Pick<PackedLayout, "seq" | "videoIndices" | "audioIndices">,
+  numConditionVideoRows: number,
+  numConditionAudioRows: number,
+  videoTimestep: number,
+  audioTimestep: number,
+): { timestep: Float32Array; timestepIndices: Int32Array } {
+  const rowTimesteps = new Float32Array(layout.seq).fill(Math.fround(videoTimestep));
+  const conditionVideoTimestep = Math.fround(Math.max(videoTimestep, KEYFRAME_NOISE_AUG));
+  for (let i = 0; i < numConditionVideoRows; i += 1) {
+    rowTimesteps[layout.videoIndices[i]!] = conditionVideoTimestep;
+  }
+  for (let i = numConditionAudioRows; i < layout.audioIndices.length; i += 1) {
+    rowTimesteps[layout.audioIndices[i]!] = Math.fround(audioTimestep);
+  }
+  for (let i = 0; i < numConditionAudioRows; i += 1) {
+    rowTimesteps[layout.audioIndices[i]!] = Math.fround(CONDITION_AUDIO_TIMESTEP);
+  }
+
+  // `torch.unique(sorted=True, return_inverse=True)`.
+  const distinct = [...new Set(rowTimesteps)].sort((a, b) => a - b);
+  const at = new Map(distinct.map((v, i) => [v, i]));
+  return {
+    timestep: Float32Array.from(distinct),
+    timestepIndices: Int32Array.from(rowTimesteps, (v) => at.get(v)!),
   };
 }

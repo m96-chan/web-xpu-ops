@@ -422,6 +422,44 @@ tokens advancing the clock by 8.
 `qwen3vlPositionGrid` builds it, and `verify-conditioner.ts` refuses to run if
 it disagrees with the model's own.
 
+## Sampling with references, read off upstream
+
+The conditioner is what R2V needs that `t2va` does not *encode*; these are what
+it needs that `t2va` does not **sample**. All three were read out of
+`diffusers`' `modular_pipelines/minimax_h3/`, and none of them needs a new
+kernel.
+
+**The reference latents are noised before they are packed.** Not clean:
+`scale_noise(condition, 0.999, noise)`, one noise draw per reference and drawn
+from the request's generator *first*, before the target's. `keyframe_noise_aug`
+is 0.999 rather than 1.0 because the released model was trained with its anchors
+very slightly noised, so exactly clean is off distribution.
+
+**Four noise levels, not two.** `buildRef2vaRowTimesteps` — the generated video
+rows, the generated audio rows, the visual anchors at `max(t, 0.999)` and the
+audio reference rows at exactly 1.0, reduced by `torch.unique` to the
+`(timestep, timestepIndices)` pair the transformer takes. The `max` is the part
+to keep: past the anchor the conditioning rows collapse onto the generated ones
+and there are three levels where there were four. A port that writes the
+constant agrees with every other step of the schedule.
+
+Held to `MiniMaxH3SetTimestepsStep.build_row_timesteps` — **called**, not
+transcribed, since a golden that transcribed the rule would agree with a port
+that transcribed it the same way wrong. Six cases, and the mutations that matter
+are caught: the constant anchor, an anchor of 1.0, an unsorted `unique`, the
+wrong index array, the wrong row count for a slice.
+
+One mutation **survived, and it was a no-op** — writing the generated audio
+level across the whole audio range before the reference rows are written back
+over the front of it. The two slices are `[n:]` and `[:n]`, disjoint, so the
+order cannot matter. The doc comment said it was load-bearing until the sweep
+made someone read the slices. Same shape as the tag-order mutation above.
+
+**The anchors are re-imposed by not being touched.** The scheduler writes only
+`latents[numReferenceVideoRows:]`; there is no mask and no re-composition. A
+port that stepped every row would drift the references away over sixteen steps
+and produce something that looks conditioned and is not.
+
 ## What is not here yet
 
 The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,
