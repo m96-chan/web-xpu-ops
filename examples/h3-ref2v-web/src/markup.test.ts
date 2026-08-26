@@ -43,10 +43,12 @@ describe("h3-ref2v-web / markup", () => {
     expect(html).toMatch(/unmeasured/);
   });
 
-  it("says the three models run in sequence", () => {
-    // 48.7 GB fits on no card this page will meet, and the staging is the
-    // reason the page can exist at all.
-    expect(html).toMatch(/48\.7 GB/);
+  it("says the models run in sequence, at the size they actually are", () => {
+    // 48.9 GB fits on no card this page will meet, and the staging is the
+    // reason the page can exist at all. The figure is asserted rather than the
+    // sentence because it is the figure that goes stale: it read 48.7 until the
+    // conversion stopped keeping a text layer nobody evaluates.
+    expect(html).toMatch(/48\.9 GB/);
     expect(html).toMatch(/sequence, not together/);
   });
 

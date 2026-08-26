@@ -6,11 +6,15 @@
  * offline and the page reads embeddings. Here the reference *is* the input, so
  * Qwen3-VL runs in the tab.
  *
- * **Three models, one at a time.** The conditioner is 25.78 GB of int8, the DiT
- * 20.08 and the VAE decoder 2.43 — 48.7 GB, which fits on no card this page
- * will meet. Each is uploaded, used, and dropped before the next, the same
- * staging `examples/h3-dit/src/generate.ts` uses across processes and for the
- * same measured reason.
+ * **Four models, one at a time.** The conditioner is 25.78 GB of int8, the DiT
+ * 20.66 (20.08 of weights and 0.58 of tables) and the VAE decoder 2.43 — 48.9 GB,
+ * which fits on no card this page will meet. Each is uploaded, used, and dropped
+ * before the next, and dropping needs `ResidentDevice.reclaim()` because
+ * `destroy()` only schedules the freeing (issue #213).
+ *
+ * The fourth is the VAE **encoder**, which turns a reference into the latents
+ * the packed sequence carries. It has a CPU reference and no GPU path — issue
+ * #214, and the reason this page still runs nothing.
  *
  * Every stage below is held to the model's own output somewhere in
  * `examples/h3-ref2v` — the layout, the presentation, the text stack, the
@@ -85,7 +89,7 @@ const gate: GateOptions = {
   } satisfies GateElements,
   files: WEIGHT_FILES,
   weightsBase: WEIGHTS_BASE,
-  downloadSize: "48.7 GB",
+  downloadSize: "48.9 GB",
   licence:
     "Powered by MiniMax H3. The model is licensed under the MiniMax H3 Community License Agreement, " +
     "not this page's MIT, and nothing here redistributes it.",
@@ -307,14 +311,15 @@ async function main(): Promise<void> {
         "</table>";
 
       // **Everything that decides *what* the models are given is here and is
-      // held to the model.** What is not here is the running of them: the
-      // conditioner and the vision tower have CPU references and no GPU path,
-      // and no converter has written a `conditioner.q8.bin`. Said plainly
-      // rather than dressed as a failure.
+      // held to the model.** What is not here is the running of them. The
+      // conditioner, the DiT and the VAE decoder all have GPU paths; the VAE
+      // **encoder** has only a CPU one, and a reference has to go through it to
+      // become the packed sequence's reference rows. Said plainly rather than
+      // dressed as a failure.
       say(
         "the request is built; the models are not wired yet.",
         `${layout.seq.toLocaleString()} packed rows, of which ${layout.numReferenceVideoRows} are references — ` +
-          "the conditioner still needs a GPU path and a conversion. Issue #212.",
+          "the VAE encoder still needs a GPU path. Issues #212 and #214.",
       );
     } catch (error) {
       say("that request could not be built.", String(error));

@@ -11,13 +11,18 @@ built. Drop a reference and press Generate and the page tells you exactly what
 it would run — how many vision tokens the reference contributed, how many rows
 are references, how long the packed sequence is.
 
-**What does not:** the conditioner and the vision tower have CPU references in
-`examples/h3-ref2v` and **no GPU path**, and no converter has written a
-`conditioner.q8.bin`. The DiT and the VAE decoder do have GPU paths
-(`examples/h3-dit`, `examples/h3-video`), so what is missing is one model of the
-three and the staging between them.
+**What does not:** the page runs no model. The conditioner does have a GPU path
+now (`examples/h3-ref2v/src/conditioner-gpu.ts`, held to the released
+Qwen3-VL-32B at a median row of 1.12%) and so do the DiT and the VAE decoder —
+what is missing is the **VAE encoder**, which has only a CPU reference, and the
+staging between all of them.
 
-That is the honest line. Nothing here pretends to generate.
+The encoder is not a detail: a reference has to be encoded into latents to
+become the packed sequence's reference rows, and the CPU one takes **120.5 s on
+an 8x32x32 clip**. A 256x256 still is eight times the voxels. Issue #214.
+
+So it is four models one at a time, not three, and one of the four does not
+exist yet. That is the honest line. Nothing here pretends to generate.
 
 ## Why R2V cannot do what `examples/h3-dit-web` does
 
@@ -26,10 +31,16 @@ fixed. **Here the reference is the input**, so Qwen3-VL has to run in the tab �
 which is the whole reason this is a different page and not a checkbox.
 
 Measured, at int8: the conditioner is **25.78 GB** (vision tower 0.61, text
-layers 0..49 24.40, embedding 0.78), the DiT **20.08 GB**, the VAE decoder 2.43.
-**48.7 GB**, which fits on no card this page will meet. So the three run **in
-sequence**: upload, use, drop, upload the next. `examples/h3-dit/src/generate.ts`
-already does this across processes, for the same measured reason.
+layers 0..49 24.40, embedding 0.78), the DiT **20.66 GB** (20.08 of weights and
+0.58 of modulation tables), the VAE decoder 2.43. **48.9 GB**, which fits on no
+card this page will meet. So they run **in sequence**: upload, use, drop, upload
+the next.
+
+**Dropping is not free and not instant.** `destroy()` schedules the freeing;
+Dawn does it on its next tick, and it ticks on GPU work rather than on a timer.
+`ResidentDevice.reclaim()` asks for that work — issue #213 has the measurement,
+and `examples/h3-dit/src/generate.ts` ran its two phases as separate *processes*
+before there was one. A tab has no process to exit.
 
 ## The tokenizer was already here
 
