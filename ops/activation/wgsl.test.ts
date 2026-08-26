@@ -63,6 +63,38 @@ const cases: { label: string; kind: ActivationKind; alpha?: number; expected: Fl
 describe("activation / wgsl", () => {
   useGpu();
 
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 workgroups is the ceiling on every backend measured (#211), which at
+   * 256 threads is 16.7 M elements — `examples/h3-encoder`'s first level passes
+   * it on a 256x256 reference with five frames. The fold uses `num_workgroups`
+   * rather than a uniform, so **every existing one-dimensional caller keeps
+   * working unchanged**: at `[n]` the y extent is 1 and `gid.y` is 0. Narrow on
+   * purpose, so most of the work lands on rows the unfolded kernel never
+   * reaches.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one index", async (run) => {
+    const n = 5000;
+    const input = Float32Array.from({ length: n }, (_, i) => Math.sin(i * 0.013) * 3);
+    const x = 4;
+    const y = Math.ceil(Math.ceil(n / WG) / x);
+    await expectAgrees(
+      run,
+      {
+        code,
+        bindings: [
+          { kind: "storage", data: input },
+          { kind: "out", type: "f32", length: n },
+          { kind: "uniform", data: params([["u32", n], ["u32", ACTIVATION.silu], ["f32", 1]]) },
+        ],
+        workgroups: [x, y],
+      },
+      [activation({ input, kind: ACTIVATION.silu })],
+      { rel: 1e-6, abs: 1e-6 },
+    );
+  });
+
   for (const { label, kind, alpha, expected } of cases) {
     gpuTest(`agrees with the reference for ${label}`, async (run) => {
       // Default tolerance throughout, and measured rather than assumed. Worst

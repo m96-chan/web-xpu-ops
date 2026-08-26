@@ -9,6 +9,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s
+  CPU version is a reference and stays one — it is a single-threaded loop over
+  `ops/conv`'s scalar `conv3d` and takes **120.5 s on an 8x32x32 clip**, which
+  is not something R2V can do once per dropped reference.
+
+  Held to the same golden the CPU one is held to — `EncoderFCN3D` and
+  `quant_conv`, the **model's own output**, never the other port:
+
+  | | 8x32x32 | worst against the model |
+  | --- | --- | --- |
+  | `encoder.ts` (CPU) | 120.5 s | 2.432e-5 |
+  | `encoder-gpu.ts` | **0.20 s** | **9.537e-6** |
+
+  At the geometry R2V actually uses, RTX 5090 / Dawn / f32 weights, 236
+  dispatches: **0.47 s** for one 256x256 still, 1.47 s for five frames, 5.30 s
+  for twenty-one.
+
+  **No new kernel** — `conv3d`, `pad`, `group_norm`, `activation`,
+  `elementwise` and `permute` cover it, which was checked against the four the
+  CPU version calls before any of it was written.
+
+- **`permute`, `activation` and `elementwise` accept a two-dimensional
+  dispatch** (issue #214). One row of workgroups runs out at 65,535, which at
+  256 threads is 16.7 M elements — the encoder's first level passes it on a
+  256x256 reference at five frames, and the guard that caught it was an
+  exception rather than a wrong picture.
+
+  The fold reads `num_workgroups.x` instead of taking a new uniform, so **every
+  existing one-dimensional caller keeps working unchanged**: at `[n]` the y
+  extent is 1 and `gid.y` is 0. `ops/pad` solves the same problem with a
+  `stride_y` uniform and needed its callers to know.
+
 - **`ResidentDevice.reclaim()`** (issue #213). `destroy()` schedules the freeing
   of a buffer's memory; it does not do it. Dawn releases on its next tick and
   **ticks on GPU work, not on a timer** — so a stage that destroys 25 GB and
