@@ -59,6 +59,50 @@ timestep MLP without its activation (1.0e-1), the refiner's residual dropped
 is at timestep 0 — and moves the audio by 2.6e-2. Dropping the video head's
 bias does the reverse. A test that checked one head would have passed either.
 
+## The packed sequence, and the schedule
+
+The transformer builds **neither**. `forward` takes the row order, the modality
+tags, every row's noise level and the `(t, h, w)` rotary grid as *arguments*, so
+each is a free choice — and **not one of them changes a shape**. A wrong layout
+generates a video; just not the one the weights were trained for.
+
+`src/layout.ts` and `src/scheduler.ts` are ported from
+`diffusers.modular_pipelines.minimax_h3` and `MiniMaxH3Scheduler`, and their
+fixtures are committed too — arithmetic on shapes and step counts carries no
+weights.
+
+**Six layout conventions**, none of them guessable:
+
+- video rows are **frame-major, then row-major** within a frame;
+- the spatial grid is **aspect-normalised** and scaled by 32 — on a *square*
+  canvas the normalisation is the identity, which is exactly where a bug hides,
+  so the fixture has a wide and a tall case as well;
+- it is built with **`np.linspace(..., endpoint=False)`**, not `torch.linspace`;
+- latent frames are spaced **`5/3 * (1, 4, 4, 4, 4)`** in rotary time, because
+  the VAE's first latent covers one pixel frame and the rest cover four;
+- **the media clock starts after the text**, so prompt length moves the video;
+- audio rows are **channel-major**, carry **no height**, and are pinned to the
+  two extremes of the width grid.
+
+Eleven mutations, all caught.
+
+**Two rounding details that are not pedantry.** `resolveCanvasSize` needs
+Python's **banker's** rounding: the default 720p canvas asks for
+`round(720 / 32) = round(22.5)`, which is 22 in Python and 23 in JavaScript, so
+half-up silently generates at **736** pixels instead of 704. And the sigma grid
+needed `torch.linspace` reproduced element for element — f32 step, second half
+counted **down from the end**, each element one **fused** multiply-add. Naive
+`1 - i / (n - 1)` disagrees at 4 of 50 points, one ulp each, which changes which
+timesteps the transformer is conditioned on and would never look wrong.
+
+**Four schedule conventions**: `t = 1 - sigma` with **`t = 1` clean**, the
+terminal sigma getting **no** model evaluation, `step` recovering its sigma from
+the *timestep* rather than the grid, and `eta = 0` despite the reference class
+being named "euler ancestral". Both shipped shifts are covered — **12.0** video,
+**3.0** audio.
+
+There is **no classifier-free guidance**: one forward per step.
+
 ## One block, against the real checkpoint
 
 ## What is checked, and against what

@@ -9,6 +9,31 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **MiniMax-H3's packed sequence layout** (issue #210). The transformer builds
+  none of it: row order, modality tags, per-row noise levels and the `(t, h, w)`
+  rotary grid all arrive as arguments, so every one is a free choice and **not
+  one of them changes a shape**. Ported from
+  `diffusers.modular_pipelines.minimax_h3`, fixture committed.
+
+  Six conventions, none guessable: video rows **frame-major then row-major**; a
+  spatial grid that is **aspect-normalised** and scaled by 32; built with
+  **`np.linspace(endpoint=False)`**, not `torch.linspace`; latent frames spaced
+  **`5/3 * (1, 4, 4, 4, 4)`** because the VAE's first latent covers one pixel
+  frame and the rest four; **the media clock starting after the text**, so
+  prompt length moves the video; audio rows **channel-major**, with no height,
+  pinned to the two extremes of the width grid.
+
+  The fixture carries a **square** canvas as well as a wide and a tall one. On a
+  square canvas the aspect normalisation is the identity, so squares alone
+  would pass with it deleted.
+
+  `resolveCanvasSize` needs Python's **banker's rounding**, and that is not
+  pedantry: the default 720p canvas asks for `round(720 / 32) = round(22.5)`,
+  which is 22 in Python and 23 in JavaScript, so half-up generates at **736**
+  pixels where the model wants 704 — and nothing downstream would object.
+
+  Eleven mutations, all caught.
+
 - **MiniMax-H3's sampling schedule** (issue #210). Rectified flow with an
   exponential shift, ported from `MiniMaxH3Scheduler`. Four conventions decided
   by upstream rather than by this port, each of which yields a *video* rather
