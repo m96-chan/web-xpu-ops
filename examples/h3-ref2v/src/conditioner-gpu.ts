@@ -6,8 +6,8 @@
  * resident version, built the way `examples/h3-dit/src/model-gpu.ts` is so a
  * divergence between the two is readable.
  *
- * **26.25 GB of int8**, and it is a third of a generation rather than the whole
- * of one: the DiT is 20.08 and the VAE decoder 2.43, which is 48.7 together and
+ * **25.78 GB of int8**, and it is a third of a generation rather than the whole
+ * of one: the DiT is 20.08 and the VAE decoder 2.43, which is 48.3 together and
  * fits on no card. The three run in sequence.
  *
  * **No new kernel.** `matmulQ8`, `rmsnorm`, `layernorm`, `activation`,
@@ -33,6 +33,15 @@
  * layers. Not concatenated, not prepended: added, in place, at the rows a
  * vision block occupies. A port that skipped it produces a well-formed
  * conditioning that has seen the image once instead of four times.
+ *
+ * Upstream adds feature `i` after layer `i` returns; this adds it **at the top
+ * of layer `i + 1`**, which is the same tensor entering the same layer and the
+ * same output for any stack deeper than three. It is written that way because
+ * `transformers` records `hidden_states[k]` from a *forward hook* on the
+ * decoder layer, so the state it hands a bisect is layer `k - 1`'s output
+ * **before** the deepstack add. Adding at the top makes `layers = k` produce
+ * exactly `hidden_states[k]` for every `k`, which is what
+ * `verify-conditioner.ts --layers` needs to be able to name a layer at all.
  */
 import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
@@ -344,6 +353,36 @@ export class ConditionerGpu {
     return { buffer: out, rows: a.rows, cols: a.cols };
   }
 
+  /**
+   * `x` with `feature`'s rows added at the token rows a vision block occupies.
+   *
+   * **Into a fresh buffer.** WebGPU refuses a buffer bound as both read-only
+   * and read-write inside one compute pass, so an in-place add is `usage
+   * (Storage(read-write)|Storage(read-only)) includes writable usage and
+   * another usage in the same synchronization scope` -- an invalid command
+   * buffer, whose output is whatever was in the pool. That reads as a plausible
+   * number rather than as an error: the run that found it reported "100.46% of
+   * peak" and the values were pool debris.
+   */
+  private async addAtVisualRows(
+    ops: ResidentOp[], x: Mat, feature: Mat, visualRuns: [number, number][],
+  ): Promise<Mat> {
+    const rowBytes = x.cols * 4;
+    const next = this.take(x.rows * x.cols);
+    ops.push({ kind: "copy", src: x.buffer, srcOffset: 0, dst: next, dstOffset: 0, size: x.rows * rowBytes });
+    let seen = 0;
+    for (const [start, length] of visualRuns) {
+      await this.dispatchSliced(ops, this.kernels.elementwise, [
+        { buffer: x.buffer, offset: start * rowBytes, size: length * rowBytes },
+        { buffer: feature.buffer, offset: seen * rowBytes, size: length * rowBytes },
+        { buffer: next, offset: start * rowBytes, size: length * rowBytes },
+        { buffer: this.uniform([["u32", length * x.cols], ["u32", ELEMENTWISE.add]]), offset: 0, size: UNIFORM_BYTES },
+      ], [Math.ceil((length * x.cols) / WG)]);
+      seen += length;
+    }
+    return { buffer: next, rows: x.rows, cols: x.cols };
+  }
+
   private async act(ops: ResidentOp[], x: Mat, kind: number): Promise<Mat> {
     const out = this.take(x.rows * x.cols);
     await this.flat(ops, this.kernels.activation, x.rows, x.cols, [
@@ -572,6 +611,13 @@ export class ConditionerGpu {
     const qWidth = t.num_attention_heads * headDim;
     const kvWidth = t.num_key_value_heads * headDim;
     for (let i = 0; i < this.manifest.layers; i += 1) {
+      // **Deepstack, at the top of the layer that reads it.** See this file's
+      // own note: upstream adds feature `i` after layer `i` returns, which is
+      // the same tensor arriving here, and doing it here is what lets a
+      // truncated stack be compared against `hidden_states[layers]`.
+      if (i > 0 && i - 1 < vision.deepstack.length) {
+        x = await this.addAtVisualRows(ops, x, vision.deepstack[i - 1]!, request.visualRuns);
+      }
       const p = `layers.${i}`;
       const normed = await this.rms(ops, x, this.w(`${p}.input_layernorm.weight`), t.rms_norm_eps);
       let q = await this.linear(ops, normed, `${p}.self_attn.q_proj.weight`, null, qWidth);
@@ -595,30 +641,6 @@ export class ConditionerGpu {
       const ff = await this.linear(
         ops, await this.pointwise(ops, gate, up, ELEMENTWISE.multiply), `${p}.mlp.down_proj.weight`, null, hidden);
       x = await this.pointwise(ops, x, ff, ELEMENTWISE.add);
-
-      // **Deepstack: added in, at the visual rows, after the layer.** Three of
-      // the vision tower's layers feed the text stack's first three.
-      if (i < vision.deepstack.length) {
-        const feature = vision.deepstack[i]!;
-        // **Into a fresh buffer.** WebGPU refuses a buffer bound as both
-        // read-only and read-write inside one compute pass, so an in-place add
-        // is `usage (Storage(read-write)|Storage(read-only)) includes writable
-        // usage and another usage in the same synchronization scope` -- an
-        // invalid command buffer, whose output is whatever was in the pool.
-        const next = this.take(seq * hidden);
-        ops.push({ kind: "copy", src: x.buffer, srcOffset: 0, dst: next, dstOffset: 0, size: seq * rowBytes });
-        let seen = 0;
-        for (const [start, length] of request.visualRuns) {
-          await this.dispatchSliced(ops, this.kernels.elementwise, [
-            { buffer: x.buffer, offset: start * rowBytes, size: length * rowBytes },
-            { buffer: feature.buffer, offset: seen * rowBytes, size: length * rowBytes },
-            { buffer: next, offset: start * rowBytes, size: length * rowBytes },
-            { buffer: this.uniform([["u32", length * hidden], ["u32", ELEMENTWISE.add]]), offset: 0, size: UNIFORM_BYTES },
-          ], [Math.ceil((length * hidden) / WG)]);
-          seen += length;
-        }
-        x = { buffer: next, rows: seq, cols: hidden };
-      }
       await this.flush(ops, [x.buffer, positionBuffer, ...vision.deepstack.map((d) => d.buffer)]);
     }
 

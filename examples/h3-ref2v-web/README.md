@@ -25,8 +25,8 @@ That page ships prompt embeddings baked offline, because its prompt list is
 fixed. **Here the reference is the input**, so Qwen3-VL has to run in the tab —
 which is the whole reason this is a different page and not a checkbox.
 
-Measured, at int8: the conditioner is **26.25 GB** (vision tower 0.60, text
-layers 0..50 24.87, embedding 0.78), the DiT **20.08 GB**, the VAE decoder 2.43.
+Measured, at int8: the conditioner is **25.78 GB** (vision tower 0.61, text
+layers 0..49 24.40, embedding 0.78), the DiT **20.08 GB**, the VAE decoder 2.43.
 **48.7 GB**, which fits on no card this page will meet. So the three run **in
 sequence**: upload, use, drop, upload the next. `examples/h3-dit/src/generate.ts`
 already does this across processes, for the same measured reason.

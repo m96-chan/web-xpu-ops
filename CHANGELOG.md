@@ -9,29 +9,51 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
-- **R2V's conditioner converts and runs on the GPU** (issue #212).
-  **26.27 GB** of int8 in 96 s — 0.61 GB of vision tower, 51 text layers, no
-  `lm_head` and no layers 51..63, because `hidden_states[50]` is a layer
-  *input*. 76 tokens in 2.4 s over 828 dispatches.
+- **R2V's conditioner converts, runs on the GPU, and reproduces the model**
+  (issue #212). **25.78 GB** of int8 in 86 s — 0.61 GB of vision tower, 50 text
+  layers, no `lm_head` and no layers 50..63. 76 tokens in 2.0 s over 8,182
+  dispatches.
 
-  **It does not yet reproduce the model**, and the bisection is recorded rather
-  than the last number: `hidden_states[0]` is 4.07% of peak, `[1]` is 19.34%,
-  `[4]` is 4.52%. The fault is in the first text layer and it washes down before
-  compounding — which is exactly what an error looks like when only the end is
-  measured.
+  Held to `hidden_states[50]` of the released Qwen3-VL-32B on a real
+  presentation, **as a median over rows** rather than as one worst element:
+  **1.12%** on the text rows and **3.00%** on the visual ones against the same
+  weights round-tripped through this converter's own int8, 2.02% and 4.27%
+  against them in bf16.
 
-  Two real bugs were found on the way. **The deepstack add aliased one buffer
-  as read and read-write inside a compute pass**, which WebGPU refuses, so the
-  command buffer was invalid and the output was whatever the pool held. And
-  **the fused `qkv` was un-interleaved with a copy per token per block** —
-  20,736 for one 256x256 reference; the converter splits it into three now and
-  the dispatch count fell from 28,957 to 828.
+  Three real bugs, and the third is why the first two were hard to see:
+
+  - **The deepstack add aliased one buffer as read and read-write inside a
+    compute pass.** WebGPU refuses that, so the command buffer was invalid and
+    the output was whatever the pool held — reported as "100.46% of peak",
+    which is not a number.
+  - **The fused `qkv` was un-interleaved with a copy per token per block** —
+    20,736 for one 256x256 reference. The converter splits it into three now,
+    as `examples/h3-video` splits `to_qkv`.
+  - **The stack ran one layer too many.** `hidden_states[50]` is the *input* to
+    layer 50: `transformers` records hidden states from a forward hook on the
+    decoder layer, so state `k` is layer `k - 1`'s output. The conversion kept
+    layer 50 and the forward evaluated it — 0.49 GB and a whole layer of
+    arithmetic past the answer. `verify-conditioner.ts` refuses to compare a
+    conversion whose layer count disagrees with the golden's now.
+
+  **A last number cannot see any of that**, because this stack's last rows are
+  massive activations: from layer 43 a few visual tokens grow by a factor of a
+  hundred, so worst-over-peak reads ~96% whether the port is right or wrong. It
+  moved by 0.01 points when the extra layer was removed; the median row moved
+  from 24.9% to 1.12%. `verify-conditioner.ts` reports rows, split by kind.
+
+  **Which tokens become massive is a near-tie, and int8 rounding flips it.**
+  `gen_real_conditioner_golden.py --quantised` runs the released weights through
+  this converter's own quantisation inside `transformers`, and the reference
+  then picks the same row this port picks. Without that second reference the
+  flip reads as an 88%-of-peak port bug; with it, it is the model's own
+  sensitivity, recorded and not fixed.
 
   **A vision token does not sit at `t = h = w = index`.** A vision block gets a
   2-D grid and the clock advances by `max(h, w) / merge`, the block's longer
   side, not by its token count. `qwen3vlPositionGrid` builds it and
   `verify-conditioner.ts` refuses to run if it disagrees with `get_rope_index`'s
-  own output — which it no longer does, and which was not the fault.
+  own output.
 
 - **R2V's image processor and its browser page** (issue #212).
   `examples/h3-ref2v/src/processor.ts` reproduces

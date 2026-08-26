@@ -1,14 +1,14 @@
 /**
  * The GPU conditioner against the hidden state Qwen3-VL's own code produced.
  *
- * Issue #212. A script rather than a test: it holds **26.27 GB** of weights on
+ * Issue #212. A script rather than a test: it holds **25.78 GB** of weights on
  * the device, which is not something to do inside a vitest worker beside 2,000
  * other tests. `examples/h3-dit/src/verify-forward.ts` is the same arrangement.
  *
  *     npx tsx examples/h3-ref2v/src/verify-conditioner.ts \
  *       --dir ~/h3-cond-gpu --golden ~/h3-cond-real
  */
-import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { createResidentDevice } from "../../../harness/resident.js";
 import { ConditionerGpu, type ConditionerManifest } from "./conditioner-gpu.js";
 import { qwen3vlPositionGrid } from "./text-encoder.js";
@@ -36,8 +36,9 @@ const manifest = JSON.parse(readFileSync(`${dir}/conditioner.manifest.json`, "ut
   processor: ProcessorConfig;
 };
 const golden = JSON.parse(readFileSync(`${goldenDir}/golden.json`, "utf8")) as {
-  imageSize: number; tokenIds: number[]; visualRuns: [number, number][];
+  imageSize: number; visualRuns: [number, number][];
   grid: Grid; seq: number; hidden: [number, number]; layer: number; stages?: number[];
+  quantised?: boolean;
   tokenIds: number[]; positionIds: { t: number[]; h: number[]; w: number[] };
 };
 
@@ -55,6 +56,20 @@ if (stage !== null) {
 
 if (stage === null && golden.layer !== manifest.textEncoderLayer) {
   console.error(`the golden read layer ${golden.layer} and this conversion holds through ${manifest.textEncoderLayer}`);
+  process.exit(2);
+}
+
+// **`hidden_states[k]` is layer `k`'s input**, so `k` layers run to produce it,
+// not `k + 1`. A conversion that keeps one layer too many still produces a
+// well-formed activation of the right shape, and against a stack whose last
+// rows are massive activations it reads as quantisation noise: the run that
+// found this reported 96% of peak either way, and only the *median row* moved
+// -- 1.1% against 24.9%.
+if (stage === null && manifest.layers !== golden.layer) {
+  console.error(
+    `this conversion evaluates ${manifest.layers} text layers and hidden_states[${golden.layer}] is the ` +
+      `input to layer ${golden.layer}, which ${golden.layer} layers produce — reconvert`,
+  );
   process.exit(2);
 }
 
@@ -107,6 +122,11 @@ const v = manifest.visionConfig;
 console.log(
   `weights ${(statSync(weightsPath).size / 1e9).toFixed(2)} GB (${manifest.dtype}), ` +
     `${manifest.layers} text layers of ${t.hidden_size}, ${v.depth} vision blocks`,
+);
+console.log(
+  golden.quantised
+    ? "golden: the released weights round-tripped through this converter's int8"
+    : "golden: the released weights in bf16 — see the README on which number this can and cannot settle",
 );
 
 const embedTokens = hostTable("embed_tokens.weight", 151936, t.hidden_size);
@@ -192,6 +212,57 @@ console.log(
   `hidden_states[${stage ?? golden.layer}]: worst ${worst.toExponential(3)}  rms ${Math.sqrt(sum / want.length).toExponential(3)}  ` +
     `signal peak ${peak.toFixed(1)}  -> ${((worst / peak) * 100).toFixed(2)}% of peak`,
 );
+
+/**
+ * The same divergence per row, split by what the row is.
+ *
+ * Worst-over-peak is one number about one element, and in this stack that
+ * element is a **massive activation**: from layer 43 a few visual tokens grow
+ * by a factor of a hundred, and which tokens is a near-tie. A row-wise figure
+ * says whether the other seventy-five rows are right, which is the question.
+ */
+const hidden = t.hidden_size;
+const isVisual = new Set<number>();
+for (const [start, length] of golden.visualRuns) {
+  for (let i = 0; i < length; i += 1) isVisual.add(start + i);
+}
+const norms: number[] = [];
+const relative = (visual: boolean): { median: number; max: number } => {
+  const rows: number[] = [];
+  for (let r = 0; r < golden.seq; r += 1) {
+    if (isVisual.has(r) !== visual) continue;
+    let dn = 0;
+    let wn = 0;
+    for (let c = 0; c < hidden; c += 1) {
+      const d = got[r * hidden + c]! - want[r * hidden + c]!;
+      dn += d * d;
+      wn += want[r * hidden + c]! ** 2;
+    }
+    rows.push(Math.sqrt(dn / wn));
+  }
+  rows.sort((a, b) => a - b);
+  return { median: rows[Math.floor(rows.length / 2)] ?? 0, max: rows[rows.length - 1] ?? 0 };
+};
+for (let r = 0; r < golden.seq; r += 1) {
+  let n = 0;
+  for (let c = 0; c < hidden; c += 1) n += got[r * hidden + c]! ** 2;
+  norms.push(Math.sqrt(n));
+}
+const percent = (x: number): string => `${(x * 100).toFixed(3)}%`;
+for (const visual of [false, true]) {
+  const { median, max } = relative(visual);
+  console.log(`  ${visual ? "visual" : "text  "} rows: median ${percent(median)}, worst row ${percent(max)}`);
+}
+const ranked = norms.map((n, r) => [r, n] as const).sort((a, b) => b[1] - a[1]).slice(0, 3);
+console.log(`  the port's largest rows: ${ranked.map(([r, n]) => `${r}:${n.toFixed(0)}`).join("  ")}`);
+
+// `--dump` writes what the port produced, so the same activation can be held
+// to the *other* reference without a second 26 GB upload.
+const dump = arg("--dump");
+if (dump) {
+  writeFileSync(dump, Buffer.from(got.buffer, got.byteOffset, got.byteLength));
+  console.log(`wrote ${dump}`);
+}
 
 conditioner.destroy();
 device.destroy();

@@ -5,7 +5,10 @@ Put images and video in, get video out: MiniMax-H3's `ref2va` workflow. Issue
 
 `examples/h3-dit` is the text-to-video half and is measured; this is the
 reference-conditioned one, and it is **being built**. What is here so far is the
-packed layout.
+packed layout, the presentation, the tokenizer, the image processor, both halves
+of the conditioner — CPU and resident GPU, held to the released Qwen3-VL-32B —
+and the `transformer_ref` conversion. What is not here is the three-stage run
+that puts them end to end in a browser.
 
 ## Why R2V is not `t2va` with extra rows
 
@@ -46,7 +49,7 @@ spends its time.
 **It cannot precompute the conditioner.** `examples/h3-dit-web` ships prompt
 embeddings baked offline, because the prompt list is fixed. Here **the reference
 is the input**, so Qwen3-VL has to be resident. Measured, at int8: vision tower
-**0.60 GB**, text layers 0..50 **24.87 GB**, embedding 0.78 GB — **26.25 GB**,
+**0.61 GB**, text layers 0..49 **24.40 GB**, embedding 0.78 GB — **25.78 GB**,
 on top of a 20 GB DiT and a 2.43 GB decoder. That does not fit at once on a
 32 GB card, and the answer is the staging `examples/h3-dit/src/generate.ts`
 already uses: upload, use, drop, upload the next.
@@ -138,7 +141,7 @@ The biggest open question in #212 was whether the vision tower needs a new
 kernel. It was answered by reading `transformers`' `modeling_qwen3_vl.py` and
 the checkpoint's own parameter shapes. **It does not.**
 
-### Qwen3-VL's text stack — 51 of 64 layers
+### Qwen3-VL's text stack — 50 of 64 layers
 
 hidden 5120, head_dim 128, **64 query heads against 8 key/value heads**,
 intermediate 25600, RMSNorm at 1e-6, `rope_theta` **5,000,000**, no attention
@@ -303,43 +306,109 @@ tokenizer is measured, not assumed: `src/tokenizer.test.ts` runs **all fourteen*
 text segments the presentation can produce and **all four** vision token ids.
 They agree.
 
-## The conditioner on the GPU — converted, running, and not yet right
+## The conditioner on the GPU
 
-`tools/convert_conditioner.py` writes **26.27 GB** of int8 in 96 s (vision tower
-0.61 GB), and `src/conditioner-gpu.ts` runs it: 76 tokens in **2.4 s** over 828
-dispatches, of which 15 ms is queue time and 2,140 ms is host recording.
+`tools/convert_conditioner.py` writes **25.78 GB** of int8 in 86 s (vision tower
+0.61 GB), and `src/conditioner-gpu.ts` runs it: 76 tokens in **2.0 s** over
+8,182 dispatches, of which 13 ms is queue time, 681 ms is reading back and
+1,408 ms is host recording. RTX 5090, Dawn/Vulkan, int8 weights, f32
+activations, one 256x256 reference in a 76-token presentation.
 
-**It does not yet reproduce the model.** Held to `hidden_states[50]` of the
-released Qwen3-VL-32B on a real presentation, and bisected by layer:
+Held to `hidden_states[50]` of the released Qwen3-VL-32B on a real
+presentation — **per row, split by what the row is**, because the last rows of
+this stack are massive activations and one worst-element figure says nothing
+about the other seventy-five:
 
-| | worst, as a percentage of peak |
-| --- | --- |
-| `hidden_states[0]` — embedding, vision tokens scattered in | **4.07%** |
-| `hidden_states[1]` — after one text layer | **19.34%** |
-| `hidden_states[2]` | 15.03% |
-| `hidden_states[4]` | 4.52% |
-| `hidden_states[50]` | 100% |
+| | text rows | visual rows |
+| --- | --- | --- |
+| against the released weights **in bf16** | 2.02% | 4.27% |
+| against them **round-tripped through this converter's int8** | **1.12%** | **3.00%** |
 
-**So the fault is in the first text layer**, and it washes down before
-compounding again — the shape of an error that reads as quantisation noise if
-only the last number is looked at. What is already ruled out:
+Median relative error per row. The int8 column is the one that measures this
+port: the bf16 column also contains everything quantisation did, and this model
+is unusually sensitive to it — see below.
 
-- **The position grid.** It is rebuilt from the token stream and compared
-  against `get_rope_index`'s own output on all three axes, exactly, before the
-  forward runs. Fixing it changed the RMS by 0.0002.
+### Bisected by layer, against the int8 reference
+
+| | text rows | visual rows |
+| --- | --- | --- |
+| `hidden_states[0]` — embedding, vision tokens scattered in | 0.16% | 2.08% |
+| `hidden_states[4]` — the three deepstack features are in | 0.48% | 1.37% |
+| `hidden_states[24]` | 1.00% | 1.75% |
+| `hidden_states[43]` — the layer before the massive activations | 1.27% | 2.25% |
+| `hidden_states[50]` | 1.12% | 3.00% |
+
+Monotone, and no step: what compounds is int8 and the f32-against-bf16
+difference, and nothing else enters.
+
+### Three bugs, and the third is why the first two were hard to see
+
+- **The deepstack add aliased one buffer as read and read-write in a compute
+  pass.** WebGPU refuses that, so the whole command buffer was invalid and the
+  output was whatever the pool held. It reported **100.46% of peak**, which is
+  not a number. It writes into a fresh buffer now.
+- **The fused `qkv` was un-interleaved with a copy per token per block** —
+  20,736 of them for one 256x256 reference, 28,957 dispatches in total. The
+  converter splits it into three, as `examples/h3-video` splits `to_qkv`.
+- **The stack ran one layer too many.** `hidden_states[50]` is the **input** to
+  layer 50, not its output: `transformers` records hidden states from a forward
+  hook on the decoder layer, so state `k` is layer `k - 1`'s output. The
+  conversion kept layer 50 and the forward evaluated it — 0.49 GB of weights
+  and a whole layer of arithmetic on the far side of the answer.
+
+That third one moved worst-over-peak by **0.01 points**, from 95.92% to 95.93%,
+and moved the median row from **24.9% to 1.12%**. A summary that reports only
+the largest element cannot see a wrong layer count in this stack, which is why
+`verify-conditioner.ts` reports rows and refuses to compare a conversion whose
+layer count disagrees with the golden's.
+
+What was ruled out on the way, and is recorded because it cost the time:
+
+- **The position grid.** Rebuilt from the token stream and compared against
+  `get_rope_index`'s own output on all three axes, exactly, before the forward
+  runs. Fixing it changed the RMS by 0.0002.
 - The layout of the flash-attention uniform, checked against
   `ops/flash_attention/wgsl/fa2.wgsl`'s own struct.
 - The GQA grouping, which is `ops/gqa`'s contiguous `floor(h / 8)`.
 
-Two bugs *were* found and fixed on the way, and both were real:
+### Deepstack is added at the top of the layer that reads it
 
-- **The deepstack add aliased one buffer as read and read-write in a compute
-  pass.** WebGPU refuses that, so the whole command buffer was invalid and the
-  output was whatever the pool held. It writes into a fresh buffer now.
-- **The fused `qkv` was un-interleaved with a copy per token per block** —
-  20,736 of them for one 256x256 reference, 28,957 dispatches in total. The
-  converter splits it into three, as `examples/h3-video` splits `to_qkv`, and
-  the count fell to 828.
+Upstream adds vision feature `i` to the visual rows **after** layer `i`
+returns. This adds it at the top of layer `i + 1` — the same tensor entering
+the same layer, and the same output for any stack deeper than three.
+
+It is written that way because of where the hook sits. `hidden_states[k]` is
+captured when layer `k - 1` *returns*, which is **before** the model's deepstack
+add. A port that adds at the end and then stops matches nothing at `k = 1, 2, 3`:
+this one read 64.6% against 1.9% at `hidden_states[1]`, which looks exactly like
+a broken first layer. Adding at the top makes `--layers k` produce
+`hidden_states[k]` for every `k`, which is what makes the bisect above mean
+anything.
+
+### The massive activations, and why there are two references
+
+From **layer 43** a handful of tokens grow by a factor of a hundred — 165 to
+18,000 in one layer, in a single channel (731). Which tokens is a **near-tie**,
+and int8 rounding flips it. On this presentation:
+
+| | rows carrying it at layer 50 |
+| --- | --- |
+| released weights, bf16 | 0, **22**, **29** |
+| the same weights through this converter's int8, in `transformers` | 0, **38** |
+| this port | 0, **29**, **38** |
+
+At layer 43 those three rows are ranked 58th, 70th and 75th of 76 by norm and sit
+within 15% of each other. Nothing selects between them but rounding.
+
+So a port held to the bf16 reference alone reads **88% of peak** and looks
+broken. `gen_real_conditioner_golden.py --quantised` runs the released weights
+through this converter's own quantisation *inside `transformers`* and produces
+the second reference; against it the same activation is 3%. **Neither number is
+wrong, and only the pair says which side a divergence is on.**
+
+This is recorded, not fixed. What it costs downstream — whether MiniMax-H3
+conditions differently on a conditioning whose sink sits on a different visual
+token — is **unmeasured**.
 
 ### What the position grid turned out to be
 
@@ -355,4 +424,5 @@ it disagrees with the model's own.
 
 ## What is not here yet
 
-The bug above, and the three-stage run in `examples/h3-ref2v-web`. See #212.
+The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,
+down, DiT up, sample, down, VAE up, decode. See #212.

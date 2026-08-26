@@ -3,8 +3,8 @@
 
 Issue #212. MiniMax-H3 conditions `ref2va` on `hidden_states[50]` of this stack,
 so R2V cannot precompute its conditioning the way `examples/h3-dit-web` does —
-the reference *is* the input. What that costs is 24.87 GB of int8 for layers
-0..50 alone, and what it needs is this forward.
+the reference *is* the input. What that costs is 24.40 GB of int8 for layers
+0..49 alone, and what it needs is this forward.
 
 **The weights are random, and that is the point.** The arithmetic is
 `transformers`' `Qwen3VLTextModel` — instantiated, not transcribed — at a

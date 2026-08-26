@@ -7,17 +7,20 @@ checkpoint at int8:
 
 | | |
 | --- | --- |
-| vision tower (27 blocks) | **0.60 GB** |
-| text layers 0..50 | **24.87 GB** |
+| vision tower (27 blocks) | **0.61 GB** |
+| text layers 0..49 | **24.40 GB** |
 | embedding | 0.78 GB |
-| **total** | **26.25 GB** |
+| **total** | **25.78 GB** |
 
 Three things are dropped and the numbers above are why:
 
-- **Text layers 51..63** (6.34 G params). MiniMax-H3 reads `hidden_states[50]`,
-  so thirteen layers of a 64-layer stack are never evaluated. The final norm
-  goes with them: `hidden_states[50]` is a layer *input*, not the stack's
-  output.
+- **Text layers 50..63** (6.83 G params). MiniMax-H3 reads `hidden_states[50]`,
+  and that is the **input** to layer 50, not its output: `transformers` records
+  hidden states from a forward hook on the decoder layer, so state `k` is layer
+  `k - 1`'s output. Fourteen layers of a 64-layer stack are never evaluated, and
+  layer 50 is the one that is easy to keep by mistake — 0.49 GB of weights and
+  one whole layer of arithmetic, on the far side of the answer. The final norm
+  goes with them for the same reason.
 - **`lm_head`** (0.78 G). A vocabulary-wide projection nothing reads.
 - **`embed_tokens`** is kept, because the presentation is token ids.
 
@@ -64,7 +67,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--quant", choices=["f32", "q8"], default="q8")
     parser.add_argument("--layers", type=int, default=0,
-                        help="convert only the first N text layers (0 = through the conditioning layer)")
+                        help="convert only the first N text layers (0 = every layer the conditioning reads)")
     args = parser.parse_args()
 
     model = pathlib.Path(args.model)
@@ -74,7 +77,11 @@ def main() -> int:
     text = config["text_config"]
     vision = config["vision_config"]
 
-    layers = args.layers or (TEXT_ENCODER_LAYER + 1)
+    # `hidden_states[50]` is layer 50's **input**, so layers 0..49 are what has
+    # to run -- fifty of them, not fifty-one. `layers` is what
+    # `conditioner-gpu.ts` evaluates, and `verify-conditioner.ts` refuses to
+    # compare a conversion whose count disagrees with the golden's layer.
+    layers = args.layers or TEXT_ENCODER_LAYER
     if layers > text["num_hidden_layers"]:
         raise SystemExit(f"the stack has {text['num_hidden_layers']} layers, not {layers}")
 
@@ -186,8 +193,8 @@ def main() -> int:
     vision_bytes = offset * 4
     print(f"  vision tower {vision_bytes / 1e9:.2f} GB, {time.time() - started:.0f} s", flush=True)
 
-    # 2. The embedding, then the text layers up to and including the one whose
-    # *input* is read.
+    # 2. The embedding, then every text layer that runs -- which stops *before*
+    # the layer whose input is read.
     add_matrix("embed_tokens.weight", tensor("model.language_model.embed_tokens.weight"))
     for i in range(layers):
         p = f"model.language_model.layers.{i}"

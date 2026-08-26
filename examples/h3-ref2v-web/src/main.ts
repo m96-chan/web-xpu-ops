@@ -6,7 +6,7 @@
  * offline and the page reads embeddings. Here the reference *is* the input, so
  * Qwen3-VL runs in the tab.
  *
- * **Three models, one at a time.** The conditioner is 26.25 GB of int8, the DiT
+ * **Three models, one at a time.** The conditioner is 25.78 GB of int8, the DiT
  * 20.08 and the VAE decoder 2.43 — 48.7 GB, which fits on no card this page
  * will meet. Each is uploaded, used, and dropped before the next, the same
  * staging `examples/h3-dit/src/generate.ts` uses across processes and for the
