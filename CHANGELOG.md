@@ -9,6 +9,31 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's packed layout** (issue #212). `examples/h3-ref2v`: MiniMax-H3's
+  `ref2va` sequence, `[text | reference blocks | target audio | target video]`,
+  held to `build_ref2va_packed_sequence` exactly on a committed fixture.
+
+  What makes it more than an ordering is that **the references advance a shared
+  rotary clock** — where the generated video sits depends on how many
+  references came before it and how long each was. An image takes **one** slot,
+  not a latent frame's `5/3`; a video's soundtrack is packed **before** its
+  video rows, sharing their origin; a video advances the clock by
+  `max(audioLatents, videoSpan)`; and that span is summed **sequentially**,
+  which is deliberately not how the `t2va` keyframe anchor sums the same
+  series — the two differ in the last ulp from 16 latent frames onwards and
+  upstream keeps both.
+
+  **The first mutation sweep caught seven of ten, and all three survivors were
+  the fixture's fault.** No case had a soundtrack longer than its own video, so
+  the `max` never chose the audio; every reference shared a canvas with the
+  target, so pinning a soundtrack to the wrong width grid was invisible; and
+  the tag assignment order genuinely cannot matter, since the three index sets
+  are disjoint. Three cases were added and the unobservable mutation was
+  replaced by one that is — which found a real gap: the port was filling in
+  `TEXT_TAG` for every text row, and `text_token_tags` is an argument precisely
+  because **a reference's vision block sits among the text rows and is tagged
+  video**.
+
 - **Flat dispatches are split to fit the device's grid** (issue #211). One
   thread per element and `ceil(n / 256)` workgroups runs out of grid at
   **16,776,960 elements** — 65,535 workgroups, which Dawn Node and Chrome both

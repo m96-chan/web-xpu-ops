@@ -46,7 +46,7 @@ const LLM = "llm";
 // were green in an editor and absent from every CI run, which is precisely what
 // the paragraph above warns about. `harness/test-discovery.test.ts` now asserts
 // this list covers what vitest collects, so the two cannot drift again.
-const EXAMPLES_TESTED = ["examples/zimage/src", "examples/zimage-vae/src", "examples/anima/src", "examples/anima-web/src", "examples/web-common/src", "examples/zimage-web/src", "examples/h3-encoder/src", "examples/h3-audio/src", "examples/h3-audio-web/src", "examples/h3-video/src", "examples/h3-video-web/src", "examples/h3-dit-web/src", "examples/h3-dit/src"];
+const EXAMPLES_TESTED = ["examples/zimage/src", "examples/zimage-vae/src", "examples/anima/src", "examples/anima-web/src", "examples/web-common/src", "examples/zimage-web/src", "examples/h3-encoder/src", "examples/h3-audio/src", "examples/h3-audio-web/src", "examples/h3-video/src", "examples/h3-video-web/src", "examples/h3-dit-web/src", "examples/h3-dit/src", "examples/h3-ref2v/src"];
 
 /** Every `*.test.ts` under `dir`, recursing into subdirectories. */
 function testFilesRecursive(dir) {
