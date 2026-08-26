@@ -26,6 +26,7 @@
  * other: two ports that drift the same way agree with each other and with
  * nothing else.
  */
+import { ropeAxisPositionBuffer } from "../../../ops/rope/index.js";
 import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
@@ -886,9 +887,11 @@ export async function ditForwardResident(
 
   /** Positions with the slack `ops/rope`'s own helper gives them. */
   const positionSlots = (ids: Int32Array): Slot => {
-    const slack = new Int32Array(ids.length + cfg.ropeAxesDims.length * 4).fill(9999);
-    slack.set(ids);
-    return upload(slack);
+    // **f32, matching `axes.wgsl`'s binding** — see `examples/anima/src/
+    // dit-resident.ts` for what an `Int32Array` here does. The ids are built as
+    // integers because that is what a grid coordinate is; only the upload
+    // changes type.
+    return upload(ropeAxisPositionBuffer(ids, cfg.ropeAxesDims.length));
   };
 
   const xPositions = positionSlots(imagePositionIds(F, hTokens, wTokens, capSeq));

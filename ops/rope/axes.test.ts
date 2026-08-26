@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AXES_CASES, axesCaseInput } from "./axes-cases.js";
-import { rope, ropeAxes } from "./reference.js";
+import { rope, ropeAxes, ropeAxisPositionBuffer } from "./reference.js";
 
 /**
  * `ropeAxes` against the implementation it exists to run, and against the
@@ -257,5 +257,33 @@ describe("ropeAxes / refuses what it cannot mean", () => {
         positions: new Int32Array(4),
       }),
     ).toThrow(/input holds 18/);
+  });
+});
+
+describe("rope / the axes positions buffer", () => {
+  /**
+   * The binding is `array<f32>`, and nothing at the WebGPU layer says so.
+   *
+   * An `Int32Array` uploaded to it is copied byte for byte, and a small
+   * integer's bits read as a float are a denormal — every angle zero, every
+   * token the identity rotation, a well-formed tensor with no position in it.
+   * `examples/anima` drew one flat colour for eighteen commits on exactly that.
+   * The type is asserted here because it is the thing that was wrong.
+   */
+  it("is float32, with four axes of visible slack", () => {
+    const got = ropeAxisPositionBuffer([0, 1, 2, 3, 4, 5], 3);
+    expect(got).toBeInstanceOf(Float32Array);
+    expect(got.length).toBe(6 + 3 * 4);
+    expect([...got.subarray(0, 6)]).toEqual([0, 1, 2, 3, 4, 5]);
+    // Not zero: a lane that overran would read the identity rotation and look
+    // right.
+    expect([...got.subarray(6)].every((v) => v === 9999)).toBe(true);
+  });
+
+  it("keeps a fractional position fractional", () => {
+    // The capability #206 added. Rounding here would put the visual VAE's
+    // normalised axes back on a grid.
+    const got = ropeAxisPositionBuffer([-1, -0.5, 0.25], 1);
+    expect([...got.subarray(0, 3)]).toEqual([-1, -0.5, 0.25]);
   });
 });
