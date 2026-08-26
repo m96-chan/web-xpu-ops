@@ -102,8 +102,12 @@ export async function bindFolder(
     e.progress.textContent = "Sorry — that folder was not granted permission.";
     return null;
   }
-  await rememberFolder(handle);
-  if (!(await readReceipt(handle))) {
+  // **Remembered only once it is usable.** Remembering first is how a wrong
+  // folder became permanent: it was stored, the page reloaded, the first read
+  // threw where nothing catches, and reloading landed in the same folder. The
+  // store now happens at the end, so backing out of a bad pick leaves the
+  // previous folder in place.
+  if (!(await readReceipt(handle, { files: o.files }))) {
     e.bar.style.display = "block";
     await provision(handle, new HttpByteSource(o.weightsBase), { files: o.files }, (p) => {
       e.progress.textContent =
@@ -112,7 +116,20 @@ export async function bindFolder(
       e.barFill.style.width = `${(p.bytesDone / Math.max(1, p.bytesTotal)) * 100}%`;
     });
   }
-  return new DirectoryByteSource(handle);
+  const source = new DirectoryByteSource(handle);
+  // One last look at what is actually there. `provision` writes the receipt
+  // last, so reaching here means it finished — but a folder that already had a
+  // receipt was never opened, and this is the cheapest place to find out.
+  for (const file of o.files) {
+    try {
+      await source.size(file);
+    } catch (error) {
+      e.progress.textContent = `Sorry — ${(error as Error).message}`;
+      return null;
+    }
+  }
+  await rememberFolder(handle);
+  return source;
 }
 
 /**
@@ -158,8 +175,15 @@ export async function requireBoundFolder(o: GateOptions): Promise<ByteSource | n
 
   // `hasPermission` rather than a request: prompting needs a user gesture, and
   // asking on load is refused silently.
+  // **The plan, not just a receipt.** A folder filled for a different model
+  // carries its own valid receipt; without the plan it was handed back here and
+  // the page threw on its first read, where nothing catches.
   const remembered = await rememberedFolder();
-  if (remembered && (await hasPermission(remembered, "readwrite")) && (await readReceipt(remembered))) {
+  if (
+    remembered
+    && (await hasPermission(remembered, "readwrite"))
+    && (await readReceipt(remembered, { files: o.files }))
+  ) {
     return new DirectoryByteSource(remembered);
   }
 
@@ -235,7 +259,10 @@ export function wireChangeFolder(o: GateOptions, button: HTMLButtonElement, curr
           e.progress.textContent = "reloading to read from the new folder …";
           location.reload();
         } catch (error) {
-          await forgetFolder();
+          // **The old folder is not forgotten.** It still works, and forgetting
+          // it here left a page whose only folder was the one that just failed.
+          // `bindFolder` remembers a new folder only after it has read every
+          // file out of it, so nothing has replaced it yet.
           e.progress.textContent = `Sorry — ${(error as Error).message}`;
           e.action.disabled = false;
         }

@@ -389,4 +389,11 @@ async function main(): Promise<void> {
   };
 }
 
-void main();
+// **A failure here has to land somewhere a person can see.** A bare `void
+// main()` turns one into an unhandled rejection in the console and a page that
+// looks like it is still loading — which is what a visitor got after pointing
+// the folder picker at another model's folder. Issue reported from a browser.
+void main().catch((error: unknown) => {
+  say("failed to start.", error instanceof Error ? error.message : String(error));
+  console.error(error);
+});

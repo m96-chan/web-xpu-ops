@@ -9,6 +9,32 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **Changing folder to the wrong one stranded the page** (reported from a
+  browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
+  `Uncaught (in promise) Error: the folder "anima-3.8B" has no
+  "model.safetensors.index.json"`, and reloading landed in the same place.
+
+  Three faults, each of which alone would have been survivable:
+
+  - **A receipt was read without asking what the caller needs.** A folder filled
+    for another model carries its own valid receipt, so `readReceipt` said
+    "filled", the fill was skipped, and the page got a folder with none of its
+    files. It takes the plan now: a receipt that does not name every file the
+    caller wants means unfilled, which fills the folder rather than failing
+    after a reload.
+  - **The folder was remembered before it was known to work.** `bindFolder`
+    stored the handle first, so a bad pick became the page's permanent answer.
+    It reads every file out of the new folder first and stores it last.
+  - **Changing folder forgot the folder that worked.** The old rule was "every
+    bind failure forgets", which is right when there is nothing to fall back on
+    and wrong when there is. `gate.test.ts` used to assert the two paths were
+    the same; it asserts they differ, and why.
+
+  And a failure that gets past all of that now lands somewhere a person can see:
+  every page's `void main()` carries a `.catch` that writes the message into the
+  status line instead of the console.
+
+
 - **Three limits a real reference hit, and one of them was silent**
   (issues #212, #211). Running R2V on an actual video and image reference — 8
   frames of 256x448 and a 256x352 still, 1,424 packed rows — found all three:
