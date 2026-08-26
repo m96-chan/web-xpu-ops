@@ -225,7 +225,54 @@ have sat unnoticed in a port that only ever indexed 50.
 
 Ten mutations, all caught.
 
+## The vision tower
+
+`src/vision.ts`, held to `transformers`' `Qwen3VLVisionModel`: **1.192e-7** on
+the tower's own output, **7.451e-9** on the pooled vision tokens and on every
+deepstack feature. Committed fixture, random weights, 399 KB.
+
+**`ops/conv`'s `conv3d` is the patch embedding** — a `Conv3d` whose kernel
+equals its stride and its input — so the op written for #201 has a second
+caller, like the VAE encoder before it. `layernorm` (with bias, unlike
+everything else in H3), `attention`, `matmul`, `activation` and `elementwise`
+cover the rest, and `ropeAxes` takes the two-axis rotation the same way the text
+stack takes M-RoPE.
+
+Four things it decides:
+
+- **Tokens are in merge-block order**, `(t, h/m, w/m, m, m)`. The position
+  embedding is permuted into it, the rotary coordinates are generated in it, and
+  a merger eats `m * m` consecutive tokens. Raster order is the same shape and a
+  picture read wrong.
+- **The position embedding is bilinearly interpolated** from a learned
+  `48 x 48` table, with `torch.linspace` and an `int()` truncation choosing the
+  four taps — #211's linspace again, because one ulp moves a truncation across
+  an integer boundary.
+- **Two different GELUs.** The blocks' MLP is `gelu_pytorch_tanh`; the mergers
+  use the exact one.
+- **Two different norm placements.** The final merger normalises *before* the
+  `m * m` shuffle, on `hidden`; the deepstack mergers normalise *after*, on
+  `hidden * m * m`. The only place that is visible is the checkpoint's own
+  shapes.
+
+### The sweep caught six of ten, and the tolerance was why
+
+Not the fixture this time. The bounds were `2e-5` against an achieved error of
+`1.192e-7` — **a hundred and seventy times too loose** — and two mutations
+walked through it: both GELU swaps. `gelu` and `gelu_tanh` differ by
+**6.932e-5** on the values this fixture produces, and a tolerance with no
+measurement beside it cannot see that.
+
+They are `3e-7` and `3e-8` now, which are the measured errors times a small
+factor, with both the measurement and the mutation's effect written next to
+them: swapping the blocks' MLP moves the tower's output to **6.109e-7**, which
+is why the bound is not a round `1e-6`.
+
+Two of the survivors were also **mutations that changed nothing** — moving an
+index lookup, and an `x = x === before ? x : x`. A no-op that "survives" says
+nothing, and both were replaced by ones that bite.
+
 ## What is not here yet
 
-The vision tower, the `Qwen3VLProcessor`, a GPU path for the text stack, and
-the page. See #212.
+The `Qwen3VLProcessor` — pixels into `pixel_values` and `image_grid_thw` —
+GPU paths for the conditioner, and the page. See #212.

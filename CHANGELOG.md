@@ -9,6 +9,29 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **Qwen3-VL's vision tower** (issue #212). Held to `transformers`' own
+  `Qwen3VLVisionModel` at **1.192e-7** on the tower's output and **7.451e-9** on
+  the pooled vision tokens and every deepstack feature. Committed fixture,
+  random weights, 399 KB.
+
+  **`ops/conv`'s `conv3d` is the patch embedding** — a `Conv3d` whose kernel
+  equals its stride and its input — so #201's op has a second caller. Nothing
+  else new either: `layernorm` (with bias), `attention`, `matmul`, `activation`,
+  `elementwise`, and `ropeAxes` for the two-axis rotation.
+
+  Tokens are in **merge-block order**, the position embedding is **bilinearly
+  interpolated** from a learned 48x48 table with #211's `torch.linspace`
+  deciding the taps, the blocks' MLP is `gelu_pytorch_tanh` while the mergers
+  use the **exact** GELU, and the final merger normalises *before* the shuffle
+  while the deepstack mergers normalise *after*.
+
+  **The sweep caught six of ten, and the tolerance was why.** The bounds were
+  `2e-5` against an achieved `1.192e-7` — 170x too loose — and both GELU swaps
+  walked through. They are `3e-7` and `3e-8` now, measured values times a small
+  factor, with the mutation's own effect recorded beside them: swapping the
+  blocks' MLP moves the output to 6.109e-7, which is why the bound is not a
+  round 1e-6.
+
 - **Qwen3-VL's text decoder** (issue #212). `examples/h3-ref2v`'s conditioner
   stack, held to `transformers`' own `Qwen3VLTextModel` at **3.576e-7** across
   every hidden state, on a **committed** fixture — random weights at a tiny
