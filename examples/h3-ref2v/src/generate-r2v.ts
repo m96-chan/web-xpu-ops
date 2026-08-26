@@ -504,7 +504,12 @@ const referenceGeometry: [number, number, number][] = [];
   const sampleNoise = noiseStream(42)(z * per);
   const sampled = new Float32Array(z * per);
   for (let i = 0; i < sampled.length; i += 1) {
-    sampled[i] = moments.data[i]! + Math.exp(0.5 * moments.data[z * per + i]!) * sampleNoise[i]!;
+    // **The log-variance is clamped to [-30, 20]** before the exponential, as
+    // `DiagonalGaussianDistribution` does. Inert on every reference measured
+    // here — a 256x256 photograph runs -11.8 to -3.1 — but the guard is one
+    // line and what it guards against is `exp(10)` multiplying a noise sample.
+    const logvar = Math.min(20, Math.max(-30, moments.data[z * per + i]!));
+    sampled[i] = moments.data[i]! + Math.exp(0.5 * logvar) * sampleNoise[i]!;
   }
   // **Rounded to float16 and back**, which upstream does explicitly: about
   // eleven bits of every conditioning latent, and leaving it out is a
@@ -587,7 +592,28 @@ if (layout.seq > MEASURED_ROWS) {
 // ------------------------------------------------- stage 2: the conditioner
 
 let conditioning: Float32Array;
-{
+/**
+ * `--conditioning FILE` reads `hidden_states[50]` instead of computing it.
+ *
+ * A bisect handle, not a shortcut: the conditioner's own massive-activation row
+ * differs from the bf16 reference's, and what that costs downstream was
+ * recorded as unmeasured for a long time. Feeding this port the reference's own
+ * conditioning and changing nothing else is how that gets a number.
+ */
+const conditioningFile = arg("--conditioning");
+if (conditioningFile) {
+  conditioning = f32(conditioningFile);
+  console.log(
+    `  conditioning read from ${conditioningFile} — ${conditioning.length / conditionerManifest.textConfig.hidden_size} rows`,
+  );
+  if (conditioning.length !== presentation.tokenIds.length * conditionerManifest.textConfig.hidden_size) {
+    console.error(
+      `it holds ${conditioning.length / conditionerManifest.textConfig.hidden_size} rows and this presentation is ` +
+        `${presentation.tokenIds.length} tokens`,
+    );
+    process.exit(2);
+  }
+} else {
   const weightsPath =
     `${conditionerDir}/${conditionerManifest.dtype === "q8" ? "conditioner.q8.bin" : "conditioner.bin"}`;
   const reader = openReader(weightsPath);

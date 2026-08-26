@@ -600,16 +600,54 @@ Bisected:
   0.894/7.14, one image 0.993/14.84, an image and a video 1.173/19.19. The
   anchors are pushing the target off distribution.
 
-What is ruled out: the transformer's arithmetic (0.68% of peak at four blocks,
-5.38% at fifty), the anchors' own magnitude (rms 1.09, the same order as the
-target's), that they drift (exactly zero after fifteen steps), the layout and
-the row timesteps (both exact against upstream).
+#### What it is not
 
-What is left is the anchors' *content* — the posterior sample, the float16
-round, the `latents_mean`/`latents_std` normalisation — or something in the
-sampling loop that **one forward's comparison cannot see**. A single forward
-matching the model to 0.68% and fifteen of them matching are different claims,
-and only one of them has been checked.
+Both claims are now checked. `tools/gen_real_ref2va_sample_golden.py` runs a
+**whole fifteen-step `ref2va` loop** in upstream — the scheduler, the
+row-timestep plan changing per step, and the rule that the anchors are never
+written — at 48 rows, which a CPU finishes in three minutes, and
+`src/verify-ref2va-sample.ts` runs this port's loop from **the same initial
+state**:
+
+| | worst | latent rms against upstream's |
+| --- | --- | --- |
+| four blocks | 2.67% of peak | −1.0% |
+| **all fifty** | **6.69% of peak** | **0.0%** |
+
+**The sampler is right, including its magnitude.** So the 31% is not the loop.
+
+| ruled out | measurement |
+| --- | --- |
+| the sampling loop | 0.0% rms against upstream over fifteen steps at fifty blocks |
+| the transformer's arithmetic | 0.68% of peak at four blocks, 5.38% at fifty |
+| int8 | `ref2va`'s forward error is *lower* than `t2va`'s — 5.38% against 12.28% |
+| the resolution | 512x512 flickers at 25.29 against 256x256's 25.23 |
+| the step count | 32 steps moves the seams a little and the colour the wrong way |
+| the anchors' magnitude | rms 1.09, the same order as the target's |
+| the anchors drifting | exactly zero after fifteen steps |
+| an unclamped log-variance | `[-30, 20]` was inert: this content runs -11.8 to -3.1 |
+| the layout, the row timesteps | exact against upstream |
+| **the conditioner's displaced massive activation** | **8.8% of the latent, and 47.33 against 46.66 of flicker — no effect** |
+
+That last row closes something this README carried as unmeasured for a long
+time. `--conditioning FILE` feeds this port the bf16 reference's own
+`hidden_states[50]` and changes nothing else: the sink landing on a different
+visual token is worth 8.8% of the latent and nothing of the temporal
+behaviour.
+
+#### What is left
+
+Flicker tracks **how much reference is in the sequence and how far off
+distribution it is**, and nothing else: no references 7.14, one image 14.84, an
+image and a video 19.19, a synthetic rainbow test pattern 47.33. Yet the loop
+with *random* anchors matches upstream exactly at full depth.
+
+So either the model does this at a third of its documented resolution, or the
+difference lives where none of these goldens reach: a **full-scale** generation,
+real anchors and real conditioning, compared against `diffusers` running the
+same request. That needs the 66 GB `transformer_ref` on a device that can hold
+it, which this one cannot — the small-geometry loop is as close as a 32 GB card
+gets.
 
 ### How long a clip is worth asking for
 
