@@ -31,7 +31,7 @@
  */
 import { ACTIVATION, activation } from "../../../ops/activation/index.js";
 import { attention } from "../../../ops/attention/index.js";
-import { ELEMENTWISE, elementwise, elementwiseRows } from "../../../ops/elementwise/index.js";
+import { ELEMENTWISE, elementwise } from "../../../ops/elementwise/index.js";
 import { matmul } from "../../../ops/matmul/index.js";
 import { rmsnorm } from "../../../ops/rmsnorm/index.js";
 import { h3RopePermutation, ropeAxes } from "../../../ops/rope/index.js";
@@ -70,21 +70,45 @@ export interface DitBlockWeights {
   adalnBias: Float32Array;
 }
 
-/** `x @ Wᵀ`, the layout `nn.Linear` stores. */
-function linear(x: Float32Array, weight: Float32Array, rows: number, inDim: number, outDim: number): Float32Array {
+/** `x @ Wᵀ + b`, the layout `nn.Linear` stores. */
+export function linear(
+  x: Float32Array,
+  weight: Float32Array,
+  rows: number,
+  inDim: number,
+  outDim: number,
+  bias?: Float32Array,
+): Float32Array {
   const wT = new Float32Array(inDim * outDim);
   for (let o = 0; o < outDim; o += 1) {
     for (let i = 0; i < inDim; i += 1) wT[i * outDim + o] = weight[o * inDim + i]!;
   }
-  return matmul({ a: x, b: wT, M: rows, N: outDim, K: inDim });
+  const out = matmul({ a: x, b: wT, M: rows, N: outDim, K: inDim });
+  if (bias) {
+    for (let r = 0; r < rows; r += 1) {
+      for (let o = 0; o < outDim; o += 1) out[r * outDim + o] = out[r * outDim + o]! + bias[o]!;
+    }
+  }
+  return out;
 }
 
 /** `[seq, heads, dim]` to `ops/attention`'s `[heads, seq, dim]`. */
-function splitHeads(x: Float32Array, seq: number, heads: number, dim: number): Float32Array {
+export function splitHeads(x: Float32Array, seq: number, heads: number, dim: number): Float32Array {
   const out = new Float32Array(seq * heads * dim);
   for (let s = 0; s < seq; s += 1) {
     for (let h = 0; h < heads; h += 1) {
       for (let d = 0; d < dim; d += 1) out[(h * seq + s) * dim + d] = x[(s * heads + h) * dim + d]!;
+    }
+  }
+  return out;
+}
+
+/** `ops/attention`'s `[heads, seq, dim]` back to `[seq, heads * dim]`. */
+export function mergeHeads(x: Float32Array, seq: number, heads: number, dim: number): Float32Array {
+  const out = new Float32Array(seq * heads * dim);
+  for (let h = 0; h < heads; h += 1) {
+    for (let s = 0; s < seq; s += 1) {
+      for (let d = 0; d < dim; d += 1) out[(s * heads + h) * dim + d] = x[(h * seq + s) * dim + d]!;
     }
   }
   return out;
@@ -126,18 +150,15 @@ export function permuteProjectionForRope(
 }
 
 /**
- * The six modulation vectors for one row of the `(timestep, modality)` table.
+ * The whole `(timestep, modality)` modulation table, `[rows, 6 * hidden]`.
  *
- * `linear(silu(temb))` produces `6 * hidden * modalityNum` values which the
- * model views as `[-1, 6 * hidden]` and chunks into six. Row
- * `timestep * modalityNum + tag` is the one a token uses.
+ * `linear(silu(temb))` produces `6 * hidden * modalityNum` values per timestep,
+ * which the model views as `[-1, 6 * hidden]`. Row `timestep * modalityNum +
+ * tag` is the one a token uses, and **one packed sequence uses many of them at
+ * once** — text, video and audio rows sit in the same tensor at possibly
+ * different noise levels, which is the whole reason the table exists.
  */
-export function modulation(
-  cfg: DitBlockConfig,
-  w: DitBlockWeights,
-  temb: Float32Array,
-  row: number,
-): { shiftMsa: Float32Array; scaleMsa: Float32Array; gateMsa: Float32Array; shiftMlp: Float32Array; scaleMlp: Float32Array; gateMlp: Float32Array } {
+export function modulationTable(cfg: DitBlockConfig, w: DitBlockWeights, temb: Float32Array): Float32Array {
   const { hiddenSize, timeEmbedDim, modalityNum } = cfg;
   const width = 6 * hiddenSize * modalityNum;
   const timesteps = temb.length / timeEmbedDim;
@@ -151,24 +172,58 @@ export function modulation(
   for (let t = 0; t < timesteps; t += 1) {
     for (let i = 0; i < width; i += 1) projected[t * width + i] = projected[t * width + i]! + w.adalnBias[i]!;
   }
-  const rows = timesteps * modalityNum;
+  return projected;
+}
+
+/** The six modulation vectors for one row of the `(timestep, modality)` table. */
+export function modulation(
+  cfg: DitBlockConfig,
+  w: DitBlockWeights,
+  temb: Float32Array,
+  row: number,
+): { shiftMsa: Float32Array; scaleMsa: Float32Array; gateMsa: Float32Array; shiftMlp: Float32Array; scaleMlp: Float32Array; gateMlp: Float32Array } {
+  const { hiddenSize, timeEmbedDim, modalityNum } = cfg;
+  const table = modulationTable(cfg, w, temb);
+  const rows = (temb.length / timeEmbedDim) * modalityNum;
   if (row < 0 || row >= rows) {
     throw new Error(`modulation: row ${row} is outside the ${rows} the table holds`);
   }
   const at = row * 6 * hiddenSize;
-  const chunk = (k: number): Float32Array => projected.slice(at + k * hiddenSize, at + (k + 1) * hiddenSize);
+  const chunk = (k: number): Float32Array => table.slice(at + k * hiddenSize, at + (k + 1) * hiddenSize);
   return {
     shiftMsa: chunk(0), scaleMsa: chunk(1), gateMsa: chunk(2),
     shiftMlp: chunk(3), scaleMlp: chunk(4), gateMlp: chunk(5),
   };
 }
 
-/** `x * (1 + scale) + shift`, broadcast over rows. */
+/**
+ * Gathers one of the six chunks for every row of the sequence, `[seq, hidden]`.
+ *
+ * `rows[s]` is the table row token `s` uses. A whole-sequence `number` is the
+ * degenerate case and still goes through here, so the two paths cannot drift.
+ */
+function gatherChunk(
+  table: Float32Array,
+  rows: Int32Array,
+  chunk: number,
+  seq: number,
+  hidden: number,
+): Float32Array {
+  const out = new Float32Array(seq * hidden);
+  const stride = 6 * hidden;
+  for (let s = 0; s < seq; s += 1) {
+    const at = rows[s]! * stride + chunk * hidden;
+    out.set(table.subarray(at, at + hidden), s * hidden);
+  }
+  return out;
+}
+
+/** `x * (1 + scale) + shift`, both `[seq, dim]`. */
 function modulate(x: Float32Array, scale: Float32Array, shift: Float32Array, seq: number, dim: number): Float32Array {
   const out = new Float32Array(x.length);
   for (let s = 0; s < seq; s += 1) {
     for (let d = 0; d < dim; d += 1) {
-      out[s * dim + d] = x[s * dim + d]! * (1 + scale[d]!) + shift[d]!;
+      out[s * dim + d] = x[s * dim + d]! * (1 + scale[s * dim + d]!) + shift[s * dim + d]!;
     }
   }
   return out;
@@ -180,13 +235,20 @@ export function permuteChannelWeight(weight: Float32Array, headDim: number, rotD
   return Float32Array.from(permutation, (from) => weight[from]!);
 }
 
-/** One block, `[seq, hidden]` to `[seq, hidden]`. */
+/**
+ * One block, `[seq, hidden]` to `[seq, hidden]`.
+ *
+ * `adaln` is either one table row for the whole sequence or **one row per
+ * token**. A packed sequence needs the second: its text, video and audio rows
+ * carry different modality tags and can sit at different noise levels, and a
+ * block that modulated them all alike would still return the right shape.
+ */
 export function h3DitBlock(
   cfg: DitBlockConfig,
   w: DitBlockWeights,
   x: Float32Array,
   temb: Float32Array,
-  adalnRow: number,
+  adaln: number | Int32Array,
   positions: Float32Array,
 ): Float32Array {
   const { hiddenSize, numHeads, headDim, ffnDim, seq, normEps, qkNormEps, ropeFreqDim, ropeTheta } = cfg;
@@ -197,11 +259,23 @@ export function h3DitBlock(
   // zero is the identity, so `rope` needs no second path.
   const axisDims = [2 * ropeFreqDim, 2 * ropeFreqDim, 2 * ropeFreqDim, headDim - rotDim];
 
-  const m = modulation(cfg, w, temb, adalnRow);
+  const rows = typeof adaln === "number" ? new Int32Array(seq).fill(adaln) : adaln;
+  if (rows.length !== seq) {
+    throw new Error(`h3DitBlock: ${rows.length} AdaLN rows for ${seq} tokens`);
+  }
+  const tableRows = (temb.length / cfg.timeEmbedDim) * cfg.modalityNum;
+  for (const row of rows) {
+    if (row < 0 || row >= tableRows) {
+      throw new Error(`h3DitBlock: AdaLN row ${row} is outside the ${tableRows} the table holds`);
+    }
+  }
+  const table = modulationTable(cfg, w, temb);
+  const m = (chunk: number): Float32Array => gatherChunk(table, rows, chunk, seq, hiddenSize);
+  const [shiftMsa, scaleMsa, gateMsa, shiftMlp, scaleMlp, gateMlp] = [m(0), m(1), m(2), m(3), m(4), m(5)];
 
   const normed1 = modulate(
     rmsnorm({ input: x, weight: w.norm1Weight, N: seq, D: hiddenSize, eps: normEps }),
-    m.scaleMsa, m.shiftMsa, seq, hiddenSize,
+    scaleMsa, shiftMsa, seq, hiddenSize,
   );
 
   let q = linear(normed1, w.toQWeight, seq, hiddenSize, width);
@@ -223,22 +297,17 @@ export function h3DitBlock(
     B: 1, H: numHeads, L: seq, S: seq, D: headDim, Dv: headDim,
     causal: false,
   });
-  const merged = new Float32Array(seq * width);
-  for (let h = 0; h < numHeads; h += 1) {
-    for (let s = 0; s < seq; s += 1) {
-      for (let d = 0; d < headDim; d += 1) {
-        merged[(s * numHeads + h) * headDim + d] = attended.output[(h * seq + s) * headDim + d]!;
-      }
-    }
-  }
+  const merged = mergeHeads(attended.output, seq, numHeads, headDim);
 
   const projected = linear(merged, w.toOutWeight, seq, width, hiddenSize);
-  const gatedAttn = elementwiseRows({ a: projected, b: m.gateMsa, S: seq, D: hiddenSize, kind: ELEMENTWISE.multiply });
+  // A gate per row, not one broadcast down the sequence: `elementwiseRows` is
+  // the wrong shape here for the same reason `modulate` changed.
+  const gatedAttn = elementwise({ a: projected, b: gateMsa, kind: ELEMENTWISE.multiply });
   let hidden = elementwise({ a: x, b: gatedAttn, kind: ELEMENTWISE.add });
 
   const normed2 = modulate(
     rmsnorm({ input: hidden, weight: w.norm2Weight, N: seq, D: hiddenSize, eps: normEps }),
-    m.scaleMlp, m.shiftMlp, seq, hiddenSize,
+    scaleMlp, shiftMlp, seq, hiddenSize,
   );
 
   // diffusers' `SwiGLU`: `hidden, gate = proj(x).chunk(2, -1); hidden * silu(gate)`.
@@ -258,7 +327,7 @@ export function h3DitBlock(
   });
 
   const ff = linear(activated, w.ffOutWeight, seq, ffnDim, hiddenSize);
-  const gatedFf = elementwiseRows({ a: ff, b: m.gateMlp, S: seq, D: hiddenSize, kind: ELEMENTWISE.multiply });
+  const gatedFf = elementwise({ a: ff, b: gateMlp, kind: ELEMENTWISE.multiply });
   hidden = elementwise({ a: hidden, b: gatedFf, kind: ELEMENTWISE.add });
   return hidden;
 }

@@ -1,13 +1,65 @@
-# MiniMax-H3's DiT, one block
+# MiniMax-H3's DiT
 
 The **generator** half of MiniMax-H3: fifty identical transformer blocks over
-5,376 channels, producing the latents `examples/h3-video` decodes. Issue
-[#200](https://github.com/m96-chan/web-xpu-ops/issues/200).
+5,376 channels, producing the latents `examples/h3-video` decodes. Issues
+[#200](https://github.com/m96-chan/web-xpu-ops/issues/200) and
+[#210](https://github.com/m96-chan/web-xpu-ops/issues/210).
 
-**One block, not a forward.** A port of a stack like this is right or wrong at
-the block and the rest is a loop — the order `examples/zimage`,
-`examples/anima` and `examples/h3-video` were all built in. What a *forward*
-would need is at the bottom of this file, and it is not close.
+**One block was where this started, and "the rest is a loop" was wrong.** Around
+the fifty blocks sit five things that each return a well-formed tensor when they
+are wrong, and `src/model.ts` is the forward that gets them right.
+
+## The forward, and a fixture that is in this repository
+
+| | worst element | RMS |
+| --- | --- | --- |
+| video velocity | **1.490e-7** | 4.341e-8 |
+| audio velocity | 1.192e-7 | — |
+
+on outputs of order 1.34, against an **f64** golden.
+
+`tools/gen_forward_golden.py` instantiates diffusers'
+`MiniMaxH3Transformer3DModel` at the geometry **upstream's own tester** uses —
+hidden 24, two layers, heads 2x16 — with **random weights**. So `fixtures/` is
+155 KB, is committed, runs in CI everywhere, and carries **none of MiniMax's
+licence**: it is not their checkpoint.
+
+Random weights lose nothing. What a forward gets wrong is *structural*, and
+none of it depends on the weights being trained:
+
+- **One packed sequence, not cross-attention.** The three modalities are
+  projected separately and scattered into one buffer at caller-chosen rows.
+  There is no cross-attention anywhere in H3.
+- **The text stream is refined first**, by two *plain* pre-norm blocks — no
+  AdaLN, no rotary — and a final norm. **Their Q and K must not be permuted for
+  RoPE**, while the DiT blocks' must: two attention modules with identical
+  parameter names and opposite weight preparation.
+- **The AdaLN table is addressed per row.** `timestep_indices * 3 + token_tags`,
+  so one forward serves rows at different noise levels.
+- **`norm_out` modulates per row too, with `shift` first** — the reverse of the
+  block's six-way chunk.
+- **Both heads run over every row**; the modality's rows are selected after.
+
+Two of the tester's geometry choices are load-bearing and deliberate:
+`numHeads * headDim` (32) differs from `hiddenSize` (24), as in the released
+checkpoint, and `2 * 3 * ropeFreqDim` (12) is smaller than `headDim` (16), so
+the partial-rotary path is exercised rather than aliased away.
+
+### Ten mutations, all caught
+
+refiner skipped (1.6e-2), its final norm skipped (2.4e-4), the AdaLN table
+addressed without the modality (2.7e-2) and without the timestep (1.2e-3),
+`norm_out`'s shift and scale swapped (5.99e-1), `norm_out` modulated from row 0
+for every token, the timestep embedding not flipped to cos-first (7.4e-2), the
+timestep MLP without its activation (1.0e-1), the refiner's residual dropped
+(8.3e-2), the video head's bias dropped (1.7e-1).
+
+**Two of those are only caught because both outputs are compared.** Modulating
+`norm_out` from row 0 leaves the *video* output bit-identical — every video row
+is at timestep 0 — and moves the audio by 2.6e-2. Dropping the video head's
+bias does the reverse. A test that checked one head would have passed either.
+
+## One block, against the real checkpoint
 
 ## What is checked, and against what
 
@@ -88,14 +140,33 @@ satisfy a length check would be bandwidth spent on nothing.
 
 Without `H3_DIT_DIR` the comparison **skips with a message** rather than passing.
 
-## What a forward would need, and why it is not here
+## Running the forward comparison
+
+Nothing to download — the fixture is in the repository:
+
+```bash
+npx vitest run examples/h3-dit/src/model.test.ts
+```
+
+To regenerate it (needs `diffusers` from main, which is where the H3 classes
+live):
+
+```bash
+python examples/h3-dit/tools/gen_forward_golden.py --out examples/h3-dit/fixtures
+```
+
+## What a forward at full size still needs
 
 | | size | state |
 | --- | --- | --- |
-| this DiT, 50 layers (20B pruned) | 8.8–21 GB quantised, 40–66 GB bf16 | **one block checked** |
+| the forward's arithmetic | — | **checked**, at the tester's geometry |
+| this DiT's weights, 50 layers | 66 GB bf16, 8.8–21 GB quantised | **one block checked** |
 | Qwen3-VL-32B text encoder | 13.1–27 GB | not implemented; `llm/` has no VL |
 | visual VAE decoder | 2.43 GB int8 | **works** (`examples/h3-video`) |
+| visual VAE encoder | — | **works**, CPU (`examples/h3-encoder`) |
 
-Twenty-seven gigabytes between the two that are missing, at the smallest
-quantisation MiniMax has published. The block being right is the part that could
-be established in a night; the rest is not a night's work.
+The *shape* of the forward is settled. What is not: the 50-layer weights on a
+GPU, and a text encoder. **Qwen3-VL-32B is not going into a browser**, so the
+plan for #210 is to precompute text embeddings offline and ship them — which
+means a page can only offer prompts somebody has already run. That is a
+limitation, not a detail, and it will be written on the page.

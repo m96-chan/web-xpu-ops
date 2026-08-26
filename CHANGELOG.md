@@ -9,6 +9,33 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The whole DiT forward, with a golden that lives in this repository**
+  (issue #210). `examples/h3-dit` held **one block** to diffusers'
+  implementation and recorded that "the rest is a loop". It is not: around the
+  fifty blocks sit one packed sequence built from three separately-projected
+  modalities, a two-block text refiner with **no rotary**, an AdaLN table
+  addressed per row, a `norm_out` that modulates per row with **shift first**,
+  and two heads that run over every row before the modality's rows are
+  selected. Each returns a well-formed tensor when it is wrong.
+
+  Held to `MiniMaxH3Transformer3DModel` at **1.490e-7** on the video velocity
+  and 1.192e-7 on the audio, against an f64 golden.
+
+  **The fixture is committed and CI runs it.** It is 155 KB because the golden
+  is generated at upstream's own tester geometry — hidden 24, two layers — with
+  **random weights**, so it is not MiniMax's checkpoint and carries none of its
+  licence. Nothing structural depends on the weights being trained, and ten
+  mutations confirm it: the refiner skipped (1.6e-2), the AdaLN table addressed
+  without its modality (2.7e-2), `norm_out`'s shift and scale swapped
+  (5.99e-1), the timestep embedding not flipped to cos-first (7.4e-2), and six
+  more.
+
+  **Two of the ten are only caught because both outputs are compared.**
+  Modulating `norm_out` from table row 0 leaves the video output
+  bit-identical — every video row is at timestep 0 — and moves the audio by
+  2.6e-2; dropping the video head's bias does the reverse. A test that checked
+  one head would have passed either.
+
 - **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole
   encoder — six levels of two `ResnetBlock3D`s, a strided convolution between
   the first four, and `quant_conv` — held to `EncoderFCN3D`'s own output at
