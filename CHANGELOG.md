@@ -9,6 +9,31 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **MiniMax-H3's sampling schedule** (issue #210). Rectified flow with an
+  exponential shift, ported from `MiniMaxH3Scheduler`. Four conventions decided
+  by upstream rather than by this port, each of which yields a *video* rather
+  than an error when it is wrong: **`t = 1 - sigma` and `t = 1` is clean** (the
+  reverse of the DDPM convention every other schedule here uses); the terminal
+  sigma gets **no model evaluation**, so `n` grid points drive `n - 1` forwards;
+  `step` recovers its sigma from the **timestep**, not the grid, because
+  `1 - (1 - sigma)` is not an exact f32 round trip below 0.5; and `eta` is **0**
+  despite the reference class being named "euler ancestral".
+
+  The sigma grid matches torch **exactly, every element**, which took three
+  details that were measured rather than reasoned about: `torch.linspace`
+  rounds its step to f32 *first*, counts the second half **down from the end**,
+  and computes each element as one **fused** multiply-add. Naive
+  `1 - i / (n - 1)` disagrees at 4 of 50 points and rounding the product first
+  disagrees at a different 4 — one f32 ulp each time, which no sampler would
+  ever look wrong for, and which changes which timesteps the transformer is
+  conditioned on.
+
+  Both shipped shifts are covered — 12.0 for video, 3.0 for audio — and the
+  fixture is committed, because a schedule is arithmetic and carries no
+  weights. `unique_consecutive` is exercised at 1,000,000 grid points, where a
+  shift of 12 collapses 42,208 of them; **no realistic step count reaches that
+  branch**, which is how a port drops it and nobody notices.
+
 - **The whole DiT forward, with a golden that lives in this repository**
   (issue #210). `examples/h3-dit` held **one block** to diffusers'
   implementation and recorded that "the rest is a loop". It is not: around the
