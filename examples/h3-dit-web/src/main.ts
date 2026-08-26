@@ -230,6 +230,30 @@ async function main(): Promise<void> {
   say("starting the device …");
   const device = await createBrowserResidentDevice();
 
+  // **Printed before anything is uploaded, not after something fails.** The
+  // first run of this page spent 21 s uploading 23 GB and then reported
+  // `Instance dropped`; the cause was a limit that could have been read in the
+  // first second. `ops/matmul` declares `@compute @workgroup_size(512)`, so a
+  // device whose `maxComputeWorkgroupSizeX` is the spec's 256 cannot build the
+  // pipeline every projection here dispatches. Issue #211.
+  const adapter = await (navigator as Navigator & { gpu: GPU }).gpu.requestAdapter();
+  const limits = adapter?.limits;
+  const workgroupX = limits?.maxComputeWorkgroupSizeX ?? 0;
+  const limitLine =
+    `workgroupX ${workgroupX}, invocations ${limits?.maxComputeInvocationsPerWorkgroup}, ` +
+    `workgroup storage ${limits?.maxComputeWorkgroupStorageSize}, ` +
+    `buffer ${((limits?.maxBufferSize ?? 0) / 1e9).toFixed(2)} GB, ` +
+    `binding ${((limits?.maxStorageBufferBindingSize ?? 0) / 1e9).toFixed(2)} GB`;
+  $<HTMLDivElement>("limits").textContent = limitLine;
+  if (workgroupX < 512) {
+    say(
+      "this browser cannot run the matmul this model needs.",
+      `maxComputeWorkgroupSizeX is ${workgroupX} and ops/matmul declares 512 — ${limitLine}`,
+    );
+    // Stopped here rather than uploading 23 GB first. See issue #211.
+    return;
+  }
+
   const bytes = async (file: string) =>
     async (offsetBytes: number, byteLength: number): Promise<Uint8Array> =>
       new Uint8Array(await source.read(file, offsetBytes, byteLength));

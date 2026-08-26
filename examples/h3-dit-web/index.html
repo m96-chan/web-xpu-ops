@@ -25,6 +25,9 @@
   button:disabled { background: #2c313b; color: #6b7383; cursor: default; }
   #status { margin: 1rem 0 .2rem; font-weight: 600; }
   #detail { margin: 0; color: #98a1b3; font-size: .85rem; min-height: 1.6em; }
+  /* The adapter's limits, shown before anything is uploaded: the first run of
+     this page spent 21 s on 23 GB and then failed on one of them. */
+  #limits { margin: .3rem 0 0; color: #6b7383; font-size: .74rem; font-variant-numeric: tabular-nums; }
   #progress { height: 4px; border-radius: 2px; background: #2c313b; margin-top: .6rem; overflow: hidden; }
   #progress > div { height: 100%; width: 0; background: #4f7cff; transition: width .2s ease; }
   canvas { max-width: 100%; height: auto; border-radius: 8px; background: #1c1f26; display: block; image-rendering: pixelated; }
@@ -95,6 +98,7 @@
 
   <p id="status">starting …</p>
   <p id="detail"></p>
+  <p id="limits"></p>
   <div id="progress"><div></div></div>
   <div id="timing"></div>
 

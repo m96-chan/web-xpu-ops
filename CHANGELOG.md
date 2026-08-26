@@ -9,6 +9,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **A lost WebGPU device says why now** (issue #211). Once a device is lost,
+  **every later call reports the same thing**: `popErrorScope` rejects with
+  `OperationError: Instance dropped in popErrorScope`, once per buffer, with a
+  stack pointing at whatever allocation came next rather than at the fault.
+  `device.lost` — where the backend says what it actually hit — was never read
+  by `createBrowserResidentDevice`.
+
+  Every error scope in the browser device now handles its **rejection** path as
+  well as its resolution, and reports the loss reason plus how much had been
+  allocated across how many buffers. `examples/web-common/src/device-lost.ts`
+  is the wording, tested without a GPU: an unknown cause is replaced, an
+  unresolved loss says it has not said why yet, and an error that *is* the
+  fault — a refused pipeline — survives intact.
+
+  **The page reads the adapter's limits before it uploads anything.** The first
+  run spent 21 s on 23 GB and then printed `Instance dropped` five times; the
+  cause was one number, `maxComputeWorkgroupSizeX = 256` against
+  `ops/matmul`'s 512, readable in the first second. It now refuses in that
+  first second and prints all five limits.
+
 - **A browser page that generates video** (issue #210).
   `examples/h3-dit-web`: a prompt, a size, a step count and a seed in; the DiT
   samples and the VAE decodes, both on WebGPU, and the frames play on a canvas.

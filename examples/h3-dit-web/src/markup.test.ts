@@ -63,6 +63,20 @@ describe("h3-dit-web / markup", () => {
     expect(main).toMatch(/ditManifest\.stepCounts/);
   });
 
+  it("reads the adapter's limits before it uploads anything", () => {
+    // The first run of this page spent 21 s uploading 23 GB and then reported
+    // `Instance dropped`, five times, with five stacks and no cause. The cause
+    // was `maxComputeWorkgroupSizeX = 256` against `ops/matmul`'s 512 — one
+    // number, readable in the first second. Issue #211.
+    const limitsAt = main.indexOf("maxComputeWorkgroupSizeX");
+    const uploadAt = main.indexOf("DitGpu.create");
+    expect(limitsAt).toBeGreaterThan(-1);
+    expect(uploadAt).toBeGreaterThan(-1);
+    expect(limitsAt).toBeLessThan(uploadAt);
+    expect(main).toMatch(/cannot run the matmul/);
+    expect(defined.has("limits")).toBe(true);
+  });
+
   it("gives the DiT and the decoder the same kernel objects", () => {
     // `examples/h3-video-web` shipped without `matmulQ8` and would have
     // dispatched `undefined` at its first matmul, because nothing typechecked
