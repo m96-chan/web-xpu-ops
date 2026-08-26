@@ -9,6 +9,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole
+  encoder — six levels of two `ResnetBlock3D`s, a strided convolution between
+  the first four, and `quant_conv` — held to `EncoderFCN3D`'s own output at
+  **2.432e-5** on moments peaking at 8.854. With `examples/h3-video`'s decoder,
+  a video goes in and frames come out, both halves checked against the model.
+
+  **`Downsample3D` pads asymmetrically before it strides**: nothing before, one
+  column and one row after, then a `k=3, stride=2` convolution with zero spatial
+  padding. A symmetric pad gives the same output size and a different alignment
+  — a video that comes back shifted, level by level. It moves the moments by
+  3.8.
+
+  CPU reference only: there is no GPU path for the encoder and no page for it.
+  The whole-encoder comparison is a **script**, not a test — the reference takes
+  123 s for 8 frames of 32x32, past `scripts/test.mjs`'s per-file minute, which
+  is the same reason `examples/anima`'s forward and the video decoder's are
+  scripts. What stays in vitest is the channel plan and the compression factors.
+
+- **`conv3d` and `pad` have a caller** (issue #200): one `ResnetBlock3D` of
+  MiniMax-H3's visual VAE **encoder**, checked against the model's own module at
+  **3.576e-7**. The VAE's decoder is a ViT and needs neither op; the encoder is a
+  3D convolutional stack, and an op nothing calls is a liability.
+
+  Three conventions the block settles, each measured rather than recalled:
+  **space reflects and time does not** — a causal convolution prepends
+  `2 * padding` zero frames and appends none, which is what `ops/pad` taking
+  `before` and `after` separately is for; **two frames, not one**, or the output
+  is a frame shorter; and **group norm is per frame**, not over the clip
+  (`use_t_isolated_gn`), which is worth 2.4 in the output when got wrong.
+
 - **Z-Image runs from a folder too, and is published** (issue #194). The same
   gate, the same receipt, the same offline-after-the-first-download. 14.4 GB in
   total — and **8.04 GB of it comes straight from
@@ -57,7 +87,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   whose cache-buster did not fire. The stamp is the bundle's content hash, so a
   rebuild that changes nothing does not invalidate anyone's cache.
 
-
 - **Z-Image runs end to end, in a browser** (issue #166). A prompt goes in and a
   1024x1024 image comes out, on WebGPU, composed from this repository's ops:
   byte-level BPE, a Qwen3-4B text encoder, the 30-layer DiT, a rectified-flow
@@ -85,6 +114,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   `reflect` on the spatial axes and **causally** in time — `2 * padding` frames
   before the data and none after — which is not a value any symmetric padding
   argument can take. That is a pad op, and it is **`pad`**, below.
+  argument can take. That is a pad op, and it is not written yet.
 
   3D is also the first place the *axis order* is checkable. The tests use an
   input whose elements name their own coordinate (`100d + 10h + w`) against a
@@ -147,7 +177,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   element for element — not obvious, since a reflection reads neighbours that
   are themselves reflections. One kernel then serves the audio VAE's 1D
   `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
-
 
 - **A transformer block of MiniMax-H3's DiT** (issue #200) — the *generator*
   half of the model, against the visual VAE this repository already decodes
@@ -348,7 +377,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   work there. Nothing checked, and it was false. What made it visible was
   #182's breakdown — `batch()`'s own timers named 55% of a browser forward and
   the rest was outside every dispatch.
-
 
 - **The Anima demo's cache buster had never fired** (issue #177). The server
   stamps the bundle's mtime onto the `<script src>` because `Cache-Control:
