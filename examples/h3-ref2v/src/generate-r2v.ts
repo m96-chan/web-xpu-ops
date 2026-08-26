@@ -131,11 +131,111 @@ if (!conditionerDir || !encoderDir || !ditDir || !vaeDir || !vaeConfigPath || re
   process.exit(2);
 }
 const prompt = arg("--prompt") ?? "the reference, moving";
-const frames = alignNumFrames(number("--frames", 22));
-const height = number("--height", 256);
-const width = number("--width", 256);
+/**
+ * The released model's own specification, from `MiniMaxAI/MiniMax-H3`'s card
+ * and the `ref2va` request in its `scripts/readme/`.
+ *
+ * **These are defaults and limits, not suggestions.** Every one of them was
+ * violated by hand on the first real run of this script — a 1.2-second target
+ * at 256 pixels from a 25.9-second reference and a six-word prompt — and each
+ * violation looked like a property of the model until the card was read. The
+ * numbers live here so that asking for something outside them takes saying so.
+ */
+const SPEC = {
+  /** "Output duration | 4–15 seconds". */
+  minSeconds: 4,
+  maxSeconds: 15,
+  /** The official `ref2va` request's own `duration_seconds`. */
+  defaultSeconds: 5,
+  /** "The shorter side is set to 768 pixels by default." */
+  defaultShortEdge: 768,
+  /** "Output frame rate | 24 FPS". */
+  fps: 24,
+  /** Ref2VA: "Videos: ≤ 3 clips; each clip must be 2–15 seconds long; total duration ≤ 15 seconds". */
+  maxVideoReferences: 3,
+  minReferenceSeconds: 2,
+  maxReferenceSeconds: 15,
+  maxTotalReferenceSeconds: 15,
+  /** "Images: ≤ 9 images" and "Maximum number of files across all input types is 12". */
+  maxImageReferences: 9,
+  maxReferences: 12,
+  /**
+   * The six sections `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` defines for a
+   * full-reference rewrite. The card calls H3-Context-IR "critical to the
+   * quality of the final output" and its own example request is 5,650 prompt
+   * tokens; a short prompt is not a small version of that input.
+   */
+  promptSections: [
+    "subject_definitions", "summary", "retention_analysis",
+    "detailed_description", "overall_soundscape", "non_diegetic_music",
+  ],
+} as const;
+
+/** Everything out-of-spec is refused unless this is passed. */
+const outOfSpec = process.argv.includes("--out-of-spec");
+const complain = (what: string): void => {
+  if (outOfSpec) {
+    console.warn(`  out of spec, and --out-of-spec was given: ${what}`);
+    return;
+  }
+  console.error(`generate-r2v: ${what}\n  pass --out-of-spec to do it anyway`);
+  process.exit(2);
+};
+
+/**
+ * The reference limits, checked before 26 GB of weights are uploaded.
+ *
+ * A video's seconds are its sampled frame count over the conditioner's own
+ * sample rate — the frames handed to this script are already the ones it reads.
+ */
+const videoRefs = referenceInputs.filter((r) => r.kind === "video");
+const imageRefs = referenceInputs.filter((r) => r.kind === "image");
+if (referenceInputs.length > SPEC.maxReferences) {
+  complain(`${referenceInputs.length} references and the model takes ${SPEC.maxReferences}`);
+}
+if (videoRefs.length > SPEC.maxVideoReferences) {
+  complain(`${videoRefs.length} video references and the model takes ${SPEC.maxVideoReferences}`);
+}
+if (imageRefs.length > SPEC.maxImageReferences) {
+  complain(`${imageRefs.length} image references and the model takes ${SPEC.maxImageReferences}`);
+}
+
+const seconds = Number(arg("--seconds") ?? SPEC.defaultSeconds);
+if (seconds < SPEC.minSeconds || seconds > SPEC.maxSeconds) {
+  complain(`the model generates ${SPEC.minSeconds}–${SPEC.maxSeconds} s and this asks for ${seconds}`);
+}
+// `--frames` still overrides, for bisecting against a golden at a fixed count.
+const frames = alignNumFrames(number("--frames", Math.round(seconds * SPEC.fps)));
 const steps = number("--steps", 16);
 const seed = number("--seed", 0);
+
+/**
+ * The target canvas, from a short edge and an aspect ratio rather than two
+ * pixel counts.
+ *
+ * Rounded to a multiple of the VAE's 16 and the DiT's 2 — 32 — because
+ * everything downstream refuses anything else, and the short edge is kept
+ * exact so `--short-edge 768` means 768.
+ */
+const aspect = arg("--aspect") ?? "1:1";
+const shortEdge = number("--short-edge", SPEC.defaultShortEdge);
+if (shortEdge !== SPEC.defaultShortEdge) {
+  complain(`the model's short edge is ${SPEC.defaultShortEdge} by default and this asks for ${shortEdge}`);
+}
+const ratio = aspect.split(":").map(Number);
+if (ratio.length !== 2 || !ratio.every((v) => Number.isFinite(v) && v > 0)) {
+  console.error(`generate-r2v: --aspect wants W:H, not "${aspect}"`);
+  process.exit(2);
+}
+const BLOCK = 32;
+const round32 = (v: number): number => Math.max(BLOCK, Math.round(v / BLOCK) * BLOCK);
+const portrait = ratio[0]! < ratio[1]!;
+const width = number("--width", portrait ? shortEdge : round32(shortEdge * (ratio[0]! / ratio[1]!)));
+const height = number("--height", portrait ? round32(shortEdge * (ratio[1]! / ratio[0]!)) : shortEdge);
+if (width % BLOCK || height % BLOCK) {
+  console.error(`generate-r2v: ${width}x${height} must be a multiple of ${BLOCK}`);
+  process.exit(2);
+}
 
 const f32 = (path: string): Float32Array => {
   const buffer = readFileSync(path);
@@ -262,6 +362,43 @@ const references = referenceInputs.map((input) => {
 const tokenizer = new ByteLevelBpeTokenizer(JSON.parse(readFileSync(
   fileURLToPath(new URL("../../../llm/data/qwen-qwen3-4b.bpe-vocab.json", import.meta.url)), "utf8",
 )) as BpeVocab);
+
+// The reference durations, now that the conditioner's own sample rate is known.
+{
+  let total = 0;
+  for (const r of videoRefs) {
+    const length = r.frames / conditionerManifest.videoSampleFps;
+    total += length;
+    if (length < SPEC.minReferenceSeconds || length > SPEC.maxReferenceSeconds) {
+      complain(
+        `${r.path.split("/").pop()} is ${length.toFixed(1)} s and a reference clip is ` +
+          `${SPEC.minReferenceSeconds}–${SPEC.maxReferenceSeconds} s`,
+      );
+    }
+  }
+  if (total > SPEC.maxTotalReferenceSeconds) {
+    complain(`${total.toFixed(1)} s of reference video and the model takes ${SPEC.maxTotalReferenceSeconds}`);
+  }
+}
+
+/**
+ * The prompt's shape.
+ *
+ * H3-Context-IR is a hosted service and is not in the open release, so this
+ * cannot build the rewrite — but it can refuse to pretend a sentence is one.
+ * Measured on one request, everything else held: replacing a six-word prompt
+ * with the six sections took the port's seam figure from 1.51 to 1.14 and put
+ * the reference's own printed shirt on the subject.
+ */
+{
+  const missing = SPEC.promptSections.filter((section) => !prompt.includes(`${section}:`));
+  if (missing.length) {
+    complain(
+      `the prompt has no ${missing.join(", ")} — the model expects H3-Context-IR's six-section rewrite, ` +
+        "see docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md in the model repository",
+    );
+  }
+}
 
 const processor = conditionerManifest.processor;
 const merge = processor.mergeSize;
@@ -430,6 +567,22 @@ console.log(
   `  ${layout.seq} packed rows, of which ${layout.numReferenceVideoRows} are the references ` +
     `(${referenceGeometry.map((g) => g.join("x")).join(", ")})`,
 );
+/**
+ * What this port has actually been timed at, said before the wait rather than
+ * after it.
+ *
+ * Attention is quadratic in the packed length, so the model's own defaults —
+ * five seconds at a short edge of 768 — are tens of thousands of rows and are
+ * not the same order of request as the ones below. Measured on an RTX 5090,
+ * int8, 16 steps: 2,036 rows at 4.5 s a step, 3,227 at 7.8, 4,768 at 12.2.
+ */
+const MEASURED_ROWS = 4768;
+if (layout.seq > MEASURED_ROWS) {
+  console.log(
+    `  note: the longest sequence this port has been timed at is ${MEASURED_ROWS} rows, at 12.2 s a step. ` +
+      `This is ${layout.seq}, and attention is quadratic in it.`,
+  );
+}
 
 // ------------------------------------------------- stage 2: the conditioner
 

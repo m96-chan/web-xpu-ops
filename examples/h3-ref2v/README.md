@@ -544,6 +544,19 @@ requests rather than inferred from how the output looked:
 The official `ref2va` request is `{"short_edge": 768, "aspect_ratio": "auto",
 "duration_seconds": 5}`.
 
+**The spec is in the tool now**, so being outside it takes saying so.
+`generate-r2v.ts` defaults to 5 seconds at a short edge of 768, derives the
+canvas from `--aspect`, and refuses — before uploading 26 GB — a duration
+outside 4–15 s, a reference clip outside 2–15 s, more than 15 s or 3 clips of
+reference video, more than 9 images or 12 files, and a prompt missing any of
+the six rewrite sections. `--out-of-spec` proceeds anyway and says which rule
+it broke.
+
+**What it cannot do is run those defaults here.** Five seconds at 768 on a 9:16
+canvas is **40,927 packed rows**; the longest this port has been timed at is
+4,768, at 12.2 s a step, and attention is quadratic in the length. The script
+prints that comparison before the wait rather than after it.
+
 **The prompt is the one that measurably mattered.** The card says
 "H3-Context-IR is critical to the quality of the final output", and
 `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` gives the format: six sections —
@@ -568,9 +581,15 @@ above the picture's own gradients:
 | --- | --- | --- | --- |
 | 28 | 1.17 | 8.67 | 1.29 |
 | **48** | **2.00** | **8.79** | **1.51** |
+| 48, Context-IR prompt | 2.00 | 8.88 | **1.14** |
 | 68 | 2.83 | 12.52 | 1.56 |
 | 108 | 4.50 | 11.94 | 1.73 |
+| 128 at 256x448, Context-IR prompt | 5.33 | 12.17 | 1.61 |
 | 168 | 7.00 | 16.30 | 3.51 |
+
+**The prompt does not buy length.** The six-section rewrite is the best seam
+figure at two seconds and still degrades at five, which is the shortest the
+model's own card allows.
 
 **48 frames is twice the length at nearly the same numbers**; past it the seams
 and the colour break up. Sampling is 5.5 s a step at 2,478 packed rows and 12.0

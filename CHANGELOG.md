@@ -67,6 +67,30 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's generator holds the model to its own specification** (issue #212).
+  Every number in `MiniMaxAI/MiniMax-H3`'s card is a default or a limit in
+  `generate-r2v.ts` now, because every one of them was violated by hand on the
+  first real request and each violation read as a property of the model until
+  the card was read.
+
+  It defaults to **5 seconds at a short edge of 768** — the official `ref2va`
+  request verbatim — derives the canvas from `--aspect`, and refuses, *before*
+  uploading 26 GB: a duration outside 4–15 s, a reference clip outside 2–15 s,
+  more than 15 s or 3 clips of reference video, more than 9 images or 12 files,
+  and a prompt missing any of H3-Context-IR's six rewrite sections.
+  `--out-of-spec` proceeds and names the rule.
+
+  The prompt check is the one with a measurement behind it: everything else
+  held, replacing a six-word prompt with the six sections moved the seam figure
+  from 1.51 to 1.14 — the best of any run — and put the reference's own printed
+  shirt on the subject. H3-Context-IR is hosted and not in the open release, so
+  this cannot build the rewrite; it can refuse to pretend a sentence is one.
+
+  It also says what it cannot do. Five seconds at 768 on a 9:16 canvas is
+  **40,927 packed rows** and the longest this port has been timed at is 4,768,
+  at 12.2 s a step — printed before the wait rather than after it.
+
+
 - **R2V runs end to end on the GPU** (issue #212). `generate-r2v.ts`: a
   reference and a prompt in, frames out, over four models one at a time —
   encoder 0.47 s, conditioner 2.0 s, `transformer_ref` 15 steps at ~1.4 s,
