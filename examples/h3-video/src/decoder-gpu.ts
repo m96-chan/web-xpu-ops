@@ -82,6 +82,12 @@ export interface VideoDecoderManifest {
     rope_theta: number;
     rope_dim_ratio: number;
   };
+  /**
+   * The per-channel statistics that separate the DiT's latent space from this
+   * decoder's. Written by conversions from #212 on; absent from older ones.
+   */
+  latentsMean?: number[];
+  latentsStd?: number[];
   /** `"f32"` or `"q8"` — which layout the weight matrices are in. */
   dtype: string;
   dim: number;
@@ -660,6 +666,40 @@ export function unpackPatches(
 }
 
 /** `x * std + mean`, the ImageNet denormalisation `decode_videos` applies. */
+/**
+ * The DiT's latent, in the space this decoder reads.
+ *
+ * **They are not the same space.** `AutoencoderKLMiniMaxH3`'s own doc: "a
+ * pipeline encodes with `(latent - latents_mean) / latents_std` and decodes
+ * with `latent * latents_std + latents_mean`". A sampler that hands its output
+ * straight to `decode` gets a picture — a blurred one with a grid over it,
+ * which for weeks was read as what int8 costs. It is not: undoing the
+ * normalisation brings back the reflections and the text on the hull.
+ *
+ * Issue #212 found it while wiring `ref2va`, where the *encoder* is a caller
+ * too and the two directions have to agree.
+ */
+export function unnormaliseLatent(latent: Float32Array, manifest: VideoDecoderManifest): Float32Array {
+  const mean = manifest.latentsMean;
+  const std = manifest.latentsStd;
+  if (!mean || !std) {
+    throw new Error(
+      "this conversion carries no latentsMean/latentsStd — re-run convert_decoder.py, " +
+        "or the DiT's output will be decoded in the wrong latent space",
+    );
+  }
+  const channels = mean.length;
+  const per = latent.length / channels;
+  if (!Number.isInteger(per)) {
+    throw new Error(`unnormaliseLatent: ${latent.length} values is not a whole number of ${channels} channels`);
+  }
+  const out = new Float32Array(latent.length);
+  for (let c = 0; c < channels; c += 1) {
+    for (let i = 0; i < per; i += 1) out[c * per + i] = latent[c * per + i]! * std[c]! + mean[c]!;
+  }
+  return out;
+}
+
 export function denormalise(pixels: Float32Array, channels: number, mean: number[], std: number[]): Float32Array {
   const per = pixels.length / channels;
   const out = new Float32Array(pixels.length);

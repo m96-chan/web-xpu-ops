@@ -90,7 +90,20 @@ export interface DitManifest {
   layers: number;
   dtype: string;
   stepCounts: number[];
-  schedules: Record<string, { video: number[]; audio: number[]; levelsPerStep: number[] }>;
+  workflow?: string;
+  /**
+   * `levels` and `maxLevels` are written by conversions from #212 on.
+   *
+   * An older `t2va` conversion has neither, and two is what it built —
+   * the video schedule and the audio one. `ref2va` carries up to four,
+   * because its conditioning rows sit at their own noise-augmentation
+   * levels, and a stack that assumed two indexed past the end of the
+   * table on the fifteenth step of the run that found it.
+   */
+  schedules: Record<string, {
+    video: number[]; audio: number[]; levelsPerStep: number[];
+    levels?: number[][]; maxLevels?: number;
+  }>;
   tensors: { name: string; shape: number[]; offset: number; count: number; kind?: string }[];
   tables: { name: string; shape: number[]; offset: number; count: number }[];
   residentBytes: number;
@@ -699,8 +712,9 @@ export class DitGpu {
       throw new Error(`step ${inputs.stepIndex} is outside the ${levels} the ${inputs.steps}-step schedule has`);
     }
     // The table is `[steps, maxLevels * 3, 6 * hidden]`, so a step is
-    // `maxLevels * 3` rows in.
-    const maxLevels = 2;
+    // `maxLevels * 3` rows in. Two for a `t2va` conversion and four for a
+    // `ref2va` one; older conversions predate the field and were all `t2va`.
+    const maxLevels = this.manifest.schedules[String(inputs.steps)]!.maxLevels ?? 2;
     const stepOffsetRows = inputs.stepIndex * maxLevels * MODALITY_NUM;
 
     const positions = this.upload(ropeAxesPositions(layout.positionIds, seq));

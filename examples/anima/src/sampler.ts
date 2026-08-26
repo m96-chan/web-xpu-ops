@@ -88,8 +88,8 @@ function timeSnrShift(alpha: number, t: number): number {
  */
 export function flowSigmas(
   shift = SAMPLING.shift,
-  multiplier = SAMPLING.multiplier,
-  timesteps = SAMPLING.timesteps,
+  multiplier: number = SAMPLING.multiplier,
+  timesteps: number = SAMPLING.timesteps,
 ): Float64Array {
   const out = new Float64Array(timesteps);
   for (let i = 1; i <= timesteps; i += 1) {
@@ -114,7 +114,7 @@ export function flowSigmas(
  * timestep embedding would be evaluated somewhere else entirely. Nothing
  * crashes; the image is just conditioned on the wrong point of the trajectory.
  */
-export function timestepOf(sigma: number, multiplier = SAMPLING.multiplier): number {
+export function timestepOf(sigma: number, multiplier: number = SAMPLING.multiplier): number {
   return sigma * multiplier;
 }
 

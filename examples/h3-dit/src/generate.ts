@@ -43,7 +43,9 @@
  */
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { createResidentDevice } from "../../../harness/resident.js";
-import { VideoDecoderGpu, denormalise, type VideoDecoderManifest } from "../../h3-video/src/decoder-gpu.js";
+import {
+  VideoDecoderGpu, denormalise, unnormaliseLatent, type VideoDecoderManifest,
+} from "../../h3-video/src/decoder-gpu.js";
 import { videoKernels } from "../../h3-video/src/kernels-node.js";
 import {
   AUDIO_CHANNELS,
@@ -256,7 +258,12 @@ vaeWeights.close();
 console.log(`  VAE uploaded in ${((performance.now() - decodeAt) / 1000).toFixed(1)} s`);
 
 decodeAt = performance.now();
-const pixels = await decoder.decode(latent, [latentFrames, latentHeight, latentWidth]);
+// **The DiT works in the normalised latent space and this decoder does not.**
+// Handing it the sampler's output verbatim produced a blurred picture with a
+// grid over it, and that was read as what int8 costs until `ref2va` needed the
+// same transform in the other direction. Issue #212.
+const pixels = await decoder.decode(
+  unnormaliseLatent(latent, vaeManifest), [latentFrames, latentHeight, latentWidth]);
 console.log(`  decoded in ${((performance.now() - decodeAt) / 1000).toFixed(1)} s`);
 
 const shown = denormalise(pixels, vaeManifest.config.out_channels, vaeManifest.pixelMean, vaeManifest.pixelStd);

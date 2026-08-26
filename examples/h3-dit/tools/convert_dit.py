@@ -53,6 +53,14 @@ VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 
 
+# `MiniMaxH3ModularPipeline.keyframe_noise_aug` — the `t` a visual conditioning
+# anchor is held at. 0.999, "just short of clean", because the released model
+# was trained with its anchors very slightly noised. `ref2va` only.
+KEYFRAME_NOISE_AUG = 0.999
+# The audio reference rows' own level, which upstream passes as a literal 1.0.
+CONDITION_AUDIO_TIMESTEP = 1.0
+
+
 def set_timesteps(num_inference_steps: int, shift: float) -> np.ndarray:
     """`MiniMaxH3Scheduler.set_timesteps`, in numpy so torch need not be loaded twice."""
     base = torch.linspace(1.0, 0.0, num_inference_steps, dtype=torch.float32)
@@ -96,6 +104,8 @@ def main() -> int:
     parser.add_argument("--quant", choices=["f32", "q8"], default="q8")
     parser.add_argument("--steps", default="16,32", help="comma-separated step counts to precompute tables for")
     parser.add_argument("--layers", type=int, default=0, help="convert only the first N blocks (0 = all)")
+    parser.add_argument("--workflow", choices=["t2va", "ref2va"], default="t2va",
+                        help="which row-timestep plan the modulation tables are evaluated for")
     args = parser.parse_args()
 
     model = pathlib.Path(args.model)
@@ -266,14 +276,39 @@ def main() -> int:
         # the single level is stored twice instead. Nothing reads the duplicate:
         # with one distinct level every row's timestep index is 0, so only rows
         # 0..2 of the table are addressed.
+        #
+        # **`ref2va` carries more than two.** Its conditioning rows sit at their
+        # own noise-augmentation levels -- the visual anchors at
+        # `max(t, keyframe_noise_aug)` and the audio reference rows at 1.0 --
+        # so a sequence carries up to four. A conversion built for two indexes
+        # a table that has no row for the third: the run that found this got
+        # fourteen steps in and then a bind group whose offset was past the end
+        # of the buffer.
+        #
+        # The `ref2va` table is the **union**, whether or not a given request
+        # has audio references, and the sampler maps its own distinct levels
+        # onto `levels` below. A row nobody addresses costs one slot; a row
+        # nobody built costs the run.
+        max_levels = 2 if args.workflow == "t2va" else 4
         levels_per_step = []
         rows = []
         for v, a in zip(video_t, audio_t):
-            distinct = np.unique(np.array([v, a], dtype=np.float32))
+            wanted = [v, a]
+            if args.workflow == "ref2va":
+                wanted += [max(float(v), KEYFRAME_NOISE_AUG), CONDITION_AUDIO_TIMESTEP]
+            distinct = np.unique(np.array(wanted, dtype=np.float32))
             levels_per_step.append(int(distinct.size))
-            rows.append(distinct if distinct.size == 2 else np.array([distinct[0], distinct[0]], dtype=np.float32))
+            # Padded by repeating the last, so the table stays rectangular and a
+            # step is a fixed number of rows in. Nothing reads the padding: an
+            # index only ever comes from a level that is really there.
+            padded = np.concatenate([distinct, np.repeat(distinct[-1:], max_levels - distinct.size)])
+            rows.append(padded.astype(np.float32))
         levels = np.stack(rows)
         schedules[steps]["levelsPerStep"] = levels_per_step
+        # **The levels themselves**, so a sampler can map its own
+        # `torch.unique` onto this table rather than assume the two agree.
+        schedules[steps]["levels"] = levels.tolist()
+        schedules[steps]["maxLevels"] = max_levels
         proj = timestep_embedding(levels.reshape(-1), config["freq_dim"])
         temb = torch.nn.functional.silu(proj @ time_w1.t() + time_b1) @ time_w2.t() + time_b2
         temb_cache[steps] = temb
@@ -319,6 +354,7 @@ def main() -> int:
         "scaleStoredAsOnePlusScale": True, "weightLayout": "[in, out]" if args.quant == "f32" else "[out, in], int8 packed four per u32",
         "ropePermutation": permutation,
         "stepCounts": step_counts,
+        "workflow": args.workflow,
         "schedules": schedules,
         "tensors": entries,
         "tables": tables_entries,

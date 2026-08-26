@@ -7,6 +7,29 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The DiT's latent space is not the decoder's, and nothing was converting
+  between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
+  pipeline "encodes with `(latent - latents_mean) / latents_std` and decodes
+  with `latent * latents_std + latents_mean`". Every sampler here handed the
+  DiT's output straight to `decode`.
+
+  What came back was a blurred frame with a grid over it, and that was read as
+  what int8 costs. It is not. With the transform, the same latent decodes to a
+  sharp paper boat with reflections in the water and the printed text on its
+  hull legible.
+
+  It surfaced while wiring `ref2va`, where the **encoder** is a caller too and
+  the two directions have to agree — a round-trip through the encoder and the
+  decoder reproduced the picture only in the raw space, while the sampler's
+  output only made sense in the normalised one. Both cannot be true of the same
+  buffer.
+
+  `unnormaliseLatent` lives beside `decode` now, the statistics ride in the
+  decoder manifest so no caller has to find them, and the three callers
+  (`h3-dit`'s sampler, `h3-dit-web`, `h3-ref2v`'s sampler) all use it.
+
 ### Added
 
 - **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s

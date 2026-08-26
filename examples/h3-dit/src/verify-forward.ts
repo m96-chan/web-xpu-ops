@@ -71,7 +71,7 @@ const layout = buildPackedSequence({
 // between this port's `buildPackedSequence` and upstream's shows up as a
 // mismatch here instead of as a wrong velocity forty blocks later.
 const same = (a: ArrayLike<number>, b: ArrayLike<number>): boolean =>
-  a.length === b.length && [...a].every((v, i) => v === b[i]);
+  a.length === b.length && Array.from(a).every((v, i) => v === b[i]);
 if (layout.seq !== golden.layout.seq || !same(layout.tokenTags, golden.layout.tokenTags)
   || !same(layout.videoIndices, golden.layout.videoIndices)) {
   console.error("the rebuilt layout disagrees with the golden's");

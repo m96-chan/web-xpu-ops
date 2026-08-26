@@ -22,7 +22,9 @@ import {
   requireBoundFolder, wireChangeFolder, type GateElements, type GateOptions,
 } from "../../web-common/src/gate.js";
 import { createBrowserResidentDevice } from "../../web-common/src/browser-resident.js";
-import { VideoDecoderGpu, denormalise, type VideoDecoderManifest } from "../../h3-video/src/decoder-gpu.js";
+import {
+  VideoDecoderGpu, denormalise, unnormaliseLatent, type VideoDecoderManifest,
+} from "../../h3-video/src/decoder-gpu.js";
 import { DitGpu, type DitManifest } from "../../h3-dit/src/model-gpu.js";
 import {
   AUDIO_CHANNELS,
@@ -350,7 +352,11 @@ async function main(): Promise<void> {
       const latent = unpatchifyVideoLatents(
         videoRows, c.in_channels, latentFrames, latentHeight, latentWidth, c.patch_size,
       );
-      const raw = await decoder.decode(latent, [latentFrames, latentHeight, latentWidth]);
+      const raw = await decoder.decode(
+      // **The DiT's latent space is not the decoder's** — issue #212. Without
+      // this the page drew a blurred frame with a grid over it and called it
+      // int8.
+      unnormaliseLatent(latent, vaeManifest), [latentFrames, latentHeight, latentWidth]);
       const decodeMs = performance.now() - decodeStart;
 
       const pixels = denormalise(raw, vaeManifest.config.out_channels, vaeManifest.pixelMean, vaeManifest.pixelStd);

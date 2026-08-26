@@ -102,6 +102,10 @@ const dit = withRopePermutation(
   cfg.modelChannels,
 );
 const device = await createResidentDevice();
+if (!device) {
+  console.error("no adapter");
+  process.exit(2);
+}
 const held = new Map<string, GPUBuffer>();
 
 const sigmas = Array.from(f32("sigmas"));
