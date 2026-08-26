@@ -224,7 +224,7 @@ export function axesScenario(
   // thread whose `token` ran past `N` reads here, and if it read zeros instead
   // it would apply the identity rotation — which against a zeroed output is
   // indistinguishable from the guard having worked.
-  const positionSlack = new Int32Array(positions.length + axisDims.length * 4).fill(9999);
+  const positionSlack = new Float32Array(positions.length + axisDims.length * 4).fill(9999);
   positionSlack.set(positions);
 
   const expected = new Float32Array(slots);
