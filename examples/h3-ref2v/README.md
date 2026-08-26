@@ -529,6 +529,35 @@ Still unmeasured: **what it costs against the same request run in `diffusers`.**
 Every stage here is held to the model, but no end-to-end generation has been
 compared with one.
 
+### What the model card says, and what this port was doing wrong
+
+Checked against `MiniMaxAI/MiniMax-H3`'s own card and its `scripts/readme/`
+requests rather than inferred from how the output looked:
+
+| | the model | this port was doing |
+| --- | --- | --- |
+| output duration | **4–15 s** | 1.2 s |
+| output resolution | **short edge 768** | 256 |
+| a `ref2va` video reference | **2–15 s each, ≤ 15 s total, ≤ 3 clips** | one 25.9 s clip |
+| the prompt | **H3-Context-IR's six-section rewrite**, thousands of tokens | six words |
+
+The official `ref2va` request is `{"short_edge": 768, "aspect_ratio": "auto",
+"duration_seconds": 5}`.
+
+**The prompt is the one that measurably mattered.** The card says
+"H3-Context-IR is critical to the quality of the final output", and
+`docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` gives the format: six sections —
+`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`,
+`overall_soundscape`, `non_diegetic_music` — with `<Subject N>`, `<Picture N>`
+and `<Video N>` labels carried through all of them. The card's own example
+request is 5,650 prompt tokens.
+
+Everything else held and only the prompt replaced, 48 frames at 256x256 and 16
+steps: the seam figure below goes from **1.51 to 1.14**, the best of any run
+here, and the subject actually wears the reference's printed shirt and performs
+the described arm raise. A six-word prompt is not a small version of that
+input; it is a different input.
+
 ### How long a clip is worth asking for
 
 `17n + 5` frames in, `(5n + 2) * 4` out, so the length is a ladder. Measured on
@@ -548,9 +577,14 @@ and the colour break up. Sampling is 5.5 s a step at 2,478 packed rows and 12.0
 s at 4,672.
 
 **It is not `ref2va`'s.** The `t2va` sampler on the `t2va` checkpoint degrades
-the same way at 108 frames — same grid, same colour. It is this checkpoint at
-256x256, sixteen steps and int8, and the ladder above is where to stop rather
-than a bug to find.
+the same way at 108 frames — same grid, same colour.
+
+And it is **not the resolution or the step count either**, both measured:
+512x512 makes the seams *worse* (1.51 → 2.31) and 32 steps moves them a little
+and the colour the wrong way (chroma 8.79 → 11.29). What is left is the int8
+this README measures at 12.28% of peak over fifty blocks, and the one thing
+still unmeasured: **the same request run end to end in `diffusers`.** Every
+stage here is held to the model; no whole generation has been.
 
 ## What is not here yet
 
