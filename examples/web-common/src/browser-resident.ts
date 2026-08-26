@@ -27,6 +27,9 @@
  * the original comment was trying to avoid and reached anyway by being the
  * only half that was implemented.
  */
+import {
+  bindingTypeMismatch, kernelName, storageElementTypes, type ElementType,
+} from "../../../harness/binding-types.js";
 import type {
   BatchProfile, ResidentDevice, ResidentOp, ResidentReadback,
 } from "../../../harness/resident.js";
@@ -70,6 +73,27 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   const pipelines = new Map<string, GPUComputePipeline>();
 
   /**
+   * Issue #221, the browser half.
+   *
+   * `harness/resident.ts` carries the same three maps and the reasoning behind
+   * them. It is duplicated rather than shared because this file exists to *be*
+   * a separate implementation -- it runs against the browser's own `navigator.gpu`
+   * with no Dawn and no Node -- and #217 is the argument for doing it: the CLI
+   * was fixed and the page was not, twice, because the two were only ever
+   * assumed to agree. The check itself is imported, so the rule lives in one
+   * place even where the plumbing does not.
+   */
+  const declarations = new WeakMap<GPUComputePipeline, { kernel: string; types: (ElementType | null)[] }>();
+  const uploaded = new WeakMap<GPUBuffer, ArrayBufferView>();
+
+  /** See `harness/resident.ts#bindingMismatch` for why this is judged at bind time and nowhere else. */
+  function bindingMismatch(pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[]): string | null {
+    const declaration = declarations.get(pipeline);
+    if (!declaration) return null;
+    return bindingTypeMismatch(declaration.kernel, declaration.types, buffers.map((b) => uploaded.get(b) ?? null));
+  }
+
+  /**
    * Bytes handed out, so an allocation failure can say how much was already in
    * flight rather than only that one more did not fit.
    */
@@ -107,6 +131,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   }
 
   function upload(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void {
+    uploaded.set(buffer, data);
     device.queue.writeBuffer(buffer, offset, data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
   }
 
@@ -129,12 +154,15 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`pipeline is not valid: ${invalid.message}`);
 
+    declarations.set(pipeline, { kernel: kernelName(code), types: storageElementTypes(code) });
     stats.pipelinesCreated += 1;
     pipelines.set(key, pipeline);
     return pipeline;
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    const mismatch = bindingMismatch(pipeline, buffers);
+    if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
@@ -153,6 +181,8 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
   ): Promise<GPUBindGroup> {
+    const mismatch = bindingMismatch(pipeline, slices.map((slice) => slice.buffer));
+    if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({

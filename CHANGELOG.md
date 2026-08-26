@@ -56,6 +56,38 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The type a buffer is uploaded with is now checked against the type the
+  kernel declared** (issue #221, out of #217). `ropeAxes`' `positions` binding
+  changed from `array<i32>` to `array<f32>`; one caller was updated, two were
+  not, and nothing anywhere said so for eighteen commits. WebGPU has no opinion
+  about this — `queue.writeBuffer` copies bytes, and a small integer's bit
+  pattern read as an `f32` is a denormal near zero. Every rotation angle became
+  zero and the page drew one flat colour, with no error.
+
+  **The type was written down the whole time**, one line above the code that
+  read it. Nothing on the host read that line. `harness/binding-types.ts` reads
+  it now, and `harness/wgsl.ts#createRunner`, `harness/resident.ts` and
+  `examples/web-common/src/browser-resident.ts` refuse the mismatch — so every
+  op test and every resident model, in Node and in the browser, is covered by
+  running at all.
+
+  Judged where a buffer, a pipeline and a binding number are in the same room,
+  which is the bind group and nowhere else. The first version also judged inside
+  `upload`, against whatever binding the buffer had last, and on Anima's real
+  forward that named the wrong kernel: buffers come from a pool, and the same
+  one had been `RMSNorm`'s input a dispatch earlier. It caught the bug and lied
+  about where — and the same staleness would eventually have rejected a pooled
+  buffer legitimately used as `array<i32>` in one op and `array<f32>` in
+  another. A check that fails on correct code is worse than no check.
+
+  Two things are deliberately unchecked, both found by turning tests red rather
+  than by reasoning. `array<atomic<T>>` says how a slot is *updated*, not what
+  it holds: `ops/scatter` is an f32 scatter-add through
+  `atomicCompareExchangeWeak`, because WGSL has no f32 atomic, and the first
+  version turned its eight tests red. And a `Uint8Array` is the host saying
+  "these are bytes" — `ops/matvec/wgsl/q8.wgsl` declares `array<u32>` and is fed
+  four packed int8 weights per word.
+
 - **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole
   encoder — six levels of two `ResnetBlock3D`s, a strided convolution between
   the first four, and `quant_conv` — held to `EncoderFCN3D`'s own output at
