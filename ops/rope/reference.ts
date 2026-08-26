@@ -595,3 +595,49 @@ export function ropeAxes({ input, N, numHeads, axisDims, positions, thetaBase }:
   }
   return output;
 }
+
+
+/**
+ * MiniMax-H3's rotary channel order, as a permutation into `ropeAxes`'s.
+ *
+ * Issue #200. Both of H3's models rotate the same way and neither matches this
+ * library's `axes` entry, so the conversion is written once here rather than
+ * twice in two examples.
+ *
+ * H3 builds `rotDim` angles as `[axis0, axis1, axis2]` — `rotDim / 2 / axes`
+ * frequencies each — and then **tiles the whole block twice**, so channel `c`
+ * rotates against `c + rotDim / 2`. `ropeAxes` gives each axis a contiguous
+ * block and rotates **adjacent** pairs inside it. Channel `c` of H3 therefore
+ * belongs at `axis * (2 * perAxis) + 2 * freq + half`.
+ *
+ * Channels past `rotDim` are not rotated by H3 (`rope_dim_ratio < 1` in the
+ * visual VAE, `2 * axes * rope_freq_dim < head_dim` in the DiT) and are left
+ * where they are; an axis pinned at position 0 covers them, because a rotation
+ * by zero is the identity.
+ *
+ * **Apply it to the weights, not the activations.** `permuteForRope` does the
+ * same for Anima: permuting the rows of the Q and K projections costs nothing
+ * per forward, and the dot product `q · k` is unchanged when both sides are
+ * permuted alike. V is never rotated and must not be touched.
+ *
+ * `h3-cases.ts`'s generated table is what this is checked against.
+ */
+export function h3RopePermutation(headDim: number, rotDim: number, axes = 3): number[] {
+  if (rotDim % (2 * axes) !== 0) {
+    throw new Error(`h3RopePermutation: ${rotDim} rotated channels do not divide into 2 x ${axes} halves`);
+  }
+  if (rotDim > headDim) {
+    throw new Error(`h3RopePermutation: ${rotDim} rotated channels exceed a head's ${headDim}`);
+  }
+  const perAxis = rotDim / 2 / axes;
+  const permutation = new Array<number>(headDim);
+  for (let c = 0; c < rotDim; c += 1) {
+    const half = Math.floor(c / (rotDim / 2));
+    const rest = c % (rotDim / 2);
+    const axis = Math.floor(rest / perAxis);
+    const freq = rest % perAxis;
+    permutation[axis * (2 * perAxis) + 2 * freq + half] = c;
+  }
+  for (let c = rotDim; c < headDim; c += 1) permutation[c] = c;
+  return permutation;
+}
