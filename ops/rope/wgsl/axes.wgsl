@@ -46,6 +46,13 @@
 // checkpoint written for `rotate_half` needs `llm/weights.ts#permuteRopeChannels`
 // first, exactly as it does for 1-D rope.
 
+// A dispatch wider than one row of workgroups is folded back into one index
+// here rather than by a uniform: `num_workgroups.x` is what the host asked for,
+// so **every existing one-dimensional caller keeps working unchanged** — at
+// `[n]` the y extent is 1 and the second term is 0. The ceiling is 65,535 on
+// every backend measured (#211), and `examples/h3-video`'s decoder passes it at
+// 42 latent frames — a seven-second clip.
+
 struct Params {
   N: u32,          // tokens
   num_heads: u32,
@@ -78,11 +85,12 @@ struct Params {
 @compute @workgroup_size(256)
 fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) workgroups: vec3<u32>,
 ) {
   let half_dim = params.head_dim / 2u;
   let total_pairs = params.N * params.num_heads * half_dim;
 
-  let pair_idx = gid.x;
+  let pair_idx = gid.x + gid.y * workgroups.x * 256u;
   if (pair_idx >= total_pairs) {
     return;
   }

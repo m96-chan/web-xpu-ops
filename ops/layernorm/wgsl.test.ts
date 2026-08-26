@@ -11,6 +11,44 @@ const EPS = 1e-5;
 describe("layernorm / wgsl", () => {
   useGpu();
 
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 is the ceiling on every backend measured (#211); the fold reads
+   * `num_workgroups` rather than a uniform, so every existing one-dimensional
+   * caller keeps working. Narrow on purpose, so most of the work lands on rows
+   * the unfolded kernel never reaches.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one row index", async (run) => {
+    // The file's own generator and a D it already covers, so the arithmetic is
+    // the arithmetic every other case here measures and the only new thing is
+    // where the work lands.
+    const N = 700;
+    const D = 256;
+    const input = wave(N * D);
+    const weight = wave(D, 0.11);
+    const bias = wave(D, 0.23);
+    const x = 8;
+    const y = Math.ceil(N / x);
+    await expectAgrees(
+      run,
+      {
+        code,
+        bindings: [
+          { kind: "storage", data: input },
+          { kind: "storage", data: weight },
+          { kind: "storage", data: bias },
+          { kind: "out", type: "f32", length: N * D },
+          { kind: "uniform", data: params([["u32", N], ["u32", D], ["f32", 1e-5]]) },
+        ],
+        workgroups: [x, y],
+      },
+      // The file's default tolerance, as every other case here uses: this is
+      // about *where* the work lands, not about the arithmetic.
+      [layernorm({ input, weight, bias, N, D, eps: 1e-5 })],
+    );
+  });
+
   // D spans the 256-wide workgroup deliberately: below it, exactly on it, and
   // not a multiple of it. The strided loop and the two tree reductions each
   // behave differently depending on which, and only one of those is the common

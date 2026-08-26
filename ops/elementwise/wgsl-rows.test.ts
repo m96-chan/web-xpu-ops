@@ -98,6 +98,40 @@ describe("elementwise rows / wgsl", () => {
    * 17 x 17 = 289 also straddles one workgroup, so the tail guard is live here
    * as well.
    */
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 is the ceiling on every backend measured (#211), and
+   * `examples/h3-video`'s decoder passes it at 42 latent frames — a
+   * seven-second clip. The fold reads `num_workgroups` rather than taking a
+   * uniform, so every existing one-dimensional caller keeps working. Narrow on
+   * purpose, so most of the work lands where the unfolded kernel never reaches.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one index", async (run) => {
+    const S = 300;
+    const D = 33;
+    const a = wave(S * D, 0.37);
+    const b = bias(D);
+    const outLength = Math.ceil((S * D) / 256) * 256;
+    const tiles = Math.ceil((S * D) / 256);
+    const x = 4;
+    const y = Math.ceil(tiles / x);
+    await expectAgrees(
+      run,
+      {
+        code,
+        bindings: [
+          { kind: "storage", data: padded(a) },
+          { kind: "storage", data: padded(b) },
+          { kind: "out", type: "f32", length: outLength },
+          { kind: "uniform", data: params([["u32", S], ["u32", D], ["u32", ELEMENTWISE.add]]) },
+        ],
+        workgroups: [x, y],
+      },
+      [withTail(elementwiseRows({ a, b, S, D, kind: ELEMENTWISE.add }), outLength)],
+    );
+  });
+
   gpuTest("indexes b by the column, not by the row", async (run) => {
     const N = 17;
     const a = wave(N * N, 0.41);

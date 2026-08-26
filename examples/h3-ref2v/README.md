@@ -529,6 +529,29 @@ Still unmeasured: **what it costs against the same request run in `diffusers`.**
 Every stage here is held to the model, but no end-to-end generation has been
 compared with one.
 
+### How long a clip is worth asking for
+
+`17n + 5` frames in, `(5n + 2) * 4` out, so the length is a ladder. Measured on
+one R2V request, chroma per frame and how far the 16-pixel VAE seams stand out
+above the picture's own gradients:
+
+| frames out | seconds | chroma | seam / gradient |
+| --- | --- | --- | --- |
+| 28 | 1.17 | 8.67 | 1.29 |
+| **48** | **2.00** | **8.79** | **1.51** |
+| 68 | 2.83 | 12.52 | 1.56 |
+| 108 | 4.50 | 11.94 | 1.73 |
+| 168 | 7.00 | 16.30 | 3.51 |
+
+**48 frames is twice the length at nearly the same numbers**; past it the seams
+and the colour break up. Sampling is 5.5 s a step at 2,478 packed rows and 12.0
+s at 4,672.
+
+**It is not `ref2va`'s.** The `t2va` sampler on the `t2va` checkpoint degrades
+the same way at 108 frames — same grid, same colour. It is this checkpoint at
+256x256, sixteen steps and int8, and the ladder above is where to stop rather
+than a bug to find.
+
 ## What is not here yet
 
 The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,

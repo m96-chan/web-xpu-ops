@@ -18,6 +18,13 @@
 //   bias:   [D]    f32 (learnable shift)
 //   output: [N, D] f32
 
+// A dispatch wider than one row of workgroups is folded back into one index
+// here rather than by a uniform: `num_workgroups.x` is what the host asked for,
+// so **every existing one-dimensional caller keeps working unchanged** — at
+// `[n]` the y extent is 1 and the second term is 0. The ceiling is 65,535 on
+// every backend measured (#211), and `examples/h3-video`'s decoder passes it at
+// 42 latent frames — a seven-second clip.
+
 struct Params {
   N: u32,
   D: u32,
@@ -37,9 +44,10 @@ var<workgroup> shared_sum: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(
   @builtin(workgroup_id) wg_id: vec3<u32>,
+  @builtin(num_workgroups) workgroups: vec3<u32>,
   @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
-  let row = wg_id.x;
+  let row = wg_id.x + wg_id.y * workgroups.x;
   // Uniform across the workgroup, so the barriers below stay in uniform control
   // flow. Callers may dispatch more workgroups than there are rows.
   if (row >= params.N) {

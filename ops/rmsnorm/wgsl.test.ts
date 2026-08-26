@@ -23,6 +23,38 @@ const groupWeight = (G: number, D: number) =>
 describe("rmsnorm / wgsl", () => {
   useGpu();
 
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 is the ceiling on every backend measured (#211); the fold reads
+   * `num_workgroups` rather than a uniform, so every existing one-dimensional
+   * caller keeps working. Narrow on purpose, so most of the work lands on rows
+   * the unfolded kernel never reaches.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one row index", async (run) => {
+    const N = 700;
+    const D = 64;
+    const input = Float32Array.from({ length: N * D }, (_, i) => Math.sin(i * 0.017) * 2 + 0.1);
+    const weight = Float32Array.from({ length: D }, (_, i) => 1 + (i % 7) * 0.05);
+    const x = 8;
+    const y = Math.ceil(N / x);
+    await expectAgrees(
+      run,
+      {
+        code,
+        bindings: [
+          { kind: "storage", data: input },
+          { kind: "storage", data: weight },
+          { kind: "out", type: "f32", length: N * D },
+          { kind: "uniform", data: params([["u32", N], ["u32", D], ["f32", 1e-6], ["u32", 1]]) },
+        ],
+        workgroups: [x, y],
+      },
+      [rmsnorm({ input, weight, N, D, eps: 1e-6 })],
+      { rel: 1e-6, abs: 1e-6 },
+    );
+  });
+
   // D spans the 256-wide workgroup deliberately: below it, exactly on it, and
   // not a multiple of it. The strided loop and the tree reduction each behave
   // differently depending on which, and only one of those is the common case.

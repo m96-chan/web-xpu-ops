@@ -100,6 +100,8 @@ export interface VideoDecoderManifest {
 }
 
 const WG = 256;
+/** 65,535 everywhere measured — see issue #211. */
+const MAX_WORKGROUPS = 65535;
 /** `ops/matmul`'s tile: `BM = 64`, `BN = 128`, 512 threads. */
 const MM_BM = 64;
 const MM_BN = 128;
@@ -234,6 +236,38 @@ export class VideoDecoderGpu {
     return buffer;
   }
 
+  /**
+   * A flat dispatch, tiled into `(x, y)` when one row of workgroups is not
+   * enough.
+   *
+   * 65,535 is the ceiling on every backend measured (#211), which at 256
+   * threads is 16.7 M elements — this decoder passes it at **42 latent
+   * frames**, a seven-second clip, and did it as an invalid *command buffer*
+   * that took every dispatch beside it down with it. Every kernel it dispatches
+   * folds `y` back in from `num_workgroups`, so the host only chooses the
+   * tiling.
+   */
+  /**
+   * The same tiling for a **workgroup-per-row** kernel — the norms, whose grid
+   * is the row count rather than the element count. `ops/rmsnorm` and
+   * `ops/layernorm` fold `y` in uniformly across the workgroup, so their
+   * barriers stay in uniform control flow.
+   */
+  private rowTiles(rows: number): [number, number] {
+    const x = Math.min(rows, MAX_WORKGROUPS);
+    const y = Math.ceil(rows / x);
+    if (y > MAX_WORKGROUPS) throw new Error(`${rows} rows need more grid than two dimensions give — see issue #211`);
+    return [x, y];
+  }
+
+  private tiles(count: number): [number, number] {
+    const wanted = Math.ceil(count / WG);
+    const x = Math.min(wanted, MAX_WORKGROUPS);
+    const y = Math.ceil(wanted / x);
+    if (y > MAX_WORKGROUPS) throw new Error(`${count} elements need ${wanted} workgroups — see issue #211`);
+    return [x, y];
+  }
+
   private take(elements: number): GPUBuffer {
     // Rounded to a multiple of 4 MB rather than to a power of two. The
     // decoder's widths are `dim`, `ffnHidden` and `heads * dim_head` times a
@@ -357,7 +391,7 @@ export class VideoDecoderGpu {
     const biased = this.take(a.rows * N);
     await this.dispatch(ops, this.kernels.rows, [out, bias, biased, this.uniform([
       ["u32", a.rows], ["u32", N], ["u32", ELEMENTWISE.add],
-    ])], [Math.ceil((a.rows * N) / WG)]);
+    ])], this.tiles(a.rows * N));
     return { buffer: biased, rows: a.rows, cols: N };
   }
 
@@ -365,7 +399,7 @@ export class VideoDecoderGpu {
     const out = this.take(x.rows * x.cols);
     await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, weight, out, this.uniform([
       ["u32", x.rows], ["u32", x.cols], ["f32", eps], ["u32", groups],
-    ])], [x.rows]);
+    ])], this.rowTiles(x.rows));
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
@@ -373,7 +407,7 @@ export class VideoDecoderGpu {
     const out = this.take(x.rows * x.cols);
     await this.dispatch(ops, this.kernels.rows, [x.buffer, vector, out, this.uniform([
       ["u32", x.rows], ["u32", x.cols], ["u32", kind],
-    ])], [Math.ceil((x.rows * x.cols) / WG)]);
+    ])], this.tiles(x.rows * x.cols));
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
@@ -381,7 +415,7 @@ export class VideoDecoderGpu {
     const out = this.take(a.rows * a.cols);
     await this.dispatch(ops, this.kernels.elementwise, [a.buffer, b.buffer, out, this.uniform([
       ["u32", a.rows * a.cols], ["u32", kind],
-    ])], [Math.ceil((a.rows * a.cols) / WG)]);
+    ])], this.tiles(a.rows * a.cols));
     return { buffer: out, rows: a.rows, cols: a.cols };
   }
 
@@ -390,7 +424,7 @@ export class VideoDecoderGpu {
     const out = this.take(dim0 * dim1 * D);
     await this.dispatch(ops, this.kernels.permute, [x, out, this.uniform([
       ["u32", dim0], ["u32", dim1], ["u32", D],
-    ])], [Math.ceil((dim0 * dim1 * D) / WG)]);
+    ])], this.tiles(dim0 * dim1 * D));
     return out;
   }
 
@@ -447,7 +481,7 @@ export class VideoDecoderGpu {
     const activated = this.take(seq * ffnHidden);
     await this.dispatch(ops, this.kernels.activation, [gate.buffer, activated, this.uniform([
       ["u32", seq * ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1],
-    ])], [Math.ceil((seq * ffnHidden) / WG)]);
+    ])], this.tiles(seq * ffnHidden));
 
     const gated = await this.pointwise(
       ops, { buffer: activated, rows: seq, cols: ffnHidden }, up, ELEMENTWISE.multiply,
@@ -463,7 +497,7 @@ export class VideoDecoderGpu {
     const out = this.take(seq * heads * headDim);
     await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, this.w("qk.ones"), out, this.uniform([
       ["u32", seq * heads], ["u32", headDim], ["f32", eps], ["u32", 1],
-    ])], [seq * heads]);
+    ])], this.rowTiles(seq * heads));
     return { buffer: out, rows: seq, cols: heads * headDim };
   }
 
@@ -590,7 +624,7 @@ export class VideoDecoderGpu {
     await this.dispatch(ops, this.kernels.ropeAxes, [x.buffer, this.w("rope.axisDims"), positions, out, this.uniform([
       ["u32", seq], ["u32", heads], ["u32", headDim], ["u32", axisDims.length],
       ["f32", this.manifest.config.rope_theta],
-    ])], [Math.ceil((seq * heads * (headDim / 2)) / WG)]);
+    ])], this.tiles(seq * heads * (headDim / 2)));
     return { buffer: out, rows: seq, cols: heads * headDim };
   }
 }
