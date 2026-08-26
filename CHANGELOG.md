@@ -87,7 +87,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   whose cache-buster did not fire. The stamp is the bundle's content hash, so a
   rebuild that changes nothing does not invalidate anyone's cache.
 
-
 - **Z-Image runs end to end, in a browser** (issue #166). A prompt goes in and a
   1024x1024 image comes out, on WebGPU, composed from this repository's ops:
   byte-level BPE, a Qwen3-4B text encoder, the 30-layer DiT, a rectified-flow
@@ -114,11 +113,8 @@ Entries record **why** a change was needed. What changed is in the diff.
   `padding_mode`**, and 3D is where that starts to cost something: H3 pads
   `reflect` on the spatial axes and **causally** in time — `2 * padding` frames
   before the data and none after — which is not a value any symmetric padding
-<<<<<<< HEAD
-  argument can take. That is a pad op, and it is not written yet.
-=======
   argument can take. That is a pad op, and it is **`pad`**, below.
->>>>>>> origin/main
+  argument can take. That is a pad op, and it is not written yet.
 
   3D is also the first place the *axis order* is checkable. The tests use an
   input whose elements name their own coordinate (`100d + 10h + w`) against a
@@ -126,8 +122,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   a swapped axis, a flipped kernel or an off-by-one pad shows up in the digits.
   Goldens measured against torch 2.10.0+cu130, integers so they are exact in
   f32.
-<<<<<<< HEAD
-=======
 
 - **A browser page for it** (issue #200). `examples/h3-audio-web`, on the same
   folder-bound, server-free footing as the other demos: 260 MB into a folder
@@ -165,7 +159,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   if a future filter makes them differ rather than quietly dropping a sample,
   which is a phase error no unit test hears.
 
->>>>>>> origin/main
 - **`pad`** (issue #200). `ops/conv`'s doc has always said `padding_mode` is a
   pad op, not a convolution argument. MiniMax-H3 is the model that makes that
   separation load-bearing: its visual VAE pads `reflect` on the spatial axes
@@ -184,9 +177,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   element for element — not obvious, since a reflection reads neighbours that
   are themselves reflections. One kernel then serves the audio VAE's 1D
   `replicate` and the visual VAE's 3D `reflect` without knowing either rank.
-
-<<<<<<< HEAD
-=======
 
 - **A transformer block of MiniMax-H3's DiT** (issue #200) — the *generator*
   half of the model, against the visual VAE this repository already decodes
@@ -314,7 +304,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   No new kernel: `matmul`, `rmsnorm`, `attention`, `rope`'s axes entry,
   `activation` and `elementwise` cover it.
 
->>>>>>> origin/main
 ### Changed
 
 - **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
@@ -388,7 +377,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   work there. Nothing checked, and it was false. What made it visible was
   #182's breakdown — `batch()`'s own timers named 55% of a browser forward and
   the rest was outside every dispatch.
-
 
 - **The Anima demo's cache buster had never fired** (issue #177). The server
   stamps the bundle's mtime onto the `<script src>` because `Cache-Control:
