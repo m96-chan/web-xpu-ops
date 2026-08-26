@@ -9,6 +9,24 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole
+  encoder — six levels of two `ResnetBlock3D`s, a strided convolution between
+  the first four, and `quant_conv` — held to `EncoderFCN3D`'s own output at
+  **2.432e-5** on moments peaking at 8.854. With `examples/h3-video`'s decoder,
+  a video goes in and frames come out, both halves checked against the model.
+
+  **`Downsample3D` pads asymmetrically before it strides**: nothing before, one
+  column and one row after, then a `k=3, stride=2` convolution with zero spatial
+  padding. A symmetric pad gives the same output size and a different alignment
+  — a video that comes back shifted, level by level. It moves the moments by
+  3.8.
+
+  CPU reference only: there is no GPU path for the encoder and no page for it.
+  The whole-encoder comparison is a **script**, not a test — the reference takes
+  123 s for 8 frames of 32x32, past `scripts/test.mjs`'s per-file minute, which
+  is the same reason `examples/anima`'s forward and the video decoder's are
+  scripts. What stays in vitest is the channel plan and the compression factors.
+
 - **`conv3d` and `pad` have a caller** (issue #200): one `ResnetBlock3D` of
   MiniMax-H3's visual VAE **encoder**, checked against the model's own module at
   **3.576e-7**. The VAE's decoder is a ViT and needs neither op; the encoder is a

@@ -32,6 +32,11 @@ CONFIG = {
     "ch": 128,
     "ch_mult": [1, 2, 2, 4, 4, 8],
     "num_res_blocks": 2,
+    "space_down": [2, 2, 2, 2, 1, 1],
+    "time_down": [1, 2, 2, 1, 1, 1],
+    "in_channels": 3,
+    "z_channels": 24,
+    "embed_dim": 24,
     "padding_mode": "reflect",
     "causal_encoder": True,
     "use_t_isolated_gn": True,
@@ -63,6 +68,41 @@ def read_prefix(path: str, prefix: str) -> dict[str, torch.Tensor]:
     return out
 
 
+def build_encoder(bundle: pathlib.Path, weights: str):
+    """`EncoderFCN3D` with the checkpoint's own configuration, plus `quant_conv`.
+
+    `AutoencoderKLLegacy.encode` is `quant_conv(encoder(x))`; the sampling that
+    follows is the caller's. The tiling and temporal-streaming paths
+    (`encode_temporal`, `clip_length`, `token_drop`) are **not** used -- they
+    are an inference optimisation for long clips, and a golden for one short
+    clip should not go through them.
+    """
+    sys.path.insert(0, str(bundle.parent))
+    from video_vae.vae_cnn import EncoderFCN3D  # type: ignore[import-not-found]
+
+    encoder = EncoderFCN3D(
+        ch=CONFIG["ch"],
+        ch_mult=CONFIG["ch_mult"],
+        space_down=CONFIG["space_down"],
+        time_down=CONFIG["time_down"],
+        num_res_blocks=CONFIG["num_res_blocks"],
+        in_channels=CONFIG["in_channels"],
+        z_channels=CONFIG["z_channels"],
+        double_z=True,
+        padding_mode=CONFIG["padding_mode"],
+        causal=CONFIG["causal_encoder"],
+        use_t_isolated_gn=CONFIG["use_t_isolated_gn"],
+    ).eval()
+    state = read_prefix(weights, "encoder.")
+    missing, unexpected = encoder.load_state_dict(state, strict=False)
+    if unexpected:
+        raise SystemExit(f"the checkpoint has encoder tensors this build does not: {unexpected}")
+    if missing:
+        raise SystemExit(f"the encoder wants tensors the checkpoint does not have: {missing}")
+    quant = read_prefix(weights, "quant_conv.")
+    return encoder, quant
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", required=True)
@@ -71,7 +111,12 @@ def main() -> int:
     parser.add_argument("--level", type=int, default=0)
     parser.add_argument("--block", type=int, default=0)
     parser.add_argument("--dims", default="3,8,8", help="input T,H,W for the golden")
+    parser.add_argument("--whole", action="store_true", help="the whole encoder, not one block")
+    parser.add_argument("--video", default="8,32,32", help="input T,H,W for the whole-encoder golden")
     args = parser.parse_args()
+
+    if args.whole:
+        return whole_encoder(args)
 
     bundle = pathlib.Path(args.bundle).expanduser().resolve()
     sys.path.insert(0, str(bundle.parent))
@@ -135,6 +180,77 @@ def main() -> int:
     print(f"  wrote {out}/resnet.bin  {offset * 4 / 1e6:.1f} MB")
     return 0
 
+
+
+
+def whole_encoder(args) -> int:
+    """A video in, the 48 moment channels out — `AutoencoderKLLegacy.encode`."""
+    bundle = pathlib.Path(args.bundle).expanduser().resolve()
+    out = pathlib.Path(args.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+
+    encoder, quant = build_encoder(bundle, args.weights)
+    T, H, W = (int(v) for v in args.video.split(","))
+    ratio = 1
+    for s in CONFIG["space_down"]:
+        ratio *= s
+    ratio_t = 1
+    for s in CONFIG["time_down"]:
+        ratio_t *= s
+    if H % ratio or W % ratio or T % ratio_t:
+        raise SystemExit(f"{T}x{H}x{W} does not divide by the {ratio_t}x/{ratio}x compression")
+
+    torch.manual_seed(20260826)
+    x = torch.randn(1, CONFIG["in_channels"], T, H, W) * 0.5
+    with torch.no_grad():
+        h = encoder(x)
+        moments = torch.nn.functional.conv3d(h, quant["weight"], quant["bias"])
+
+    print(f"whole encoder: {tuple(x.shape)} -> {tuple(moments.shape)}")
+    print(f"  moments[0,0,0,0,:4] {[round(v, 6) for v in moments[0, 0, 0, 0, :4].tolist()]}")
+
+    names = ["conv_in.weight", "conv_in.bias"]
+    for level in range(len(CONFIG["ch_mult"])):
+        for block in range(CONFIG["num_res_blocks"]):
+            p = f"down.{level}.block.{block}."
+            names += [p + n for n in ("norm1.weight", "norm1.bias", "conv1.weight", "conv1.bias",
+                                      "norm2.weight", "norm2.bias", "conv2.weight", "conv2.bias")]
+        if CONFIG["space_down"][level] * CONFIG["time_down"][level] > 1:
+            names += [f"down.{level}.downsample.conv.weight", f"down.{level}.downsample.conv.bias"]
+    names += ["norm_out.weight", "norm_out.bias", "conv_out.weight", "conv_out.bias"]
+
+    state = read_prefix(args.weights, "encoder.")
+    # The shortcut convolutions exist only where a block changes channel count.
+    extra = [k for k in state if "nin_shortcut" in k]
+    names += sorted(extra)
+
+    entries, offset = [], 0
+    with (out / "encoder.bin").open("wb") as sink:
+        for name in names:
+            tensor = state[name].to(torch.float32).contiguous()
+            array = tensor.numpy().ravel()
+            entries.append({"name": name, "shape": list(tensor.shape), "offset": offset, "count": int(array.size)})
+            sink.write(array.tobytes())
+            offset += int(array.size)
+        for name, tensor in (("quant_conv.weight", quant["weight"]), ("quant_conv.bias", quant["bias"])):
+            tensor = tensor.to(torch.float32).contiguous()
+            array = tensor.numpy().ravel()
+            entries.append({"name": name, "shape": list(tensor.shape), "offset": offset, "count": int(array.size)})
+            sink.write(array.tobytes())
+            offset += int(array.size)
+
+    (out / "encoder.manifest.json").write_text(json.dumps({
+        "model": "minimax-h3-video-vae-encoder",
+        "source": "MiniMaxAI/MiniMax-H3 (FL2VA/video_vae/source)",
+        "licence": "MiniMax H3 Community License Agreement — not this repository's, and not redistributed by it",
+        "config": CONFIG, "video": [T, H, W],
+        "latent": [T // ratio_t, H // ratio, W // ratio],
+        "torch": torch.__version__, "tensors": entries, "elements": offset,
+    }, indent=1))
+    x.numpy().astype(np.float32).tofile(out / "video.bin")
+    moments.numpy().astype(np.float32).tofile(out / "moments.bin")
+    print(f"  wrote {out}/encoder.bin  {offset * 4 / 1e6:.1f} MB")
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
