@@ -9,6 +9,30 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **R2V's conditioner converts and runs on the GPU** (issue #212).
+  **26.27 GB** of int8 in 96 s — 0.61 GB of vision tower, 51 text layers, no
+  `lm_head` and no layers 51..63, because `hidden_states[50]` is a layer
+  *input*. 76 tokens in 2.4 s over 828 dispatches.
+
+  **It does not yet reproduce the model**, and the bisection is recorded rather
+  than the last number: `hidden_states[0]` is 4.07% of peak, `[1]` is 19.34%,
+  `[4]` is 4.52%. The fault is in the first text layer and it washes down before
+  compounding — which is exactly what an error looks like when only the end is
+  measured.
+
+  Two real bugs were found on the way. **The deepstack add aliased one buffer
+  as read and read-write inside a compute pass**, which WebGPU refuses, so the
+  command buffer was invalid and the output was whatever the pool held. And
+  **the fused `qkv` was un-interleaved with a copy per token per block** —
+  20,736 for one 256x256 reference; the converter splits it into three now and
+  the dispatch count fell from 28,957 to 828.
+
+  **A vision token does not sit at `t = h = w = index`.** A vision block gets a
+  2-D grid and the clock advances by `max(h, w) / merge`, the block's longer
+  side, not by its token count. `qwen3vlPositionGrid` builds it and
+  `verify-conditioner.ts` refuses to run if it disagrees with `get_rope_index`'s
+  own output — which it no longer does, and which was not the fault.
+
 - **R2V's image processor and its browser page** (issue #212).
   `examples/h3-ref2v/src/processor.ts` reproduces
   `Qwen2VLImageProcessor` **exactly** — worst difference **0**, once the two f32

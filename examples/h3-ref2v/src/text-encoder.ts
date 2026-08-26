@@ -157,6 +157,75 @@ export function mropePositions(
   return out;
 }
 
+/**
+ * The `(t, h, w)` grid `Qwen3VLModel` builds for a presentation.
+ *
+ * **A vision token does not sit at `t = h = w = index`.** A text run takes
+ * consecutive positions on all three axes, but a vision block gets a *2-D*
+ * grid — width cycling, height held for a row, time constant across the whole
+ * block — and the clock then advances by **`max(h, w) / merge`**, the block's
+ * longer side, not by its token count.
+ *
+ * For a 256x256 reference that is 64 tokens advancing the clock by 8. A port
+ * that numbered them consecutively puts every later token 56 positions too far
+ * along, which is a working model conditioned on the wrong geometry: measured
+ * here at **19% of peak after one layer**, washing down to 4.5% by layer four,
+ * which is exactly the shape of an error that looks like quantisation noise.
+ *
+ * `modalities` is 0 text, 1 image, 2 video — the `mm_token_type_ids` rule,
+ * which is 1 at an image pad and 2 at a video pad and 0 everywhere else,
+ * **including at the `<|vision_start|>` and `<|vision_end|>` markers**.
+ */
+export function qwen3vlPositionGrid(
+  modalities: ArrayLike<number>,
+  grids: { grid: [number, number, number]; modality: 1 | 2 }[],
+  mergeSize: number,
+): PositionGrid {
+  const t: number[] = [];
+  const h: number[] = [];
+  const w: number[] = [];
+  let position = 0;
+  let gridAt = 0;
+  for (let i = 0; i < modalities.length; ) {
+    const modality = modalities[i]!;
+    let end = i;
+    while (end < modalities.length && modalities[end] === modality) end += 1;
+    if (modality === 0) {
+      for (let k = i; k < end; k += 1) {
+        const at = position + (k - i);
+        t.push(at);
+        h.push(at);
+        w.push(at);
+      }
+      position += end - i;
+    } else {
+      const entry = grids[gridAt];
+      if (!entry) throw new Error(`qwen3vlPositionGrid: no grid for the vision run at ${i}`);
+      if (entry.modality !== modality) {
+        throw new Error(`qwen3vlPositionGrid: grid ${gridAt} is modality ${entry.modality}, the run is ${modality}`);
+      }
+      gridAt += 1;
+      const [gt, gh, gw] = entry.grid;
+      const rows = gh / mergeSize;
+      const cols = gw / mergeSize;
+      const count = gt * rows * cols;
+      if (count !== end - i) {
+        throw new Error(`qwen3vlPositionGrid: the grid gives ${count} tokens and the run is ${end - i}`);
+      }
+      // `repeat` for width and `repeat_interleave` for height, both over
+      // `cols * gt` — upstream's own two calls, written out.
+      for (let k = 0; k < count; k += 1) {
+        t.push(position);
+        h.push(position + Math.floor(k / (cols * gt)));
+        w.push(position + (k % cols));
+      }
+      position += Math.max(gh, gw) / mergeSize;
+    }
+    i = end;
+  }
+  return { t, h, w };
+}
+
 /** `x @ Wᵀ`, the layout `nn.Linear` stores. No bias anywhere in this stack. */
 function linear(x: Float32Array, weight: Float32Array, rows: number, inDim: number, outDim: number): Float32Array {
   const wT = new Float32Array(inDim * outDim);

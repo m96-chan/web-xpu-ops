@@ -303,11 +303,56 @@ tokenizer is measured, not assumed: `src/tokenizer.test.ts` runs **all fourteen*
 text segments the presentation can produce and **all four** vision token ids.
 They agree.
 
+## The conditioner on the GPU — converted, running, and not yet right
+
+`tools/convert_conditioner.py` writes **26.27 GB** of int8 in 96 s (vision tower
+0.61 GB), and `src/conditioner-gpu.ts` runs it: 76 tokens in **2.4 s** over 828
+dispatches, of which 15 ms is queue time and 2,140 ms is host recording.
+
+**It does not yet reproduce the model.** Held to `hidden_states[50]` of the
+released Qwen3-VL-32B on a real presentation, and bisected by layer:
+
+| | worst, as a percentage of peak |
+| --- | --- |
+| `hidden_states[0]` — embedding, vision tokens scattered in | **4.07%** |
+| `hidden_states[1]` — after one text layer | **19.34%** |
+| `hidden_states[2]` | 15.03% |
+| `hidden_states[4]` | 4.52% |
+| `hidden_states[50]` | 100% |
+
+**So the fault is in the first text layer**, and it washes down before
+compounding again — the shape of an error that reads as quantisation noise if
+only the last number is looked at. What is already ruled out:
+
+- **The position grid.** It is rebuilt from the token stream and compared
+  against `get_rope_index`'s own output on all three axes, exactly, before the
+  forward runs. Fixing it changed the RMS by 0.0002.
+- The layout of the flash-attention uniform, checked against
+  `ops/flash_attention/wgsl/fa2.wgsl`'s own struct.
+- The GQA grouping, which is `ops/gqa`'s contiguous `floor(h / 8)`.
+
+Two bugs *were* found and fixed on the way, and both were real:
+
+- **The deepstack add aliased one buffer as read and read-write in a compute
+  pass.** WebGPU refuses that, so the whole command buffer was invalid and the
+  output was whatever the pool held. It writes into a fresh buffer now.
+- **The fused `qkv` was un-interleaved with a copy per token per block** —
+  20,736 of them for one 256x256 reference, 28,957 dispatches in total. The
+  converter splits it into three, as `examples/h3-video` splits `to_qkv`, and
+  the count fell to 828.
+
+### What the position grid turned out to be
+
+Worth recording even though it was not the fault. **A vision token does not sit
+at `t = h = w = index`.** A text run takes consecutive positions on all three
+axes; a vision block gets a *2-D* grid — width cycling, height held for a row,
+time constant — and the clock then advances by **`max(h, w) / merge`**, the
+block's longer side, not by its token count. For a 256x256 reference that is 64
+tokens advancing the clock by 8.
+
+`qwen3vlPositionGrid` builds it, and `verify-conditioner.ts` refuses to run if
+it disagrees with the model's own.
+
 ## What is not here yet
 
-**GPU paths for the conditioner.** The text stack and the vision tower have CPU
-references held to the model; neither has a resident version, and no converter
-has written a `conditioner.q8.bin`. That is the one model of three that
-`examples/h3-ref2v-web` is missing.
-
-See #212.
+The bug above, and the three-stage run in `examples/h3-ref2v-web`. See #212.
