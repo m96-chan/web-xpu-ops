@@ -50,6 +50,11 @@ describe("h3-ref2v-web / markup", () => {
     // conversion stopped keeping a text layer nobody evaluates.
     expect(html).toMatch(/48\.9 GB/);
     expect(html).toMatch(/sequence, not together/);
+    // The parts have to add up to the total, which they did not: the page
+    // showed 25.78 + 20.08 + 2.43 and called it 48.9, and it took looking at a
+    // screenshot to see it. The DiT's 0.58 GB of tables were the missing term.
+    expect(html).toMatch(/25\.78 GB/);
+    expect(html).toMatch(/20\.66 GB/);
   });
 
   it("reads the adapter's limits before it uploads anything", () => {

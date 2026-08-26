@@ -117,11 +117,14 @@
   <div id="timing"></div>
 
   <p class="note">
-    <strong>Three models run in sequence, not together.</strong> The conditioner
-    is <strong>25.78 GB</strong> of int8, the DiT <strong>20.08 GB</strong> and
-    the VAE decoder 2.43 — 48.9 GB, which does not fit at once on any card this
-    page will meet. Each is uploaded, used, and dropped before the next, so a
-    generation pays about three uploads.
+    <strong>Four models run in sequence, not together.</strong> The conditioner
+    is <strong>25.78 GB</strong> of int8, the DiT <strong>20.66 GB</strong>
+    (20.08 of weights and 0.58 of modulation tables) and the VAE decoder 2.43 —
+    48.9 GB, which does not fit at once on any card this page will meet. Each is
+    uploaded, used, and dropped before the next, so a generation pays four
+    uploads. The fourth is the VAE <em>encoder</em>, which turns a reference into
+    the latents the packed sequence carries, and it is the one that has no GPU
+    path yet.
   </p>
   <p class="note">
     <strong>The reference is resized by the browser, not by PIL.</strong>

@@ -231,6 +231,17 @@ def main() -> int:
         "weightLayout": "[in, out]" if args.quant == "f32" else "[out, in], int8 packed four per u32",
         "mropePermutation": order,
         "visionPermutation": vision_order,
+        # **The four vision token ids**, from the checkpoint's own config rather
+        # than from a constant here. `examples/h3-ref2v-web` reads them to build
+        # a presentation and there is nowhere else for it to get them: the page
+        # was written against this field before this file wrote it, so the first
+        # Generate threw on `specials.visionStart` being undefined.
+        "specials": {
+            "visionStart": config["vision_start_token_id"],
+            "visionEnd": config["vision_end_token_id"],
+            "imagePad": config["image_token_id"],
+            "videoPad": config["video_token_id"],
+        },
         # What the page needs to build a request, so it reads one manifest.
         "processor": {
             "patchSize": vision["patch_size"], "mergeSize": vision["spatial_merge_size"],
