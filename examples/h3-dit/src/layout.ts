@@ -171,6 +171,56 @@ export function patchifyVideoLatents(
 }
 
 /**
+ * The inverse of `patchifyVideoLatents`: rows back to `[C, F, H, W]`.
+ *
+ * What the sampler produces is rows; what the VAE decoder takes is a latent
+ * volume. Written as its own function rather than inline so the round trip can
+ * be asserted — a patchify and an unpatchify that agree with *each other* and
+ * not with the model is a failure both halves survive.
+ */
+export function unpatchifyVideoLatents(
+  rows: Float32Array,
+  channels: number,
+  frames: number,
+  height: number,
+  width: number,
+  patchSize: [number, number, number],
+): Float32Array {
+  const [pt, ph, pw] = patchSize;
+  if (frames % pt || height % ph || width % pw) {
+    throw new Error(`unpatchifyVideoLatents: ${frames}x${height}x${width} is not divisible by ${patchSize}`);
+  }
+  if (rows.length !== channels * frames * height * width) {
+    throw new Error(`unpatchifyVideoLatents: ${rows.length} values for ${channels}x${frames}x${height}x${width}`);
+  }
+  const fp = frames / pt;
+  const hp = height / ph;
+  const wp = width / pw;
+  const out = new Float32Array(rows.length);
+  let at = 0;
+  for (let f = 0; f < fp; f += 1) {
+    for (let y = 0; y < hp; y += 1) {
+      for (let x = 0; x < wp; x += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          for (let dt = 0; dt < pt; dt += 1) {
+            for (let dy = 0; dy < ph; dy += 1) {
+              for (let dx = 0; dx < pw; dx += 1) {
+                const frame = f * pt + dt;
+                const row = y * ph + dy;
+                const col = x * pw + dx;
+                out[((c * frames + frame) * height + row) * width + col] = rows[at]!;
+                at += 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * One aspect-normalised spatial axis, `dim / patch` coordinates scaled by 32.
  *
  * `np.linspace(left, left + ratio, n, endpoint=False)` is

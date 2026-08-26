@@ -14,6 +14,7 @@ import {
   buildRowTimesteps,
   patchifyVideoLatents,
   resolveCanvasSize,
+  unpatchifyVideoLatents,
   videoLatentNumFrames,
 } from "./layout.js";
 
@@ -135,6 +136,23 @@ describe("h3 dit / layout", () => {
       // Every element names its own coordinate, so these are exact integers
       // and a transposed axis shows up in the digits.
       expect([...got]).toEqual(values);
+    }
+  });
+
+  it("unpatchifies back to what patchify was given", () => {
+    // The round trip alone would pass for a patchify and an unpatchify that
+    // agree with each other and not with the model, which is why patchify has
+    // its own golden above. This is the half that has no golden: the sampler
+    // produces rows and the VAE decoder takes a volume.
+    for (const c of golden.cases) {
+      const { channels } = c.patchify;
+      const latents = Float32Array.from(
+        { length: channels * c.numLatentFrames * c.latentHeight * c.latentWidth }, (_, i) => i);
+      const rows = patchifyVideoLatents(
+        latents, channels, c.numLatentFrames, c.latentHeight, c.latentWidth, golden.patchSize);
+      const back = unpatchifyVideoLatents(
+        rows, channels, c.numLatentFrames, c.latentHeight, c.latentWidth, golden.patchSize);
+      expect([...back]).toEqual([...latents]);
     }
   });
 
