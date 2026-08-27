@@ -683,7 +683,62 @@ this README measures at 12.28% of peak over fifty blocks, and the one thing
 still unmeasured: **the same request run end to end in `diffusers`.** Every
 stage here is held to the model; no whole generation has been.
 
+## A reference with more than one frame is chunked, and was not
+
+Issue #216. `examples/h3-encoder` is held to `EncoderFCN3D` + `quant_conv` at
+9.537e-6, and **that pair is not the entry point a reference goes through.**
+`AutoencoderKLLegacy.encode` is what those two are; `encode_base` calls it only
+for a single image. A frame stack goes through `encode_temporal`: padded up to a
+multiple of `clip_length` by repeating its last frame, each 17-frame chunk
+encoded **on its own** so the causal state restarts, and `token_drop` latent
+frames off the end of the concatenation. The released checkpoint ships
+`vae_clip_length 17` and `vae_token_drop 3`.
+
+Measured on the released weights, `encode` against `encode_temporal` on the same
+clip — RTX 5090 is not involved, this is torch on the CPU with the source
+`video_vae` package, `tools/measure_temporal_chunking.py`:
+
+| pixel frames | `encode` | `encode_temporal` | rms difference |
+|---|---|---|---|
+| 8 | 48x2x2x2 | 48x2x2x2 | 0.0% |
+| 17 | 48x5x2x2 | 48x2x2x2 | different shape |
+| 22 | 48x6x2x2 | 48x7x2x2 | different shape |
+| **48** | 48x12x2x2 | 48x12x2x2 | **17.9%** |
+| 68 | 48x17x2x2 | 48x17x2x2 | 19.0% |
+| 85 | 48x22x2x2 | 48x22x2x2 | 21.5% |
+
+A video reference is 2 to 15 seconds at 24 fps — 48 to 360 frames — so that is
+the whole of the range, and the error grows with the length of the reference.
+
+**The shapes coinciding at 48 and 68 is arithmetic, not agreement.** It is why
+nothing downstream complained for as long as it did. And 8 frames agree
+outright because the encoder is causal: two latent frames depend only on the
+first eight pixel frames, and the padding after them is exactly what
+`token_drop` removes — so the 8x32x32 golden `verify-encode-gpu.ts` uses could
+not have caught this at any point.
+
+`encodeConditioning` is the path now, held to `encode_temporal`'s own output at
+**worst 5.388e-5, 0.0006% of peak**, on a 48-frame reference (RTX 5090, driver
+610.57.04, Dawn via `webgpu` 0.4.0, f32 activations, 48x32x32 in).
+
 ## What is not here yet
 
 The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,
 down, DiT up, sample, down, VAE up, decode. See #212.
+
+**Why the output still moves too much between frames**, which is the open half
+of #216. The flicker — mean absolute difference between consecutive frames, in
+8-bit levels, `tools/measure_flicker.py` — scales with how much reference is in
+the sequence and with how far out of distribution it is:
+
+| | flicker |
+|---|---|
+| the reference video itself | 4.17 |
+| no reference (`t2va`) | 7.14 |
+| one image | 14.84 |
+| image + video | 19.19 |
+| a synthetic rainbow tile | 47.33 |
+
+The chunking above is a real defect on that path and does **not** explain the
+one-image row, which takes the unchunked path in both. What has been ruled out
+with numbers is in the issue.
