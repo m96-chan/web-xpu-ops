@@ -48,6 +48,32 @@ KEYFRAME_NOISE_AUG = 0.999
 CONDITION_AUDIO_TIMESTEP = 1.0
 
 
+
+def quantise_roundtrip_(weight: torch.Tensor, chunk: int = 4096) -> None:
+    """`convert_dit.quantize_rows`, dequantised straight back, in place.
+
+    Issue #216. One forward over real content disagrees with upstream by 7.38%
+    of peak at fifty blocks and fifteen steps of it by 21.71% -- so something
+    accumulates that random content does not make accumulate. The port runs int8
+    weights and there is no float conversion of fifty blocks that fits on a
+    32 GB card, so the only way to ask "is this int8?" is to put int8 on
+    *upstream's* side and see whether the number comes back.
+
+    Per-row absmax, the same rounding and the same clamp `convert_dit.py` does,
+    minus the packing -- the packing is a layout, not an approximation.
+    Row-chunked so a float32 copy of a wide matrix does not sit beside a model
+    that already fills the machine.
+    """
+    for start in range(0, weight.shape[0], chunk):
+        block = weight[start:start + chunk]
+        values = block.to(torch.float32)
+        absmax = values.abs().amax(dim=1)
+        scale = torch.where(absmax == 0, torch.ones_like(absmax), absmax / 127.0)
+        inverse = torch.where(absmax == 0, torch.zeros_like(absmax), 127.0 / absmax)
+        codes = torch.clamp(torch.round(values * inverse.unsqueeze(1)), -127, 127)
+        block.copy_((codes * scale.unsqueeze(1)).to(weight.dtype))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="the transformer_ref/ directory")
@@ -62,8 +88,16 @@ def main() -> None:
     parser.add_argument("--audio-latents", type=int, default=3)
     parser.add_argument("--layers", type=int, default=0, help="run only the first N blocks (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--quantised", action="store_true",
+                        help="round every matrix through convert_dit.py's int8 first, so the port's "
+                             "quantisation is on this side of the comparison too (issue #216)")
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--step-index", type=int, default=5)
+    parser.add_argument("--conditioning", help="a directory `gen_real_conditioner_golden.py` wrote: its "
+                        "`hidden.<layer>.bin` and real token tags replace the random text rows (issue #216)")
+    parser.add_argument("--conditioning-layer", type=int, default=50)
+    parser.add_argument("--reference-latent", help="a directory `gen_real_anchor.py` wrote: its `anchor.bin` "
+                        "replaces the random conditioning latent (issue #216)")
     args = parser.parse_args()
 
     started = time.time()
@@ -79,20 +113,59 @@ def main() -> None:
         model.config.num_layers = args.layers
         print(f"running only the first {args.layers} blocks", flush=True)
 
+    if args.quantised:
+        started = time.time()
+        matrices = 0
+        with torch.no_grad():
+            for _, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    quantise_roundtrip_(module.weight)
+                    matrices += 1
+        print(f"round-tripped {matrices} matrices through int8 in {time.time() - started:.0f} s", flush=True)
+
     c = model.config
 
     # **A reference's vision block is tagged video, not text.** That is why the
     # layout takes the caller's tags rather than filling them in, and a golden
     # whose text rows were all text would never notice.
-    tags = torch.full((args.text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
-    tags[1 : 1 + args.vision_tokens] = MINIMAX_H3_VIDEO_TAG
+    # **Real conditioning and a real anchor when they are given.** Issue #216:
+    # one forward over random content agrees with upstream to 5.38% of peak at
+    # fifty blocks, and the same loop over *real* content came out at 21.71%.
+    # Whether that arrives in one forward or accumulates over fifteen steps is
+    # what this golden, with the same two options as the sample one, separates.
+    real_text = None
+    if args.conditioning:
+        cond_dir = pathlib.Path(args.conditioning).expanduser()
+        meta = json.loads((cond_dir / "golden.json").read_text())
+        seq, dim = meta["hidden"]
+        if dim != c.text_dim:
+            raise SystemExit(f"conditioning is {dim} wide and the transformer wants {c.text_dim}")
+        real_text = torch.from_numpy(
+            np.fromfile(cond_dir / f"hidden.{args.conditioning_layer}.bin", dtype="<f4").reshape(1, seq, dim).copy()
+        )
+        tags = torch.tensor(meta["tokenTags"], dtype=torch.long)
+        args.text_tokens = seq
+        print(f"real conditioning: {seq} rows, layer {args.conditioning_layer}, "
+              f"{int((tags == MINIMAX_H3_VIDEO_TAG).sum())} of them visual", flush=True)
+    else:
+        tags = torch.full((args.text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        tags[1 : 1 + args.vision_tokens] = MINIMAX_H3_VIDEO_TAG
 
-    # One image reference, at its own latent geometry -- deliberately *not* the
-    # target's, so a port that reused the target's grid disagrees here.
-    condition = torch.zeros(
-        1, c.in_channels, args.reference_frames, args.reference_size, args.reference_size)
     generator = torch.Generator("cpu").manual_seed(args.seed)
-    condition.normal_(generator=generator)
+    if args.reference_latent:
+        anchor_dir = pathlib.Path(args.reference_latent).expanduser()
+        shape = json.loads((anchor_dir / "anchor.json").read_text())["shape"]
+        condition = torch.from_numpy(
+            np.fromfile(anchor_dir / "anchor.bin", dtype="<f4").reshape(1, *shape).copy()
+        )
+        args.reference_frames, args.reference_size = shape[1], shape[2]
+        print(f"real anchor: {tuple(shape)}  rms {float(condition.pow(2).mean().sqrt()):.4f}", flush=True)
+    else:
+        # One image reference, at its own latent geometry -- deliberately *not*
+        # the target's, so a port that reused the target's grid disagrees here.
+        condition = torch.zeros(
+            1, c.in_channels, args.reference_frames, args.reference_size, args.reference_size)
+        condition.normal_(generator=generator)
 
     (
         position_ids, token_tags, video_indices, audio_indices, text_indices, cond_video, cond_audio,
@@ -128,7 +201,10 @@ def main() -> None:
     patch_dim = c.in_channels * c.patch_size[0] * c.patch_size[1] * c.patch_size[2]
     video = torch.randn(1, int(video_indices.numel()), patch_dim, generator=generator, dtype=torch.float32)
     audio = torch.randn(1, int(audio_indices.numel()), c.audio_in_channels, generator=generator, dtype=torch.float32)
-    text = torch.randn(1, args.text_tokens, c.text_dim, generator=generator, dtype=torch.float32)
+    text = (
+        real_text if real_text is not None
+        else torch.randn(1, args.text_tokens, c.text_dim, generator=generator, dtype=torch.float32)
+    )
 
     started = time.time()
     with torch.no_grad():
@@ -161,6 +237,9 @@ def main() -> None:
         "dtype": "bfloat16 block stack, float32 projections and heads",
         "seed": args.seed,
         "steps": args.steps,
+        "quantised": bool(args.quantised),
+        "conditioning": args.conditioning or None,
+        "referenceLatent": args.reference_latent or None,
         "stepIndex": args.step_index,
         "layers": int(len(model.transformer_blocks)),
         "config": {k: (list(v) if isinstance(v, (tuple, list)) else v)

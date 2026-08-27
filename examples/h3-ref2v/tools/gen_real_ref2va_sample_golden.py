@@ -50,6 +50,32 @@ VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 
 
+
+def quantise_roundtrip_(weight: torch.Tensor, chunk: int = 4096) -> None:
+    """`convert_dit.quantize_rows`, dequantised straight back, in place.
+
+    Issue #216. One forward over real content disagrees with upstream by 7.38%
+    of peak at fifty blocks and fifteen steps of it by 21.71% -- so something
+    accumulates that random content does not make accumulate. The port runs int8
+    weights and there is no float conversion of fifty blocks that fits on a
+    32 GB card, so the only way to ask "is this int8?" is to put int8 on
+    *upstream's* side and see whether the number comes back.
+
+    Per-row absmax, the same rounding and the same clamp `convert_dit.py` does,
+    minus the packing -- the packing is a layout, not an approximation.
+    Row-chunked so a float32 copy of a wide matrix does not sit beside a model
+    that already fills the machine.
+    """
+    for start in range(0, weight.shape[0], chunk):
+        block = weight[start:start + chunk]
+        values = block.to(torch.float32)
+        absmax = values.abs().amax(dim=1)
+        scale = torch.where(absmax == 0, torch.ones_like(absmax), absmax / 127.0)
+        inverse = torch.where(absmax == 0, torch.zeros_like(absmax), 127.0 / absmax)
+        codes = torch.clamp(torch.round(values * inverse.unsqueeze(1)), -127, 127)
+        block.copy_((codes * scale.unsqueeze(1)).to(weight.dtype))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="the transformer_ref/ directory")
@@ -63,6 +89,9 @@ def main() -> None:
     parser.add_argument("--audio-latents", type=int, default=3)
     parser.add_argument("--layers", type=int, default=0, help="run only the first N blocks (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--quantised", action="store_true",
+                        help="round every matrix through convert_dit.py's int8 first, so the port's "
+                             "quantisation is on this side of the comparison too (issue #216)")
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--conditioning", help="a directory `gen_real_conditioner_golden.py` wrote: "
                         "its `hidden.<layer>.bin` and real token tags replace the random text rows (issue #216)")
@@ -82,6 +111,16 @@ def main() -> None:
         model.transformer_blocks = model.transformer_blocks[: args.layers]
         model.config.num_layers = args.layers
         print(f"running only the first {args.layers} blocks", flush=True)
+
+    if args.quantised:
+        started = time.time()
+        matrices = 0
+        with torch.no_grad():
+            for _, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    quantise_roundtrip_(module.weight)
+                    matrices += 1
+        print(f"round-tripped {matrices} matrices through int8 in {time.time() - started:.0f} s", flush=True)
 
     c = model.config
 
@@ -227,6 +266,9 @@ def main() -> None:
         "workflow": "t2va" if args.no_reference else "ref2va",
         "seed": args.seed,
         "steps": args.steps,
+        "quantised": bool(args.quantised),
+        "conditioning": args.conditioning or None,
+        "referenceLatent": args.reference_latent or None,
         "layers": int(len(model.transformer_blocks)),
         "layout": {
             "numTextTokens": args.text_tokens,

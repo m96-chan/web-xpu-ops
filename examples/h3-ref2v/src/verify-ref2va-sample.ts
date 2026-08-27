@@ -235,6 +235,43 @@ const got = { video: videoRows, audio: audioRows };
   );
 }
 
+/**
+ * Where the disagreement actually lives, row by row.
+ *
+ * **`worst / peak` is the wrong statistic for this model family and it has
+ * already cost this repository twice.** MiniMax-H3's stack carries massive
+ * activations — a handful of channels orders of magnitude above the rest — so a
+ * single element can hold the headline number still while everything around it
+ * moves, or blow it up while nothing around it does. `examples/h3-ref2v`'s
+ * conditioner work hit that: a bug that ran one layer too many moved the worst
+ * element by 0.01 of a point.
+ *
+ * So this prints the distribution. If the median row is quiet and the top row
+ * is loud, the number to act on is the median; if the whole distribution has
+ * shifted, it is a real disagreement.
+ */
+function reportSpread(name: string, gotValues: Float32Array, want: Float32Array, peak: number): void {
+  const rows = 448;
+  const per = Math.floor(want.length / rows) || want.length;
+  const perRow: number[] = [];
+  for (let row = 0; row * per < want.length; row += 1) {
+    let worst = 0;
+    for (let i = row * per; i < Math.min((row + 1) * per, want.length); i += 1) {
+      worst = Math.max(worst, Math.abs(gotValues[i]! - want[i]!));
+    }
+    perRow.push(worst);
+  }
+  const sorted = [...perRow].sort((a, b) => a - b);
+  const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
+  const pc = (v: number) => `${((v / peak) * 100).toFixed(2)}%`;
+  console.log(
+    `${name}: per-row worst, over ${sorted.length} rows — ` +
+      `median ${pc(at(0.5))}, p90 ${pc(at(0.9))}, p99 ${pc(at(0.99))}, max ${pc(at(1))}`,
+  );
+  const loud = perRow.filter((v) => v > peak * 0.05).length;
+  console.log(`${name}: ${loud} of ${sorted.length} rows are past 5% of peak`);
+}
+
 function compare(name: string, gotValues: Float32Array, want: Float32Array): number {
   if (gotValues.length !== want.length) {
     console.error(`${name}: ${gotValues.length} values against ${want.length}`);
@@ -257,6 +294,7 @@ function compare(name: string, gotValues: Float32Array, want: Float32Array): num
   }
   const wantRms = Math.sqrt(want.reduce((s, v) => s + v * v, 0) / want.length);
   const gotRms = Math.sqrt(gotValues.reduce((s, v) => s + v * v, 0) / gotValues.length);
+  reportSpread(name, gotValues, want, peak);
   console.log(
     `${name}: worst ${worst.toExponential(3)}  rms ${Math.sqrt(sum / want.length).toExponential(3)}  ` +
       `peak ${peak.toFixed(4)}  |  rms got ${gotRms.toFixed(4)} against ${wantRms.toFixed(4)} ` +
