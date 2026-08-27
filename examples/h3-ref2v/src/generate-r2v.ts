@@ -953,6 +953,21 @@ const vaeManifest = JSON.parse(
   readFileSync(`${vaeDir}/decoder.q8.manifest.json`, "utf8"),
 ) as VideoDecoderManifest;
 const vaeWeights = openReader(`${vaeDir}/${vaeManifest.dtype === "q8" ? "decoder.q8.bin" : "decoder.bin"}`);
+
+// **The latent is written before the decode, not after.** It is the expensive
+// half -- 22 minutes at 19,027 rows -- and the decode is the half that can
+// still refuse: a 512x896 clip needs a 2.18 GB binding against this device's
+// 2.15 GB ceiling. Writing it afterwards means a decoder that cannot allocate
+// throws away a sampling run that had already finished, which is what happened.
+// `decode-latent.ts` can pick it up from here.
+mkdirSync(outDir, { recursive: true });
+writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffset, latent.byteLength));
+writeFileSync(`${outDir}/latent.json`, `${JSON.stringify({
+  shape: [vaeConfig.latent_channels, latentFrames, latentHeight, latentWidth],
+  rms: rms(latent), steps, seed,
+}, null, 1)}\n`);
+console.log(`  latent saved to ${outDir}/latent.bin before the decode`);
+
 let at = performance.now();
 const decoder = await VideoDecoderGpu.create(device, videoKernels(), vaeManifest, vaeWeights.read);
 vaeWeights.close();
@@ -985,12 +1000,7 @@ if (high - low < 1e-6) {
   console.error(`the decoded frames are constant at ${low} — see the per-stage rms above for where it went`);
   process.exit(1);
 }
-mkdirSync(outDir, { recursive: true });
 writeFileSync(`${outDir}/frames.rgb`, Buffer.from(bytes));
-// The latent as well as the frames: a drift that is already in the latent is
-// the sampler's and one that appears at the decode is the decoder's, and only
-// having both says which.
-writeFileSync(`${outDir}/latent.bin`, Buffer.from(latent.buffer, latent.byteOffset, latent.byteLength));
 writeFileSync(`${outDir}/frames.json`, `${JSON.stringify({
   workflow: "ref2va",
   prompt,

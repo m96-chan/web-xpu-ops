@@ -287,6 +287,36 @@ export class DitGpu {
     return buffer;
   }
 
+  /**
+   * Hand one buffer back **before** the submit, because it is already dead.
+   *
+   * Issue #223. The attention path holds eleven buffers at `heads * head_dim`
+   * wide -- q, k, v, the two `qkNorm` outputs, the two rotated ones, three head
+   * swaps, the attended one and the merge -- and every one of them is written
+   * once, read once, and then never touched again. At 19,027 rows that is 6.0
+   * GB of the 31.3 GB that filled a 32 GB card.
+   *
+   * Safe before the submit because dispatches recorded into one compute pass
+   * run in order with their writes visible to what follows: a later dispatch
+   * that takes this buffer back out of the pool cannot overtake the earlier one
+   * that read it. Recycling one that is *still to be read* would be a real bug,
+   * so every call site names the last read it is after.
+   */
+  /** `recycle` the old tensor and return the new one, for `x = consume(x, f(x))`. */
+  private consume(dead: Mat, made: Mat): Mat {
+    if (dead.buffer !== made.buffer) this.recycle(dead.buffer);
+    return made;
+  }
+
+  private recycle(buffer: GPUBuffer): void {
+    const at = this.lent.indexOf(buffer);
+    if (at < 0) return;
+    this.lent.splice(at, 1);
+    const free = this.pool.get(buffer.size) ?? [];
+    free.push(buffer);
+    this.pool.set(buffer.size, free);
+  }
+
   private release(keep: GPUBuffer[] = []): void {
     for (const buffer of this.lent) {
       if (keep.includes(buffer)) continue;
@@ -564,6 +594,10 @@ export class DitGpu {
     const qh = await this.swapLeading(ops, q.buffer, seq, heads, headDim);
     const kh = await this.swapLeading(ops, k.buffer, seq, heads, headDim);
     const vh = await this.swapLeading(ops, v.buffer, seq, heads, headDim);
+    // The row-major q, k and v are read only by the three swaps above. Issue #223.
+    this.recycle(q.buffer);
+    this.recycle(k.buffer);
+    this.recycle(v.buffer);
     const attended = this.take(heads * seq * headDim);
     await this.dispatch(ops, this.kernels.flashAttention, [
       qh, kh, vh, this.w("attn.noMask"), attended,
@@ -575,7 +609,13 @@ export class DitGpu {
         ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
       ]),
     ], flashGrid(seq, heads, 1));
+    // `qh`, `kh` and `vh` are read only by the dispatch above, and `attended`
+    // only by the swap below.
+    this.recycle(qh);
+    this.recycle(kh);
+    this.recycle(vh);
     const merged = await this.swapLeading(ops, attended, heads, seq, headDim);
+    this.recycle(attended);
     return { buffer: merged, rows: seq, cols: heads * headDim };
   }
 
@@ -597,10 +637,18 @@ export class DitGpu {
     await this.dispatchFlat(ops, this.kernels.activation, seq, c.ffn_dim, [
       { buffer: gate.buffer, sliced: true }, { buffer: activated, sliced: true },
     ], (count) => [["u32", count * c.ffn_dim], ["u32", ACTIVATION.silu], ["f32", 1]]);
+    // `gate` is read only by the activation above. Issue #223: at 19,027 rows
+    // each of these is 1,095 MB and four of them alive is the wall the
+    // attention path was moved off.
+    this.recycle(gate.buffer);
     const gated = await this.pointwise(
       ops, value, { buffer: activated, rows: seq, cols: c.ffn_dim }, ELEMENTWISE.multiply,
     );
-    return this.linear(ops, gated, `${prefix}ff.net.2.weight`, null, c.hidden_size);
+    this.recycle(value.buffer);
+    this.recycle(activated);
+    const out = await this.linear(ops, gated, `${prefix}ff.net.2.weight`, null, c.hidden_size);
+    this.recycle(gated.buffer);
+    return out;
   }
 
   /**
@@ -663,22 +711,31 @@ export class DitGpu {
     // `x * (1 + scale) + shift`, and the table already holds `1 + scale`.
     const scaled = await this.modulateChunk(
       ops, normed, table, stepOffsetRows, runs, 1, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
+    this.recycle(normed.buffer);
     const shifted = await this.modulateChunk(
       ops, scaled, table, stepOffsetRows, runs, 0, 6, ELEMENTWISE.add, this.take(seq * c.hidden_size));
+    this.recycle(scaled.buffer);
 
     let q = await this.linear(ops, shifted, `${p}attn.to_q.weight`, null, width);
     let k = await this.linear(ops, shifted, `${p}attn.to_k.weight`, null, width);
     const v = await this.linear(ops, shifted, `${p}attn.to_v.weight`, null, width);
-    q = await this.qkNorm(ops, q, seq, this.w(`${p}attn.norm_q.weight`));
-    k = await this.qkNorm(ops, k, seq, this.w(`${p}attn.norm_k.weight`));
-    q = await this.rope(ops, q, seq, positions);
-    k = await this.rope(ops, k, seq, positions);
+    // Each of these reads its input once and writes a new buffer, so the input
+    // is dead the moment the dispatch is recorded. Issue #223.
+    q = this.consume(q, await this.qkNorm(ops, q, seq, this.w(`${p}attn.norm_q.weight`)));
+    k = this.consume(k, await this.qkNorm(ops, k, seq, this.w(`${p}attn.norm_k.weight`)));
+    q = this.consume(q, await this.rope(ops, q, seq, positions));
+    k = this.consume(k, await this.rope(ops, k, seq, positions));
 
+    // `shifted` fed the three projections and nothing else.
+    this.recycle(shifted.buffer);
     const merged = await this.attention(ops, q, k, v, seq);
     const projected = await this.linear(ops, merged, `${p}attn.to_out.0.weight`, null, c.hidden_size);
+    this.recycle(merged.buffer);
     const gated = await this.modulateChunk(
       ops, projected, table, stepOffsetRows, runs, 2, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
+    this.recycle(projected.buffer);
     let hidden = await this.pointwise(ops, x, gated, ELEMENTWISE.add);
+    this.recycle(gated.buffer);
 
     // **The block's own halfway point.** Everything above is dead once the
     // residual has been added, and nothing below has been allocated yet, so
@@ -690,13 +747,20 @@ export class DitGpu {
     const normed2 = await this.norm(ops, hidden, this.w(`${p}norm2.weight`), c.norm_eps);
     const scaled2 = await this.modulateChunk(
       ops, normed2, table, stepOffsetRows, runs, 4, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
+    this.recycle(normed2.buffer);
     const shifted2 = await this.modulateChunk(
       ops, scaled2, table, stepOffsetRows, runs, 3, 6, ELEMENTWISE.add, this.take(seq * c.hidden_size));
+    this.recycle(scaled2.buffer);
 
     const ff = await this.feedForward(ops, shifted2, p);
+    this.recycle(shifted2.buffer);
     const gated2 = await this.modulateChunk(
       ops, ff, table, stepOffsetRows, runs, 5, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
+    this.recycle(ff.buffer);
+    // **`hidden` is not recycled**: the add reads it and writes a new buffer,
+    // and the one it writes is what this returns.
     hidden = await this.pointwise(ops, hidden, gated2, ELEMENTWISE.add);
+    this.recycle(gated2.buffer);
     return hidden;
   }
 
