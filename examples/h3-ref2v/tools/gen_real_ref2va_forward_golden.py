@@ -232,6 +232,7 @@ def main() -> None:
 
     (out / "golden.json").write_text(json.dumps({
         "source": "MiniMaxAI/MiniMax-H3 transformer_ref, run by diffusers MiniMaxH3Transformer3DModel",
+        "sourcePath": str(args.model),
         "note": "Activations only. No weights are redistributed by this file.",
         "workflow": "ref2va",
         "dtype": "bfloat16 block stack, float32 projections and heads",

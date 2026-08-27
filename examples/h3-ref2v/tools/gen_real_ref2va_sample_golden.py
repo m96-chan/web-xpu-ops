@@ -262,6 +262,7 @@ def main() -> None:
     write("output.audio.bin", audio_latents)
     (out_dir / "golden.json").write_text(json.dumps({
         "source": "MiniMaxAI/MiniMax-H3 transformer_ref, sampled by diffusers MiniMaxH3Scheduler",
+        "sourcePath": str(args.model),
         "note": "Activations only. No weights are redistributed by this file.",
         "workflow": "t2va" if args.no_reference else "ref2va",
         "seed": args.seed,

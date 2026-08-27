@@ -346,7 +346,13 @@ def main() -> int:
 
     manifest = {
         "model": "minimax-h3-dit",
-        "source": "MiniMaxAI/MiniMax-H3 (transformer)",
+        # **The directory that was actually read**, not a label. This line said
+        # "(transformer)" whatever it converted, so a `transformer_ref`
+        # conversion claimed to be a `transformer` one -- and the two are the
+        # difference between R2V working and not. A provenance field that does
+        # not track the provenance is worse than none: it gets believed.
+        "source": f"MiniMaxAI/MiniMax-H3 ({model.name})",
+        "sourcePath": str(model),
         "licence": "MiniMax H3 Community License Agreement — not this repository's, and not redistributed by it",
         "config": config,
         "layers": num_layers,
