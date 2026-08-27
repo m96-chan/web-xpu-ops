@@ -76,6 +76,26 @@ def quantise_roundtrip_(weight: torch.Tensor, chunk: int = 4096) -> None:
         block.copy_((codes * scale.unsqueeze(1)).to(weight.dtype))
 
 
+def quantised_names(manifest_path: str) -> set[str]:
+    """The torch parameter names behind a manifest's `q8` entries.
+
+    `ff.hidden` and `ff.gate` are `ff.net.0.proj` split in two. The split is
+    along rows, and the quantisation is per row, so rounding the whole matrix is
+    the same arithmetic as rounding the halves -- which is why they collapse back
+    to one name here rather than needing to be handled apart.
+    """
+    entries = json.loads(pathlib.Path(manifest_path).expanduser().read_text())["tensors"]
+    names = set()
+    for entry in entries:
+        if entry.get("kind") != "q8":
+            continue
+        name = entry["name"]
+        if name.endswith(".ff.hidden.weight") or name.endswith(".ff.gate.weight"):
+            name = name.rsplit(".ff.", 1)[0] + ".ff.net.0.proj.weight"
+        names.add(name)
+    return names
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="the transformer_ref/ directory")
@@ -89,9 +109,10 @@ def main() -> None:
     parser.add_argument("--audio-latents", type=int, default=3)
     parser.add_argument("--layers", type=int, default=0, help="run only the first N blocks (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--quantised", action="store_true",
-                        help="round every matrix through convert_dit.py's int8 first, so the port's "
-                             "quantisation is on this side of the comparison too (issue #216)")
+    parser.add_argument("--quantised", metavar="MANIFEST",
+                        help="a `dit.manifest.json` the port loads: round exactly the matrices it marks "
+                             "`q8` through int8 first, so the port's quantisation is on this side of the "
+                             "comparison too (issue #216)")
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--conditioning", help="a directory `gen_real_conditioner_golden.py` wrote: "
                         "its `hidden.<layer>.bin` and real token tags replace the random text rows (issue #216)")
@@ -113,14 +134,21 @@ def main() -> None:
         print(f"running only the first {args.layers} blocks", flush=True)
 
     if args.quantised:
+        # **Exactly what the port quantises, named by the port's own manifest.**
+        # The first version of this rounded every `nn.Linear` it could reach and
+        # came out *further* from the port than the bf16 reference did -- because
+        # `convert_dit.py` folds the modulation matrices into precomputed level
+        # tables and never quantises them at all. A reference that approximates
+        # differently from the thing it is a reference for is not a reference.
+        want = quantised_names(args.quantised)
+        params = dict(model.named_parameters())
         started = time.time()
-        matrices = 0
         with torch.no_grad():
-            for _, module in model.named_modules():
-                if isinstance(module, torch.nn.Linear):
-                    quantise_roundtrip_(module.weight)
-                    matrices += 1
-        print(f"round-tripped {matrices} matrices through int8 in {time.time() - started:.0f} s", flush=True)
+            for name in sorted(want):
+                if name not in params:
+                    raise SystemExit(f"{name} is marked q8 in the manifest and is not in the model")
+                quantise_roundtrip_(params[name])
+        print(f"round-tripped {len(want)} matrices through int8 in {time.time() - started:.0f} s", flush=True)
 
     c = model.config
 
