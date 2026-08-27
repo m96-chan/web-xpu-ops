@@ -94,7 +94,7 @@ export interface EncoderGpuManifest {
  */
 export function conditioningChunking(
   manifest: EncoderGpuManifest,
-): { clipLength: number; tokenDrop: number } {
+): { clipLength: number; tokenDrop: number; latentsPerChunk: number; temporalRatio: number } {
   const { clipLength, tokenDrop } = manifest;
   if (typeof clipLength !== "number" || typeof tokenDrop !== "number") {
     throw new Error(
@@ -102,7 +102,15 @@ export function conditioningChunking(
         "Re-run `tools/gen_resnet_golden.py --whole`, which writes them.",
     );
   }
-  return { clipLength, tokenDrop };
+  // `tokens_chunk_size = ceil(clip_length / temporal_compression_ratio)`, and
+  // the ratio is the product of the encoder's own temporal strides -- derived
+  // rather than written down, so a checkpoint that downsamples time differently
+  // is followed rather than assumed.
+  const temporalRatio = manifest.config.time_down.reduce((a, b) => a * b, 1);
+  return {
+    clipLength, tokenDrop, temporalRatio,
+    latentsPerChunk: Math.ceil(clipLength / temporalRatio),
+  };
 }
 
 const WG = 256;

@@ -44,7 +44,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync }
 import { fileURLToPath } from "node:url";
 import { createResidentDevice, type ResidentDevice } from "../../../harness/resident.js";
 import { ByteLevelBpeTokenizer, type BpeVocab } from "../../../llm/tokenizer-bpe.js";
-import { EncoderGpu, type EncoderGpuManifest } from "../../h3-encoder/src/encoder-gpu.js";
+import { EncoderGpu, conditioningChunking, type EncoderGpuManifest } from "../../h3-encoder/src/encoder-gpu.js";
 import { encoderKernels } from "../../h3-encoder/src/kernels-node.js";
 import {
   AUDIO_CHANNELS, alignNumFrames, audioLatentNumFrames, patchifyVideoLatents,
@@ -58,9 +58,11 @@ import {
 } from "../../h3-video/src/decoder-gpu.js";
 import { videoKernels } from "../../h3-video/src/kernels-node.js";
 import { ConditionerGpu, type ConditionerManifest } from "./conditioner-gpu.js";
+import { vaeConditionFrames } from "./conditioning-frames.js";
 import { conditionerKernels } from "./kernels-node.js";
 import { buildRef2vaRowTimesteps, buildRef2vaSequence } from "./layout.js";
-import { buildPresentation, sampleVideoConditionFrames, type VisionSpecials } from "./presentation.js";
+import { buildPresentation, sampleVideoConditionFrames, type VisionSpecials, type SampledVideo,
+} from "./presentation.js";
 import { patchify, visionTokenCount, type ProcessorConfig } from "./processor.js";
 import type { Reference } from "./layout.js";
 import { qwen3vlPositionGrid } from "./text-encoder.js";
@@ -85,19 +87,27 @@ const vaeConfigPath = arg("--vae-config");
 const outDir = arg("--out") ?? "h3-out-r2v";
 
 /**
- * `--reference image:PATH:W:H` or `--reference video:PATH:W:H:FRAMES`,
+ * `--reference image:PATH:W:H` or `--reference video:PATH:W:H:FRAMES[:FPS]`,
  * repeatable, **in packed order**.
  *
  * Raw `uint8` RGB, already at a size `smartResize` would have asked for —
  * `patchify` refuses anything else rather than cropping it quietly, and a
- * browser would do the resampling with `drawImage`. A video's frames are the
- * ones the conditioner reads, sampled at `videoSampleFps`.
+ * browser would do the resampling with `drawImage`.
+ *
+ * **A video's frames are the clip at its own rate**, not the conditioner's.
+ * Issue #216: this took them already sampled at `videoSampleFps`, and then gave
+ * the *same* frames to the VAE -- which is a two-second reference described to
+ * the anchor as twenty-four seconds of slow motion. `encoders.py` samples for
+ * the tower and hands the VAE the clip at `fps`, so `FPS` is the clip's own and
+ * defaults to the model's 24.
  */
 interface ReferenceInput {
   kind: "image" | "video";
   path: string;
   width: number;
   height: number;
+  /** The clip's own rate, not the conditioner's. See the note above. */
+  fps: number;
   /** 1 for a still; the sampled count for a video. */
   frames: number;
 }
@@ -113,15 +123,30 @@ for (let i = 0; i < process.argv.length; i += 1) {
     console.error(`--reference must start with image: or video:, not "${spec}"`);
     process.exit(2);
   }
-  const numbers = kind === "image" ? 2 : 3;
+  // A video may carry its own frame rate as a fifth field. Optional rather than
+  // required so every existing invocation keeps working, and defaulted to the
+  // model's own 24 rather than to the conditioner's 2.
+  // `kind` is already off the front, so a video with an fps is a path plus four
+  // numbers -- five parts, not six. All four have to parse: a path ending in a
+  // numeric segment is the ambiguity this format already has for `FRAMES`, and
+  // requiring the whole tail to be numeric is as far as it can be narrowed.
+  const hasFps = kind === "video" && parts.length >= 5
+    && parts.slice(-4).every((v) => v !== "" && Number.isFinite(Number(v)));
+  const numbers = kind === "image" ? 2 : hasFps ? 4 : 3;
   if (parts.length < numbers + 1) {
-    console.error(`--reference ${kind}:PATH:W:H${kind === "video" ? ":FRAMES" : ""} — got "${spec}"`);
+    console.error(
+      `--reference ${kind}:PATH:W:H${kind === "video" ? ":FRAMES[:FPS]" : ""} — got "${spec}"`,
+    );
     process.exit(2);
   }
   const tail = parts.splice(parts.length - numbers, numbers).map(Number);
   referenceInputs.push({
     kind, path: parts.join(":"),
     width: tail[0]!, height: tail[1]!, frames: kind === "video" ? tail[2]! : 1,
+    // 24 spelled out rather than `SPEC.fps`, which is declared below this loop.
+    // `SPEC.fps` is asserted against it right after the object exists, so the
+    // two cannot drift.
+    fps: kind === "video" && hasFps ? tail[3]! : 24,
   });
 }
 if (!conditionerDir || !encoderDir || !ditDir || !vaeDir || !vaeConfigPath || referenceInputs.length === 0) {
@@ -170,6 +195,15 @@ const SPEC = {
     "detailed_description", "overall_soundscape", "non_diegetic_music",
   ],
 } as const;
+
+// The parse loop above cannot see `SPEC` -- it runs first -- so it writes 24
+// literally. This is where the two are held together.
+for (const r of referenceInputs) {
+  if (r.kind === "video" && r.fps === 24 && SPEC.fps !== 24) {
+    console.error(`--reference defaults a clip to 24 fps and the model card says ${SPEC.fps}`);
+    process.exit(2);
+  }
+}
 
 /** Everything out-of-spec is refused unless this is passed. */
 const outOfSpec = process.argv.includes("--out-of-spec");
@@ -367,7 +401,11 @@ const tokenizer = new ByteLevelBpeTokenizer(JSON.parse(readFileSync(
 {
   let total = 0;
   for (const r of videoRefs) {
-    const length = r.frames / conditionerManifest.videoSampleFps;
+    // **The clip's own rate.** This divided by `videoSampleFps` and called a
+    // two-second reference twenty-four seconds, refusing a correct input --
+    // `video_sample_fps` is how often the *tower* reads the clip, not how fast
+    // the clip runs.
+    const length = r.frames / r.fps;
     total += length;
     if (length < SPEC.minReferenceSeconds || length > SPEC.maxReferenceSeconds) {
       complain(
@@ -402,8 +440,22 @@ const tokenizer = new ByteLevelBpeTokenizer(JSON.parse(readFileSync(
 
 const processor = conditionerManifest.processor;
 const merge = processor.mergeSize;
-const towered = references.map(({ input, frames }) =>
-  ({ input, ...patchify(frames, input.height, input.width, processor) }));
+// **The tower reads a clip at `videoSampleFps`, not at the clip's own rate.**
+// Issue #216: this port handed it every frame it was given and required the
+// caller to have sampled already, which made the same array serve the VAE as
+// well -- and the VAE must have the clip at its own rate.
+const sampledVideo = new Map<ReferenceInput, SampledVideo>();
+for (const { input } of references) {
+  if (input.kind !== "video") continue;
+  sampledVideo.set(input, sampleVideoConditionFrames(
+    input.frames, input.fps, conditionerManifest.videoSampleFps, processor.temporalPatchSize,
+  ));
+}
+const towered = references.map(({ input, frames }) => {
+  const sampled = sampledVideo.get(input);
+  const forTower = sampled ? sampled.indices.map((at) => frames[at]!) : frames;
+  return { input, ...patchify(forTower, input.height, input.width, processor) };
+});
 for (const t of towered) {
   console.log(`  ${t.input.kind} ${t.input.path.split("/").pop()}: ${t.input.frames} frame(s) of ` +
     `${t.input.width}x${t.input.height} -> grid ${t.grid.join("x")}, ` +
@@ -413,13 +465,9 @@ for (const t of towered) {
 const packedReferences: Reference[] = towered.map((t) => ({ kind: t.input.kind, hasAudio: false }));
 // **A video is one vision block per merged frame group**, each with its own
 // timestamp, so its token count is one group's worth and not the whole clip's.
-// The frames here are already the ones the conditioner reads, so the sampler is
-// asked for a stride of one and only its block timestamps are used.
-const videoBlocks = towered.filter((t) => t.input.kind === "video").map((t) =>
-  sampleVideoConditionFrames(
-    t.input.frames, conditionerManifest.videoSampleFps, conditionerManifest.videoSampleFps,
-    processor.temporalPatchSize,
-  ).blockTimestamps);
+// The same sampling that chose the tower's frames labels them.
+const videoBlocks = towered.filter((t) => t.input.kind === "video")
+  .map((t) => sampledVideo.get(t.input)!.blockTimestamps);
 
 const presentation = buildPresentation({
   tokenize: (text) => tokenizer.encode(text),
@@ -525,17 +573,30 @@ const referenceGeometry: [number, number, number][] = [];
 
   const packed: Float32Array[] = [];
   for (const { input, bytes: raw } of references) {
-    const small = shrink(raw, input.width, input.height, input.frames, anchorScale);
+    // **The clip at its own rate, snapped down to `17n + 5`.** `encoders.py`
+    // does this so the chunked encode lands on whole chunks; padding instead
+    // gives the same latent frame count and a different last chunk.
+    const { clipLength, latentsPerChunk } = conditioningChunking(encoderManifest);
+    const usable = input.kind === "video"
+      ? vaeConditionFrames(input.frames, clipLength, latentsPerChunk)
+      : input.frames;
+    if (usable !== input.frames) {
+      console.log(`    snapped ${input.frames} frames down to ${usable} (${clipLength}n + ${latentsPerChunk})`);
+    }
+    const small = shrink(raw, input.width, input.height, usable, anchorScale);
     const bytes = small.bytes;
     // `encode_vae_condition`: ImageNet-normalised `u8 / 255`, channel-major
     // over the whole clip.
     const plane = small.width * small.height;
-    const voxels = plane * input.frames;
+    // `usable`, not `input.frames`: the snap above chose how many frames are
+    // encoded, and the buffer has to be built for that count or the channel
+    // stride runs into the next channel's frames.
+    const voxels = plane * usable;
     const normalised = new Float32Array(3 * voxels);
-    for (let f = 0; f < input.frames; f += 1) {
+    for (let f = 0; f < usable; f += 1) {
       for (let i = 0; i < plane; i += 1) {
         for (let ch = 0; ch < 3; ch += 1) {
-          normalised[(ch * input.frames + f) * plane + i] =
+          normalised[(ch * usable + f) * plane + i] =
             (bytes[(f * plane + i) * 3 + ch]! / 255 - PIXEL_MEAN[ch]!) / PIXEL_STD[ch]!;
         }
       }
@@ -547,7 +608,7 @@ const referenceGeometry: [number, number, number][] = [];
     // 17-frame chunks. Measured on the released weights, the two differ by
     // 17.9% rms at a two-second reference and 21.5% at a three-and-a-half
     // second one -- with the same shape, which is why nothing complained.
-    const moments = await encoder.encodeConditioning(normalised, input.frames, small.height, small.width);
+    const moments = await encoder.encodeConditioning(normalised, usable, small.height, small.width);
     console.log(
       `  ${input.kind} encoded in ${((performance.now() - at) / 1000).toFixed(2)} s -> ` +
         `moments ${moments.C}x${moments.D}x${moments.H}x${moments.W}`,
