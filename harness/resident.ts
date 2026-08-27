@@ -287,6 +287,37 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
 
   /** Bytes handed out, so an allocation failure can say what was already in flight. */
   let allocated = 0;
+  /** Bytes still held: `allocated` minus everything `destroy`ed. */
+  let live = 0;
+  /**
+   * The first allocation that failed, kept until something can raise it.
+   *
+   * `createBuffer` is synchronous and its out-of-memory arrives through an
+   * async error scope, so the failure is always known *after* the caller has
+   * taken the buffer. Everything downstream of an invalid buffer is invalid
+   * too, and reports itself rather than the cause.
+   */
+  let allocationFailure: string | null = null;
+  /**
+   * The error scopes still in flight.
+   *
+   * `popErrorScope` resolves on a later turn, and `createStorageBuffer` is
+   * synchronous because every caller's inner loop is. So the failure is known
+   * *after* the buffer has been handed out and after the dispatches that read
+   * it have been recorded -- checking a flag at the bind group finds it still
+   * unset, which is what the first version of this did. Draining here is the
+   * one place that is both async and downstream of every allocation.
+   */
+  const pendingScopes: Promise<unknown>[] = [];
+  /**
+   * How many buffers of each size were created, so a failure can say where the
+   * bytes went rather than only how many there are.
+   *
+   * "69 GB across 3,080 buffers" on a 32 GB card says the pool is not being
+   * reused; it does not say *which* pool. The histogram does, and it costs a
+   * map increment per allocation.
+   */
+  const sizeHistogram = new Map<number, number>();
 
   function createStorageBuffer(bytes: number, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC): GPUBuffer {
     stats.buffersCreated += 1;
@@ -295,16 +326,59 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // `createBuffer` returns an invalid buffer instead of throwing, and the
     // first thing to notice is `createBindGroup`, which reports a binding index
     // and no size. See the browser runtime's copy of this note.
+    // **Both scopes.** An allocation can fail as out-of-memory *or* as
+    // validation -- a size past `maxBufferSize` or
+    // `maxStorageBufferBindingSize` is the second, and an out-of-memory scope
+    // alone catches none of it. Issue #216 lost a run to exactly that: the OOM
+    // scope was silent and the buffer was invalid anyway.
+    device.pushErrorScope("validation");
     device.pushErrorScope("out-of-memory");
     const buffer = device.createBuffer({ size, usage });
-    void device.popErrorScope().then((error) => {
-      if (!error) return;
-      throw new Error(
-        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
-          `(${(allocated / 1e9).toFixed(2)} GB already allocated, ${stats.buffersCreated} buffers). ${error.message}`,
-      );
-    });
+    // **Remembered, not thrown.** This used to `throw` inside the `then`, which
+    // is a rejection in a detached promise: nobody awaits it, the caller carries
+    // on holding an invalid buffer, and the first thing that notices is a bind
+    // group several dispatches later saying "[Invalid Buffer] is invalid due to
+    // a previous error" with no size and no total. Issue #216 spent two runs on
+    // that message. The scope catches the real cause; this keeps it until
+    // something is in a position to raise it.
+    const note = (kind: string) => (error: GPUError | null) => {
+      if (!error || allocationFailure) return;
+      allocationFailure = describeFailure(kind, error, size);
+    };
+    pendingScopes.push(device.popErrorScope().then(note("out of GPU memory")));
+    pendingScopes.push(device.popErrorScope().then(note("invalid")));
+    const describeFailure = (kind: string, error: GPUError, bytes: number): string =>
+      `${kind}: a ${(bytes / 1e6).toFixed(0)} MB buffer was refused ` +
+      `(${(live / 1e9).toFixed(2)} GB still held, ${(allocated / 1e9).toFixed(2)} GB handed out over the ` +
+      `run across ${stats.buffersCreated} buffers; ` +
+      `this device allows ${(device.limits.maxBufferSize / 1e9).toFixed(2)} GB a buffer and ` +
+      `${(device.limits.maxStorageBufferBindingSize / 1e9).toFixed(2)} GB a storage binding).\n` +
+      "  where the bytes went, largest first:\n" +
+      [...sizeHistogram.entries()]
+        .map(([bytes, count]) => ({ bytes, count, total: bytes * count }))
+        .sort((x, y) => y.total - x.total)
+        .slice(0, 8)
+        .map((e) => `    ${(e.total / 1e9).toFixed(2)} GB — ${e.count} x ${(e.bytes / 1e6).toFixed(0)} MB`)
+        .join("\n") +
+      `\n  ${error.message}`;
     allocated += size;
+    live += size;
+    sizeHistogram.set(size, (sizeHistogram.get(size) ?? 0) + 1);
+    // **`destroy` wrapped, so the number means something.** Without this
+    // `allocated` is cumulative -- it counts the conditioner's 25 GB and the
+    // encoder's, long after both were dropped -- and a failure message built on
+    // it reads as "69 GB on a 32 GB card", which sounds like a leak and is not
+    // one. Issue #216 misread exactly that. `live` is what is still held.
+    const release = buffer.destroy.bind(buffer);
+    let destroyed = false;
+    buffer.destroy = () => {
+      if (!destroyed) {
+        destroyed = true;
+        live -= size;
+        sizeHistogram.set(size, (sizeHistogram.get(size) ?? 1) - 1);
+      }
+      release();
+    };
     return buffer;
   }
 
@@ -397,6 +471,15 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     return pipeline;
   }
 
+  /** Waits out every allocation scope and raises the first failure. */
+  async function drainAllocationScopes(): Promise<void> {
+    if (pendingScopes.length > 0) {
+      const waiting = pendingScopes.splice(0, pendingScopes.length);
+      await Promise.all(waiting);
+    }
+    if (allocationFailure) throw new Error(allocationFailure);
+  }
+
   async function bindGroupSliced(
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
@@ -404,6 +487,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // The sliced path binds a *range* of a buffer, so what was uploaded into
     // the whole of it is not necessarily what this binding reads -- but the
     // element type is the same either way, which is the only thing checked.
+    await drainAllocationScopes();
     const mismatch = bindingMismatch(pipeline, slices.map((slice) => slice.buffer));
     if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
@@ -420,6 +504,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    await drainAllocationScopes();
     const mismatch = bindingMismatch(pipeline, buffers);
     if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();

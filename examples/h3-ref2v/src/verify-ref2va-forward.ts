@@ -170,6 +170,15 @@ const tables = openReader(`${dir}/adaln.bin`);
 
 const uploadStart = performance.now();
 const dit = await DitGpu.create(device, ditKernels(), manifest, weights.read, tables.read);
+// `--split-blocks N` forces the mid-block flush on at N rows, so the path a
+// long sequence takes is checked against the golden at a sequence short enough
+// to have one. Issue #216: it exists to make a 32 GB card hold 19,027 rows, and
+// the geometry that needs it has no golden.
+const splitArg = arg("--split-blocks");
+if (splitArg) {
+  dit.splitBlockAboveRows = Number(splitArg);
+  console.log(`splitting every block above ${dit.splitBlockAboveRows} rows`);
+}
 if (maxWorkgroupsArg) {
   dit.maxWorkgroupsPerDimension = Number(maxWorkgroupsArg);
   console.log(`grid ceiling lowered to ${dit.maxWorkgroupsPerDimension} workgroups — the chunked path`);

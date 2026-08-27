@@ -161,6 +161,31 @@ export class DitGpu {
   /** Blocks recorded into one command buffer — see `examples/h3-video` for why 1. */
   blocksPerSubmit = 1;
 
+  /**
+   * Flush **inside** a block once the sequence is longer than this.
+   *
+   * A block holds around twenty intermediates alive at once: `q`, `k`, `v` and
+   * their rotated and head-swapped copies at `heads * head_dim` wide, the
+   * feed-forward's four at `ffn_dim`, and a handful at `hidden_size`. They can
+   * only be recycled at a submit, because until then they are what the recorded
+   * dispatches read. At 19,027 rows that is about 12 GB on top of 20 GB of
+   * weights, and a 32 GB card refuses somewhere in the middle of it — as an
+   * invalid buffer rather than an error, so it surfaces one bind group later
+   * as "invalid due to a previous error".
+   *
+   * Splitting the block at the residual add costs one extra submit per block
+   * and halves the peak: the attention half's buffers go back to the pool
+   * before the feed-forward half asks for its own.
+   *
+   * **Measured at no cost, so it is always on.** The threshold was going to be
+   * a compromise with the extra submit; against the real-content golden at 572
+   * rows the split run is bit-identical (worst 1.394e+0 either way) and 2409 ms
+   * against 2663 ms, which is noise in the direction of faster. A knob whose
+   * off position is never better is a knob to delete, so the default is 0 and
+   * what is left is a way to turn it *off* for a measurement.
+   */
+  splitBlockAboveRows = 0;
+
   submitMs = 0;
   readbackMs = 0;
   recordMs = 0;
@@ -654,6 +679,13 @@ export class DitGpu {
     const gated = await this.modulateChunk(
       ops, projected, table, stepOffsetRows, runs, 2, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
     let hidden = await this.pointwise(ops, x, gated, ELEMENTWISE.add);
+
+    // **The block's own halfway point.** Everything above is dead once the
+    // residual has been added, and nothing below has been allocated yet, so
+    // this is where the peak can be cut without keeping anything alive across
+    // it. `x` is deliberately not kept: the caller replaces it with what this
+    // returns.
+    if (seq > this.splitBlockAboveRows) await this.flush(ops, [hidden.buffer, positions]);
 
     const normed2 = await this.norm(ops, hidden, this.w(`${p}norm2.weight`), c.norm_eps);
     const scaled2 = await this.modulateChunk(
