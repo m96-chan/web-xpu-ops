@@ -13,6 +13,11 @@ Entries record **why** a change was needed. What changed is in the diff.
   #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
   `array<f32>` when it learned fractional positions; `examples/zimage/src/
   dit-gpu.ts` was updated in that commit and the two **resident** DiTs were not.
+- **Anima and Z-Image's resident paths drew one flat colour** (issue #217, a
+  regression from #206). `ropeAxes`' `positions` binding stopped being
+  `array<i32>` and became `array<f32>` when it learned fractional positions;
+  `examples/zimage/src/dit-gpu.ts` was updated in that commit and the two
+  **resident** DiTs were not.
 
   Nothing errors. WebGPU copies the bytes, and a small integer's bit pattern
   read as a float is a denormal — so every rope angle became zero, every token
@@ -23,7 +28,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   `ropeAxisPositionBuffer` in `ops/rope` is where the type lives now, with the
   slack the kernel expects, and both resident paths build their buffer with it.
   Its test asserts the array type, because that is the thing that was wrong.
-
 
 - **Changing folder to the wrong one stranded the page** (reported from a
   browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
@@ -49,7 +53,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   And a failure that gets past all of that now lands somewhere a person can see:
   every page's `void main()` carries a `.catch` that writes the message into the
   status line instead of the console.
-
 
 - **Three limits a real reference hit, and one of them was silent**
   (issues #212, #211). Running R2V on an actual video and image reference — 8
@@ -84,7 +87,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   latent geometry comes back from the encoder rather than being assumed — the
   causal temporal compression is on the way. The layout is built *after* the
   encoder for that reason.
-
 
 - **The DiT's latent space is not the decoder's, and nothing was converting
   between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
@@ -132,7 +134,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   **40,927 packed rows** and the longest this port has been timed at is 4,768,
   at 12.2 s a step — printed before the wait rather than after it.
 
-
 - **R2V runs end to end on the GPU** (issue #212). `generate-r2v.ts`: a
   reference and a prompt in, frames out, over four models one at a time —
   encoder 0.47 s, conditioner 2.0 s, `transformer_ref` 15 steps at ~1.4 s,
@@ -161,7 +162,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   curve, with troughs exactly at the frames that sit at position 0 of a latent
   frame. What remains is the DiT's int8, which a reference encoded and decoded
   straight back does not have and only DiT-produced latents do.
-
 
 - **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s
   CPU version is a reference and stays one — it is a single-threaded loop over
@@ -580,6 +580,68 @@ Entries record **why** a change was needed. What changed is in the diff.
   bit-identical — every video row is at timestep 0 — and moves the audio by
   2.6e-2; dropping the video head's bias does the reverse. A test that checked
   one head would have passed either.
+  Its test asserts the array type, because a test that only checked the values
+  passed the whole time.
+
+- **Changing folder to the wrong one left the page with no folder at all**
+  (issue #219). Reported from a browser: Z-Image's picker was pointed at Anima's
+  folder, and the page died with `the folder "anima-3.8B" has no
+  "model.safetensors.index.json"`. Reloading landed in the same place.
+
+  Three faults, and each alone would have been survivable.
+
+  A receipt was read without asking what the caller needs. A folder filled for
+  another model carries its own valid receipt, so `readReceipt` answered
+  "filled", the fill was skipped, and the page got a folder holding none of its
+  files. It takes the plan now, and a receipt that does not name every file the
+  caller wants means unfilled — which fills the folder rather than failing after
+  a reload, the cheap direction to be wrong in.
+
+  The folder was remembered before it was known to work, so a bad pick became
+  the page's permanent answer and no reload could escape it. `bindFolder` reads
+  every file out of the new folder first and stores the handle last.
+
+  And changing folder forgot the folder that worked. The old rule was "every
+  bind failure forgets the folder", which is right when there is nothing to fall
+  back on and wrong when there is. `gate.test.ts` asserted the two paths were
+  the same thing; it now asserts they differ, and says why, because that rule
+  was the bug.
+
+  Each page's `main()` also catches now, so a start-up failure reaches the
+  status line instead of being an unhandled rejection under a page that looks
+  like it is still loading.
+
+- **The type a buffer is uploaded with is now checked against the type the
+  kernel declared** (issue #221, out of #217). `ropeAxes`' `positions` binding
+  changed from `array<i32>` to `array<f32>`; one caller was updated, two were
+  not, and nothing anywhere said so for eighteen commits. WebGPU has no opinion
+  about this — `queue.writeBuffer` copies bytes, and a small integer's bit
+  pattern read as an `f32` is a denormal near zero. Every rotation angle became
+  zero and the page drew one flat colour, with no error.
+
+  **The type was written down the whole time**, one line above the code that
+  read it. Nothing on the host read that line. `harness/binding-types.ts` reads
+  it now, and `harness/wgsl.ts#createRunner`, `harness/resident.ts` and
+  `examples/web-common/src/browser-resident.ts` refuse the mismatch — so every
+  op test and every resident model, in Node and in the browser, is covered by
+  running at all.
+
+  Judged where a buffer, a pipeline and a binding number are in the same room,
+  which is the bind group and nowhere else. The first version also judged inside
+  `upload`, against whatever binding the buffer had last, and on Anima's real
+  forward that named the wrong kernel: buffers come from a pool, and the same
+  one had been `RMSNorm`'s input a dispatch earlier. It caught the bug and lied
+  about where — and the same staleness would eventually have rejected a pooled
+  buffer legitimately used as `array<i32>` in one op and `array<f32>` in
+  another. A check that fails on correct code is worse than no check.
+
+  Two things are deliberately unchecked, both found by turning tests red rather
+  than by reasoning. `array<atomic<T>>` says how a slot is *updated*, not what
+  it holds: `ops/scatter` is an f32 scatter-add through
+  `atomicCompareExchangeWeak`, because WGSL has no f32 atomic, and the first
+  version turned its eight tests red. And a `Uint8Array` is the host saying
+  "these are bytes" — `ops/matvec/wgsl/q8.wgsl` declares `array<u32>` and is fed
+  four packed int8 weights per word.
 
 - **The visual VAE round-trips** (issue #200): `examples/h3-encoder` is the whole
   encoder — six levels of two `ResnetBlock3D`s, a strided convolution between
@@ -670,8 +732,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   (4.386e-6 at 70 tokens, 4.889e-6 at 1,039, 5.560e-6 at 4,111), the text
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
-
-### Added
 
 - **`conv3d`** (issue #200). MiniMax-H3's visual VAE compresses time as well as
   space — `temporal_downsample_factors [1,2,2,1,1,1]`, 4x — so every convolution
@@ -898,8 +958,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   does for Anima — and `rope_dim_ratio: 0.75` is covered by a fourth axis pinned
   at position 0, which is the identity. Worst element **2.384e-7**.
 
-### Changed
-
 - **The browser `ResidentDevice` lives in one place** (issue #200).
   `anima-web` and `zimage-web` each had a copy, and they had already drifted:
   one carried the profiling half and the other carried a comment saying a stub
@@ -928,8 +986,6 @@ Entries record **why** a change was needed. What changed is in the diff.
 
   The addressing is a swept field rather than a rewrite, so #198 can re-decide
   it on hardware that is not this one.
-
-### Fixed
 
 - **The Anima demo re-read weights it already had on the GPU, once per forward**
   (issue #186). A 40-step generation at 832x1216 goes from **347.4 s to
@@ -1123,8 +1179,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   straight back in. One forward went from 20.2 s to 0.17 s once the weights are
   resident — against 990 s for the CPU reference.
 
-### Changed
-
 - `harness/wgsl.ts` and `harness/resident.ts` request the adapter's own limits
   rather than a fixed 512 MiB. That constant was why the VAE could not decode at
   1024: Dawn's error said the adapter supports 1 TiB and that it had to be asked
@@ -1146,8 +1200,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   own implementation before being wired to the next — one block at the shipped
   width (8.72e-8), the full DiT forward (4.386e-6), the text encoder
   (7.993e-7), the sampler's schedule (exact), and generation end to end.
-
-### Changed
 
 - The DiT's GPU path reads packed q8 weights through `ops/matmul`'s `q8` entry
   instead of `ops/dequant_transpose` followed by `matmul`. The dequantised
@@ -1213,8 +1265,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   one silently changes every id and no test written against this module alone
   would notice.
 
-### Fixed
-
 - The GPU tests stop dying for no stated reason. `harness/wgsl.ts` and
   `harness/resident.ts` now keep the `GPU` instance and its adapter reachable
   for as long as the device they produced, because the Dawn Node binding does
@@ -1244,8 +1294,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   this repository had accumulated instead was three weeks of symptom
   descriptions and workarounds — splitting test files (#68), retrying, and
   treating the whole class as "Dawn flake".
-
-### Added
 
 - `ops/axpy` (issue #152): `out[i] = y[i] + a * x[i]` with a **scalar** `a`,
   in two entry points — `kernel` (out-of-place) and `inplace` (`y[i] += a *
@@ -1591,8 +1639,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   diff ~1.2e-7 for prefill logits, matching the pre-existing float32
   rounding noise this fixture's tolerance was already sized for, not a new
   source of error.
-
-### Changed
 
 - `LlamaEngineQ8Resident.runPrefillResident` no longer re-packs and
   re-uploads every projection's int8 weight on every `forward()` call —
