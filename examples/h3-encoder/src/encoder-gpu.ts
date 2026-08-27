@@ -40,6 +40,7 @@
  */
 import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
+import { encodeConditioning, type Moments } from "./conditioning.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 
@@ -69,6 +70,39 @@ export interface EncoderGpuManifest {
   };
   tensors: { name: string; offset: number; count: number }[];
   elements: number;
+  /**
+   * `vae_clip_length` and `vae_token_drop` from the released `video_vae`
+   * config, for `encodeConditioning`. Issue #216.
+   *
+   * Optional because manifests written before it existed do not carry them, and
+   * `conditioningChunking` refuses rather than defaulting: 17 and 3 are what
+   * *this* checkpoint ships, and a silent default is how a second checkpoint
+   * with different chunking would be encoded wrongly and never say so.
+   */
+  clipLength?: number;
+  tokenDrop?: number;
+}
+
+/**
+ * The chunk geometry a conditioning encode uses, or an error naming the fix.
+ *
+ * Not defaulted. The released `Ref2VA/video_vae/config.json` says
+ * `vae_clip_length 17` and `vae_token_drop 3`, and those numbers belong to that
+ * checkpoint -- writing them in here would encode the next checkpoint's
+ * references with the wrong geometry and return a well-shaped tensor while
+ * doing it, which is the failure #216 is about.
+ */
+export function conditioningChunking(
+  manifest: EncoderGpuManifest,
+): { clipLength: number; tokenDrop: number } {
+  const { clipLength, tokenDrop } = manifest;
+  if (typeof clipLength !== "number" || typeof tokenDrop !== "number") {
+    throw new Error(
+      "encoder manifest has no `clipLength`/`tokenDrop`: it predates issue #216. " +
+        "Re-run `tools/gen_resnet_golden.py --whole`, which writes them.",
+    );
+  }
+  return { clipLength, tokenDrop };
 }
 
 const WG = 256;
@@ -464,6 +498,44 @@ export class EncoderGpu {
     staging.destroy();
     this.recordMs = performance.now() - startedAt - this.submitMs - this.readbackMs;
     return { data: out as Float32Array, C: v.C, D: v.D, H: v.H, W: v.W };
+  }
+
+  /**
+   * The conditioning path: `encode_temporal`, not `encode`.
+   *
+   * **Issue #216. `encode` above is the wrong entry point for a reference with
+   * more than one frame**, and holding it to `EncoderFCN3D` + `quant_conv` --
+   * which `verify-encode-gpu.ts` does, at 9.537e-6 -- cannot see that, because
+   * `EncoderFCN3D` is what `encode` wraps. The model's own `encode_base` calls
+   * `encode` only for a single image; for a frame stack it calls
+   * `encode_temporal`, transcribed here from `video_vae/klvae.py` lines
+   * 461-493. The released checkpoint ships `vae_clip_length 17` and
+   * `vae_token_drop 3`; the `isolated_*` flags that guard the other branches
+   * are absent from its config and default to false.
+   *
+   * The clip is padded up to a multiple of `clip_length` by **repeating its
+   * last frame**, each 17-frame chunk is encoded on its own -- the causal state
+   * restarts, so chunk two knows nothing of chunk one -- and `token_drop`
+   * latent frames come off the end of the concatenation.
+   *
+   * **Measured** (`tools/measure_temporal_chunking.py`, the released weights,
+   * this against `encode` alone): at 48 pixel frames, the shortest video
+   * reference the model card allows, both return 12 latent frames and they
+   * differ by **17.9% rms**, worst element 5.62. 68 frames: 19.0%. 85 frames:
+   * 21.5%. At 17, 22, 51 and 120 frames the *shapes* disagree outright. The
+   * shapes coinciding at 48 and 68 is arithmetic, not agreement, and it is why
+   * nothing downstream ever complained.
+   *
+   * A loop over `encode` rather than chunking inside the dispatch graph: the
+   * reference is a loop over an encode, the chunks are independent by
+   * construction, and a version fused into the kernels would be a second thing
+   * to hold to the first.
+   */
+  async encodeConditioning(video: Float32Array, T: number, H: number, W: number): Promise<Moments> {
+    return encodeConditioning(
+      (clip, frames, h, w) => this.encode(clip, frames, h, w),
+      video, T, H, W, conditioningChunking(this.manifest),
+    );
   }
 
   private async flush(ops: ResidentOp[], keep: GPUBuffer[]): Promise<void> {

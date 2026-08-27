@@ -541,7 +541,13 @@ const referenceGeometry: [number, number, number][] = [];
       }
     }
     at = performance.now();
-    const moments = await encoder.encode(normalised, input.frames, small.height, small.width);
+    // **`encodeConditioning`, not `encode`** (issue #216). `encode` is
+    // `AutoencoderKLLegacy.encode`, which `encode_base` calls only for a single
+    // image; a frame stack goes through `encode_temporal`'s independent
+    // 17-frame chunks. Measured on the released weights, the two differ by
+    // 17.9% rms at a two-second reference and 21.5% at a three-and-a-half
+    // second one -- with the same shape, which is why nothing complained.
+    const moments = await encoder.encodeConditioning(normalised, input.frames, small.height, small.width);
     console.log(
       `  ${input.kind} encoded in ${((performance.now() - at) / 1000).toFixed(2)} s -> ` +
         `moments ${moments.C}x${moments.D}x${moments.H}x${moments.W}`,

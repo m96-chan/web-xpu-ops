@@ -9,6 +9,39 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **Every R2V reference with more than one frame was encoded by a path the model
+  does not use** (issue #216). `examples/h3-encoder` is held to `EncoderFCN3D` +
+  `quant_conv` at 9.537e-6, and that pair is `AutoencoderKLLegacy.encode` —
+  which `encode_base` calls **only for a single image**. A frame stack goes
+  through `encode_temporal`: padded up to a multiple of `clip_length` by
+  repeating its last frame, each 17-frame chunk encoded **on its own** so the
+  causal state restarts, and `token_drop` latent frames off the end.
+
+  Measured on the released weights, the two paths on the same clip:
+
+  | frames | `encode` | `encode_temporal` | rms difference |
+  |---|---|---|---|
+  | 8 | 48x2x2x2 | 48x2x2x2 | 0.0% |
+  | 17 | 48x5x2x2 | 48x2x2x2 | different shape |
+  | 22 | 48x6x2x2 | 48x7x2x2 | different shape |
+  | **48** | 48x12x2x2 | 48x12x2x2 | **17.9%** |
+  | 68 | 48x17x2x2 | 48x17x2x2 | 19.0% |
+  | 85 | 48x22x2x2 | 48x22x2x2 | 21.5% |
+
+  A video reference is 2 to 15 seconds at 24 fps — 48 to 360 frames — so that is
+  the whole of the range. **The shapes coinciding at 48 and 68 is arithmetic,
+  not agreement**, and it is why nothing downstream ever complained. Eight
+  frames agree because the encoder is causal: two latent frames depend only on
+  the first eight pixel frames, and what follows them is exactly what
+  `token_drop` removes — which is why the 8x32x32 golden could not see any of
+  this.
+
+  `encodeConditioning` is the path now, held to `encode_temporal`'s own output
+  at **5.388e-5, 0.0006% of peak** on a 48-frame reference. `clip_length` and
+  `token_drop` come from the manifest and are refused if absent, rather than
+  defaulted to this checkpoint's 17 and 3.
+
+
 - **Anima and Z-Image's resident paths drew one flat colour** (regression from
   #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
   `array<f32>` when it learned fractional positions; `examples/zimage/src/
