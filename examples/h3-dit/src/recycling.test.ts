@@ -120,9 +120,36 @@ describe("h3 dit / recycling an intermediate", () => {
     expect(body).not.toMatch(/this\.recycle\(hidden\.buffer\)/);
   });
 
-  it("takes a buffer out of `lent` when it pools it", () => {
+  it("takes a buffer out of `lent` when it holds it", () => {
     // Otherwise `release` pools it a second time at the next flush and the pool
     // hands the same buffer to two callers at once.
     expect(code).toMatch(/const at = this\.lent\.indexOf\(buffer\);[\s\S]{0,120}this\.lent\.splice\(at, 1\);/);
+  });
+
+  it("does NOT put it back in the pool until the next flush", () => {
+    // **The thing that was wrong and looked right.** Handing the buffer
+    // straight to the pool lets a later dispatch in the same pass *write* what
+    // an earlier one still *reads*. Dawn barriers read-after-write and does not
+    // barrier write-after-read, so nothing errors and the numbers move:
+    // `examples/h3-video`'s twelve-frame golden went 1.753e-1 -> 3.512e+0, 10
+    // wrong pixel levels to 201, while its two-frame golden stayed green.
+    //
+    // A submit is a real barrier, so the buffer waits in quarantine for one.
+    // The memory win is therefore the number of flushes, which is what
+    // `splitBlockAboveRows` is for.
+    for (const [name, body] of [
+      ["dit", code],
+      ["decoder", readFileSync(
+        fileURLToPath(new URL("../../h3-video/src/decoder-gpu.ts", import.meta.url)), "utf8",
+      ).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "")],
+    ] as const) {
+      const recycle = body.slice(body.indexOf("private recycle(buffer: GPUBuffer)"));
+      const end = recycle.indexOf("\n  }\n");
+      const inside = recycle.slice(0, end);
+      expect(inside, `${name}: recycle must not pool directly`).not.toContain("this.pool.set(");
+      expect(inside, `${name}: recycle must quarantine`).toContain("this.quarantine.push(buffer)");
+      expect(body, `${name}: the flush is what releases the quarantine`)
+        .toMatch(/for \(const buffer of this\.quarantine\)[\s\S]{0,200}this\.pool\.set\(/);
+    }
   });
 });

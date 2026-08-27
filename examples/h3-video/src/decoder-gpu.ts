@@ -113,6 +113,22 @@ const MM_BN = 128;
  * lets one pool serve every kernel.
  */
 const UNIFORM_BYTES = 128;
+/**
+ * The most a single storage binding may cover, measured on this device.
+ *
+ * Issue #223: `maxBufferSize` here is 1,099 GB and this is **2.147 GB**, so a
+ * buffer can be far larger than any one view of it. Rounded down to a multiple
+ * of 256 so a chunk boundary is always a legal offset.
+ */
+const MAX_BINDING_BYTES = 2_147_483_392;
+
+/**
+ * A binding in a row-chunked dispatch: sliced by row, or bound whole.
+ *
+ * A weight is `whole` -- every chunk reads all of it. An activation is `cols`
+ * wide and its rows are cut with the dispatch.
+ */
+type Part = { buffer: GPUBuffer; cols: number } | { whole: GPUBuffer };
 
 /** A device-side matrix: a buffer and the shape that is live in it. */
 interface Mat {
@@ -143,6 +159,19 @@ export class VideoDecoderGpu {
    * default; `--blocks-per-submit` on `verify-decode.ts` sweeps it.
    */
   blocksPerSubmit = 1;
+
+  /**
+   * Flush **inside** a block once the sequence is longer than this.
+   *
+   * Issue #223, the same knob `examples/h3-dit/src/model-gpu.ts` carries and for
+   * the same reason: a recycled buffer cannot be handed out again until the
+   * pass that read it has been submitted, so the peak falls with the number of
+   * submits and not with the bookkeeping. At 66,432 tokens this decoder held
+   * twenty-eight buffers at `dim` and six at `ffnHidden` between flushes.
+   *
+   * 0, i.e. always -- measured at no cost on both goldens.
+   */
+  splitBlockAboveRows = 0;
 
   private constructor(
     private readonly device: ResidentDevice,
@@ -281,6 +310,43 @@ export class VideoDecoderGpu {
     return buffer;
   }
 
+  /**
+   * Hand one buffer back **before** the submit, because it is already dead.
+   *
+   * Issue #223, the same as `examples/h3-dit/src/model-gpu.ts`. At 66,432
+   * tokens this decoder held twenty-eight buffers at `dim` (545 MB each) and
+   * six at `ffnHidden` (2,177 MB) until the flush -- 28.3 GB of the 32.4 GB
+   * that refused. Every one of them is written once, read once, then dead.
+   *
+   * **Held until the submit, not returned to the pool immediately**, and that
+   * distinction was measured rather than reasoned. Handing a buffer straight
+   * back lets a later dispatch in the same pass *write* what an earlier one
+   * still *reads* -- a write-after-read hazard, which Dawn does not barrier
+   * even though it barriers read-after-write. It cost nothing at 2 latent
+   * frames and moved `examples/h3-video`'s twelve-frame golden from 1.753e-1 to
+   * 3.512e+0, 10 wrong pixel levels to 201. The small golden could not see it.
+   *
+   * So `recycle` only takes the buffer out of `lent`; the pool gets it at the
+   * next flush, where the submit is a real barrier. The win is therefore the
+   * *number of flushes*, which is why the block is split at its residual add.
+   * Recycling something still to be read is still a silent wrong answer, so
+   * each call site names the read it comes after.
+   */
+  private readonly quarantine: GPUBuffer[] = [];
+
+  private recycle(buffer: GPUBuffer): void {
+    const at = this.lent.indexOf(buffer);
+    if (at < 0) return;
+    this.lent.splice(at, 1);
+    this.quarantine.push(buffer);
+  }
+
+  /** `recycle` the old tensor and return the new one, for `x = consume(x, f(x))`. */
+  private consume(dead: Mat, made: Mat): Mat {
+    if (dead.buffer !== made.buffer) this.recycle(dead.buffer);
+    return made;
+  }
+
   private release(keep: GPUBuffer[] = []): void {
     for (const buffer of this.lent) {
       if (keep.includes(buffer)) continue;
@@ -288,6 +354,12 @@ export class VideoDecoderGpu {
       free.push(buffer);
       this.pool.set(buffer.size, free);
     }
+    for (const buffer of this.quarantine) {
+      const free = this.pool.get(buffer.size) ?? [];
+      free.push(buffer);
+      this.pool.set(buffer.size, free);
+    }
+    this.quarantine.length = 0;
     this.lent.length = 0;
     this.lent.push(...keep);
     // Uniforms go back to their own pool, kept apart from the storage one:
@@ -366,6 +438,80 @@ export class VideoDecoderGpu {
     ops.push({ kind: "dispatch", pipeline, bindGroup: await this.device.bindGroup(pipeline, buffers), workgroups });
   }
 
+
+  /**
+   * The same dispatch, over row ranges small enough to bind.
+   *
+   * Issue #223. A buffer here may be far larger than a *binding* may be:
+   * `maxBufferSize` on this device is 1,099 GB and
+   * `maxStorageBufferBindingSize` is **2.147 GB**, and the ViT's feed-forward
+   * at 66,432 tokens by 8,192 is 2.18 GB. The whole run reaches the decode and
+   * then refuses, having already spent twenty-two minutes sampling.
+   *
+   * Every operation this is used for is row-wise -- output row `i` reads input
+   * row `i` and the whole weight -- so cutting the rows is arithmetic-preserving
+   * rather than an approximation, and the chunks are dispatched into the same
+   * pass in order.
+   *
+   * The offsets are row boundaries, and a storage binding's offset must be a
+   * multiple of 256 bytes. Every width here (`dim` 2,048, `ffnHidden` 8,192,
+   * `heads * dim_head`) is a multiple of 64 floats, so every row boundary is
+   * aligned -- asserted rather than assumed, because a width that is not would
+   * fail validation at a size nothing smaller reaches.
+   */
+  private async dispatchRowChunks(
+    ops: ResidentOp[],
+    code: string,
+    rows: number,
+    parts: Part[],
+    uniform: (rowCount: number) => Parameters<typeof params>[0],
+    grid: (rowCount: number) => [number] | [number, number] | [number, number, number],
+  ): Promise<void> {
+    const widths = parts.flatMap((p) => ("cols" in p ? [p.cols] : []));
+    const widest = Math.max(...widths, 1);
+    const pipeline = await this.device.pipelineFor(code);
+
+    // **Chunked only when it has to be.** Most of these buffers are nowhere
+    // near the cap -- `post_quant_conv` reads 24 floats a row -- and a whole
+    // binding is one bind group instead of many. It is also the only thing that
+    // works for a width whose row is not a multiple of 256 bytes, which 24
+    // floats is not.
+    if (rows * widest * 4 <= MAX_BINDING_BYTES) {
+      const buffers = parts.map((p) => ("whole" in p ? p.whole : p.buffer));
+      buffers.push(this.uniform(uniform(rows)));
+      ops.push({
+        kind: "dispatch", pipeline,
+        bindGroup: await this.device.bindGroup(pipeline, buffers),
+        workgroups: grid(rows),
+      });
+      return;
+    }
+
+    for (const cols of widths) {
+      if ((cols * 4) % 256 !== 0) {
+        throw new Error(
+          `dispatchRowChunks: ${rows} rows of ${cols} is past this device's ` +
+            `${(MAX_BINDING_BYTES / 1e9).toFixed(2)} GB binding limit and cannot be cut, because a ` +
+            `${cols}-wide row is ${cols * 4} bytes and a storage binding's offset must be a multiple of 256`,
+        );
+      }
+    }
+    const perChunk = Math.max(1, Math.floor(MAX_BINDING_BYTES / (widest * 4)));
+    for (let start = 0; start < rows; start += perChunk) {
+      const count = Math.min(perChunk, rows - start);
+      const slices = parts.map((p) =>
+        "whole" in p
+          ? { buffer: p.whole, offset: 0, size: p.whole.size }
+          : { buffer: p.buffer, offset: start * p.cols * 4, size: count * p.cols * 4 });
+      slices.push({ buffer: this.uniform(uniform(count)), offset: 0, size: UNIFORM_BYTES });
+      ops.push({
+        kind: "dispatch", pipeline,
+        bindGroup: await this.device.bindGroupSliced(pipeline, slices),
+        workgroups: grid(count),
+      });
+    }
+  }
+
   /**
    * `a @ W`, then `+ bias` broadcast over rows.
    *
@@ -377,21 +523,27 @@ export class VideoDecoderGpu {
    */
   private async linear(ops: ResidentOp[], a: Mat, name: string, bias: GPUBuffer | null, N: number): Promise<Mat> {
     const out = this.take(a.rows * N);
+    // Row-chunked throughout. Output row `i` reads input row `i` and the whole
+    // weight, so cutting rows is the same arithmetic in more dispatches --
+    // which is what lets a 2.18 GB activation exist at all (issue #223).
     if (this.manifest.dtype === "q8") {
-      await this.dispatch(ops, this.kernels.matmulQ8, [
-        a.buffer, this.w(name), this.w(`${name}.scale`), out,
-        this.uniform([["u32", a.rows], ["u32", N], ["u32", a.cols]]),
-      ], matmulQ8Grid(a.rows, N));
+      await this.dispatchRowChunks(ops, this.kernels.matmulQ8, a.rows, [
+        { buffer: a.buffer, cols: a.cols }, { whole: this.w(name) }, { whole: this.w(`${name}.scale`) },
+        { buffer: out, cols: N },
+      ], (count) => [["u32", count], ["u32", N], ["u32", a.cols]], (count) => matmulQ8Grid(count, N));
     } else {
-      await this.dispatch(ops, this.kernels.matmul, [a.buffer, this.w(name), out, this.uniform([
-        ["u32", a.rows], ["u32", N], ["u32", a.cols],
-      ])], [Math.ceil(N / MM_BN), Math.ceil(a.rows / MM_BM), 1]);
+      await this.dispatchRowChunks(ops, this.kernels.matmul, a.rows, [
+        { buffer: a.buffer, cols: a.cols }, { whole: this.w(name) }, { buffer: out, cols: N },
+      ], (count) => [["u32", count], ["u32", N], ["u32", a.cols]],
+      (count) => [Math.ceil(N / MM_BN), Math.ceil(count / MM_BM), 1]);
     }
     if (!bias) return { buffer: out, rows: a.rows, cols: N };
     const biased = this.take(a.rows * N);
-    await this.dispatch(ops, this.kernels.rows, [out, bias, biased, this.uniform([
-      ["u32", a.rows], ["u32", N], ["u32", ELEMENTWISE.add],
-    ])], this.tiles(a.rows * N));
+    await this.dispatchRowChunks(ops, this.kernels.rows, a.rows, [
+      { buffer: out, cols: N }, { whole: bias }, { buffer: biased, cols: N },
+    ], (count) => [["u32", count], ["u32", N], ["u32", ELEMENTWISE.add]], (count) => this.tiles(count * N));
+    // The un-biased product is read only by the add above.
+    this.recycle(out);
     return { buffer: biased, rows: a.rows, cols: N };
   }
 
@@ -405,17 +557,17 @@ export class VideoDecoderGpu {
 
   private async rows(ops: ResidentOp[], x: Mat, vector: GPUBuffer, kind: number): Promise<Mat> {
     const out = this.take(x.rows * x.cols);
-    await this.dispatch(ops, this.kernels.rows, [x.buffer, vector, out, this.uniform([
-      ["u32", x.rows], ["u32", x.cols], ["u32", kind],
-    ])], this.tiles(x.rows * x.cols));
+    await this.dispatchRowChunks(ops, this.kernels.rows, x.rows, [
+      { buffer: x.buffer, cols: x.cols }, { whole: vector }, { buffer: out, cols: x.cols },
+    ], (count) => [["u32", count], ["u32", x.cols], ["u32", kind]], (count) => this.tiles(count * x.cols));
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
   private async pointwise(ops: ResidentOp[], a: Mat, b: Mat, kind: number): Promise<Mat> {
     const out = this.take(a.rows * a.cols);
-    await this.dispatch(ops, this.kernels.elementwise, [a.buffer, b.buffer, out, this.uniform([
-      ["u32", a.rows * a.cols], ["u32", kind],
-    ])], this.tiles(a.rows * a.cols));
+    await this.dispatchRowChunks(ops, this.kernels.elementwise, a.rows, [
+      { buffer: a.buffer, cols: a.cols }, { buffer: b.buffer, cols: b.cols }, { buffer: out, cols: a.cols },
+    ], (count) => [["u32", count * a.cols], ["u32", kind]], (count) => this.tiles(count * a.cols));
     return { buffer: out, rows: a.rows, cols: a.cols };
   }
 
@@ -439,21 +591,29 @@ export class VideoDecoderGpu {
     let q = await this.linear(ops, normed, `${p}q.weight`, this.w(`${p}q.bias`), width);
     let k = await this.linear(ops, normed, `${p}k.weight`, this.w(`${p}k.bias`), width);
     const v = await this.linear(ops, normed, `${p}v.weight`, this.w(`${p}v.bias`), width);
+    // `normed` fed the three projections and nothing else.
+    this.recycle(normed.buffer);
 
     // QK-norm over each head's channels, with no weights (`qk_norm_affine:
     // false`). `groups` is what makes one dispatch normalise `seq * heads` rows
     // of `dim_head` inside a `[seq, width]` buffer.
-    q = await this.qkNorm(ops, q, seq, c.heads, c.dim_head, c.eps);
-    k = await this.qkNorm(ops, k, seq, c.heads, c.dim_head, c.eps);
+    // Each reads its input once and writes a new buffer, so the input is dead
+    // as soon as the dispatch is recorded. Issue #223.
+    q = this.consume(q, await this.qkNorm(ops, q, seq, c.heads, c.dim_head, c.eps));
+    k = this.consume(k, await this.qkNorm(ops, k, seq, c.heads, c.dim_head, c.eps));
 
-    q = await this.rope(ops, q, seq, c.heads, c.dim_head, positions);
-    k = await this.rope(ops, k, seq, c.heads, c.dim_head, positions);
+    q = this.consume(q, await this.rope(ops, q, seq, c.heads, c.dim_head, positions));
+    k = this.consume(k, await this.rope(ops, k, seq, c.heads, c.dim_head, positions));
 
     // `[seq, heads, dim_head]` -> `[heads, seq, dim_head]`, which is the layout
     // `ops/flash_attention` reads.
     const qh = await this.swapLeading(ops, q.buffer, seq, c.heads, c.dim_head);
     const kh = await this.swapLeading(ops, k.buffer, seq, c.heads, c.dim_head);
     const vh = await this.swapLeading(ops, v.buffer, seq, c.heads, c.dim_head);
+    // The row-major q, k and v are read only by the three swaps above.
+    this.recycle(q.buffer);
+    this.recycle(k.buffer);
+    this.recycle(v.buffer);
 
     const attended = this.take(c.heads * seq * c.dim_head);
     await this.dispatch(ops, this.kernels.flashAttention, [qh, kh, vh, mask, attended, this.uniform([
@@ -464,31 +624,58 @@ export class VideoDecoderGpu {
       ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
     ])], flashGrid(seq, c.heads, 1));
 
+    // `qh`, `kh` and `vh` fed the attention and nothing else.
+    this.recycle(qh);
+    this.recycle(kh);
+    this.recycle(vh);
     const merged = await this.swapLeading(ops, attended, c.heads, seq, c.dim_head);
+    this.recycle(attended);
     const projected = await this.linear(
       ops, { buffer: merged, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
     );
+    this.recycle(merged);
     // LayerScale: a per-channel parameter that multiplies the branch before it
     // is added back. Initialised to zero, so dropping it is a block that starts
     // from scratch every forward.
     const scaled = await this.rows(ops, projected, this.w(`${p}scale1`), ELEMENTWISE.multiply);
+    this.recycle(projected.buffer);
     let hidden = await this.pointwise(ops, x, scaled, ELEMENTWISE.add);
+    this.recycle(scaled.buffer);
+
+    // **The block's halfway point.** Everything above is dead once the residual
+    // has been added and nothing below has been allocated, so this is where the
+    // peak can be cut. It has to be a *submit* rather than bookkeeping: a
+    // recycled buffer only becomes safe to hand out again once the pass that
+    // read it has been submitted (issue #223's write-after-read).
+    if (seq > this.splitBlockAboveRows) await this.flush(ops, [hidden.buffer, positions, mask]);
 
     const normed2 = await this.norm(ops, hidden, this.w(`${p}norm2.weight`), c.eps);
     const gate = await this.linear(ops, normed2, `${p}gate.weight`, this.w(`${p}gate.bias`), ffnHidden);
     const up = await this.linear(ops, normed2, `${p}up.weight`, this.w(`${p}up.bias`), ffnHidden);
+    // `normed2` fed both projections and nothing else.
+    this.recycle(normed2.buffer);
 
     const activated = this.take(seq * ffnHidden);
-    await this.dispatch(ops, this.kernels.activation, [gate.buffer, activated, this.uniform([
-      ["u32", seq * ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1],
-    ])], this.tiles(seq * ffnHidden));
+    await this.dispatchRowChunks(ops, this.kernels.activation, seq, [
+      { buffer: gate.buffer, cols: ffnHidden }, { buffer: activated, cols: ffnHidden },
+    ], (count) => [["u32", count * ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1]],
+    (count) => this.tiles(count * ffnHidden));
 
+    // `gate` is read only by the activation above.
+    this.recycle(gate.buffer);
     const gated = await this.pointwise(
       ops, { buffer: activated, rows: seq, cols: ffnHidden }, up, ELEMENTWISE.multiply,
     );
+    this.recycle(activated);
+    this.recycle(up.buffer);
     const ff = await this.linear(ops, gated, `${p}w2.weight`, this.w(`${p}w2.bias`), dim);
+    this.recycle(gated.buffer);
     const scaled2 = await this.rows(ops, ff, this.w(`${p}scale2`), ELEMENTWISE.multiply);
+    this.recycle(ff.buffer);
+    // **`hidden` is not recycled**: the add reads it and what the add writes is
+    // what this returns.
     hidden = await this.pointwise(ops, hidden, scaled2, ELEMENTWISE.add);
+    this.recycle(scaled2.buffer);
     return hidden;
   }
 
@@ -585,7 +772,11 @@ export class VideoDecoderGpu {
     await this.dispatch(ops, this.kernels.layernorm, [
       hidden.buffer, this.w("norm_out.weight"), this.w("norm_out.bias"), normed,
       this.uniform([["u32", seq], ["u32", dim], ["f32", c.eps]]),
-    ], [seq]);
+      // `rowTiles`, not `[seq]`: one workgroup a row and 66,309 rows is past
+      // the 65,535 a dimension allows (issue #211). The kernel already folds
+      // the second dimension; this call site was the one that did not, and it
+      // only shows at a size nothing smaller reaches.
+    ], this.rowTiles(seq));
 
     const patchDim = c.out_channels * c.patch_size_t * c.patch_size * c.patch_size;
     const projected = await this.linear(

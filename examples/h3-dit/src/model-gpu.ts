@@ -296,11 +296,19 @@ export class DitGpu {
    * once, read once, and then never touched again. At 19,027 rows that is 6.0
    * GB of the 31.3 GB that filled a 32 GB card.
    *
-   * Safe before the submit because dispatches recorded into one compute pass
-   * run in order with their writes visible to what follows: a later dispatch
-   * that takes this buffer back out of the pool cannot overtake the earlier one
-   * that read it. Recycling one that is *still to be read* would be a real bug,
-   * so every call site names the last read it is after.
+   * **Held until the submit, not returned to the pool immediately**, and that
+   * distinction was measured rather than reasoned. Handing a buffer straight
+   * back lets a later dispatch in the same pass *write* what an earlier one
+   * still *reads* -- a write-after-read hazard, which Dawn does not barrier
+   * even though it barriers read-after-write. It cost nothing at 2 latent
+   * frames and moved `examples/h3-video`'s twelve-frame golden from 1.753e-1 to
+   * 3.512e+0, 10 wrong pixel levels to 201. The small golden could not see it.
+   *
+   * So `recycle` only takes the buffer out of `lent`; the pool gets it at the
+   * next flush, where the submit is a real barrier. The win is therefore the
+   * *number of flushes*, which is why the block is split at its residual add.
+   * Recycling something still to be read is still a silent wrong answer, so
+   * each call site names the read it comes after.
    */
   /** `recycle` the old tensor and return the new one, for `x = consume(x, f(x))`. */
   private consume(dead: Mat, made: Mat): Mat {
@@ -308,13 +316,13 @@ export class DitGpu {
     return made;
   }
 
+  private readonly quarantine: GPUBuffer[] = [];
+
   private recycle(buffer: GPUBuffer): void {
     const at = this.lent.indexOf(buffer);
     if (at < 0) return;
     this.lent.splice(at, 1);
-    const free = this.pool.get(buffer.size) ?? [];
-    free.push(buffer);
-    this.pool.set(buffer.size, free);
+    this.quarantine.push(buffer);
   }
 
   private release(keep: GPUBuffer[] = []): void {
@@ -324,6 +332,12 @@ export class DitGpu {
       free.push(buffer);
       this.pool.set(buffer.size, free);
     }
+    for (const buffer of this.quarantine) {
+      const free = this.pool.get(buffer.size) ?? [];
+      free.push(buffer);
+      this.pool.set(buffer.size, free);
+    }
+    this.quarantine.length = 0;
     this.lent.length = 0;
     this.lent.push(...keep);
     this.freeUniforms.push(...this.lentUniforms);
