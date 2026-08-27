@@ -726,10 +726,54 @@ not have caught this at any point.
 The three-stage run in `examples/h3-ref2v-web` — VL up, encode the references,
 down, DiT up, sample, down, VAE up, decode. See #212.
 
-**Why the output still moves too much between frames**, which is the open half
-of #216. The flicker — mean absolute difference between consecutive frames, in
-8-bit levels, `tools/measure_flicker.py` — scales with how much reference is in
-the sequence and with how far out of distribution it is:
+### Why the output moves as much as it does between frames — measured, #216
+
+**It is not this port.** Same decoder, same conditioning, same anchor, same
+seed, same geometry, fifty blocks, fifteen steps, upstream's own latent against
+this one (RTX 5090, driver 610.57.04, Dawn via `webgpu` 0.4.0, int8 weights and
+f32 activations; upstream is bf16 on the CPU):
+
+| | flicker |
+|---|---|
+| upstream's own latent, decoded | **22.04** |
+| this port's latent, decoded | **21.70** |
+
+Per position in a cycle of four — one latent frame is four pixel frames:
+
+    upstream  15.83  16.08  18.28  41.15
+    port      15.46  16.25  17.40  40.90
+
+The seam between latent frames is two and a half times the frames inside one,
+in upstream's output as much as in this one.
+
+The two pieces underneath that:
+
+- **The DiT.** Quantising upstream the same way this port does takes the median
+  per-row disagreement from 12.49% to 8.15%, and the random-content floor of the
+  same comparison is 7.37%. After the quantisation is accounted for, real
+  content disagrees exactly as much as random content does — there is no
+  content-specific defect left.
+- **The decoder**, at the geometry a generation actually uses. The shipped
+  golden is *two* latent frames and a generation uses twelve, which is where a
+  temporal stride error would be degenerate. At twelve:
+
+  | latent frames | worst | as 8-bit | RMS 8-bit |
+  |---|---|---|---|
+  | 2 | 2.0% of peak | 2 levels | 0.564 |
+  | 12 | 5.0% of peak | 10 levels | 0.589 |
+
+  The worst pixel is five times louder and the RMS is unchanged, so it is
+  scattered int8 noise rather than a shifted picture — nowhere near the colour
+  fringing a generation shows.
+
+So the fringing is in the latent, and the latent is upstream's. What is left is
+geometry rather than a defect: the model's own request is a short edge of 768
+over five seconds, and every number above was measured at a third of that.
+
+**What the ladder below cannot do on its own**, and why the comparison above had
+to be built: it was only ever measured on this port's output, so it could not
+tell "the model flickers" from "the port makes it flicker" — opposite
+conclusions carrying the same number.
 
 | | flicker |
 |---|---|
@@ -738,7 +782,3 @@ the sequence and with how far out of distribution it is:
 | one image | 14.84 |
 | image + video | 19.19 |
 | a synthetic rainbow tile | 47.33 |
-
-The chunking above is a real defect on that path and does **not** explain the
-one-image row, which takes the unchunked path in both. What has been ruled out
-with numbers is in the issue.

@@ -43,6 +43,17 @@ const manifest = JSON.parse(
  * has run. Reported as a time, never as a correctness claim: this mode has
  * nothing to compare against and says so.
  */
+/**
+ * `--golden DIR` reads the fixture from somewhere other than the weights.
+ *
+ * `convert_decoder.py --skip-weights --dims T,H,W` writes a `golden-TxHxW/`
+ * beside the conversion rather than into it, so a second geometry costs a
+ * fixture and not another 9.69 GB. Issue #216: the shipped golden is **two**
+ * latent frames and a generation uses twelve, which is where a temporal stride
+ * error is degenerate -- the same blind spot the encoder's eight-frame golden
+ * had.
+ */
+const goldenDir = arg("--golden") ?? dir;
 const bench = arg("--bench");
 const golden = bench
   ? (() => {
@@ -50,7 +61,7 @@ const golden = bench
       const c = manifest.config;
       return { dims: [T, H, W] as [number, number, number], frames: T * c.patch_size_t, height: H * c.patch_size, width: W * c.patch_size };
     })()
-  : (JSON.parse(readFileSync(`${dir}/golden.json`, "utf8")) as {
+  : (JSON.parse(readFileSync(`${goldenDir}/golden.json`, "utf8")) as {
       dims: [number, number, number];
       frames: number;
       height: number;
@@ -87,8 +98,8 @@ console.log(`uploaded in ${((performance.now() - uploadStart) / 1000).toFixed(1)
 const [T, H, W] = golden.dims;
 const latent = bench
   ? Float32Array.from({ length: manifest.config.in_channels * T * H * W }, (_, i) => Math.sin(i * 0.37) * 0.5)
-  : f32(`${dir}/latent.bin`);
-const want = bench ? null : f32(`${dir}/pixels.bin`);
+  : f32(`${goldenDir}/latent.bin`);
+const want = bench ? null : f32(`${goldenDir}/pixels.bin`);
 
 const started = performance.now();
 const got = await decoder.decode(latent, golden.dims);
