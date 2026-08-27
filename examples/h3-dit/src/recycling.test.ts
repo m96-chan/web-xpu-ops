@@ -113,6 +113,25 @@ describe("h3 dit / recycling an intermediate", () => {
       .toBeGreaterThan(last);
   });
 
+  it("splits the block wherever a group of buffers has just died", () => {
+    // The quarantine means the peak falls with the number of *submits*, not
+    // with the bookkeeping, so a split has to sit where a group is already
+    // dead. Four of them, and the one inside the attention is the one that was
+    // missing: twelve buffers at `heads * head_dim` are live to the head swaps
+    // and eight are dead straight after, which at 19,027 rows is 4.4 GB. A
+    // split after `attention` returns is too late for those.
+    const attention = method("attention");
+    expect(attention, "the attention must split after the head swaps")
+      .toMatch(/this\.recycle\(v\.buffer\);[\s\S]{0,400}await this\.flush\(ops, \[qh, kh, vh/);
+    // Four in the block -- before the head swaps, after the attention, after
+    // the residual add and after the feed-forward -- plus the one inside
+    // `attention` above. Counted rather than matched: a split that is deleted
+    // costs memory and nothing else, so nothing else would notice.
+    const block = method("block");
+    const splits = block.match(/await this\.flush\(ops, \[/g) ?? [];
+    expect(splits.length, "the block's four split points").toBe(4);
+  });
+
   it("keeps the residual it is about to return", () => {
     // `hidden` is read by the add that produces the block's result. Recycling
     // it would hand the pool the buffer the answer is being written from.

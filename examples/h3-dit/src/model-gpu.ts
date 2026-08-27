@@ -601,7 +601,9 @@ export class DitGpu {
     return { buffer: out, rows: seq, cols: width };
   }
 
-  private async attention(ops: ResidentOp[], q: Mat, k: Mat, v: Mat, seq: number): Promise<Mat> {
+  private async attention(
+    ops: ResidentOp[], q: Mat, k: Mat, v: Mat, seq: number, keep: GPUBuffer[] = [],
+  ): Promise<Mat> {
     const c = this.manifest.config;
     const heads = c.num_attention_heads;
     const headDim = c.attention_head_dim;
@@ -612,6 +614,14 @@ export class DitGpu {
     this.recycle(q.buffer);
     this.recycle(k.buffer);
     this.recycle(v.buffer);
+    // **Split, inside the attention.** Twelve buffers at `heads * head_dim` are
+    // live to here -- q, k, v, the two `qkNorm` outputs, the two rotated ones
+    // and the three swaps -- and eight of them are now in quarantine. Only a
+    // submit lets the pool hand them back, so the split has to be here rather
+    // than after the attention returns: at 19,027 rows those eight are 4.4 GB.
+    if (seq > this.splitBlockAboveRows && keep.length > 0) {
+      await this.flush(ops, [qh, kh, vh, ...keep]);
+    }
     const attended = this.take(heads * seq * headDim);
     await this.dispatch(ops, this.kernels.flashAttention, [
       qh, kh, vh, this.w("attn.noMask"), attended,
@@ -742,7 +752,18 @@ export class DitGpu {
 
     // `shifted` fed the three projections and nothing else.
     this.recycle(shifted.buffer);
-    const merged = await this.attention(ops, q, k, v, seq);
+    // **Split, before the head swaps.** The projections' outputs and the
+    // `qkNorm` ones -- four buffers at `heads * head_dim` -- died on the way
+    // here, and the swaps below are about to ask for three more. Without this
+    // the peak is ten of them rather than six (issue #223).
+    if (seq > this.splitBlockAboveRows) {
+      await this.flush(ops, [q.buffer, k.buffer, v.buffer, x.buffer, positions]);
+    }
+    const merged = await this.attention(ops, q, k, v, seq, [x.buffer, positions]);
+    // **Split one: the attention is finished with.** q, k, v, their rotated and
+    // head-swapped copies and the attended rows are all in quarantine by now,
+    // and only a submit lets the pool hand them out again (issue #223).
+    if (seq > this.splitBlockAboveRows) await this.flush(ops, [merged.buffer, x.buffer, positions]);
     const projected = await this.linear(ops, merged, `${p}attn.to_out.0.weight`, null, c.hidden_size);
     this.recycle(merged.buffer);
     const gated = await this.modulateChunk(
@@ -751,7 +772,7 @@ export class DitGpu {
     let hidden = await this.pointwise(ops, x, gated, ELEMENTWISE.add);
     this.recycle(gated.buffer);
 
-    // **The block's own halfway point.** Everything above is dead once the
+    // **Split two: the block's own halfway point.** Everything above is dead once the
     // residual has been added, and nothing below has been allocated yet, so
     // this is where the peak can be cut without keeping anything alive across
     // it. `x` is deliberately not kept: the caller replaces it with what this
@@ -768,6 +789,10 @@ export class DitGpu {
 
     const ff = await this.feedForward(ops, shifted2, p);
     this.recycle(shifted2.buffer);
+    // **Split three: the feed-forward's four `ffn_dim` buffers are done.** At
+    // 19,027 rows each is 1,095 MB, which is the difference between fitting and
+    // not.
+    if (seq > this.splitBlockAboveRows) await this.flush(ops, [ff.buffer, hidden.buffer, positions]);
     const gated2 = await this.modulateChunk(
       ops, ff, table, stepOffsetRows, runs, 5, 6, ELEMENTWISE.multiply, this.take(seq * c.hidden_size));
     this.recycle(ff.buffer);
