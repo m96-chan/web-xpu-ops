@@ -64,6 +64,11 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=0, help="run only the first N blocks (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--conditioning", help="a directory `gen_real_conditioner_golden.py` wrote: "
+                        "its `hidden.<layer>.bin` and real token tags replace the random text rows (issue #216)")
+    parser.add_argument("--conditioning-layer", type=int, default=50)
+    parser.add_argument("--reference-latent", help="a directory `gen_real_anchor.py` wrote: its `anchor.bin` "
+                        "replaces the random conditioning latent (issue #216)")
     parser.add_argument("--no-reference", action="store_true",
                         help="build the t2va layout instead, so the two can be compared with nothing else changed")
     args = parser.parse_args()
@@ -79,13 +84,48 @@ def main() -> None:
         print(f"running only the first {args.layers} blocks", flush=True)
 
     c = model.config
-    tags = torch.full((args.text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
-    tags[1 : 1 + args.vision_tokens] = MINIMAX_H3_VIDEO_TAG
+
+    # **Real conditioning and a real anchor, when they are given.** Issue #216:
+    # every golden here has fed the transformer `randn` for both, and the loop
+    # matches upstream exactly when it does -- 0.0% rms over all fifty blocks.
+    # The flicker only appears with real references, so the *content* of these
+    # two tensors is the thing that has never been in a golden. Nothing else in
+    # this script changes, so a run with them and a run without differ only in
+    # what the sequence is carrying.
+    real_text = None
+    if args.conditioning:
+        cond_dir = pathlib.Path(args.conditioning).expanduser()
+        meta = json.loads((cond_dir / "golden.json").read_text())
+        seq, dim = meta["hidden"]
+        if dim != c.text_dim:
+            raise SystemExit(f"conditioning is {dim} wide and the transformer wants {c.text_dim}")
+        real_text = torch.from_numpy(
+            np.fromfile(cond_dir / f"hidden.{args.conditioning_layer}.bin", dtype="<f4").reshape(1, seq, dim).copy()
+        )
+        # The real tags too. A reference's vision block is tagged *video* in the
+        # presentation, not text, and which rows carry which tag is part of the
+        # layout rather than a detail of the text.
+        tags = torch.tensor(meta["tokenTags"], dtype=torch.long)
+        args.text_tokens = seq
+        print(f"real conditioning: {seq} rows, layer {args.conditioning_layer}, "
+              f"{int((tags == MINIMAX_H3_VIDEO_TAG).sum())} of them visual", flush=True)
+    else:
+        tags = torch.full((args.text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        tags[1 : 1 + args.vision_tokens] = MINIMAX_H3_VIDEO_TAG
 
     generator = torch.Generator("cpu").manual_seed(args.seed)
-    condition = torch.empty(
-        1, c.in_channels, args.reference_frames, args.reference_size, args.reference_size)
-    condition.normal_(generator=generator)
+    if args.reference_latent:
+        anchor_dir = pathlib.Path(args.reference_latent).expanduser()
+        shape = json.loads((anchor_dir / "anchor.json").read_text())["shape"]
+        condition = torch.from_numpy(
+            np.fromfile(anchor_dir / "anchor.bin", dtype="<f4").reshape(1, *shape).copy()
+        )
+        args.reference_frames, args.reference_size = shape[1], shape[2]
+        print(f"real anchor: {tuple(shape)}  rms {float(condition.pow(2).mean().sqrt()):.4f}", flush=True)
+    else:
+        condition = torch.empty(
+            1, c.in_channels, args.reference_frames, args.reference_size, args.reference_size)
+        condition.normal_(generator=generator)
 
     if args.no_reference:
         # The `t2va` layout: the same target, no conditioning rows, and the text
@@ -129,8 +169,11 @@ def main() -> None:
     video = torch.cat([condition_rows, target_rows])[None]
     audio = torch.empty(1, int(audio_indices.numel()), c.audio_in_channels)
     audio.normal_(generator=generator)
-    text = torch.empty(1, args.text_tokens, c.text_dim)
-    text.normal_(generator=generator)
+    if real_text is not None:
+        text = real_text
+    else:
+        text = torch.empty(1, args.text_tokens, c.text_dim)
+        text.normal_(generator=generator)
 
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
