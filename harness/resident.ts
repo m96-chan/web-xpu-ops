@@ -1,5 +1,6 @@
 import { create, globals } from "webgpu";
 import { compilationFailure, type Binding, type Dispatch, type Runner } from "./wgsl.js";
+import { bindingTypeMismatch, kernelName, storageElementTypes, type ElementType } from "./binding-types.js";
 
 /**
  * A lower-level counterpart to `harness/wgsl.ts#createRunner`, built for issue
@@ -253,6 +254,19 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   const pipelines = new Map<string, Map<string, GPUComputePipeline>>();
   const modules = new Map<string, GPUShaderModule>();
 
+  /**
+   * Issue #221: the three things that have to meet for a binding's type to be
+   * checkable, and which this API deliberately keeps apart.
+   *
+   * `pipelineFor` holds the WGSL, `upload` holds the TypedArray, and only
+   * `bindGroup` knows which buffer is which binding of which pipeline. None of
+   * the three can see the mismatch alone -- which is exactly why #217 survived
+   * eighteen commits. `WeakMap` throughout so none of this keeps a device
+   * object alive past its owner.
+   */
+  const declarations = new WeakMap<GPUComputePipeline, { kernel: string; types: (ElementType | null)[] }>();
+  const uploaded = new WeakMap<GPUBuffer, ArrayBufferView>();
+
   /** Bytes handed out, so an allocation failure can say what was already in flight. */
   let allocated = 0;
 
@@ -282,10 +296,48 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   }
 
   function upload(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void {
+    // Issue #221: remembered, not judged. Nothing here knows what this buffer
+    // is *for* — `bindGroup` is the only place a buffer, a pipeline and a
+    // binding number are in the same room, so that is where the comparison
+    // happens and this only records the evidence.
+    uploaded.set(buffer, data);
     // Same `as any` cast `wgsl.ts#dispatch` documents: `data` is always a
     // plain-`ArrayBuffer`-backed view here, never `SharedArrayBuffer`, but
     // `@webgpu/types` cannot express that without `DOM` lib.
     device.queue.writeBuffer(buffer, offset, data.buffer as any, data.byteOffset, data.byteLength);
+  }
+
+  /**
+   * Does what was uploaded into each of these buffers agree with what this
+   * pipeline declares at that binding? The message, or null.
+   *
+   * **Judged here and nowhere else, and the reason is buffer pooling.** The
+   * first version also checked inside `upload`, against whatever binding the
+   * buffer had been given last — and on Anima's real forward it reported
+   * "RMSNorm: binding 0" for a buffer that was `ropeAxes`' `positions`. The
+   * pool had handed the same buffer out for both. It caught the bug and named
+   * the wrong kernel, and the same staleness would eventually reject a pooled
+   * buffer legitimately used as `array<i32>` in one op and `array<f32>` in
+   * another. A check that fails on correct code is worse than no check.
+   *
+   * At bind time there is no ambiguity: this pipeline, this index, this
+   * buffer's most recent contents.
+   *
+   * **What that gives up**, stated rather than left to be discovered: a buffer
+   * bound once and rewritten many times afterwards — `llm/engine-q8-resident.ts`
+   * binds at construction and uploads per token — is checked on the upload
+   * before its bind group and not on the ones after. The type a call site
+   * uploads is fixed by its code rather than by the run, so the first pass
+   * through that code is the one that matters, and that pass is covered.
+   */
+  function bindingMismatch(pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[]): string | null {
+    const declaration = declarations.get(pipeline);
+    if (!declaration) return null;
+    return bindingTypeMismatch(
+      declaration.kernel,
+      declaration.types,
+      buffers.map((b) => uploaded.get(b) ?? null),
+    );
   }
 
   async function pipelineFor(code: string, entry = "main"): Promise<GPUComputePipeline> {
@@ -312,6 +364,9 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
     const invalid = await device.popErrorScope();
     if (invalid) throw new Error(`resident pipeline is not valid: ${invalid.message}`);
+    // Recorded here rather than parsed at every bind group: `bindGroup` is
+    // called thousands of times a forward and `pipelineFor` once per kernel.
+    declarations.set(pipeline, { kernel: kernelName(code), types: storageElementTypes(code) });
     const entries = pipelines.get(code) ?? new Map<string, GPUComputePipeline>();
     entries.set(entry, pipeline);
     pipelines.set(code, entries);
@@ -323,6 +378,11 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     pipeline: GPUComputePipeline,
     slices: { buffer: GPUBuffer; offset: number; size: number }[],
   ): Promise<GPUBindGroup> {
+    // The sliced path binds a *range* of a buffer, so what was uploaded into
+    // the whole of it is not necessarily what this binding reads -- but the
+    // element type is the same either way, which is the only thing checked.
+    const mismatch = bindingMismatch(pipeline, slices.map((slice) => slice.buffer));
+    if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({
@@ -337,6 +397,8 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    const mismatch = bindingMismatch(pipeline, buffers);
+    if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
     device.pushErrorScope("validation");
     const group = device.createBindGroup({

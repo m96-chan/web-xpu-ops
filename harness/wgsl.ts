@@ -1,4 +1,5 @@
 import { create, globals } from "webgpu";
+import { bindingTypeMismatch, kernelName, storageElementTypes } from "./binding-types.js";
 
 /**
  * Runs a WGSL compute shader and reads its outputs back.
@@ -227,6 +228,21 @@ export async function createRunner(): Promise<Runner | null> {
         if (failure) throw new Error(failure);
         compiled.set(code, module);
       }
+
+      // Issue #221. Checked here, before a single buffer exists, because the
+      // whole class of bug this catches produces no error later: WebGPU copies
+      // whatever bytes it is given into whatever the kernel declared, and an
+      // `Int32Array` in an `array<f32>` reads back as denormals (#217). Every
+      // op's `wgsl.test.ts` goes through this function, so every op is covered
+      // by having tests at all rather than by anyone remembering to check.
+      const mismatch = bindingTypeMismatch(
+        kernelName(code),
+        storageElementTypes(code),
+        bindings.map((b) =>
+          b.kind === "storage" ? b.data : b.kind === "out" ? b.type : null,
+        ),
+      );
+      if (mismatch) throw new Error(mismatch);
 
       const created: GPUBuffer[] = [];
       const outputs: { spec: Extract<Binding, { kind: "out" }>; buffer: GPUBuffer }[] = [];

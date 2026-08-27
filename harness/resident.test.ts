@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runnerFromResident, type BatchProfileSink } from "./resident.js";
+import { runnerFromResident, type BatchProfileSink, type ResidentDevice } from "./resident.js";
 import { params } from "./wgsl.js";
 import { kernel, residentTest, skipUnlessPresent, useResidentGpu } from "./suite.js";
 
@@ -30,8 +30,8 @@ describe("resident device", () => {
     const bBuf = device.createStorageBuffer(N * 4);
     const sumBuf = device.createStorageBuffer(N * 4);
     const productBuf = device.createStorageBuffer(N * 4);
-    const addParams = device.createUniformBuffer(16);
-    const mulParams = device.createUniformBuffer(16);
+    const addParams = device.createUniformBuffer(32);
+    const mulParams = device.createUniformBuffer(32);
     const staging = device.createStorageBuffer(N * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
 
     device.upload(aBuf, 0, a);
@@ -76,7 +76,7 @@ describe("resident device", () => {
     const a = device.createStorageBuffer(16);
     const b = device.createStorageBuffer(16);
     const out = device.createStorageBuffer(16);
-    const uniform = device.createUniformBuffer(16);
+    const uniform = device.createUniformBuffer(32);
     const staging = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     device.upload(a, 0, new Float32Array([1, 1, 1, 1]));
     device.upload(b, 0, new Float32Array([2, 2, 2, 2]));
@@ -108,12 +108,12 @@ describe("resident device", () => {
     const a1 = device.createStorageBuffer(16);
     const b1 = device.createStorageBuffer(16);
     const out1 = device.createStorageBuffer(16);
-    const uniform1 = device.createUniformBuffer(16);
+    const uniform1 = device.createUniformBuffer(32);
     const staging1 = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     const a2 = device.createStorageBuffer(16);
     const b2 = device.createStorageBuffer(16);
     const out2 = device.createStorageBuffer(16);
-    const uniform2 = device.createUniformBuffer(16);
+    const uniform2 = device.createUniformBuffer(32);
     const staging2 = device.createStorageBuffer(16, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
     device.upload(a1, 0, new Float32Array([1, 2, 3, 4]));
     device.upload(b1, 0, new Float32Array([10, 10, 10, 10]));
@@ -233,8 +233,8 @@ describe("resident device / BatchProfile (issue #131)", () => {
     const b = device.createStorageBuffer(16);
     const sum = device.createStorageBuffer(16);
     const product = device.createStorageBuffer(16);
-    const addParams = device.createUniformBuffer(16);
-    const mulParams = device.createUniformBuffer(16);
+    const addParams = device.createUniformBuffer(32);
+    const mulParams = device.createUniformBuffer(32);
     device.upload(a, 0, new Float32Array([1, 2, 3, 4]));
     device.upload(b, 0, new Float32Array([10, 10, 10, 10]));
     device.upload(addParams, 0, new Uint8Array(params([["u32", 4], ["u32", 0]])));
@@ -330,5 +330,102 @@ describe("resident device / BatchProfile (issue #131)", () => {
     );
 
     expect(sink.gpuEntries.map((e) => e.label)).toEqual(["add"]);
+  });
+  /**
+   * Issue #221, out of #217.
+   *
+   * `ropeAxes` is the kernel the bug was actually in, so it is the kernel used
+   * here rather than a fixture: `positions` is `array<f32>` at binding 2, two
+   * callers kept uploading an `Int32Array`, and for eighteen commits nothing
+   * anywhere said so. WebGPU copies the bytes, a small integer read as a float
+   * is a denormal, every rotation angle became zero, and Anima's page drew one
+   * flat colour with no error in the console.
+   *
+   * No weights, no golden, four floats. The verifier that *could* have caught
+   * this needed 5 GB and a GPU, which is why it was a script nobody ran.
+   */
+});
+
+describe("resident device / binding types (issue #221)", () => {
+  const getDevice = useResidentGpu();
+
+  describe("the type the host uploads against the type the kernel declared", () => {
+    const ropeAxes = kernel(new URL("../ops/rope/index.ts", import.meta.url), "axes");
+
+    /** Buffers shaped for `ropeAxes`, minus whatever the caller wants to get wrong. */
+    const slots = (device: ResidentDevice) => ({
+      input: device.createStorageBuffer(64),
+      axisDims: device.createStorageBuffer(16),
+      positions: device.createStorageBuffer(64),
+      output: device.createStorageBuffer(64),
+      params: device.createUniformBuffer(32),
+    });
+
+    residentTest("refuses an Int32Array bound where the kernel declared array<f32>", async (device) => {
+      const s = slots(device);
+      device.upload(s.positions, 0, new Int32Array([0, 1, 2, 3]));
+      device.upload(s.axisDims, 0, new Uint32Array([2, 2]));
+      const pipeline = await device.pipelineFor(ropeAxes);
+      // Thrown at the bind group, not at the upload: until a buffer is bound to
+      // a pipeline nothing knows what it is *for*, and `upload` is called first
+      // in both callers that had the bug.
+      await expect(
+        device.bindGroup(pipeline, [s.input, s.axisDims, s.positions, s.output, s.params]),
+      ).rejects.toThrow(/binding 2.*array<f32>.*Int32Array/s);
+    });
+
+    residentTest("refuses it through the sliced path too, which is the one #217 went through", async (device) => {
+      // Not a second copy of the test above: removing *both* call sites in
+      // `resident.ts` failed exactly one test, which means the sliced path had
+      // no observation point at all. It is also the path Anima's rope actually
+      // takes -- `applyRope` binds a slice per chunk, because the sequence is
+      // longer than WebGPU's 65,535-workgroup limit allows in one dispatch.
+      const s = slots(device);
+      device.upload(s.positions, 0, new Int32Array([0, 1, 2, 3]));
+      const pipeline = await device.pipelineFor(ropeAxes);
+      const whole = (buffer: GPUBuffer, size: number) => ({ buffer, offset: 0, size });
+      await expect(device.bindGroupSliced(pipeline, [
+        whole(s.input, 64), whole(s.axisDims, 16), whole(s.positions, 64),
+        whole(s.output, 64), whole(s.params, 32),
+      ])).rejects.toThrow(/binding 2.*array<f32>.*Int32Array/s);
+    });
+
+    residentTest("judges a pooled buffer by the binding it has now, not the one it had", async (device) => {
+      // The case that made the first version of this wrong. Anima recycles
+      // activation buffers through a pool, so one buffer is `RMSNorm`'s input
+      // on one dispatch and `ropeAxes`' `positions` on the next. A check that
+      // remembered a buffer's *previous* binding reported "RMSNorm: binding 0"
+      // for a positions buffer -- right that something was wrong, wrong about
+      // what -- and would eventually have rejected a pooled buffer legitimately
+      // used as `array<i32>` in one op and `array<f32>` in another.
+      const s = slots(device);
+      const pipeline = await device.pipelineFor(ropeAxes);
+      // First life: floats at binding 0, which is `array<f32>`. Fine.
+      device.upload(s.input, 0, new Float32Array([0, 1, 2, 3]));
+      await device.bindGroup(pipeline, [s.input, s.axisDims, s.positions, s.output, s.params]);
+      // Second life: the same buffer, recycled as `axis_dims`, which is
+      // `array<u32>`, and rewritten as such. The stale expectation from its
+      // first life must not fire.
+      device.upload(s.input, 0, new Uint32Array([2, 2]));
+      await expect(
+        device.bindGroup(pipeline, [s.positions, s.input, s.output, s.output, s.params]),
+      ).resolves.toBeDefined();
+    });
+
+    residentTest("says nothing about the correct types, or about packed bytes", async (device) => {
+      // The other half of the mutation: this has to stay green, or the check is
+      // just a way to fail. `axis_dims` is `array<u32>` and gets a
+      // `Uint32Array`; `params` is a uniform struct and gets packed bytes,
+      // which have no element type to disagree with.
+      const s = slots(device);
+      const pipeline = await device.pipelineFor(ropeAxes);
+      device.upload(s.positions, 0, new Float32Array([0, 1, 2, 3]));
+      device.upload(s.axisDims, 0, new Uint32Array([2, 2]));
+      device.upload(s.params, 0, new Uint8Array(params([["u32", 4], ["u32", 1], ["u32", 4], ["u32", 2], ["f32", 256]])));
+      await expect(
+        device.bindGroup(pipeline, [s.input, s.axisDims, s.positions, s.output, s.params]),
+      ).resolves.toBeDefined();
+      expect(() => device.upload(s.positions, 0, new Float32Array([1, 1, 1, 1]))).not.toThrow();
+    });
   });
 });
