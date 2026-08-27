@@ -15,7 +15,7 @@
  *     npx tsx examples/h3-ref2v/src/verify-ref2va-sample.ts \
  *       --dir ~/h3-work/h3-ref-gpu-4 --golden ~/h3-work/h3-ref2va-sample
  */
-import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { createResidentDevice } from "../../../harness/resident.js";
 import { DitGpu, type DitManifest } from "../../h3-dit/src/model-gpu.js";
 import { ditKernels } from "../../h3-dit/src/kernels-node.js";
@@ -193,6 +193,20 @@ for (let i = 0; i < anchored; i += 1) {
 console.log(`anchor drift: ${anchorDrift.toExponential(3)}`);
 
 const got = { video: videoRows, audio: audioRows };
+
+// `--dump DIR` writes this port's rows in the golden's own layout, so the two
+// latents can be decoded and looked at side by side. Issue #216: the flicker
+// ladder had only ever been measured on this port's output, which cannot say
+// whether the model flickers or the port makes it -- and those are opposite
+// conclusions.
+const dumpDir = arg("--dump");
+if (dumpDir) {
+  mkdirSync(dumpDir, { recursive: true });
+  copyFileSync(`${goldenDir}/golden.json`, `${dumpDir}/golden.json`);
+  writeFileSync(`${dumpDir}/output.video.bin`, Buffer.from(videoRows.buffer, videoRows.byteOffset, videoRows.byteLength));
+  writeFileSync(`${dumpDir}/output.audio.bin`, Buffer.from(audioRows.buffer, audioRows.byteOffset, audioRows.byteLength));
+  console.log(`wrote this port's rows to ${dumpDir}`);
+}
 
 /**
  * The temporal roughness of the generated rows, in this port and in upstream's
