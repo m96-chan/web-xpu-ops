@@ -19,6 +19,7 @@
  * The two are never compared against each other: two ports that drift the same
  * way agree with each other and with nothing else.
  */
+import { ropeAxisPositionBuffer } from "../../../ops/rope/index.js";
 import type { BatchProfile, BatchProfileSink, ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
@@ -860,7 +861,16 @@ export async function animaForwardResident(
    * rather than like a bug.
    */
   const positionSlots: Slot[] = axisDims.map((_, axis) => {
-    const ids = new Int32Array(seq * 3 + axisDims.length * 4).fill(9999);
+    // **f32, matching `axes.wgsl`'s binding**, which stopped being `i32` when
+    // `ropeAxes` learned fractional positions (#206). Anima's positions are
+    // whole numbers and stay exact here — but an `Int32Array` uploaded to an
+    // `array<f32>` is read bit-for-bit, and a small integer's bits are a
+    // denormal: every angle became zero, every token got the same rotation, and
+    // the DiT returned a latent that is constant per channel. The image is a
+    // single colour and nothing errors. `examples/zimage/src/dit-gpu.ts` was
+    // updated in that commit and this file and `zimage/src/dit-resident.ts`
+    // were not.
+    const ids = ropeAxisPositionBuffer(new Float32Array(seq * 3), axisDims.length);
     let at = 0;
     for (let t = 0; t < T / patchTemporal; t += 1) {
       for (let h = 0; h < H / patchSpatial; h += 1) {

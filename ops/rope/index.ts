@@ -2,6 +2,7 @@ export {
   rope,
   h3RopePermutation,
   ropeAxes,
+  ropeAxisPositionBuffer,
   ropeCache,
   ropeFrequencyParams,
   type RoPEArgs,

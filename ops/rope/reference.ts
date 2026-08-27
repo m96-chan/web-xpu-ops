@@ -641,3 +641,29 @@ export function h3RopePermutation(headDim: number, rotDim: number, axes = 3): nu
   for (let c = rotDim; c < headDim; c += 1) permutation[c] = c;
   return permutation;
 }
+
+/**
+ * The `positions` buffer `wgsl/axes.wgsl` binds, with the slack it expects.
+ *
+ * **`Float32Array`, and that is the whole point of this function existing.**
+ * The binding was `array<i32>` until `ropeAxes` learned fractional positions
+ * (#206) and is `array<f32>` now. Uploading an `Int32Array` to it is not an
+ * error anywhere: WebGPU copies the bytes, and a small integer's bit pattern
+ * read as a float is a denormal — so every angle becomes zero, every token gets
+ * the identity rotation, and the model returns a plausible tensor with no
+ * positional information in it. `examples/anima` shipped that for eighteen
+ * commits and drew a single flat colour.
+ *
+ * Four axes of slack past the end, filled with something visible, for the same
+ * reason `testing.ts` does it: a lane that ran past `count` reads there, and
+ * zeros would look like the identity rotation rather than like a bug.
+ */
+export function ropeAxisPositionBuffer(
+  positions: ArrayLike<number>,
+  numAxes: number,
+  slackValue = 9999,
+): Float32Array {
+  const out = new Float32Array(positions.length + numAxes * 4).fill(slackValue);
+  out.set(Array.from(positions), 0);
+  return out;
+}
