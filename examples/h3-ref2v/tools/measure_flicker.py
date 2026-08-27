@@ -51,6 +51,9 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("inputs", nargs="+")
     p.add_argument("--shape", help="T,H,W for a bare .rgb")
+    p.add_argument("--colour", action="store_true",
+                   help="also report how far each frame is from monochrome — the colour fringe R2V shows "
+                        "is periodic, and the period is the thing to compare against upstream")
     p.add_argument("--period", type=int, default=0,
                    help="also report the mean per position in a cycle of this length — "
                         "4 tests whether the VAE's temporal upsample is the source")
@@ -65,6 +68,15 @@ def main() -> int:
         size = f"{meta['width']}x{meta['height']}"
         worst = max(steps) if steps else 0.0
         print(f"{path.name:<28}  {len(frames):>6}  {size:>9}  {mean:>8.2f}  {worst:>10.2f}")
+        if args.colour:
+            # Mean distance from grey, per frame. The fringe is a *colour*
+            # artefact and the flicker number cannot see colour at all: a frame
+            # that is uniformly brighter and a frame whose channels have come
+            # apart give the same mean absolute difference.
+            spread = np.abs(frames - frames.mean(1, keepdims=True)).mean((1, 2, 3))
+            print(f"{'':<28}  colour spread per frame: "
+                  + " ".join(f"{v:.1f}" for v in spread[:24])
+                  + (" …" if len(spread) > 24 else ""))
         if args.period > 1 and steps:
             # A latent frame becomes `temporal_compression_ratio` pixel frames.
             # If the upsample were the source, the difference would land on one

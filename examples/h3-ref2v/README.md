@@ -746,6 +746,19 @@ Per position in a cycle of four — one latent frame is four pixel frames:
 The seam between latent frames is two and a half times the frames inside one,
 in upstream's output as much as in this one.
 
+**And the colour fringe is upstream's too.** The flicker number cannot see
+colour at all — a frame that is uniformly brighter and a frame whose channels
+have come apart give the same mean absolute difference — so it took its own
+measurement. Mean distance from grey, per frame:
+
+    upstream  2.7 6.3 6.7 5.8 | 2.6 10.2 10.9 12.0 | 2.5 5.6 6.9 4.2 | 2.8 9.2 10.1 10.1
+    port      2.6 4.8 5.0 4.4 | 1.9 10.7 11.0 15.4 | 2.3 4.2 5.1 2.8 | 2.0 9.8 10.9  9.9
+
+**One frame in four comes back to grey, in both.** That is the temporal
+upsample's four sub-frames, not an index gone wrong — and the picture is worth
+looking at before believing it, because a run of clean-then-rainbow frames looks
+exactly like a stride bug and is not one.
+
 The two pieces underneath that:
 
 - **The DiT.** Quantising upstream the same way this port does takes the median
