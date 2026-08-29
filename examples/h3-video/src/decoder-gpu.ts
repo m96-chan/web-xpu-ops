@@ -370,7 +370,8 @@ export class VideoDecoderGpu {
     return made;
   }
 
-  private release(keep: GPUBuffer[] = []): void {
+  /** Returns how many bytes it actually destroyed — 0 when the plan was empty. */
+  private release(keep: GPUBuffer[] = []): number {
     for (const buffer of this.lent) {
       if (keep.includes(buffer)) continue;
       const free = this.pool.get(buffer.size) ?? [];
@@ -398,14 +399,19 @@ export class VideoDecoderGpu {
     // was drained would plan against sizes that had not yet arrived.
     const free = [...this.pool.entries()].map(([size, buffers]) => ({ size, count: buffers.length }));
     const plan = evictionPlan(free, this.maxFreePoolBytes);
+    let evictedBytes = 0;
     for (const [size, count] of plan) {
       const buffers = this.pool.get(size);
       if (!buffers) continue;
       for (let i = 0; i < count; i++) {
-        buffers.pop()?.destroy();
+        const buffer = buffers.pop();
+        if (!buffer) break;
+        buffer.destroy();
+        evictedBytes += size;
       }
       if (buffers.length === 0) this.pool.delete(size);
     }
+    return evictedBytes;
   }
 
   /**
@@ -427,7 +433,13 @@ export class VideoDecoderGpu {
     this.submitMs += performance.now() - at;
     this.dispatches += ops.length;
     ops.length = 0;
-    this.release(keep);
+    const evicted = this.release(keep);
+    // An eviction is bookkeeping until Dawn ticks: a destroyed buffer's VRAM
+    // comes back only after RECLAIM_ROUND_TRIPS submits (issue #213, measured
+    // in harness/verify-reclaim.ts). Without this the run refused a 411 MB
+    // allocation while our own counter said 25 of 32 GB -- the other seven
+    // were destroyed and not yet returned.
+    if (evicted > 0) await this.device.reclaim();
   }
 
   /** Where a decode's wall clock went. Reset at the top of `decode`. */

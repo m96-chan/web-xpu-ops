@@ -168,6 +168,16 @@ Entries record **why** a change was needed. What changed is in the diff.
   buffers are never touched; eviction runs only after both have already been
   folded into the pool at the flush.
 
+  **The eviction alone was bookkeeping, not memory.** The acceptance run still
+  refused a 411 MB allocation at 25.00 GB held on a 32 GB card — the accounting
+  said 25 GB, the driver still held around 32. `destroy()` only schedules the
+  free; Dawn returns a destroyed buffer's VRAM after `RECLAIM_ROUND_TRIPS`
+  device round trips, not at the destroy call (issue #213,
+  `harness/reclaim.ts`). `release()` now returns the byte count it destroyed,
+  and `flush()` in both classes `await`s `this.device.reclaim()` when that
+  count is greater than zero — and only then, since most flushes at short
+  sequences evict nothing and a round trip is not free.
+
 ### Added
 
 - **R2V's generator holds the model to its own specification** (issue #212).

@@ -181,4 +181,56 @@ describe("h3 dit / recycling an intermediate", () => {
       expect(inside, `${name}: the planned buffers must actually be destroyed`).toMatch(/\.destroy\(\)/);
     }
   });
+
+  it("release() returns the byte count it destroyed", () => {
+    // Issue #223, the reclaim step. `flush` needs to know whether anything was
+    // actually evicted, and the only place that knows is `release` itself --
+    // it is the one holding the plan.
+    for (const [name, body] of [
+      ["dit", code],
+      ["decoder", readFileSync(
+        fileURLToPath(new URL("../../h3-video/src/decoder-gpu.ts", import.meta.url)), "utf8",
+      ).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "")],
+    ] as const) {
+      expect(body, `${name}: release() must be declared to return a number`)
+        .toMatch(/private release\(keep: GPUBuffer\[\] = \[\]\): number \{/);
+
+      const at = body.indexOf("private release(keep");
+      expect(at, `${name}: release() is not in the file`).toBeGreaterThan(-1);
+      const rest = body.slice(at);
+      const end = rest.indexOf("\n  }\n");
+      expect(end, `${name}: release() has no end`).toBeGreaterThan(-1);
+      const inside = rest.slice(0, end);
+
+      expect(inside, `${name}: release() must accumulate what it actually destroys`)
+        .toMatch(/evictedBytes/);
+      expect(inside, `${name}: release() must return what it destroyed`)
+        .toMatch(/return evictedBytes;/);
+    }
+  });
+
+  it("flush() reclaims only when release() actually evicted something", () => {
+    // Issue #223 (the reclaim step, #213 measured): destroy() only schedules
+    // freeing -- Dawn returns a destroyed buffer's VRAM after
+    // `RECLAIM_ROUND_TRIPS` submits, not at the destroy call. A flush that
+    // evicted nothing must not pay for four round trips it does not need.
+    for (const [name, body] of [
+      ["dit", code],
+      ["decoder", readFileSync(
+        fileURLToPath(new URL("../../h3-video/src/decoder-gpu.ts", import.meta.url)), "utf8",
+      ).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "")],
+    ] as const) {
+      const at = body.indexOf("private async flush(");
+      expect(at, `${name}: flush() is not in the file`).toBeGreaterThan(-1);
+      const rest = body.slice(at);
+      const end = rest.indexOf("\n  }\n");
+      expect(end, `${name}: flush() has no end`).toBeGreaterThan(-1);
+      const inside = rest.slice(0, end);
+
+      expect(inside, `${name}: flush() must capture release()'s return value`)
+        .toMatch(/const evicted = this\.release\(keep\);/);
+      expect(inside, `${name}: flush() must reclaim only when release() evicted > 0`)
+        .toMatch(/if \(evicted > 0\) await this\.device\.reclaim\(\);/);
+    }
+  });
 });
