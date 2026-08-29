@@ -151,4 +151,34 @@ describe("h3 dit / recycling an intermediate", () => {
         .toMatch(/for \(const buffer of this\.quarantine\)[\s\S]{0,200}this\.pool\.set\(/);
     }
   });
+
+  it("evicts the free pool, largest-first, after the quarantine drain", () => {
+    // Issue #223: the pool only ever grew, so resident memory was the SUM of
+    // every size class's own peak. `evictionPlan` bounds the FREE half of the
+    // pool; it must only run once `lent` and `quarantine` have both been
+    // folded in, and it must only ever destroy what it plans to.
+    for (const [name, body] of [
+      ["dit", code],
+      ["decoder", readFileSync(
+        fileURLToPath(new URL("../../h3-video/src/decoder-gpu.ts", import.meta.url)), "utf8",
+      ).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "")],
+    ] as const) {
+      const at = body.indexOf("private release(keep");
+      expect(at, `${name}: release() is not in the file`).toBeGreaterThan(-1);
+      const rest = body.slice(at);
+      const end = rest.indexOf("\n  }\n");
+      expect(end, `${name}: release() has no end`).toBeGreaterThan(-1);
+      const inside = rest.slice(0, end);
+
+      const quarantineDrain = inside.indexOf("this.quarantine.length = 0");
+      expect(quarantineDrain, `${name}: release() must drain the quarantine`).toBeGreaterThan(-1);
+
+      const evictionCall = inside.indexOf("evictionPlan(");
+      expect(evictionCall, `${name}: release() must call evictionPlan`).toBeGreaterThan(-1);
+      expect(evictionCall, `${name}: eviction must run after the quarantine drain`)
+        .toBeGreaterThan(quarantineDrain);
+
+      expect(inside, `${name}: the planned buffers must actually be destroyed`).toMatch(/\.destroy\(\)/);
+    }
+  });
 });

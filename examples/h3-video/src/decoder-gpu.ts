@@ -41,6 +41,7 @@ import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
+import { evictionPlan } from "./pool.js";
 
 export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry: string }[] = [
   { key: "matmul", op: "matmul", entry: "kernel" },
@@ -177,6 +178,23 @@ export class VideoDecoderGpu {
    * 0, i.e. always -- measured at no cost on both goldens.
    */
   splitBlockAboveRows = 0;
+
+  /**
+   * The most the FREE half of the pool (buffers in neither `lent` nor
+   * `quarantine`) is allowed to hold, enforced at the end of `release()`.
+   *
+   * Issue #223, the same knob `examples/h3-dit/src/model-gpu.ts` carries and
+   * for the same reason: the pool only ever grew, so resident memory was the
+   * SUM of every size class's own peak where what a step actually needs at
+   * once is the MAX. See that field's doc comment for the measured table.
+   * 2 GiB keeps most of one stretch's working set warm between blocks while
+   * forcing consecutive stretches to share instead of accumulate.
+   *
+   * Settable, so a measurement can turn eviction off with `Infinity`. Do not
+   * tune this beyond making the run fit — it is a correctness-of-fit change,
+   * not a performance one (rule 8).
+   */
+  maxFreePoolBytes = 2 * 1024 ** 3;
 
   private constructor(
     private readonly device: ResidentDevice,
@@ -374,6 +392,20 @@ export class VideoDecoderGpu {
     // exactly when this runs.
     this.freeUniforms.push(...this.lentUniforms);
     this.lentUniforms.length = 0;
+
+    // Issue #223: bound the free half of the pool now that `lent` and
+    // `quarantine` have both been folded into it -- evicting before either
+    // was drained would plan against sizes that had not yet arrived.
+    const free = [...this.pool.entries()].map(([size, buffers]) => ({ size, count: buffers.length }));
+    const plan = evictionPlan(free, this.maxFreePoolBytes);
+    for (const [size, count] of plan) {
+      const buffers = this.pool.get(size);
+      if (!buffers) continue;
+      for (let i = 0; i < count; i++) {
+        buffers.pop()?.destroy();
+      }
+      if (buffers.length === 0) this.pool.delete(size);
+    }
   }
 
   /**

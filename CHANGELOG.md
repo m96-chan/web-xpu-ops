@@ -142,6 +142,32 @@ Entries record **why** a change was needed. What changed is in the diff.
   decoder manifest so no caller has to find them, and the three callers
   (`h3-dit`'s sampler, `h3-dit-web`, `h3-ref2v`'s sampler) all use it.
 
+- **`DitGpu` and `VideoDecoderGpu`'s buffer pools only ever grew, so resident
+  memory was the SUM of every size class's own peak where what a step
+  actually needs at once is the MAX** (issue #223). After the token-major
+  kernel change (5d52019) a 19,027-row step still refused at 32.14 GB held,
+  asking for a 1095 MB buffer:
+
+  | resident | count x size | class |
+  |---|---|---|
+  | 12.02 GB | 156 x 77 MB | weights |
+  | 8.02 GB | 208 x 39 MB | weights |
+  | 3.85 GB | 7 x 549 MB | attention-width activations |
+  | 3.28 GB | 3 x 1095 MB | ffn-width activations (a 4th refused) |
+  | 1.64 GB | 4 x 411 MB | hidden-width |
+  | 1.16 GB | 50 x 23 MB | |
+
+  The attention stretch and the feed-forward stretch of a block run one after
+  the other and never need their buffers at the same time, but a free buffer
+  stayed allocated forever, so both stretches' peaks stayed resident at once.
+  A new pure helper, `evictionPlan` (`examples/h3-video/src/pool.ts`, shared
+  by both classes), decides which free buffers to destroy — largest-first,
+  since one big buffer frees as much as fifty small ones — so `release()` can
+  bound the FREE half of the pool to a `maxFreePoolBytes` budget (2 GiB by
+  default, settable, `Infinity` to turn it off). `lent` and `quarantine`
+  buffers are never touched; eviction runs only after both have already been
+  folded into the pool at the flush.
+
 ### Added
 
 - **R2V's generator holds the model to its own specification** (issue #212).

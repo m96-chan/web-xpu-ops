@@ -41,6 +41,7 @@ import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
+import { evictionPlan } from "../../h3-video/src/pool.js";
 import { MODALITY_NUM, type PackedLayout } from "./model.js";
 
 export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: string }[] = [
@@ -190,6 +191,35 @@ export class DitGpu {
    * what is left is a way to turn it *off* for a measurement.
    */
   splitBlockAboveRows = 0;
+
+  /**
+   * The most the FREE half of the pool (buffers in neither `lent` nor
+   * `quarantine`) is allowed to hold, enforced at the end of `release()`.
+   *
+   * Issue #223: the pool only ever grew, so resident memory was the SUM of
+   * every size class's own peak — at 19,027 rows, after the token-major
+   * kernel change (5d52019):
+   *
+   *     12.02 GB — 156 x   77 MB   weights
+   *      8.02 GB — 208 x   39 MB   weights
+   *      3.85 GB —   7 x  549 MB   attention-width activations
+   *      3.28 GB —   3 x 1095 MB   ffn-width activations (a 4th refused)
+   *      1.64 GB —   4 x  411 MB   hidden-width
+   *      1.16 GB —  50 x   23 MB
+   *      ...                                          (32.14 GB held, refused)
+   *
+   * but what a step actually needs at once is the MAX: the attention stretch
+   * and the feed-forward stretch of a block run one after the other and never
+   * need their buffers at the same time. 2 GiB keeps most of the attention
+   * set (4 x 549 MB) warm between blocks — churn of ~1-2 recreations of
+   * ~549 MB per block, microseconds-to-ms each against an 85 s step — while
+   * forcing the attention and ffn stretches to share rather than accumulate.
+   *
+   * Settable, so a measurement can turn eviction off with `Infinity`. Do not
+   * tune this beyond making the run fit — it is a correctness-of-fit change,
+   * not a performance one (rule 8).
+   */
+  maxFreePoolBytes = 2 * 1024 ** 3;
 
   submitMs = 0;
   readbackMs = 0;
@@ -347,6 +377,20 @@ export class DitGpu {
     this.lent.push(...keep);
     this.freeUniforms.push(...this.lentUniforms);
     this.lentUniforms.length = 0;
+
+    // Issue #223: bound the free half of the pool now that `lent` and
+    // `quarantine` have both been folded into it — evicting before either
+    // was drained would plan against sizes that had not yet arrived.
+    const free = [...this.pool.entries()].map(([size, buffers]) => ({ size, count: buffers.length }));
+    const plan = evictionPlan(free, this.maxFreePoolBytes);
+    for (const [size, count] of plan) {
+      const buffers = this.pool.get(size);
+      if (!buffers) continue;
+      for (let i = 0; i < count; i++) {
+        buffers.pop()?.destroy();
+      }
+      if (buffers.length === 0) this.pool.delete(size);
+    }
   }
 
   private async flush(ops: ResidentOp[], keep: GPUBuffer[]): Promise<void> {
