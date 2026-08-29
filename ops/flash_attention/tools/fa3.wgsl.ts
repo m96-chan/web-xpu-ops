@@ -27,6 +27,13 @@
  *
  * **Whether it is faster is a measurement, not an argument.** `bench.ts` sweeps
  * both generations against the same reference in the same rounds.
+ *
+ * **No token-major variant (#223).** `FLASH_GENERATION` never selects fa3 in
+ * production — see `index.ts` — so `generate.ts` only emits a token-major fa2.
+ * The `REGISTER_ISSUE` prefetch below also hand-inlines `k`/`v`'s head-major
+ * address rather than going through `parts.ts`'s `stageTile`, which is a
+ * second reason a token-major fa3 is not a `shape.layout` flag away: that
+ * prefetch would need its own token-major address too.
  */
 import { accumulate, epilogue, preamble, prologue, scores, softmax, stageTile } from "./parts.js";
 import type { FlashShape } from "./shape.js";
@@ -157,7 +164,7 @@ ${land}
     cur = 1u - cur;
   }
 
-${epilogue()}
+${epilogue(shape)}
 }
 `;
 }

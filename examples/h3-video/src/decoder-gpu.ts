@@ -39,7 +39,7 @@ import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
-import { FLASH_GENERATION, flashGrid } from "../../../ops/flash_attention/index.js";
+import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 
 export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry: string }[] = [
@@ -53,6 +53,10 @@ export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry:
   { key: "ropeAxes", op: "rope", entry: "axes" },
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "flashAttention", op: "flash_attention", entry: FLASH_GENERATION },
+  // Token-major (#223): `q`/`k`/`v` are already `[seq, heads * dim_head]` here
+  // — see `block()` — so this entry reads that layout directly instead of the
+  // three `swapLeading` copies the head-major entry above needed.
+  { key: "flashAttentionToken", op: "flash_attention", entry: FLASH_TOKEN_ENTRY },
 ];
 
 export interface VideoKernels {
@@ -66,6 +70,7 @@ export interface VideoKernels {
   ropeAxes: string;
   permute: string;
   flashAttention: string;
+  flashAttentionToken: string;
 }
 
 export interface VideoDecoderManifest {
@@ -605,18 +610,13 @@ export class VideoDecoderGpu {
     q = this.consume(q, await this.rope(ops, q, seq, c.heads, c.dim_head, positions));
     k = this.consume(k, await this.rope(ops, k, seq, c.heads, c.dim_head, positions));
 
-    // `[seq, heads, dim_head]` -> `[heads, seq, dim_head]`, which is the layout
-    // `ops/flash_attention` reads.
-    const qh = await this.swapLeading(ops, q.buffer, seq, c.heads, c.dim_head);
-    const kh = await this.swapLeading(ops, k.buffer, seq, c.heads, c.dim_head);
-    const vh = await this.swapLeading(ops, v.buffer, seq, c.heads, c.dim_head);
-    // The row-major q, k and v are read only by the three swaps above.
-    this.recycle(q.buffer);
-    this.recycle(k.buffer);
-    this.recycle(v.buffer);
-
-    const attended = this.take(c.heads * seq * c.dim_head);
-    await this.dispatch(ops, this.kernels.flashAttention, [qh, kh, vh, mask, attended, this.uniform([
+    // `q`, `k` and `v` are already `[seq, heads, dim_head]` — token-major —
+    // which `flashAttentionToken` reads directly. Issue #223: this used to
+    // run three `swapLeading` copies in and one out, four buffers at 549 MB
+    // each at 19,027 rows, which is most of what stopped 512x896 x 120 frames
+    // from fitting in 32 GB.
+    const attended = this.take(seq * c.heads * c.dim_head);
+    await this.dispatch(ops, this.kernels.flashAttentionToken, [q.buffer, k.buffer, v.buffer, mask, attended, this.uniform([
       ["u32", c.heads], ["u32", seq], ["u32", seq], ["u32", c.dim_head], ["u32", c.dim_head],
       ["f32", 1 / Math.sqrt(c.dim_head)],
       // `causal_decoder: false` in the checkpoint's own config -- every token
@@ -624,16 +624,14 @@ export class VideoDecoderGpu {
       ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
     ])], flashGrid(seq, c.heads, 1));
 
-    // `qh`, `kh` and `vh` fed the attention and nothing else.
-    this.recycle(qh);
-    this.recycle(kh);
-    this.recycle(vh);
-    const merged = await this.swapLeading(ops, attended, c.heads, seq, c.dim_head);
-    this.recycle(attended);
+    // q, k and v fed the attention and nothing else. Issue #223.
+    this.recycle(q.buffer);
+    this.recycle(k.buffer);
+    this.recycle(v.buffer);
     const projected = await this.linear(
-      ops, { buffer: merged, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
+      ops, { buffer: attended, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
     );
-    this.recycle(merged);
+    this.recycle(attended);
     // LayerScale: a per-channel parameter that multiplies the branch before it
     // is added back. Initialised to zero, so dropping it is a block that starts
     // from scratch every forward.

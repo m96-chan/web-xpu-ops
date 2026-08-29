@@ -11,7 +11,7 @@ import {
 } from "../../harness/index.js";
 import { attention, defaultScale, type AttentionArgs } from "../attention/reference.js";
 import { DEFAULT_TILE, flashAttention } from "./reference.js";
-import { FLASH_GENERATION, flashGrid, flashSupports } from "./index.js";
+import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid, flashSupports } from "./index.js";
 import { shippedKernels } from "./tools/generate.js";
 
 /**
@@ -564,9 +564,12 @@ describe("flash_attention / wgsl", () => {
 
   // A generator edited without regenerating ships the old kernel while the
   // sweep times the new one — the same failure as benchmarking a program other
-  // than the one that runs.
+  // than the one that runs. `shippedKernels()` also builds `fa2_token`
+  // (#223) — the equivalent check for that file is in the token-major
+  // describe block below, next to the fixture that loads it.
   it("the shipped .wgsl files are what the generators produce", () => {
-    expect(CODE).toEqual(shippedKernels());
+    const { fa2, fa3 } = shippedKernels();
+    expect(CODE).toEqual({ fa2, fa3 });
   });
 
   // Not a GPU test: the recurrence is a claim about the algorithm.
@@ -650,5 +653,174 @@ describe("flash_attention / wgsl", () => {
   // happy with operands sized exactly to their contents.
   it("the padded case really is padded", () => {
     expect(PADDED.padding).toEqual({ q: 64, k: 64, v: 64 });
+  });
+});
+
+/**
+ * The token-major variant (#223): `q`/`k`/`v`/`output` addressed
+ * `[B, L, H, D]` instead of `[B, H, L, D]`, so `examples/h3-dit` and
+ * `examples/h3-video` can dispatch straight off the layout they already hold
+ * q/k/v in, without `swapLeading` copying all four in and out.
+ *
+ * The staged tiles (`sq`/`sk`/`sv`) and everything that reads them — scores,
+ * softmax, accumulate — are the same generated code for both layouts; only
+ * the four global-memory index expressions differ (`tools/parts.ts`'s
+ * `qAddress`/`kAddress`/`vAddress`/`outAddress`). That is what makes
+ * bit-exactness against the head-major kernel the right acceptance test
+ * (test b below) rather than a tolerance: same values land in the same
+ * staged slots in the same order, so the arithmetic that follows cannot see
+ * which layout fed it.
+ */
+describe("flash_attention / wgsl / token-major layout (#223)", () => {
+  useGpu();
+
+  const TOKEN_CODE = kernel(import.meta.url, "fa2_token");
+
+  /**
+   * Q/K content: a per-head phase shift, so two heads attend differently —
+   * `wave` alone would make every head's scores a near-mirror of every
+   * other's, and a softmax of near-mirror scores is itself near-identical,
+   * which would let a head-stride bug hide within tolerance. **Not** a large
+   * per-head constant like `headFolded` below: `Q . K` is a dot product, and
+   * a large constant in both operands is squared into it (`offset^2 * D`),
+   * swamping legitimate signal and turning ordinary f32-vs-f64 rounding into
+   * a failure that has nothing to do with layout — measured while building
+   * this test, at `+ head * 100` in both Q and K: rel 2.7e-5 against this
+   * op's own f64 reference, nothing to do with the kernel under test.
+   */
+  const perHeadWave = (B: number, H: number, L: number, D: number, freq: number, phase: number): Float32Array => {
+    const out = new Float32Array(B * H * L * D);
+    for (let b = 0; b < B; b += 1) {
+      for (let h = 0; h < H; h += 1) {
+        const head = b * H + h;
+        for (let i = 0; i < L; i += 1) {
+          for (let d = 0; d < D; d += 1) {
+            out[(head * L + i) * D + d] = Math.sin(i * freq + d * 0.31 + phase + head * 1.7) * 1.5;
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  /**
+   * V content: folds the (batch, head) index into the value itself
+   * (`+ head * 100`). Unlike Q/K, V only ever appears in a *linear*
+   * combination (the softmax-weighted sum), so a large per-head constant
+   * here is safe — it does not get squared into anything — and it is what
+   * turns a stride bug into garbage rather than a near-miss: a kernel that
+   * reads one head's `v` rows out of another's slot lands on a value wrong
+   * by 100, six orders of magnitude past what a dropped rescale or a masked
+   * key could produce (see `TOLERANCE`'s own comment above).
+   */
+  const headFolded = (B: number, H: number, L: number, D: number, freq: number, phase: number): Float32Array => {
+    const out = new Float32Array(B * H * L * D);
+    for (let b = 0; b < B; b += 1) {
+      for (let h = 0; h < H; h += 1) {
+        const head = b * H + h;
+        for (let i = 0; i < L; i += 1) {
+          for (let d = 0; d < D; d += 1) {
+            out[(head * L + i) * D + d] = Math.sin(i * freq + d * 0.31 + phase) * 1.5 + head * 100;
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  /** `[B, H, L, D]` (head-major, what `flashAttention` and `dispatchFor` read) -> `[B, L, H, D]`. */
+  const toTokenMajor = (x: Float32Array, B: number, H: number, L: number, D: number): Float32Array => {
+    const out = new Float32Array(x.length);
+    for (let b = 0; b < B; b += 1) {
+      for (let h = 0; h < H; h += 1) {
+        for (let i = 0; i < L; i += 1) {
+          for (let d = 0; d < D; d += 1) {
+            out[((b * L + i) * H + h) * D + d] = x[((b * H + h) * L + i) * D + d]!;
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  /** The inverse of `toTokenMajor`: `[B, L, H, D]` -> `[B, H, L, D]`. */
+  const toHeadMajor = (x: Float32Array, B: number, H: number, L: number, D: number): Float32Array => {
+    const out = new Float32Array(x.length);
+    for (let b = 0; b < B; b += 1) {
+      for (let h = 0; h < H; h += 1) {
+        for (let i = 0; i < L; i += 1) {
+          for (let d = 0; d < D; d += 1) {
+            out[((b * H + h) * L + i) * D + d] = x[((b * L + i) * H + h) * D + d]!;
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  // H >= 2: at H = 1 head-major and token-major are the same bytes in the
+  // same order (there is only one head to misplace), so every index bug —
+  // including both mutations below — would pass by accident. L != S and
+  // D != Dv so a stride confused with the wrong dimension is also visible.
+  // S spans two tiles (DEFAULT_TILE = 64) so the token-major `j` — which
+  // walks with `base`, the tile offset — is exercised past the first one.
+  const SHAPE = { B: 2, H: 3, L: 5, S: 70, D: 8, Dv: 6 };
+  const ARGS: AttentionArgs = {
+    ...SHAPE,
+    q: perHeadWave(SHAPE.B, SHAPE.H, SHAPE.L, SHAPE.D, 0.37, 0),
+    k: perHeadWave(SHAPE.B, SHAPE.H, SHAPE.S, SHAPE.D, 0.11, 0.5),
+    v: headFolded(SHAPE.B, SHAPE.H, SHAPE.S, SHAPE.Dv, 0.23, 1.25),
+  };
+  const WANT_HEAD_MAJOR = flashAttention(ARGS).output;
+  const Q_TOKEN = toTokenMajor(ARGS.q, SHAPE.B, SHAPE.H, SHAPE.L, SHAPE.D);
+  const K_TOKEN = toTokenMajor(ARGS.k, SHAPE.B, SHAPE.H, SHAPE.S, SHAPE.D);
+  const V_TOKEN = toTokenMajor(ARGS.v, SHAPE.B, SHAPE.H, SHAPE.S, SHAPE.Dv);
+
+  function tokenDispatch(): Dispatch {
+    const { B, H, L, Dv } = ARGS;
+    return {
+      code: TOKEN_CODE,
+      bindings: [
+        { kind: "storage", data: Q_TOKEN },
+        { kind: "storage", data: K_TOKEN },
+        { kind: "storage", data: V_TOKEN },
+        { kind: "storage", data: maskFor(ARGS) },
+        { kind: "out", type: "f32", length: B * H * L * Dv },
+        { kind: "uniform", data: uniforms(ARGS) },
+      ],
+      workgroups: flashGrid(L, H, B),
+    };
+  }
+
+  // (a) Against this op's own reference, transposed at the boundary: the
+  // reference only ever speaks head-major, so the kernel input is built
+  // head-major and transposed to token-major, and the kernel's token-major
+  // output is transposed back before the comparison.
+  gpuTest("agrees with the reference on token-major inputs", async (run) => {
+    const [got] = await run(tokenDispatch());
+    const gotHeadMajor = toHeadMajor(got as Float32Array, SHAPE.B, SHAPE.H, SHAPE.L, SHAPE.Dv);
+    const mismatch = agree(gotHeadMajor, WANT_HEAD_MAJOR, TOLERANCE);
+    expect(mismatch, mismatch ? JSON.stringify(mismatch) : undefined).toBeNull();
+  });
+
+  // (b) Against the head-major kernel itself, on the same logical tensors,
+  // to 0 ulp — not a tolerance. See the describe block's own comment for why
+  // exact equality is the right bar here rather than a generous one.
+  gpuTest("is bit-identical to the head-major kernel, transposed", async (run) => {
+    const [headMajorGot] = await run(dispatchFor(ARGS));
+    const [tokenGot] = await run(tokenDispatch());
+    const tokenAsHeadMajor = toHeadMajor(tokenGot as Float32Array, SHAPE.B, SHAPE.H, SHAPE.L, SHAPE.Dv);
+    expect(Array.from(tokenAsHeadMajor)).toEqual(Array.from(headMajorGot as Float32Array));
+  });
+
+  // The same staleness guard the head-major kernels get, extended to the
+  // token-major file: a generator edited without regenerating would ship the
+  // old kernel while this describe block tests the new one.
+  it("the shipped fa2_token.wgsl is what the generator produces", () => {
+    expect(TOKEN_CODE).toEqual(shippedKernels().fa2_token);
+  });
+
+  it("FLASH_TOKEN_ENTRY names the file this describe block loaded", () => {
+    expect(FLASH_TOKEN_ENTRY).toBe("fa2_token");
   });
 });

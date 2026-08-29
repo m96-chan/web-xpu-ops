@@ -22,6 +22,7 @@ import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
 import { FLASH_GENERATION } from "../../../ops/flash_attention/index.js";
 import fa2Kernel from "../../../ops/flash_attention/wgsl/fa2.wgsl";
 import fa3Kernel from "../../../ops/flash_attention/wgsl/fa3.wgsl";
+import fa2TokenKernel from "../../../ops/flash_attention/wgsl/fa2_token.wgsl";
 
 const flashAttention = FLASH_GENERATION === "fa3" ? fa3Kernel : fa2Kernel;
 
@@ -35,6 +36,8 @@ export const ditKernels: DitKernels = {
   ropeAxes: ropeAxesKernel,
   permute: permuteKernel,
   flashAttention,
+  // Token-major (#223) — see `DIT_KERNEL_SOURCES`'s own comment in `model-gpu.ts`.
+  flashAttentionToken: fa2TokenKernel,
 };
 
 /** The VAE decoder's set — one more entry (`layernorm`) than the DiT needs. */

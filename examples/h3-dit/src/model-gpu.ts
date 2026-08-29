@@ -39,7 +39,7 @@ import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
-import { FLASH_GENERATION, flashGrid } from "../../../ops/flash_attention/index.js";
+import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
 import { MODALITY_NUM, type PackedLayout } from "./model.js";
 
@@ -53,6 +53,10 @@ export const DIT_KERNEL_SOURCES: { key: keyof DitKernels; op: string; entry: str
   { key: "ropeAxes", op: "rope", entry: "axes" },
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "flashAttention", op: "flash_attention", entry: FLASH_GENERATION },
+  // Token-major (#223): `q`/`k`/`v` are already `[seq, heads * headDim]` here
+  // — see `attention()` — so this entry reads that layout directly instead
+  // of the three `swapLeading` copies the head-major entry above needed.
+  { key: "flashAttentionToken", op: "flash_attention", entry: FLASH_TOKEN_ENTRY },
 ];
 
 export interface DitKernels {
@@ -65,6 +69,7 @@ export interface DitKernels {
   ropeAxes: string;
   permute: string;
   flashAttention: string;
+  flashAttentionToken: string;
 }
 
 export interface DitManifest {
@@ -601,30 +606,22 @@ export class DitGpu {
     return { buffer: out, rows: seq, cols: width };
   }
 
+  /**
+   * `q`, `k` and `v` arrive already `[seq, heads * headDim]` — token-major,
+   * the layout every caller here holds them in — so `flashAttentionToken`
+   * reads them directly. Issue #223: this used to run three `swapLeading`
+   * copies in and one out, four buffers at 549 MB each at 19,027 rows, which
+   * is most of what stopped 512x896 x 120 frames from fitting in 32 GB.
+   */
   private async attention(
     ops: ResidentOp[], q: Mat, k: Mat, v: Mat, seq: number, keep: GPUBuffer[] = [],
   ): Promise<Mat> {
     const c = this.manifest.config;
     const heads = c.num_attention_heads;
     const headDim = c.attention_head_dim;
-    const qh = await this.swapLeading(ops, q.buffer, seq, heads, headDim);
-    const kh = await this.swapLeading(ops, k.buffer, seq, heads, headDim);
-    const vh = await this.swapLeading(ops, v.buffer, seq, heads, headDim);
-    // The row-major q, k and v are read only by the three swaps above. Issue #223.
-    this.recycle(q.buffer);
-    this.recycle(k.buffer);
-    this.recycle(v.buffer);
-    // **Split, inside the attention.** Twelve buffers at `heads * head_dim` are
-    // live to here -- q, k, v, the two `qkNorm` outputs, the two rotated ones
-    // and the three swaps -- and eight of them are now in quarantine. Only a
-    // submit lets the pool hand them back, so the split has to be here rather
-    // than after the attention returns: at 19,027 rows those eight are 4.4 GB.
-    if (seq > this.splitBlockAboveRows && keep.length > 0) {
-      await this.flush(ops, [qh, kh, vh, ...keep]);
-    }
-    const attended = this.take(heads * seq * headDim);
-    await this.dispatch(ops, this.kernels.flashAttention, [
-      qh, kh, vh, this.w("attn.noMask"), attended,
+    const attended = this.take(seq * heads * headDim);
+    await this.dispatch(ops, this.kernels.flashAttentionToken, [
+      q.buffer, k.buffer, v.buffer, this.w("attn.noMask"), attended,
       this.uniform([
         ["u32", heads], ["u32", seq], ["u32", seq], ["u32", headDim], ["u32", headDim],
         ["f32", 1 / Math.sqrt(headDim)],
@@ -633,14 +630,18 @@ export class DitGpu {
         ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
       ]),
     ], flashGrid(seq, heads, 1));
-    // `qh`, `kh` and `vh` are read only by the dispatch above, and `attended`
-    // only by the swap below.
-    this.recycle(qh);
-    this.recycle(kh);
-    this.recycle(vh);
-    const merged = await this.swapLeading(ops, attended, heads, seq, headDim);
-    this.recycle(attended);
-    return { buffer: merged, rows: seq, cols: heads * headDim };
+    // q, k and v are read only by the dispatch above. Issue #223.
+    this.recycle(q.buffer);
+    this.recycle(k.buffer);
+    this.recycle(v.buffer);
+    // **Split, once the flash dispatch has read q, k and v.** Down from eight
+    // buffers in quarantine (three head swaps plus the five that fed them) to
+    // three, now that the kernel reads token-major directly rather than
+    // needing head-major copies of all three.
+    if (seq > this.splitBlockAboveRows && keep.length > 0) {
+      await this.flush(ops, [attended, ...keep]);
+    }
+    return { buffer: attended, rows: seq, cols: heads * headDim };
   }
 
   /**
@@ -752,17 +753,17 @@ export class DitGpu {
 
     // `shifted` fed the three projections and nothing else.
     this.recycle(shifted.buffer);
-    // **Split, before the head swaps.** The projections' outputs and the
+    // **Split, before the attention.** The projections' outputs and the
     // `qkNorm` ones -- four buffers at `heads * head_dim` -- died on the way
-    // here, and the swaps below are about to ask for three more. Without this
-    // the peak is ten of them rather than six (issue #223).
+    // here (issue #223).
     if (seq > this.splitBlockAboveRows) {
       await this.flush(ops, [q.buffer, k.buffer, v.buffer, x.buffer, positions]);
     }
     const merged = await this.attention(ops, q, k, v, seq, [x.buffer, positions]);
-    // **Split one: the attention is finished with.** q, k, v, their rotated and
-    // head-swapped copies and the attended rows are all in quarantine by now,
-    // and only a submit lets the pool hand them out again (issue #223).
+    // **Split one: the attention is finished with.** `attention` already
+    // split once it recycled q, k and v; this is a second chance in case
+    // nothing forced a submit in between (`flush` is a no-op on an empty
+    // `ops`, so this costs nothing when the one above already ran).
     if (seq > this.splitBlockAboveRows) await this.flush(ops, [merged.buffer, x.buffer, positions]);
     const projected = await this.linear(ops, merged, `${p}attn.to_out.0.weight`, null, c.hidden_size);
     this.recycle(merged.buffer);

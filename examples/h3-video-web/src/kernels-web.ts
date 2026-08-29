@@ -20,6 +20,7 @@ import permuteKernel from "../../../ops/permute/wgsl/kernel.wgsl";
 import { FLASH_GENERATION } from "../../../ops/flash_attention/index.js";
 import fa2Kernel from "../../../ops/flash_attention/wgsl/fa2.wgsl";
 import fa3Kernel from "../../../ops/flash_attention/wgsl/fa3.wgsl";
+import fa2TokenKernel from "../../../ops/flash_attention/wgsl/fa2_token.wgsl";
 
 export const videoKernels: VideoKernels = {
   matmul: matmulKernel,
@@ -34,4 +35,6 @@ export const videoKernels: VideoKernels = {
   ropeAxes: ropeAxesKernel,
   permute: permuteKernel,
   flashAttention: FLASH_GENERATION === "fa3" ? fa3Kernel : fa2Kernel,
+  // Token-major (#223) — see `VIDEO_KERNEL_SOURCES`'s own comment in `decoder-gpu.ts`.
+  flashAttentionToken: fa2TokenKernel,
 };

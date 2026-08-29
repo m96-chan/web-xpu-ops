@@ -99,6 +99,20 @@ export const FLASH_TILE = {
  */
 export const FLASH_GENERATION: "fa2" | "fa3" = "fa2";
 
+/**
+ * The token-major FA2 variant (#223): `q`/`k`/`v`/`output` are `[B, L, H, D]`
+ * instead of `[B, H, L, D]`, which is the layout `examples/h3-dit` and
+ * `examples/h3-video` already hold q/k/v in — dispatching against it directly
+ * deletes the four `swapLeading` copies each of them ran per attention call.
+ *
+ * Same `FLASH_TILE` shape, same grid (`flashGrid`), same `Params` layout as
+ * `FLASH_GENERATION`'s kernel — only the four global-memory index expressions
+ * differ (`tools/parts.ts`'s `qAddress`/`kAddress`/`vAddress`/`outAddress`).
+ * A caller swaps this entry in for `FLASH_GENERATION`'s and changes nothing
+ * else about the dispatch.
+ */
+export const FLASH_TOKEN_ENTRY = "fa2_token";
+
 /** `[x, y, z]` for the shipped kernel over `L` queries, `H` heads, `B` batches. */
 export function flashGrid(L: number, H: number, B: number): [number, number, number] {
   return [Math.ceil(L / FLASH_TILE.bq), H, B];

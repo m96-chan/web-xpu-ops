@@ -971,6 +971,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Changed
 
+- **`ops/flash_attention` can read `q`/`k`/`v` token-major, and the DiT and the
+  video decoder now dispatch it that way** (issue #223). The kernel only ever
+  read head-major `[B, H, L, D]`, but `examples/h3-dit`'s `attention()` and
+  `examples/h3-video`'s decoder `block()` hold q/k/v token-major —
+  `[seq, heads * headDim]` — because every other op in both forwards does, so
+  each attention call ran three `swapLeading` copies in and one out to convert.
+  At 19,027 rows those four buffers are 549 MB each, roughly 2 GB, which is
+  what stood between a 512x896 x 120-frame generation and a 32 GB card:
+  **31.9 GB held at the refusal, and the four swap outputs are exactly the
+  remainder.**
+
+  `ops/flash_attention/tools/generate.ts` now also emits
+  `wgsl/fa2_token.wgsl` — the same shape, the same staged-tile arithmetic
+  (scores, softmax, accumulate untouched), only the four global-memory index
+  expressions changed. `ops/flash_attention/wgsl.test.ts` holds it to two
+  things: the usual tolerance against this op's own reference, and **bit-exact
+  agreement with the head-major kernel** on the same logical tensors — the
+  staging loops land the same values in the same slots in the same order
+  either way, so the arithmetic that follows cannot tell which layout fed it,
+  and a `===` per element is the right bar rather than a tolerance. fa3 gets
+  no token variant; it is not the generation `FLASH_GENERATION` selects.
+
+  Both callers' `attention()`/`block()` dispatch `flashAttentionToken`
+  directly on `q.buffer`/`k.buffer`/`v.buffer` now and the four `swapLeading`
+  calls are gone. **Bit-identical**, confirmed against the real-content
+  goldens: the DiT forward stays `video velocity: worst 1.394e+0` /
+  `relative to peak: video 7.38%, audio 3.47%`, and the decoder stays
+  `worst 3.606e-2` (synthetic latent) and `worst 1.753e-1` (12x16x16 real
+  latent) — none of those numbers moved by a digit.
+
 - **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
   by their grid coordinate, so its positions are whole numbers and the binding
   was `i32`. MiniMax-H3's visual VAE normalises each axis to `(-1, 1)` —

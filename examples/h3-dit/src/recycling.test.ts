@@ -38,45 +38,25 @@ function method(name: string): string {
 }
 
 describe("h3 dit / recycling an intermediate", () => {
-  it("gives q, k and v back only after the head swaps have read them", () => {
-    // The three swaps are the last readers. Recycling above them would hand a
-    // later dispatch the memory `swapLeading` is still reading, which is a
-    // wrong number rather than an error.
+  // Issue #223: `q`, `k` and `v` arrive already token-major, so
+  // `flashAttentionToken` reads them directly and there is no head-swap step
+  // to give them back after — the dispatch itself is the last reader.
+  it("gives q, k and v back only after the flash dispatch has read them", () => {
     const body = method("attention");
+    const dispatch = body.indexOf("this.kernels.flashAttentionToken");
+    expect(dispatch, "the attention dispatches the token-major kernel").toBeGreaterThan(-1);
     for (const name of ["q", "k", "v"]) {
-      const swap = body.indexOf(`const ${name}h = await this.swapLeading(ops, ${name}.buffer`);
       const back = body.indexOf(`this.recycle(${name}.buffer)`);
-      expect(swap, `${name} is not swapped`).toBeGreaterThan(-1);
       expect(back, `${name} is never given back`).toBeGreaterThan(-1);
-      expect(back, `${name} is recycled before its swap reads it`).toBeGreaterThan(swap);
+      expect(back, `${name} is recycled before the dispatch reads it`).toBeGreaterThan(dispatch);
     }
-  });
-
-  it("gives the head-swapped copies back only after the attention dispatch", () => {
-    const body = method("attention");
-    const dispatch = body.indexOf("this.kernels.flashAttention");
-    expect(dispatch).toBeGreaterThan(-1);
-    for (const name of ["qh", "kh", "vh"]) {
-      const back = body.indexOf(`this.recycle(${name})`);
-      expect(back, `${name} is never given back`).toBeGreaterThan(-1);
-      expect(back, `${name} is recycled before the attention reads it`).toBeGreaterThan(dispatch);
-    }
-  });
-
-  it("gives the attended rows back only after the merge has read them", () => {
-    const body = method("attention");
-    const merge = body.indexOf("const merged = await this.swapLeading(ops, attended");
-    const back = body.indexOf("this.recycle(attended)");
-    expect(merge).toBeGreaterThan(-1);
-    expect(back).toBeGreaterThan(-1);
-    expect(back, "attended is recycled before the merge reads it").toBeGreaterThan(merge);
   });
 
   it("never gives back what it is about to return", () => {
-    // `merged` is the method's result. Handing it to the pool would let the
+    // `attended` is the method's result. Handing it to the pool would let the
     // caller's next `take` return the same memory and overwrite the answer.
     const body = method("attention");
-    expect(body).not.toContain("this.recycle(merged)");
+    expect(body).not.toContain("this.recycle(attended)");
   });
 
   it("recycles through `consume`, which cannot free a buffer it also returns", () => {
@@ -116,14 +96,14 @@ describe("h3 dit / recycling an intermediate", () => {
   it("splits the block wherever a group of buffers has just died", () => {
     // The quarantine means the peak falls with the number of *submits*, not
     // with the bookkeeping, so a split has to sit where a group is already
-    // dead. Four of them, and the one inside the attention is the one that was
-    // missing: twelve buffers at `heads * head_dim` are live to the head swaps
-    // and eight are dead straight after, which at 19,027 rows is 4.4 GB. A
-    // split after `attention` returns is too late for those.
+    // dead. Issue #223 shrank the group inside `attention` from eight
+    // buffers (three head swaps plus the five that fed them) to three (q, k
+    // and v themselves) — smaller, but still worth a split rather than
+    // waiting for the caller's own one after `attention` returns.
     const attention = method("attention");
-    expect(attention, "the attention must split after the head swaps")
-      .toMatch(/this\.recycle\(v\.buffer\);[\s\S]{0,400}await this\.flush\(ops, \[qh, kh, vh/);
-    // Four in the block -- before the head swaps, after the attention, after
+    expect(attention, "the attention must split once q, k and v are recycled")
+      .toMatch(/this\.recycle\(v\.buffer\);[\s\S]{0,200}await this\.flush\(ops, \[attended/);
+    // Four in the block -- before the attention, after the attention, after
     // the residual add and after the feed-forward -- plus the one inside
     // `attention` above. Counted rather than matched: a split that is deleted
     // costs memory and nothing else, so nothing else would notice.
