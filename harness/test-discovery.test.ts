@@ -16,7 +16,7 @@
  * So the lists are compared rather than trusted.
  */
 import { describe, expect, it } from "vitest";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -90,4 +90,22 @@ describe("test discovery / the two lists agree", () => {
       ).toBe(true);
     });
   }
+
+  it("type-checks every example: root include, or a tsconfig of its own", () => {
+    // Issue #227. `npm run lint` used to name three web demos by hand, and the
+    // two H3 demos it did not name carried a missing module and a missing
+    // kernel entry for a month — `tsc` would have said so on the first run.
+    // The lint script globs `examples/*/tsconfig.json` now; this checks that a
+    // demo without one is at least in the root program, so a new example
+    // cannot sit outside both.
+    const rootInclude = (JSON.parse(readFileSync(fileURLToPath(new URL("../tsconfig.json", import.meta.url)), "utf8")) as { include: string[] }).include;
+    const examplesDir = fileURLToPath(new URL("../examples", import.meta.url));
+    const uncovered = readdirSync(examplesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && existsSync(path.join(examplesDir, entry.name, "src")))
+      .map((entry) => entry.name)
+      .filter((name) => !existsSync(path.join(examplesDir, name, "tsconfig.json")) && !rootInclude.includes(`examples/${name}/src`))
+      // `web-common` is reached from every web demo's program and has no entry point of its own.
+      .filter((name) => name !== "web-common");
+    expect(uncovered).toEqual([]);
+  });
 });
