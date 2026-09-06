@@ -231,6 +231,33 @@ class BufferPool {
   }
 }
 
+/**
+ * Which blocks one call runs, for a forward split across devices (issue #225).
+ *
+ * The DiT is 52 blocks and 3.76 GB resident; a device under 4 GB holds none of
+ * it. BrowserComputeCluster splits the blocks over K nodes and passes the
+ * activation between them. The state that crosses a block boundary is `x`
+ * alone — `[seq, dim]` f32 — because everything else the loop reads is
+ * loop-invariant and cheap to rebuild on every shard: the timestep embedding
+ * and its adaLN LoRA come from `t` and the `net.t_embed*` tensors (one row
+ * each), the rope position tables from `T/H/W`, and `context` is
+ * `input.context`, which the caller already has.
+ *
+ * `from > 0` skips the patch embedder and starts from `activation`;
+ * `to < numBlocks` skips the final layer and returns `x` after block `to - 1`
+ * instead of the latent — exactly the array the next shard's `activation`
+ * takes. The full range is the unsharded forward, and `dit-resident.shard.test.ts`
+ * holds a split run to it bit for bit: the carried tensor is f32 both ways.
+ */
+export interface AnimaShard {
+  /** First block this call runs. */
+  from: number;
+  /** One past the last block this call runs; `cfg.numBlocks` runs the final layer too. */
+  to: number;
+  /** `x` after block `from - 1` — what the previous shard returned. Required when `from > 0`, refused when `from === 0`. */
+  activation?: Float32Array;
+}
+
 /** Frees weights held across forwards. The caller owns them. */
 export function releaseAnimaWeights(held: Map<string, GPUBuffer>): void {
   for (const buffer of held.values()) buffer.destroy();
@@ -273,6 +300,8 @@ export async function animaForwardResident(
    * caller must say "no breakdown" rather than reporting zeros as a duration.
    */
   profile?: AnimaProfile,
+  /** Which blocks to run — see `AnimaShard`. Omitted, the whole model. */
+  shard?: AnimaShard,
 ): Promise<Float32Array> {
   const { modelChannels: dim, numHeads, adalnLoraDim, inChannels, patchSpatial, patchTemporal, normEps } = cfg;
   const headDim = dim / numHeads;
@@ -283,6 +312,26 @@ export async function animaForwardResident(
   const patchDim = patchTemporal * patchSpatial * patchSpatial * totalC;
   const axisDims = ropeAxisDims(headDim);
   const thetaPerAxis = ropeBases(axisDims, cfg.ropeExtrapolation);
+
+  const from = shard?.from ?? 0;
+  const to = shard?.to ?? cfg.numBlocks;
+  if (!(Number.isInteger(from) && Number.isInteger(to) && from >= 0 && from < to)) {
+    throw new Error(`animaForwardResident: shard needs 0 <= from < to, got from ${from}, to ${to}`);
+  }
+  if (to > cfg.numBlocks) {
+    throw new Error(`animaForwardResident: shard ends at block ${to}, and numBlocks is ${cfg.numBlocks}`);
+  }
+  if (from > 0 && !shard?.activation) {
+    throw new Error(`animaForwardResident: a shard starting at block ${from} needs the activation after block ${from - 1}`);
+  }
+  if (from === 0 && shard?.activation) {
+    throw new Error("animaForwardResident: a shard with from: 0 starts from the latent; an activation would be ignored");
+  }
+  if (shard?.activation && shard.activation.length !== seq * dim) {
+    throw new Error(
+      `animaForwardResident: activation length ${shard.activation.length}, expected ${seq} tokens x ${dim} = ${seq * dim}`,
+    );
+  }
 
   const pool = new BufferPool(device);
   const pipelines = new Map<string, GPUComputePipeline>();
@@ -808,7 +857,7 @@ export async function animaForwardResident(
   // The forward. Structure follows `animaForward` exactly.
   // ============================================================
 
-  const totalSteps = cfg.numBlocks + 2;
+  const totalSteps = 2 + (to - from);
   let stepsDone = 0;
   const progress = (label: string): void => {
     stepsDone += 1;
@@ -834,17 +883,25 @@ export async function animaForwardResident(
   const emb = await rmsnorm(sample, "net.t_embedding_norm.weight", 1, dim);
   await flush([emb, adalnLora], trace ? { name: "tEmbed", slot: emb, length: dim } : undefined);
 
-  await onBeforePrefix?.("net.x_embedder");
-  progress("patch embedder");
-  let x = await project(
-    "net.x_embedder.proj.1.weight",
-    upload(patchify(input.latent, inChannels, T, H, W, patchSpatial, patchTemporal, cfg.concatPaddingMask)),
-    seq,
-    patchDim,
-    dim,
-  );
-  if (weights.has("net.x_embedder.proj.1.bias")) {
-    x = await rowsOp(x, weightSlot("net.x_embedder.proj.1.bias"), seq, dim, ELEMENTWISE.add);
+  let x: Slot;
+  if (from === 0) {
+    await onBeforePrefix?.("net.x_embedder");
+    progress("patch embedder");
+    x = await project(
+      "net.x_embedder.proj.1.weight",
+      upload(patchify(input.latent, inChannels, T, H, W, patchSpatial, patchTemporal, cfg.concatPaddingMask)),
+      seq,
+      patchDim,
+      dim,
+    );
+    if (weights.has("net.x_embedder.proj.1.bias")) {
+      x = await rowsOp(x, weightSlot("net.x_embedder.proj.1.bias"), seq, dim, ELEMENTWISE.add);
+    }
+  } else {
+    // The previous shard's readback, as-is: f32 in, f32 out, no conversion
+    // anywhere between the two devices.
+    progress("activation");
+    x = upload(shard!.activation!);
   }
 
   const context = upload(input.context);
@@ -889,7 +946,7 @@ export async function animaForwardResident(
   const kept = [emb, adalnLora, context, ...positionSlots];
   await flush([...kept, x]);
 
-  for (let index = 0; index < cfg.numBlocks; index += 1) {
+  for (let index = from; index < to; index += 1) {
     progress(`block ${index + 1}/${cfg.numBlocks}`);
     const p = `net.blocks.${index}.`;
     await onBeforePrefix?.(p);
@@ -989,6 +1046,34 @@ export async function animaForwardResident(
     await flush([...kept, x], capture);
   }
 
+  const finish = (staging: GPUBuffer): void => {
+    if (stats) {
+      stats.dispatches = dispatches;
+      stats.submits = device.stats.submits;
+      stats.poolSlots = pool.created;
+      stats.poolBytes = pool.bytes;
+      stats.weightBuffers = weightBuffers.size;
+      stats.uploadedBytes = uploaded;
+    }
+    pool.destroy();
+    staging.destroy();
+    for (const buffer of uniforms) buffer.destroy();
+    if (!held) for (const buffer of weightBuffers.values()) buffer.destroy();
+  };
+
+  if (to < cfg.numBlocks) {
+    // A shard that stops short hands `x` back instead of a latent — the one
+    // readback this call makes, and the next shard's `activation` verbatim.
+    const staging = device.createStorageBuffer(seq * dim * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    const [carried] = await device.batch(ops, [
+      { staging, source: x.buffer, sourceOffset: 0, length: seq * dim, type: "f32" },
+    ]);
+    ops = [];
+    const activation = (carried as Float32Array).slice();
+    finish(staging);
+    return activation;
+  }
+
   // --- final layer: two chunks, shift and scale, no gate ---
   await onBeforePrefix?.("net.final_layer");
   const finalActivated = await activation(emb, dim, ACTIVATION.silu);
@@ -1027,19 +1112,7 @@ export async function animaForwardResident(
   ]);
   ops = [];
 
-  if (stats) {
-    stats.dispatches = dispatches;
-    stats.submits = device.stats.submits;
-    stats.poolSlots = pool.created;
-    stats.poolBytes = pool.bytes;
-    stats.weightBuffers = weightBuffers.size;
-    stats.uploadedBytes = uploaded;
-  }
-
   const latent = unpatchify(out as Float32Array, cfg.outChannels, T, H, W, patchSpatial, patchTemporal);
-  pool.destroy();
-  staging.destroy();
-  for (const buffer of uniforms) buffer.destroy();
-  if (!held) for (const buffer of weightBuffers.values()) buffer.destroy();
+  finish(staging);
   return latent;
 }
