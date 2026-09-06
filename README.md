@@ -35,7 +35,9 @@ described in the LLM-engine sections that produced them rather than here.
 
 **Who runs these.** `examples/` carries two image models checked against their
 own implementations — [Anima-3.8B](examples/anima/) and
-[Z-Image](examples/zimage/) — and an LLM engine in `llm/`. The audio ops have a
+[Z-Image](examples/zimage/) — and an LLM engine in `llm/`. The Anima port and
+the engine are importable, as `web-xpu-ops/models/anima` and
+`web-xpu-ops/llm/engine` — see "Models and engines" below. The audio ops have a
 consumer too, and it is in another repository:
 [**VoxShot**](https://github.com/m96-chan/voxshot) builds MioTTS on them —
 browser text-to-speech and zero-shot voice cloning, `istft`'s `"same"` padding,
@@ -236,6 +238,48 @@ stable and the file is present.
 You supply the `GPUDevice`. This library has no opinion about how an application
 gets one, and the Node-and-Dawn runner under `harness/` is test infrastructure
 rather than a runtime: it imports vitest, so it is deliberately not published.
+What *is* published from it is the contract — `web-xpu-ops/harness` carries
+`Runner`, `ResidentDevice`, `params` and the kernel-source registry, and
+imports nothing at runtime.
+
+## Models and engines
+
+Issue #224. The Anima-3.8B port and the Llama engines ship as subpaths, so a
+page or a worker can import the same code the `verify-*` scripts hold to the
+goldens rather than copy it.
+
+| subpath | what it is |
+| --- | --- |
+| `web-xpu-ops/models/anima` | the resident DiT forward, the CPU forwards it is checked against, both tokenizers, the Qwen3-0.6B encoder (CPU and GPU), the adapter, the sampler, the VAE decoder, and `createBrowserResidentDevice` / `createBrowserRunner` over `navigator.gpu` |
+| `web-xpu-ops/models/anima/kernels` | `animaKernels(load)` — builds the three shader tables from WGSL you fetched or bundled; `ANIMA_KERNEL_FILES` names the files |
+| `web-xpu-ops/models/anima/fetch-weights` | the Cache API loader (`Range` required), kept apart so a host with its own storage does not inherit its policy |
+| `web-xpu-ops/llm/engine` | `LlamaEngine`, `LlamaEngineQ8`, `LlamaEngineQ8Resident`, the IndexedDB weight cache, and `registerKernelSources` |
+| `web-xpu-ops/harness` | `Runner`, `ResidentDevice`, `params`, `opKernel`, `registerKernelSources` — the contract, no Dawn |
+
+Every dispatching module takes its WGSL as strings. Nothing here reads a file
+or fetches one; the host says where the text comes from, once:
+
+```ts
+import { LLM_KERNEL_SOURCES, LlamaEngineQ8Resident, registerKernelSources } from "web-xpu-ops/llm/engine";
+import { ANIMA_KERNEL_FILES, animaKernels } from "web-xpu-ops/models/anima/kernels";
+
+// The engines resolve `(op, entry)` through a registry — fill it from what
+// your bundler inlined (LLM_KERNEL_SOURCES lists the fifteen it will ask for).
+registerKernelSources({ rmsnorm: { kernel: rmsnormWgsl }, matvec: { q8: matvecQ8Wgsl /* … */ } });
+
+// The Anima forwards take explicit tables instead — one loader, three tables.
+const { dit, encoder, vae } = animaKernels((op, entry) => wgslText[`ops/${op}/wgsl/${entry}.wgsl`]);
+```
+
+Where the `.wgsl` text comes from is the same story as above: a bundler's raw
+loader, or a fetch of `web-xpu-ops/ops/<op>/wgsl/<entry>.wgsl` at startup.
+
+What is **not** here: the weights. The converted checkpoints are redistributed
+under conditions still being settled (issue #190); the loaders take a URL or a
+directory the host provides. Speed for these paths is measured in
+[`examples/anima/README.md`](examples/anima/README.md) and
+[`examples/anima-web/README.md`](examples/anima-web/README.md), with the
+conditions each number was taken under.
 
 ---
 

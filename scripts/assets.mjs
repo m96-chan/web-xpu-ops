@@ -20,7 +20,7 @@
  * packaging bug — and packaging bugs are invisible in a repo where the tests
  * import from the source tree and never touch `dist/` at all.
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const OPS = "ops";
@@ -57,6 +57,23 @@ for (const op of ops) {
     copyFileSync(join(from, kernel), join(to, kernel));
     copied += 1;
   }
+}
+
+// Every `exports` entry that points into `dist/` has to be there. The ops
+// above are checked by walking `ops/`; the model and engine subpaths (issue
+// #224) are built by a second `tsc` program, and a program that silently
+// dropped an entry from its `include` would publish a subpath that resolves
+// to nothing — visible only at a consumer's first import.
+const promised = [];
+const walkExports = (value) => {
+  if (typeof value === "string") {
+    if (value.startsWith("./dist/")) promised.push(value.slice("./".length));
+  } else if (value && typeof value === "object") Object.values(value).forEach(walkExports);
+};
+walkExports(JSON.parse(readFileSync("package.json", "utf8")).exports);
+for (const path of promised) {
+  if (path.includes("*")) continue; // `./ops/*` patterns are covered by the walk above
+  if (!existsSync(path)) problems.push(`${path}: promised by package.json#exports, not built`);
 }
 
 // Test files reach `dist/` only through a mistake in the build config, and one

@@ -39,7 +39,7 @@ function includeGlobs(): string[] {
  */
 function runnerRoots(): string[] {
   const roots: string[] = [];
-  for (const name of ["OPS", "HARNESS", "LLM"]) {
+  for (const name of ["OPS", "HARNESS", "LLM", "MODELS"]) {
     const m = runner.match(new RegExp(`const ${name} = "([^"]+)"`));
     if (m) roots.push(m[1]!);
   }
