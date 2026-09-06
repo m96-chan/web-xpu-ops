@@ -87,7 +87,7 @@
     "lint": "tsc --noEmit && for t in examples/*/tsconfig.json; do echo \"  $t\" && npx tsc -p \"$t\" --noEmit || exit 1; done",
     "test": "node scripts/test.mjs",
     "test:file": "vitest run",
-    "prepublishOnly": "npm run build",
+    "prepack": "npm run build",
     "demo:build": "node examples/llm-demo/build.mjs",
     "demo:serve": "node examples/llm-demo/server.mjs",
     "zimage:build": "node examples/zimage-web/build.mjs",

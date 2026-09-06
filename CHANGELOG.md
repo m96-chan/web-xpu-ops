@@ -38,6 +38,9 @@ Entries record **why** a change was needed. What changed is in the diff.
   Verified by packing the tarball, installing it in another directory, and
   compiling a consumer that imports every new subpath under `strict` with
   `skipLibCheck: false`.
+  `npm pack` now builds first (`prepack`, which `npm publish` also runs;
+  `prepublishOnly` did not cover `pack`) — a consumer verifying a branch from
+  a clean checkout got a 116 KB tarball with an empty `dist/`.
 
 - **`gaussianNoise` and `resMultistepAsync` in `examples/anima/src/sampler.ts`.**
   The initial-latent generator (xorshift128+ under Box-Muller — this port's own
