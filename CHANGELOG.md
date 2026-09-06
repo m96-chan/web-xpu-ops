@@ -9,6 +9,26 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Added
 
+- **`animaForwardResident` runs a range of blocks** (issue #225): a trailing
+  `shard: { from, to, activation? }` argument. `from > 0` skips the patch
+  embedder and starts from the activation the previous shard returned;
+  `to < numBlocks` skips the final layer and returns `x` after block `to - 1`
+  instead of the latent. The DiT is 52 blocks and 3.76 GB resident, so a
+  device under 4 GB holds none of it; BrowserComputeCluster splits the blocks
+  over K nodes and passes `[seq, 2048]` f32 between them — 2 MB at 256²,
+  32 MB at 832×1216.
+
+  What crosses a shard boundary is `x` alone. The timestep embedding and its
+  adaLN LoRA are one row each from `t` and the `net.t_embed*` tensors, the
+  rope tables come from `T/H/W`, and `context` is the caller's input — all
+  rebuilt per shard rather than carried. The split run is held to the unsplit
+  one **bit for bit**, not to a tolerance: the carried tensor is f32 through
+  the readback and the upload, so any difference would be a block that ran
+  twice or not at all. `dit-resident.shard.test.ts` does this on a synthetic
+  4-block model in the suite; `verify-forward-gpu.ts` does it on the real
+  weights against the forward it has just held to the golden, in 2 and 4
+  shards. The cost of a cut is in `examples/anima/README.md`.
+
 - **The Anima port and the Llama engines are importable** (issue #224):
   `web-xpu-ops/models/anima`, `web-xpu-ops/models/anima/kernels`,
   `web-xpu-ops/models/anima/fetch-weights`, `web-xpu-ops/llm/engine` and

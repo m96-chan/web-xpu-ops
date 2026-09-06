@@ -251,6 +251,37 @@ for (const [name, got] of checkpoints) {
   }
 }
 
+// --- the same forward, split across blocks (issue #225) ---
+//
+// The reference is `out` above — the unsplit forward this file has just held
+// to the golden. A shard boundary carries `x` as f32 through a readback and an
+// upload, so the split run has to reproduce it exactly, not to a tolerance:
+// any difference at all would be a block that ran twice, or not at all.
+const split = async (cuts: number[]): Promise<{ result: Float32Array; seconds: number }> => {
+  const started = Date.now();
+  let x: Float32Array | undefined;
+  const bounds = [0, ...cuts, cfg.numBlocks];
+  for (let i = 0; i + 1 < bounds.length; i += 1) {
+    x = await animaForwardResident(
+      device, ditKernels(), cfg, watched, input, undefined, held, undefined, undefined, undefined, undefined,
+      { from: bounds[i]!, to: bounds[i + 1]!, activation: x },
+    );
+  }
+  return { result: x!, seconds: (Date.now() - started) / 1000 };
+};
+const maxAbsDiff = (a: Float32Array, b: Float32Array): number => {
+  let m = 0;
+  for (let i = 0; i < a.length; i += 1) m = Math.max(m, Math.abs(a[i]! - b[i]!));
+  return m;
+};
+console.log("");
+for (const cuts of [[26], [13, 26, 39]]) {
+  const { result, seconds } = await split(cuts);
+  const diff = maxAbsDiff(result, out);
+  console.log(`  ${cuts.length + 1} shards at ${JSON.stringify(cuts)}: ${seconds.toFixed(2)}s, max |diff| vs unsplit ${diff}  ${diff === 0 ? "ok" : "MISMATCH"}`);
+  if (diff !== 0) failed = true;
+}
+
 releaseAnimaWeights(held);
 if (failed) process.exit(1);
 console.log(
