@@ -1,6 +1,6 @@
 {
   "name": "web-xpu-ops",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Web primitive layer implementations for xPU: one reference per op, one implementation per backend, and tests that hold them together.",
   "type": "module",
   "license": "MIT",

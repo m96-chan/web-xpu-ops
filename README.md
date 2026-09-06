@@ -640,10 +640,9 @@ already ships, and issue [#98](https://github.com/m96-chan/web-xpu-ops/issues/98
 tracks that specific composition, not a new op.
 
 ```ts
-// The engine itself is source-only — `llm/tokenizer`, `llm/sampler`,
-// `llm/kv-cache` and `llm/reshape` are published (0.2.0), but `LlamaEngine`
-// and everything under it is not, so this is a within-repo import rather
-// than a package one.
+// Within the repository. A consumer imports the same engine from the
+// package as `web-xpu-ops/llm/engine` (0.3.0, issue #224) and registers the
+// WGSL it bundled first — see "Models and engines" above.
 import { LlamaEngine, TINY_FIXTURE_CONFIG } from "./llm/index.js";
 
 const engine = new LlamaEngine(config, weights, runner.run);
@@ -1508,14 +1507,13 @@ in practice: 17-33s per independent turn, dominated by `create()`'s own
 `device.upload()` calls rebuilding every persistent `matvecQ8` weight buffer
 from the ~1.4 GiB checkpoint — for a workload (a chat: many short,
 independent generations against a model that never changes between turns)
-where none of that needed to happen again. This is a **within-repo (source-only)
-API** — the same status the engine layer has had since issue #98: the leaf
-modules `llm/tokenizer`, `llm/sampler`, `llm/kv-cache` and `llm/reshape` are
-published (0.2.0, issue #138), but the engines and the storage layer around
-them are not, so a consumer of `reset()` needs a source/`llm/` import rather
-than a package one. Not a blocker for
-this repository's own real consumer: `alibi-ai` already imports `llm/`
-straight from source and bundles it with esbuild, not through `npm install`,
+where none of that needed to happen again. `reset()` ships with the engine:
+`LlamaEngineQ8Resident` and the storage layer around it are published as
+`web-xpu-ops/llm/engine` since 0.3.0 (issue #224; the leaf modules
+`llm/tokenizer`, `llm/sampler`, `llm/kv-cache` and `llm/reshape` had been
+since 0.2.0, issue #138). This repository's own first consumer, `alibi-ai`,
+predates that and imports `llm/` straight from source, bundling it with
+esbuild rather than through `npm install`,
 so this status quo is unchanged by issue #120 and no `exports` work is
 required to use `reset()` there. Widening the published surface is tracked
 as a separate, later concern if anyone needs it.
@@ -2223,7 +2221,7 @@ shipping it stay two decisions:
 
 ```bash
 # on main, with package.json already at the new version
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 `.github/workflows/release.yml` then lints, builds, runs the suite, checks that

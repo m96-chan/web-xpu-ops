@@ -7,6 +7,8 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-06
+
 ### Added
 
 - **`animaForwardResident` runs a range of blocks** (issue #225): a trailing
@@ -70,179 +72,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   async stepper is the verified sync one replayed over its own growing
   prefix, which is what both demos did by hand; `sampler.test.ts` holds the
   two to bit equality, and both demos now call it.
-
-### Fixed
-
-- **Every R2V reference with more than one frame was encoded by a path the model
-  does not use** (issue #216). `examples/h3-encoder` is held to `EncoderFCN3D` +
-  `quant_conv` at 9.537e-6, and that pair is `AutoencoderKLLegacy.encode` —
-  which `encode_base` calls **only for a single image**. A frame stack goes
-  through `encode_temporal`: padded up to a multiple of `clip_length` by
-  repeating its last frame, each 17-frame chunk encoded **on its own** so the
-  causal state restarts, and `token_drop` latent frames off the end.
-
-  Measured on the released weights, the two paths on the same clip:
-
-  | frames | `encode` | `encode_temporal` | rms difference |
-  |---|---|---|---|
-  | 8 | 48x2x2x2 | 48x2x2x2 | 0.0% |
-  | 17 | 48x5x2x2 | 48x2x2x2 | different shape |
-  | 22 | 48x6x2x2 | 48x7x2x2 | different shape |
-  | **48** | 48x12x2x2 | 48x12x2x2 | **17.9%** |
-  | 68 | 48x17x2x2 | 48x17x2x2 | 19.0% |
-  | 85 | 48x22x2x2 | 48x22x2x2 | 21.5% |
-
-  A video reference is 2 to 15 seconds at 24 fps — 48 to 360 frames — so that is
-  the whole of the range. **The shapes coinciding at 48 and 68 is arithmetic,
-  not agreement**, and it is why nothing downstream ever complained. Eight
-  frames agree because the encoder is causal: two latent frames depend only on
-  the first eight pixel frames, and what follows them is exactly what
-  `token_drop` removes — which is why the 8x32x32 golden could not see any of
-  this.
-
-  `encodeConditioning` is the path now, held to `encode_temporal`'s own output
-  at **5.388e-5, 0.0006% of peak** on a 48-frame reference. `clip_length` and
-  `token_drop` come from the manifest and are refused if absent, rather than
-  defaulted to this checkpoint's 17 and 3.
-
-
-- **Anima and Z-Image's resident paths drew one flat colour** (regression from
-  #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
-  `array<f32>` when it learned fractional positions; `examples/zimage/src/
-  dit-gpu.ts` was updated in that commit and the two **resident** DiTs were not.
-- **Anima and Z-Image's resident paths drew one flat colour** (issue #217, a
-  regression from #206). `ropeAxes`' `positions` binding stopped being
-  `array<i32>` and became `array<f32>` when it learned fractional positions;
-  `examples/zimage/src/dit-gpu.ts` was updated in that commit and the two
-  **resident** DiTs were not.
-
-  Nothing errors. WebGPU copies the bytes, and a small integer's bit pattern
-  read as a float is a denormal — so every rope angle became zero, every token
-  got the identity rotation, and the DiT returned a well-formed latent whose
-  every channel is constant. Bisected: `597d567` is the first bad commit, and
-  the latent's per-channel standard deviation goes 1.02 → 0.038 across it.
-
-  `ropeAxisPositionBuffer` in `ops/rope` is where the type lives now, with the
-  slack the kernel expects, and both resident paths build their buffer with it.
-  Its test asserts the array type, because that is the thing that was wrong.
-
-- **Changing folder to the wrong one stranded the page** (reported from a
-  browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
-  `Uncaught (in promise) Error: the folder "anima-3.8B" has no
-  "model.safetensors.index.json"`, and reloading landed in the same place.
-
-  Three faults, each of which alone would have been survivable:
-
-  - **A receipt was read without asking what the caller needs.** A folder filled
-    for another model carries its own valid receipt, so `readReceipt` said
-    "filled", the fill was skipped, and the page got a folder with none of its
-    files. It takes the plan now: a receipt that does not name every file the
-    caller wants means unfilled, which fills the folder rather than failing
-    after a reload.
-  - **The folder was remembered before it was known to work.** `bindFolder`
-    stored the handle first, so a bad pick became the page's permanent answer.
-    It reads every file out of the new folder first and stores it last.
-  - **Changing folder forgot the folder that worked.** The old rule was "every
-    bind failure forgets", which is right when there is nothing to fall back on
-    and wrong when there is. `gate.test.ts` used to assert the two paths were
-    the same; it asserts they differ, and why.
-
-  And a failure that gets past all of that now lands somewhere a person can see:
-  every page's `void main()` carries a `.catch` that writes the message into the
-  status line instead of the console.
-
-- **Three limits a real reference hit, and one of them was silent**
-  (issues #212, #211). Running R2V on an actual video and image reference — 8
-  frames of 256x448 and a 256x352 still, 1,424 packed rows — found all three:
-
-  - **`qkNorm` dispatched one workgroup per head-row**, so the grid was
-    `seq * heads`. At 56 heads that passes 65,535 at **1,171 tokens**, which is
-    a 256x256 clip with two references. It is split on head-row boundaries now.
-  - **The vision tower never flushed.** Every one of its 27 blocks' buffers
-    stayed lent for the whole tower, which at 2,144 patches is gigabytes beside
-    25.78 GB of weights.
-  - **The per-row norms had the same shape of limit** — one workgroup per row,
-    so `seq * heads` rows. The conditioner's QK norms reach 65,535 at **1,024
-    tokens** at 64 heads and the DiT's at **1,171** at 56, which is any
-    presentation with a video reference in it. Both split on row boundaries
-    now, and both are `headDim` floats wide, so the slices were already
-    aligned.
-  - **`swapLeading` refused instead of tiling.** Its own comment said splitting
-    needed a second grid dimension in `ops/permute`, which #214 added; it tiles
-    now, in the DiT and in the conditioner's tower.
-  - **A dispatch past the grid limit is reported as an invalid *command
-    buffer*.** That takes every dispatch recorded beside it with it, so the run
-    completed — fifteen sampling steps at 91 ms instead of 1,400, and frames
-    written from pool debris. `ResidentDevice.batch` refuses now, naming the op
-    and the kernel, and the kernel is named from its own WGSL header because
-    every entry point here is `main`.
-
-- **R2V takes more than one reference, and takes video** (issue #212).
-  `--reference image:PATH:W:H` and `--reference video:PATH:W:H:FRAMES`,
-  repeatable, in packed order. A video is one vision block per merged frame
-  group with its own timestamp, its rotary clock advances per block, and its
-  latent geometry comes back from the encoder rather than being assumed — the
-  causal temporal compression is on the way. The layout is built *after* the
-  encoder for that reason.
-
-- **The DiT's latent space is not the decoder's, and nothing was converting
-  between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
-  pipeline "encodes with `(latent - latents_mean) / latents_std` and decodes
-  with `latent * latents_std + latents_mean`". Every sampler here handed the
-  DiT's output straight to `decode`.
-
-  What came back was a blurred frame with a grid over it, and that was read as
-  what int8 costs. It is not. With the transform, the same latent decodes to a
-  sharp paper boat with reflections in the water and the printed text on its
-  hull legible.
-
-  It surfaced while wiring `ref2va`, where the **encoder** is a caller too and
-  the two directions have to agree — a round-trip through the encoder and the
-  decoder reproduced the picture only in the raw space, while the sampler's
-  output only made sense in the normalised one. Both cannot be true of the same
-  buffer.
-
-  `unnormaliseLatent` lives beside `decode` now, the statistics ride in the
-  decoder manifest so no caller has to find them, and the three callers
-  (`h3-dit`'s sampler, `h3-dit-web`, `h3-ref2v`'s sampler) all use it.
-
-- **`DitGpu` and `VideoDecoderGpu`'s buffer pools only ever grew, so resident
-  memory was the SUM of every size class's own peak where what a step
-  actually needs at once is the MAX** (issue #223). After the token-major
-  kernel change (5d52019) a 19,027-row step still refused at 32.14 GB held,
-  asking for a 1095 MB buffer:
-
-  | resident | count x size | class |
-  |---|---|---|
-  | 12.02 GB | 156 x 77 MB | weights |
-  | 8.02 GB | 208 x 39 MB | weights |
-  | 3.85 GB | 7 x 549 MB | attention-width activations |
-  | 3.28 GB | 3 x 1095 MB | ffn-width activations (a 4th refused) |
-  | 1.64 GB | 4 x 411 MB | hidden-width |
-  | 1.16 GB | 50 x 23 MB | |
-
-  The attention stretch and the feed-forward stretch of a block run one after
-  the other and never need their buffers at the same time, but a free buffer
-  stayed allocated forever, so both stretches' peaks stayed resident at once.
-  A new pure helper, `evictionPlan` (`examples/h3-video/src/pool.ts`, shared
-  by both classes), decides which free buffers to destroy — largest-first,
-  since one big buffer frees as much as fifty small ones — so `release()` can
-  bound the FREE half of the pool to a `maxFreePoolBytes` budget (2 GiB by
-  default, settable, `Infinity` to turn it off). `lent` and `quarantine`
-  buffers are never touched; eviction runs only after both have already been
-  folded into the pool at the flush.
-
-  **The eviction alone was bookkeeping, not memory.** The acceptance run still
-  refused a 411 MB allocation at 25.00 GB held on a 32 GB card — the accounting
-  said 25 GB, the driver still held around 32. `destroy()` only schedules the
-  free; Dawn returns a destroyed buffer's VRAM after `RECLAIM_ROUND_TRIPS`
-  device round trips, not at the destroy call (issue #213,
-  `harness/reclaim.ts`). `release()` now returns the byte count it destroyed,
-  and `flush()` in both classes `await`s `this.device.reclaim()` when that
-  count is greater than zero — and only then, since most flushes at short
-  sequences evict nothing and a round trip is not free.
-
-### Added
 
 - **R2V's generator holds the model to its own specification** (issue #212).
   Every number in `MiniMaxAI/MiniMax-H3`'s card is a default or a limit in
@@ -1069,6 +898,179 @@ Entries record **why** a change was needed. What changed is in the diff.
   No new kernel: `matmul`, `rmsnorm`, `attention`, `rope`'s axes entry,
   `activation` and `elementwise` cover it.
 
+
+### Fixed
+
+- **Every R2V reference with more than one frame was encoded by a path the model
+  does not use** (issue #216). `examples/h3-encoder` is held to `EncoderFCN3D` +
+  `quant_conv` at 9.537e-6, and that pair is `AutoencoderKLLegacy.encode` —
+  which `encode_base` calls **only for a single image**. A frame stack goes
+  through `encode_temporal`: padded up to a multiple of `clip_length` by
+  repeating its last frame, each 17-frame chunk encoded **on its own** so the
+  causal state restarts, and `token_drop` latent frames off the end.
+
+  Measured on the released weights, the two paths on the same clip:
+
+  | frames | `encode` | `encode_temporal` | rms difference |
+  |---|---|---|---|
+  | 8 | 48x2x2x2 | 48x2x2x2 | 0.0% |
+  | 17 | 48x5x2x2 | 48x2x2x2 | different shape |
+  | 22 | 48x6x2x2 | 48x7x2x2 | different shape |
+  | **48** | 48x12x2x2 | 48x12x2x2 | **17.9%** |
+  | 68 | 48x17x2x2 | 48x17x2x2 | 19.0% |
+  | 85 | 48x22x2x2 | 48x22x2x2 | 21.5% |
+
+  A video reference is 2 to 15 seconds at 24 fps — 48 to 360 frames — so that is
+  the whole of the range. **The shapes coinciding at 48 and 68 is arithmetic,
+  not agreement**, and it is why nothing downstream ever complained. Eight
+  frames agree because the encoder is causal: two latent frames depend only on
+  the first eight pixel frames, and what follows them is exactly what
+  `token_drop` removes — which is why the 8x32x32 golden could not see any of
+  this.
+
+  `encodeConditioning` is the path now, held to `encode_temporal`'s own output
+  at **5.388e-5, 0.0006% of peak** on a 48-frame reference. `clip_length` and
+  `token_drop` come from the manifest and are refused if absent, rather than
+  defaulted to this checkpoint's 17 and 3.
+
+
+- **Anima and Z-Image's resident paths drew one flat colour** (regression from
+  #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
+  `array<f32>` when it learned fractional positions; `examples/zimage/src/
+  dit-gpu.ts` was updated in that commit and the two **resident** DiTs were not.
+- **Anima and Z-Image's resident paths drew one flat colour** (issue #217, a
+  regression from #206). `ropeAxes`' `positions` binding stopped being
+  `array<i32>` and became `array<f32>` when it learned fractional positions;
+  `examples/zimage/src/dit-gpu.ts` was updated in that commit and the two
+  **resident** DiTs were not.
+
+  Nothing errors. WebGPU copies the bytes, and a small integer's bit pattern
+  read as a float is a denormal — so every rope angle became zero, every token
+  got the identity rotation, and the DiT returned a well-formed latent whose
+  every channel is constant. Bisected: `597d567` is the first bad commit, and
+  the latent's per-channel standard deviation goes 1.02 → 0.038 across it.
+
+  `ropeAxisPositionBuffer` in `ops/rope` is where the type lives now, with the
+  slack the kernel expects, and both resident paths build their buffer with it.
+  Its test asserts the array type, because that is the thing that was wrong.
+
+- **Changing folder to the wrong one stranded the page** (reported from a
+  browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
+  `Uncaught (in promise) Error: the folder "anima-3.8B" has no
+  "model.safetensors.index.json"`, and reloading landed in the same place.
+
+  Three faults, each of which alone would have been survivable:
+
+  - **A receipt was read without asking what the caller needs.** A folder filled
+    for another model carries its own valid receipt, so `readReceipt` said
+    "filled", the fill was skipped, and the page got a folder with none of its
+    files. It takes the plan now: a receipt that does not name every file the
+    caller wants means unfilled, which fills the folder rather than failing
+    after a reload.
+  - **The folder was remembered before it was known to work.** `bindFolder`
+    stored the handle first, so a bad pick became the page's permanent answer.
+    It reads every file out of the new folder first and stores it last.
+  - **Changing folder forgot the folder that worked.** The old rule was "every
+    bind failure forgets", which is right when there is nothing to fall back on
+    and wrong when there is. `gate.test.ts` used to assert the two paths were
+    the same; it asserts they differ, and why.
+
+  And a failure that gets past all of that now lands somewhere a person can see:
+  every page's `void main()` carries a `.catch` that writes the message into the
+  status line instead of the console.
+
+- **Three limits a real reference hit, and one of them was silent**
+  (issues #212, #211). Running R2V on an actual video and image reference — 8
+  frames of 256x448 and a 256x352 still, 1,424 packed rows — found all three:
+
+  - **`qkNorm` dispatched one workgroup per head-row**, so the grid was
+    `seq * heads`. At 56 heads that passes 65,535 at **1,171 tokens**, which is
+    a 256x256 clip with two references. It is split on head-row boundaries now.
+  - **The vision tower never flushed.** Every one of its 27 blocks' buffers
+    stayed lent for the whole tower, which at 2,144 patches is gigabytes beside
+    25.78 GB of weights.
+  - **The per-row norms had the same shape of limit** — one workgroup per row,
+    so `seq * heads` rows. The conditioner's QK norms reach 65,535 at **1,024
+    tokens** at 64 heads and the DiT's at **1,171** at 56, which is any
+    presentation with a video reference in it. Both split on row boundaries
+    now, and both are `headDim` floats wide, so the slices were already
+    aligned.
+  - **`swapLeading` refused instead of tiling.** Its own comment said splitting
+    needed a second grid dimension in `ops/permute`, which #214 added; it tiles
+    now, in the DiT and in the conditioner's tower.
+  - **A dispatch past the grid limit is reported as an invalid *command
+    buffer*.** That takes every dispatch recorded beside it with it, so the run
+    completed — fifteen sampling steps at 91 ms instead of 1,400, and frames
+    written from pool debris. `ResidentDevice.batch` refuses now, naming the op
+    and the kernel, and the kernel is named from its own WGSL header because
+    every entry point here is `main`.
+
+- **R2V takes more than one reference, and takes video** (issue #212).
+  `--reference image:PATH:W:H` and `--reference video:PATH:W:H:FRAMES`,
+  repeatable, in packed order. A video is one vision block per merged frame
+  group with its own timestamp, its rotary clock advances per block, and its
+  latent geometry comes back from the encoder rather than being assumed — the
+  causal temporal compression is on the way. The layout is built *after* the
+  encoder for that reason.
+
+- **The DiT's latent space is not the decoder's, and nothing was converting
+  between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
+  pipeline "encodes with `(latent - latents_mean) / latents_std` and decodes
+  with `latent * latents_std + latents_mean`". Every sampler here handed the
+  DiT's output straight to `decode`.
+
+  What came back was a blurred frame with a grid over it, and that was read as
+  what int8 costs. It is not. With the transform, the same latent decodes to a
+  sharp paper boat with reflections in the water and the printed text on its
+  hull legible.
+
+  It surfaced while wiring `ref2va`, where the **encoder** is a caller too and
+  the two directions have to agree — a round-trip through the encoder and the
+  decoder reproduced the picture only in the raw space, while the sampler's
+  output only made sense in the normalised one. Both cannot be true of the same
+  buffer.
+
+  `unnormaliseLatent` lives beside `decode` now, the statistics ride in the
+  decoder manifest so no caller has to find them, and the three callers
+  (`h3-dit`'s sampler, `h3-dit-web`, `h3-ref2v`'s sampler) all use it.
+
+- **`DitGpu` and `VideoDecoderGpu`'s buffer pools only ever grew, so resident
+  memory was the SUM of every size class's own peak where what a step
+  actually needs at once is the MAX** (issue #223). After the token-major
+  kernel change (5d52019) a 19,027-row step still refused at 32.14 GB held,
+  asking for a 1095 MB buffer:
+
+  | resident | count x size | class |
+  |---|---|---|
+  | 12.02 GB | 156 x 77 MB | weights |
+  | 8.02 GB | 208 x 39 MB | weights |
+  | 3.85 GB | 7 x 549 MB | attention-width activations |
+  | 3.28 GB | 3 x 1095 MB | ffn-width activations (a 4th refused) |
+  | 1.64 GB | 4 x 411 MB | hidden-width |
+  | 1.16 GB | 50 x 23 MB | |
+
+  The attention stretch and the feed-forward stretch of a block run one after
+  the other and never need their buffers at the same time, but a free buffer
+  stayed allocated forever, so both stretches' peaks stayed resident at once.
+  A new pure helper, `evictionPlan` (`examples/h3-video/src/pool.ts`, shared
+  by both classes), decides which free buffers to destroy — largest-first,
+  since one big buffer frees as much as fifty small ones — so `release()` can
+  bound the FREE half of the pool to a `maxFreePoolBytes` budget (2 GiB by
+  default, settable, `Infinity` to turn it off). `lent` and `quarantine`
+  buffers are never touched; eviction runs only after both have already been
+  folded into the pool at the flush.
+
+  **The eviction alone was bookkeeping, not memory.** The acceptance run still
+  refused a 411 MB allocation at 25.00 GB held on a 32 GB card — the accounting
+  said 25 GB, the driver still held around 32. `destroy()` only schedules the
+  free; Dawn returns a destroyed buffer's VRAM after `RECLAIM_ROUND_TRIPS`
+  device round trips, not at the destroy call (issue #213,
+  `harness/reclaim.ts`). `release()` now returns the byte count it destroyed,
+  and `flush()` in both classes `await`s `this.device.reclaim()` when that
+  count is greater than zero — and only then, since most flushes at short
+  sequences evict nothing and a round trip is not free.
+
+
 ### Changed
 
 - **`ops/flash_attention` can read `q`/`k`/`v` token-major, and the DiT and the
@@ -1112,6 +1114,16 @@ Entries record **why** a change was needed. What changed is in the diff.
   `Float32Array` is the general one and integers still fit exactly. Existing
   callers pass `Int32Array` unchanged — the reference takes either — and the one
   GPU caller (`examples/zimage/src/dit-gpu.ts`) uploads f32 now.
+
+  **Breaking for anyone dispatching the published kernel.** `ops/rope/wgsl/axes.wgsl`'s
+  `positions` binding is `array<f32>` now, not `array<i32>`. An `Int32Array`
+  uploaded to it is read bit-for-bit as floats — every small integer is a
+  denormal, every angle is zero, every token gets the same rotation — and
+  nothing errors: the output is merely wrong. That is exactly how this
+  repository's own Anima and Z-Image resident paths regressed (issues #206,
+  #217, the "one flat colour" entry above). Upload `Float32Array` positions.
+  The reference (`ropeAxes` in `ops/rope/index.ts`) takes either, which is
+  why the change was first described as compatible.
 
   `ops/rope/h3-axes.test.ts` pins the whole mapping onto H3's rope, not just the
   capability: the **frequencies already agree** (both are
@@ -1864,6 +1876,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   margin threshold, mutation-confirmed by temporarily reverting
   `bindMatmulQ8` back to `matmulQ8IntoShape` and watching the assertion
   fail at the measured pre-#142 value.
+
 
 ## [0.2.0] - 2026-08-21
 
@@ -2934,6 +2947,7 @@ Entries record **why** a change was needed. What changed is in the diff.
   should be reported against, and the resolution grammar has target and dtype
   rungs that no kernel yet uses. A major version would claim those are settled.
 
-[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/m96-chan/web-xpu-ops/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/m96-chan/web-xpu-ops/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/m96-chan/web-xpu-ops/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m96-chan/web-xpu-ops/releases/tag/v0.1.0
