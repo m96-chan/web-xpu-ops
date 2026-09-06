@@ -2,7 +2,11 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["ops/**/*.test.ts", "harness/*.test.ts", "llm/**/*.test.ts", "models/**/*.test.ts", "examples/anima/src/**/*.test.ts", "examples/anima-web/src/**/*.test.ts", "examples/web-common/src/**/*.test.ts", "examples/zimage-web/src/**/*.test.ts", "examples/zimage/src/**/*.test.ts", "examples/zimage-vae/src/**/*.test.ts", "examples/h3-encoder/src/**/*.test.ts", "examples/h3-audio/src/**/*.test.ts", "examples/h3-audio-web/src/**/*.test.ts", "examples/h3-video/src/**/*.test.ts", "examples/h3-video-web/src/**/*.test.ts", "examples/h3-dit-web/src/**/*.test.ts", "examples/h3-dit/src/**/*.test.ts", "examples/h3-ref2v/src/**/*.test.ts", "examples/h3-ref2v-web/src/**/*.test.ts"],
+    include: ["ops/**/*.test.ts", "harness/*.test.ts", "llm/**/*.test.ts", "models/**/*.test.ts", "examples/anima/src/**/*.test.ts", "examples/anima-web/src/**/*.test.ts", "examples/web-common/src/**/*.test.ts", "examples/zimage-web/src/**/*.test.ts", "examples/zimage/src/**/*.test.ts", "examples/zimage-vae/src/**/*.test.ts", "examples/h3-encoder/src/**/*.test.ts", "examples/h3-audio/src/**/*.test.ts", "examples/h3-audio-web/src/**/*.test.ts", "examples/h3-video/src/**/*.test.ts", "examples/h3-video-web/src/**/*.test.ts", "examples/h3-dit/src/**/*.test.ts"],
+    // Every test file runs in its own process under `scripts/test.mjs`, and a
+    // test with a mocked Runner imports `llm/kernels.ts` without touching the
+    // harness — so nothing would register Node's WGSL reader for it. Issue #224.
+    setupFiles: ["./harness/kernel-sources-node.ts"],
     pool: "forks",
     poolOptions: { forks: { singleFork: true } },
     isolate: false,

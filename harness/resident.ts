@@ -1,4 +1,5 @@
 import { create, globals } from "webgpu";
+import "./kernel-sources-node.js";
 import { compilationFailure, type Binding, type Dispatch, type Runner } from "./api.js";
 import { reclaimByRoundTrips } from "./reclaim.js";
 import { bindingTypeMismatch, kernelName, storageElementTypes, type ElementType } from "./binding-types.js";

@@ -1,4 +1,5 @@
 import { create, globals } from "webgpu";
+import "./kernel-sources-node.js";
 import { bindingTypeMismatch, kernelName, storageElementTypes } from "./binding-types.js";
 
 /**
