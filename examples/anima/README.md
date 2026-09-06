@@ -178,9 +178,9 @@ readback + re-upload of one cut and nothing of the network a real split adds.
 | 832x1216, 3,952 tokens | 32.4 MB | 1,797 ms | 1,867 ms (+70 ms) | 1,968 ms (+171 ms) |
 
 At 832x1216 a cut is 35 to 60 ms for 32 MB down and 32 MB back up, against
-a 1.8 s forward. Note the one-device forward here is 1.8 s where the table
-above says 8.40 s per model call: that row predates the flash-attention
-kernel and has not been re-measured (issue #228).
+a 1.8 s forward. The sampling row above prices a model call at 2.22 s: that
+is the same forward measured inside a whole generation, not on its own, and
+what the 0.4 s between the two is has not been measured.
 
 Roofline: **not measured.** The DiT is 3,290 dispatches over 55 submits, and
 what fraction of the device's achievable bandwidth that reaches has not been
