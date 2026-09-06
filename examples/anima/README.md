@@ -151,6 +151,32 @@ be reproduced or compared.
 | the same forward, weights resident | 0.2 s |
 | the CPU reference, one forward at 64 tokens | 814 s |
 
+### Splitting the forward across devices (issue #225)
+
+`animaForwardResident` takes a trailing `shard: { from, to, activation? }` and
+runs blocks `[from, to)`. A shard that stops before the last block returns `x`
+after its last block — `[seq, 2048]` f32 — instead of the latent, and the next
+shard starts from it. Only `x` crosses a boundary; the timestep embedding, the
+adaLN LoRA, the rope tables and `context` are rebuilt on every shard from `t`,
+`T/H/W` and the caller's input. The split run is held to the unsplit one **bit
+for bit** (`dit-resident.shard.test.ts` on a synthetic model,
+`verify-forward-gpu.ts` on the real weights), so what a cut costs is time,
+not accuracy.
+
+Same device and driver as the table above, weights resident, `context` of 512
+tokens, median of 5 forwards, the whole model on one device — so this is the
+readback + re-upload of one cut and nothing of the network a real split adds.
+
+| | activation | one device | 2 shards at `[26]` | 4 shards at `[13, 26, 39]` |
+| --- | --- | --- | --- | --- |
+| 256x256, 256 tokens | 2.1 MB | 304 ms | 305 ms (+1 ms) | 327 ms (+23 ms) |
+| 832x1216, 3,952 tokens | 32.4 MB | 1,797 ms | 1,867 ms (+70 ms) | 1,968 ms (+171 ms) |
+
+At 832x1216 a cut is 35 to 60 ms for 32 MB down and 32 MB back up, against
+a 1.8 s forward. Note the one-device forward here is 1.8 s where the table
+above says 8.40 s per model call: that row predates the flash-attention
+kernel and has not been re-measured (issue #228).
+
 Roofline: **not measured.** The DiT is 3,290 dispatches over 55 submits, and
 what fraction of the device's achievable bandwidth that reaches has not been
 established.
