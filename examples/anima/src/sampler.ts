@@ -302,6 +302,8 @@ export function cfgEnabled(scale: number): boolean {
 export interface ResMultistepOptions {
   /** Called with the latent at the start of each step, as ComfyUI's callback is. */
   onStep?: (index: number, total: number, x: Float32Array, sigma: number) => void;
+  /** Called after each step with the latent it produced — the hook a progress line wants. */
+  onStepDone?: (index: number, total: number, x: Float32Array, sigma: number) => void;
 }
 
 /**
@@ -383,6 +385,7 @@ export function resMultistep(
 
     oldDenoised = denoised;
     oldSigmaDown = sigmaDown;
+    options.onStepDone?.(i, steps, x, sigma);
   }
   return x;
 }
@@ -407,6 +410,80 @@ export function vaeToLatent(latent: Float32Array, channels = LATENT.channels): F
     for (let i = 0; i < perChannel; i += 1) {
       out[c * perChannel + i] = (latent[c * perChannel + i]! - LATENT.mean[c]!) / LATENT.std[c]!;
     }
+  }
+  return out;
+}
+
+/**
+ * `resMultistep` for a denoiser that has to be awaited — a 52-block forward.
+ *
+ * The sync stepper is the one pinned step by step against ComfyUI's, and the
+ * way to keep it the one that runs is not to write a second stepper. So this
+ * does what `generate.ts` and `anima-web` each did by hand before issue #224:
+ * after step `k` it replays the `k + 1` predictions collected so far through
+ * the verified sync function. The stepper's whole state is `old_denoised` and
+ * `old_sigma_down`, both functions of that prefix, so the replay reproduces a
+ * streaming implementation exactly — `sampler.test.ts` holds the two to bit
+ * equality. It is arithmetic on one latent next to a forward that takes
+ * seconds; the quadratic replay is not where any time goes.
+ */
+export async function resMultistepAsync(
+  denoise: (x: Float32Array, sigma: number, index: number) => Promise<Float32Array>,
+  x0: Float32Array,
+  sigmas: Float64Array | number[],
+  options: ResMultistepOptions = {},
+): Promise<Float32Array> {
+  const sigmaList = Array.from(sigmas);
+  const steps = sigmaList.length - 1;
+  if (steps < 1) throw new Error(`resMultistepAsync: need at least two sigmas, got ${sigmaList.length}`);
+
+  const predictions: Float32Array[] = [];
+  let x: Float32Array = Float32Array.from(x0);
+  for (let step = 0; step < steps; step += 1) {
+    const sigma = sigmaList[step]!;
+    options.onStep?.(step, steps, x, sigma);
+    predictions.push(await denoise(x, sigma, step));
+    let cursor = 0;
+    x = resMultistep(() => predictions[cursor++]!, x0, sigmaList.slice(0, step + 2));
+    options.onStepDone?.(step, steps, x, sigma);
+  }
+  return x;
+}
+
+/**
+ * The initial latent: xorshift128+ under Box-Muller, so a seed reproduces a
+ * run without pulling in a dependency.
+ *
+ * **Not torch's Philox.** A seed reproduces this port's own image, run to run
+ * and process to process — which is what a cluster needs to hold its result
+ * against a single-process golden (issue #224) — and does not reproduce
+ * ComfyUI's image for the same number. Matching torch's generator is a
+ * separate piece of work and would be the only way to compare images rather
+ * than tensors.
+ *
+ * `Math.log`/`cos`/`sin` are the host's: V8 to V8 (Node, Chrome) the sequence
+ * is bit-identical; another engine may differ in the last ulp.
+ */
+export function gaussianNoise(count: number, seedValue: number): Float32Array {
+  let s0 = (seedValue ^ 0x9e3779b9) >>> 0 || 1;
+  let s1 = (seedValue * 0x85ebca6b + 0xc2b2ae35) >>> 0 || 2;
+  const next = (): number => {
+    let x = s0;
+    const y = s1;
+    s0 = y;
+    x ^= x << 23;
+    x ^= x >>> 17;
+    x ^= y ^ (y >>> 26);
+    s1 = x >>> 0;
+    return ((s0 + s1) >>> 0) / 4294967296;
+  };
+  const out = new Float32Array(count);
+  for (let i = 0; i < count; i += 2) {
+    const u = Math.max(next(), Number.MIN_VALUE);
+    const v = next();
+    const r = Math.sqrt(-2 * Math.log(u));
+    out[i] = r * Math.cos(2 * Math.PI * v);
+    if (i + 1 < count) out[i + 1] = r * Math.sin(2 * Math.PI * v);
   }
   return out;
 }

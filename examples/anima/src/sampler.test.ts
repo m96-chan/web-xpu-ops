@@ -23,6 +23,8 @@ import {
   timestepOf,
   noiseScaling,
   resMultistep,
+  resMultistepAsync,
+  gaussianNoise,
   rint,
   vaeToLatent,
 } from "./sampler.js";
@@ -287,5 +289,84 @@ describe("the latent conventions", () => {
     const vae = latentToVae(new Float32Array(LATENT.channels * 4));
     expect(vae[7 * 4]).toBeCloseTo(LATENT.mean[7]!, 5);
     expect(vae[2 * 4]).toBeCloseTo(LATENT.mean[2]!, 5);
+  });
+});
+
+describe("gaussianNoise", () => {
+  // The values below are what `examples/anima/src/generate.ts`'s private copy
+  // produced before the function moved here (issue #224). A consumer that
+  // wants to reproduce a single-process run — BrowserComputeCluster's golden
+  // against its cluster — needs the generator, not a description of it, so the
+  // sequence is pinned rather than the distribution alone.
+  it("reproduces the sequence generate.ts produced for the same seed", () => {
+    expect(Array.from(gaussianNoise(5, 0))).toEqual([
+      0.9190666675567627, -1.3581693172454834, 0.9928322434425354, 2.715806722640991, -1.3351887464523315,
+    ]);
+    expect(Array.from(gaussianNoise(5, 42))).toEqual([
+      -0.5976259708404541, -0.69472336769104, 0.5955292582511902, 1.5691413879394531, 1.0364665985107422,
+    ]);
+  });
+
+  it("is a seed away from a different sequence and a call away from the same one", () => {
+    expect(Array.from(gaussianNoise(4, 1))).toEqual(Array.from(gaussianNoise(4, 1)));
+    expect(Array.from(gaussianNoise(4, 1))).not.toEqual(Array.from(gaussianNoise(4, 2)));
+  });
+
+  it("is standard normal to the precision 100k samples allow", () => {
+    const big = gaussianNoise(100_000, 7);
+    let sum = 0, sq = 0;
+    for (const x of big) { sum += x; sq += x * x; }
+    const mean = sum / big.length;
+    const variance = sq / big.length - mean * mean;
+    expect(Math.abs(mean)).toBeLessThan(0.02);
+    expect(Math.abs(variance - 1)).toBeLessThan(0.02);
+  });
+
+  it("fills an odd count without reading past the end", () => {
+    const odd = gaussianNoise(3, 5);
+    expect(odd.length).toBe(3);
+    expect(Array.from(odd).every(Number.isFinite)).toBe(true);
+  });
+});
+
+describe("resMultistepAsync", () => {
+  // A toy denoiser with state that depends on the step index and the input, so
+  // an async loop that fed the wrong `x` or the wrong `sigma` to any step
+  // would diverge from the sync one.
+  const toy = (x: Float32Array, sigma: number, index: number): Float32Array =>
+    x.map((v, i) => v * (1 - sigma / (index + 2)) + Math.sin(i + index) * 0.1);
+  const sigmas = [1, 0.7, 0.45, 0.2, 0.05, 0];
+  const x0 = Float32Array.from({ length: 16 }, (_, i) => Math.cos(i) * 2);
+
+  it("is bit-identical to the sync stepper given the same denoiser", async () => {
+    const sync = resMultistep(toy, x0, sigmas);
+    const async = await resMultistepAsync(async (x, sigma, i) => toy(x, sigma, i), x0, sigmas);
+    expect(Array.from(async)).toEqual(Array.from(sync));
+  });
+
+  it("hands each step the latent the sync stepper would have", async () => {
+    const seenSync: Float32Array[] = [];
+    const seenAsync: Float32Array[] = [];
+    resMultistep((x, s, i) => { seenSync.push(Float32Array.from(x)); return toy(x, s, i); }, x0, sigmas);
+    await resMultistepAsync(async (x, s, i) => { seenAsync.push(Float32Array.from(x)); return toy(x, s, i); }, x0, sigmas);
+    expect(seenAsync.length).toBe(sigmas.length - 1);
+    seenAsync.forEach((x, i) => expect(Array.from(x)).toEqual(Array.from(seenSync[i]!)));
+  });
+
+  it("reports each finished step with the latent it produced, in both variants", async () => {
+    const doneSync: [number, number][] = [];
+    const doneAsync: [number, number][] = [];
+    let lastSync: Float32Array | null = null;
+    let lastAsync: Float32Array | null = null;
+    const out = resMultistep(toy, x0, sigmas, {
+      onStepDone: (i, total, x) => { doneSync.push([i, total]); lastSync = Float32Array.from(x); },
+    });
+    const outAsync = await resMultistepAsync(async (x, s, i) => toy(x, s, i), x0, sigmas, {
+      onStepDone: (i, total, x) => { doneAsync.push([i, total]); lastAsync = Float32Array.from(x); },
+    });
+    expect(doneSync).toEqual([[0, 5], [1, 5], [2, 5], [3, 5], [4, 5]]);
+    expect(doneAsync).toEqual(doneSync);
+    expect(Array.from(lastSync!)).toEqual(Array.from(out));
+    expect(Array.from(lastAsync!)).toEqual(Array.from(outAsync));
   });
 });

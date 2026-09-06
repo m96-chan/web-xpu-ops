@@ -59,7 +59,8 @@ import {
   flowSigmas,
   latentToVae,
   noiseScaling,
-  resMultistep,
+  resMultistepAsync,
+  gaussianNoise,
   timestepOf,
 } from "../../anima/src/sampler.js";
 import { type T5Vocab, animaTokenizers, tokenizePrompt } from "../../anima/src/tokenize.js";
@@ -135,33 +136,6 @@ function say(message: string, extra = ""): void {
 }
 
 $<HTMLElement>("build").textContent = BUILD_STAMP;
-
-/** xorshift128+ and Box-Muller, matching `examples/anima/src/generate.ts`. */
-function gaussianNoise(count: number, seedValue: number): Float32Array {
-  let s0 = (seedValue ^ 0x9e3779b9) >>> 0 || 1;
-  let s1 = (seedValue * 0x85ebca6b + 0xc2b2ae35) >>> 0 || 2;
-  const next = (): number => {
-    let x = s0;
-    const y = s1;
-    s0 = y;
-    x ^= x << 23;
-    x ^= x >>> 17;
-    x ^= y ^ (y >>> 26);
-    s1 = x >>> 0;
-    return ((s0 + s1) >>> 0) / 4294967296;
-  };
-  const out = new Float32Array(count);
-  // Not torch's Philox, so a seed reproduces this port's own runs and **not**
-  // ComfyUI's image for the same number.
-  for (let i = 0; i < count; i += 2) {
-    const u = Math.max(next(), Number.MIN_VALUE);
-    const v = next();
-    const r = Math.sqrt(-2 * Math.log(u));
-    out[i] = r * Math.cos(2 * Math.PI * v);
-    if (i + 1 < count) out[i + 1] = r * Math.sin(2 * Math.PI * v);
-  }
-  return out;
-}
 
 /** `[3, H, W]` in roughly `[-1, 1]` onto the canvas. */
 function draw(image: Float32Array, H: number, W: number): void {
@@ -675,7 +649,6 @@ async function main(): Promise<void> {
      * while the prefixes it has not reached yet still need preloading.
      */
     let weightsResident = false;
-    const predictions: Float32Array[] = [];
     let out = x0;
     const samplingStart = performance.now();
     // The first forward uploads 3.63 GB of weights and hydrates the heap from
@@ -684,103 +657,107 @@ async function main(): Promise<void> {
     // ends up disagreeing with a command line for no visible reason.
     let firstForwardSeconds = 0;
 
-    for (let step = 0; step < sigmas.length - 1; step += 1) {
-      const sigma = sigmas[step]!;
-      const t = timestepOf(sigma);
-      const stepStarted = performance.now();
+    let stepStarted = performance.now();
+    // `resMultistepAsync` is the verified sync stepper replayed over its own
+    // growing prefix — `sampler.ts` has the reasoning. This page and
+    // `generate.ts` each carried that replay by hand until issue #224.
+    out = await resMultistepAsync(
+      async (out, sigma, step) => {
+        // Yield first, so the previous step's status text actually paints
+        // before this step's forwards hold the thread.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const t = timestepOf(sigma);
+        stepStarted = performance.now();
 
-      const forward = async (context: Float32Array, first = false): Promise<Float32Array> => {
-        const input: AnimaInput = { latent: out, ...shape, t, context };
-        // The *second* step, not the first: the first uploads 3.63 GB and
-        // hydrates the heap, so its timings are the loading cost rather than
-        // the steady-state one.
-        const wanted = wantProfile && first && step === 1;
-        if (wanted && !profile) {
-          profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0, bindGroupMs: 0, bindGroups: 0, hostCallbackMs: 0 };
-        }
-        const stats = wanted
-          ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
-          : undefined;
-        // Device counters are cumulative; a forward's share is the difference.
-        const bindGroupsBefore = residentDevice.stats.bindGroupMs;
-        const hostCallbackBefore = hostCallbackMsTotal;
-        const preloadBefore = preloadMsTotal;
-        const yieldBefore = yieldMsTotal;
-        const bindGroupCountBefore = residentDevice.stats.bindGroups;
-        const forwardStart = wanted ? performance.now() : 0;
-        const result = await animaForwardResident(
-          residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
-          // Hydrates the heap a block at a time, from the disk cache, for the
-          // first forward only — the guard below is what makes that true. It
-          // used to be an unchecked claim in this comment, and it was false.
-          async (prefix) => {
-            // **Only while the device does not already hold the weights.**
-            // `weightBuffer()` and `project()` both check `held` before asking
-            // the source for anything — "Already on the device: dispatch
-            // without asking the source for anything" — so from the second
-            // forward on, this pulled tensors off disk that nothing would
-            // read. Measured at 1346 ms of a 3769 ms forward, ~36%, and every
-            // millisecond of it wasted; the heap holds 192 packed tensors
-            // against 898 in the model, so the LRU cannot even make the
-            // re-read cheap.
-            //
-            // **`held.size > 0` is the wrong test, and running it is how that
-            // was found.** `held` fills *during* the first forward, so it is
-            // non-empty from the first prefix onward and every later prefix
-            // was skipped on the very forward that needed them:
-            // `"net.t_embedder.1.linear_1.weight" was read before it was
-            // preloaded`. The condition is "a forward has finished", which
-            // nothing about `held` expresses partway through one.
-            if (weightsResident) return;
-            const t0 = performance.now();
-            await dit.preloadPrefix(prefix);
-            const t1 = performance.now();
-            // Yield, so a 52-block first forward does not freeze the tab.
-            await new Promise((resolve) => setTimeout(resolve, 0));
-            preloadMsTotal += t1 - t0;
-            yieldMsTotal += performance.now() - t1;
-            // Into a counter that runs for every forward, never straight into
-            // `profile`: this callback fires on all eighty and `profile`
-            // outlives the one being measured, so `+= into profile` summed the
-            // whole generation and reported 2853% of one forward.
-            hostCallbackMsTotal += performance.now() - t0;
-          },
-          wanted ? profile ?? undefined : undefined,
-        );
-        // Every weight the DiT touches is on the device now, so nothing after
-        // this needs the source.
-        weightsResident = true;
-        if (wanted && stats) {
-          profiledWallSeconds = (performance.now() - forwardStart) / 1000;
-          profiledDispatches = stats.dispatches;
-          if (profile) {
-            profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
-            profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
-            profile.hostCallbackMs = hostCallbackMsTotal - hostCallbackBefore;
-            profiledPreloadMs = preloadMsTotal - preloadBefore;
-            profiledYieldMs = yieldMsTotal - yieldBefore;
+        const forward = async (context: Float32Array, first = false): Promise<Float32Array> => {
+          const input: AnimaInput = { latent: out, ...shape, t, context };
+          // The *second* step, not the first: the first uploads 3.63 GB and
+          // hydrates the heap, so its timings are the loading cost rather than
+          // the steady-state one.
+          const wanted = wantProfile && first && step === 1;
+          if (wanted && !profile) {
+            profile = { byKernel: new Map(), supported: residentDevice.timestampsSupported, encodeMs: 0, submitToDoneMs: 0, readbackMs: 0, bindGroupMs: 0, bindGroups: 0, hostCallbackMs: 0 };
           }
-        }
-        return result;
-      };
-      const cond = await forward(positive, true);
-      const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
-      predictions.push(calculateDenoised(sigma, prediction, out));
+          const stats = wanted
+            ? { dispatches: 0, submits: 0, poolSlots: 0, poolBytes: 0, weightBuffers: 0, uploadedBytes: 0 }
+            : undefined;
+          // Device counters are cumulative; a forward's share is the difference.
+          const bindGroupsBefore = residentDevice.stats.bindGroupMs;
+          const hostCallbackBefore = hostCallbackMsTotal;
+          const preloadBefore = preloadMsTotal;
+          const yieldBefore = yieldMsTotal;
+          const bindGroupCountBefore = residentDevice.stats.bindGroups;
+          const forwardStart = wanted ? performance.now() : 0;
+          const result = await animaForwardResident(
+            residentDevice, ditKernels, cfg, ditWeights, input, stats, held, undefined, undefined,
+            // Hydrates the heap a block at a time, from the disk cache, for the
+            // first forward only — the guard below is what makes that true. It
+            // used to be an unchecked claim in this comment, and it was false.
+            async (prefix) => {
+              // **Only while the device does not already hold the weights.**
+              // `weightBuffer()` and `project()` both check `held` before asking
+              // the source for anything — "Already on the device: dispatch
+              // without asking the source for anything" — so from the second
+              // forward on, this pulled tensors off disk that nothing would
+              // read. Measured at 1346 ms of a 3769 ms forward, ~36%, and every
+              // millisecond of it wasted; the heap holds 192 packed tensors
+              // against 898 in the model, so the LRU cannot even make the
+              // re-read cheap.
+              //
+              // **`held.size > 0` is the wrong test, and running it is how that
+              // was found.** `held` fills *during* the first forward, so it is
+              // non-empty from the first prefix onward and every later prefix
+              // was skipped on the very forward that needed them:
+              // `"net.t_embedder.1.linear_1.weight" was read before it was
+              // preloaded`. The condition is "a forward has finished", which
+              // nothing about `held` expresses partway through one.
+              if (weightsResident) return;
+              const t0 = performance.now();
+              await dit.preloadPrefix(prefix);
+              const t1 = performance.now();
+              // Yield, so a 52-block first forward does not freeze the tab.
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              preloadMsTotal += t1 - t0;
+              yieldMsTotal += performance.now() - t1;
+              // Into a counter that runs for every forward, never straight into
+              // `profile`: this callback fires on all eighty and `profile`
+              // outlives the one being measured, so `+= into profile` summed the
+              // whole generation and reported 2853% of one forward.
+              hostCallbackMsTotal += performance.now() - t0;
+            },
+            wanted ? profile ?? undefined : undefined,
+          );
+          // Every weight the DiT touches is on the device now, so nothing after
+          // this needs the source.
+          weightsResident = true;
+          if (wanted && stats) {
+            profiledWallSeconds = (performance.now() - forwardStart) / 1000;
+            profiledDispatches = stats.dispatches;
+            if (profile) {
+              profile.bindGroupMs = residentDevice.stats.bindGroupMs - bindGroupsBefore;
+              profile.bindGroups = residentDevice.stats.bindGroups - bindGroupCountBefore;
+              profile.hostCallbackMs = hostCallbackMsTotal - hostCallbackBefore;
+              profiledPreloadMs = preloadMsTotal - preloadBefore;
+              profiledYieldMs = yieldMsTotal - yieldBefore;
+            }
+          }
+          return result;
+        };
+        const cond = await forward(positive, true);
+        const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
+        return calculateDenoised(sigma, prediction, out);
 
-      // The verified stepper, replayed over its own growing prefix — see
-      // `generate.ts` for why the sampler is not made async instead.
-      let cursor = 0;
-      out = resMultistep(() => predictions[cursor++]!, x0, sigmas.slice(0, step + 2));
-
-      const stepSeconds = (performance.now() - stepStarted) / 1000;
-      if (step === 0) firstForwardSeconds = stepSeconds;
-      say(
-        `step ${step + 1}/${sigmas.length - 1}`,
-        `sigma ${sigma.toFixed(4)}, ${stepSeconds.toFixed(2)}s`,
-      );
-      // Yield, so the status text above actually paints.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+      },
+      x0,
+      sigmas,
+      {
+        onStepDone: (step, total, _out, sigma) => {
+          const stepSeconds = (performance.now() - stepStarted) / 1000;
+          if (step === 0) firstForwardSeconds = stepSeconds;
+          say(`step ${step + 1}/${total}`, `sigma ${sigma.toFixed(4)}, ${stepSeconds.toFixed(2)}s`);
+        },
+      },
+    );
     const samplingSeconds = (performance.now() - samplingStart) / 1000;
     releaseAnimaWeights(held);
 
