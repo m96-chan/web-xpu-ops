@@ -1,7 +1,7 @@
 import type { ChunkStore } from "./chunk-store.js";
 import type { LlamaConfig } from "./config.js";
 import { createIndexedDbChunkStore, isIndexedDbSupported } from "./idb-chunk-store.js";
-import type { LoadedRealModelQ8 } from "./real-model-weights.js";
+import type { LoadedRealModelQ8 } from "./weights-q8-io.js";
 import { estimateStorageQuota, requestPersistentStorage, type QuotaEstimate } from "./storage-quota.js";
 import {
   decideCacheStrategy,

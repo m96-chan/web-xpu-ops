@@ -72,8 +72,13 @@ describe("published surface", () => {
     exports: Record<string, unknown>;
     files: string[];
   };
+  // Two programs emit into `dist/` — `tsconfig.build-models.json` grants
+  // WebGPU's types to the model ports and engines, which the ops build
+  // deliberately withholds (issue #224) — so a promised entry point may be
+  // built by either.
   const build = readJsonWithComments("tsconfig.build.json") as { include: string[] };
-  const include = new Set(build.include);
+  const models = readJsonWithComments("tsconfig.build-models.json") as { include: string[] };
+  const include = new Set([...build.include, ...models.include]);
 
   it("builds every module that exports promises", () => {
     const missing = exportedDistPaths(pkg.exports)

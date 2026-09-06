@@ -60,14 +60,34 @@
       "types": "./dist/llm/sampler.d.ts",
       "default": "./dist/llm/sampler.js"
     },
+    "./llm/engine": {
+      "types": "./dist/llm/engine-index.d.ts",
+      "default": "./dist/llm/engine-index.js"
+    },
+    "./harness": {
+      "types": "./dist/harness/api.d.ts",
+      "default": "./dist/harness/api.js"
+    },
+    "./models/anima": {
+      "types": "./dist/models/anima/index.d.ts",
+      "default": "./dist/models/anima/index.js"
+    },
+    "./models/anima/kernels": {
+      "types": "./dist/models/anima/kernels.d.ts",
+      "default": "./dist/models/anima/kernels.js"
+    },
+    "./models/anima/fetch-weights": {
+      "types": "./dist/models/anima/fetch-weights.d.ts",
+      "default": "./dist/models/anima/fetch-weights.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/assets.mjs",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.build-models.json && node scripts/assets.mjs",
     "lint": "tsc --noEmit && for t in examples/*/tsconfig.json; do echo \"  $t\" && npx tsc -p \"$t\" --noEmit || exit 1; done",
     "test": "node scripts/test.mjs",
     "test:file": "vitest run",
-    "prepublishOnly": "npm run build",
+    "prepack": "npm run build",
     "demo:build": "node examples/llm-demo/build.mjs",
     "demo:serve": "node examples/llm-demo/server.mjs",
     "zimage:build": "node examples/zimage-web/build.mjs",

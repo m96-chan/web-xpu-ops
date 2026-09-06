@@ -31,7 +31,7 @@
  * instead of restating them makes that class of drift impossible rather
  * than merely checked.
  */
-import type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/resident.js";
+import type { BatchProfile, ResidentDevice, ResidentOp, ResidentReadback } from "../../../harness/api.js";
 // Runtime-importable because `reclaim.ts` imports nothing at runtime, unlike
 // `resident.ts` with its native `webgpu` addon. See its doc.
 import { reclaimByRoundTrips } from "../../../harness/reclaim.js";

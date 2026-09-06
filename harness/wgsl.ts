@@ -1,4 +1,5 @@
 import { create, globals } from "webgpu";
+import "./kernel-sources-node.js";
 import { bindingTypeMismatch, kernelName, storageElementTypes } from "./binding-types.js";
 
 /**
@@ -9,70 +10,8 @@ import { bindingTypeMismatch, kernelName, storageElementTypes } from "./binding-
  * every part of that turned out to be avoidable.
  */
 
-/** One entry of a shader's `@group(0)` layout, in binding order. */
-export type Binding =
-  | { kind: "storage"; data: Float32Array | Int32Array | Uint32Array }
-  | { kind: "out"; type: "f32" | "i32" | "u32"; length: number }
-  /**
-   * Storage the kernel uses but nobody supplies or inspects: no upload, no
-   * readback, contents undefined (zero in practice).
-   *
-   * It exists for the roofline calibration, which streams hundreds of megabytes
-   * to find out how fast this device moves memory. Through `storage` that would
-   * upload the buffer, and through `out` it would copy it back — either one puts
-   * a transfer of the same size next to the thing being timed, which is exactly
-   * what must not happen when the measurement *is* the transfer rate.
-   */
-  | { kind: "scratch"; length: number }
-  | { kind: "uniform"; data: ArrayBuffer };
-
-export interface Dispatch {
-  code: string;
-  entry?: string;
-  bindings: Binding[];
-  workgroups: [number] | [number, number] | [number, number, number];
-}
-
-export interface Runner {
-  run(dispatch: Dispatch): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
-  /**
-   * Seconds of GPU time for the dispatch, or null when this device cannot say.
-   *
-   * Read from a timestamp query written around the compute pass, not from a
-   * clock on the host. Wall-clock here measures buffer creation, submission and
-   * the round trip waiting for a mapped readback — about a millisecond on this
-   * machine, which is several times a real dispatch and swamps exactly the
-   * quantity being measured. Measured while building the roofline: a wall-clock
-   * slope reported 5.3 TB/s on a card whose ceiling is 1.8.
-   *
-   * `timestamp-query` is optional, and the devices most in need of an honest
-   * ceiling advertise the fewest features. Null rather than a guess is the point
-   * — rule 9 says an unmeasured figure must say so, and a fabricated one is
-   * worse than none because it looks authoritative.
-   */
-  time(dispatch: Dispatch): Promise<number | null>;
-  destroy(): void;
-}
-
-/**
- * The reason a shader could not be used, or null when it compiled.
- *
- * Split out as a pure function so it can be tested without a device. The half
- * that needs a GPU — whether Dawn reports a bad shader at all — is platform
- * behaviour and is measured in `harness/README` notes and issue #46. The half
- * that is ours is this: given messages, do we refuse. That distinction matters
- * because provoking a real compile failure crashes this binding in roughly four
- * runs in five, so an end-to-end test of it cannot be kept green, while this
- * can.
- */
-export function compilationFailure(
-  messages: readonly Pick<GPUCompilationMessage, "type" | "lineNum" | "linePos" | "message">[],
-): string | null {
-  const errors = messages.filter((message) => message.type === "error");
-  if (errors.length === 0) return null;
-  const where = (m: (typeof errors)[number]) => `${m.lineNum}:${m.linePos}: ${m.message}`;
-  return `shader failed to compile\n${errors.map(where).join("\n")}`;
-}
+export { compilationFailure, params, type Binding, type Dispatch, type Runner } from "./api.js";
+import { compilationFailure, type Binding, type Dispatch, type Runner } from "./api.js";
 
 /**
  * Instances and adapters this process has created, kept reachable on purpose.
@@ -406,14 +345,3 @@ export async function createRunner(): Promise<Runner | null> {
   };
 }
 
-/** Packs a params struct of mixed u32 / i32 / f32 into a uniform buffer. */
-export function params(fields: ["u32" | "i32" | "f32", number][]): ArrayBuffer {
-  const buffer = new ArrayBuffer(Math.max(16, fields.length * 4));
-  const view = new DataView(buffer);
-  fields.forEach(([kind, value], index) => {
-    if (kind === "f32") view.setFloat32(index * 4, value, true);
-    else if (kind === "i32") view.setInt32(index * 4, value, true);
-    else view.setUint32(index * 4, value, true);
-  });
-  return buffer;
-}

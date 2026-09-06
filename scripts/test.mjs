@@ -37,6 +37,7 @@ import { join } from "node:path";
 const OPS = "ops";
 const HARNESS = "harness";
 const LLM = "llm";
+const MODELS = "models";
 // `examples/` is not published and mostly not tested, but `zimage` carries the
 // composition check for issue #163 — the one place that asserts the ops add up
 // to a real model rather than to their own references. Left out of the runner,
@@ -84,6 +85,9 @@ function testFiles() {
   // being forced into either shape. None of these need a GPU, but per-file
   // processes are what makes a crash attributable to one file (see #38).
   found.push(...testFilesRecursive(LLM));
+  // `models/` is the published surface over `examples/` (issue #224): a barrel
+  // and the kernel-table helper, each with a test beside it.
+  found.push(...testFilesRecursive(MODELS));
   for (const dir of EXAMPLES_TESTED) found.push(...testFilesRecursive(dir));
   return found.sort();
 }

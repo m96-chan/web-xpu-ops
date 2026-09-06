@@ -35,8 +35,8 @@
  * around a device-side buffer — the input is 24 channels and the output is read
  * back to be displayed anyway.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";

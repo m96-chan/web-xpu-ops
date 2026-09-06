@@ -12,8 +12,8 @@
  * CPU side — see `text-encoder.ts` for why, and for the 1.002e-1 it costs to
  * forget.
  */
-import type { Runner } from "../../../harness/wgsl.js";
-import { params } from "../../../harness/wgsl.js";
+import type { Runner } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { Qwen3Config, Qwen3LayerWeights } from "./text-encoder.js";

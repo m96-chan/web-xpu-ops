@@ -7,6 +7,50 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ## [Unreleased]
 
+### Added
+
+- **The Anima port and the Llama engines are importable** (issue #224):
+  `web-xpu-ops/models/anima`, `web-xpu-ops/models/anima/kernels`,
+  `web-xpu-ops/models/anima/fetch-weights`, `web-xpu-ops/llm/engine` and
+  `web-xpu-ops/harness`. Until now 0.2.0 published `ops/*` and the tokenizers
+  and nothing that dispatched them; a downstream that wanted the DiT forward
+  (BrowserComputeCluster, to split it across a cluster) had to depend on the
+  source tree by git or copy files out of `examples/`, and copies of a
+  verified forward stop being verified.
+
+  Two things had to give for that to be publishable. `harness/wgsl.ts` and
+  `harness/resident.ts` import Dawn's Node binding at module scope, so every
+  browser demo carried an esbuild plugin whose job was to swap the whole
+  harness for a hand-kept copy; the contract they define — `Runner`,
+  `ResidentDevice`, `params`, `compilationFailure` — now lives in
+  `harness/api.ts` with no runtime import, and both files re-export it. And
+  `llm/kernels.ts` read its WGSL through `readFileSync`, which no page can;
+  it now asks a registry (`registerKernelSources`) that Node fills from the
+  filesystem on importing the harness and a page fills from whatever it
+  bundled. The three copies of the engine's kernel list — two `CODE` objects
+  and the demo's table, held equal by a test that parsed all three as text —
+  are one exported `LLM_KERNEL_SOURCES`.
+
+  The build is two `tsc` programs: the ops build keeps `types: []`, so a
+  reference still cannot reach for a `GPUBuffer`; `tsconfig.build-models.json`
+  grants WebGPU's types only to the code that dispatches. `scripts/assets.mjs`
+  now checks that every subpath `package.json` promises was actually built.
+  Verified by packing the tarball, installing it in another directory, and
+  compiling a consumer that imports every new subpath under `strict` with
+  `skipLibCheck: false`.
+  `npm pack` now builds first (`prepack`, which `npm publish` also runs;
+  `prepublishOnly` did not cover `pack`) — a consumer verifying a branch from
+  a clean checkout got a 116 KB tarball with an empty `dist/`.
+
+- **`gaussianNoise` and `resMultistepAsync` in `examples/anima/src/sampler.ts`.**
+  The initial-latent generator (xorshift128+ under Box-Muller — this port's own
+  sequence, not torch's Philox) was a private copy in `generate.ts` and
+  another in `anima-web`; a cluster that wants to hold its result to a
+  single-process golden needs the generator, not a description of it. The
+  async stepper is the verified sync one replayed over its own growing
+  prefix, which is what both demos did by hand; `sampler.test.ts` holds the
+  two to bit equality, and both demos now call it.
+
 ### Fixed
 
 - **Every R2V reference with more than one frame was encoded by a path the model

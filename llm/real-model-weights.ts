@@ -3,7 +3,9 @@ import { join } from "node:path";
 import type { LlamaConfig } from "./config.js";
 import type { LlamaWeightsQ8 } from "./weights-q8.js";
 import { assertWeightShapesQ8 } from "./weights-q8.js";
-import { buildLlamaWeightsQ8, llamaConfigFromManifest, type WeightManifestConfig, type WeightManifestEntry } from "./weights-q8-io.js";
+import { buildLlamaWeightsQ8, llamaConfigFromManifest, type LoadedRealModelQ8, type WeightManifestConfig, type WeightManifestEntry } from "./weights-q8-io.js";
+
+export type { LoadedRealModelQ8 } from "./weights-q8-io.js";
 
 /**
  * Loads a checkpoint converted by `llm/tools/convert_weights.py` — issue
@@ -28,11 +30,6 @@ import { buildLlamaWeightsQ8, llamaConfigFromManifest, type WeightManifestConfig
 interface ConvertedManifest {
   config: WeightManifestConfig;
   weights: WeightManifestEntry[];
-}
-
-export interface LoadedRealModelQ8 {
-  config: LlamaConfig;
-  weights: LlamaWeightsQ8;
 }
 
 /** A copy of `buffer`'s bytes as a plain `ArrayBuffer`, since `buildLlamaWeightsQ8` indexes from byte 0 of what it is given but a `Buffer`'s `.buffer` is the whole underlying allocation. */

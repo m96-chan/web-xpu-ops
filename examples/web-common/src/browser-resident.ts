@@ -32,7 +32,7 @@ import {
 } from "../../../harness/binding-types.js";
 import type {
   BatchProfile, ResidentDevice, ResidentOp, ResidentReadback,
-} from "../../../harness/resident.js";
+} from "../../../harness/api.js";
 // **A value import, and deliberately from a different file.** `resident.ts`
 // pulls in the native `webgpu` addon at module scope, which is the whole reason
 // this browser copy exists; `reclaim.ts` imports nothing at runtime, so both

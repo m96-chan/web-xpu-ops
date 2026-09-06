@@ -21,7 +21,7 @@
  * around 1e-12, and agree exactly at an all-zero pixel, where both give zero.
  * The golden is what says whether that is good enough, and it reads 4.7e-7.
  */
-import { params, type Runner } from "../../../harness/wgsl.js";
+import { params, type Runner } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { conv2dOutputSize } from "../../../ops/conv/index.js";

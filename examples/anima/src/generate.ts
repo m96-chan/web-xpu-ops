@@ -62,7 +62,8 @@ import {
   flowSigmas,
   latentToVae,
   noiseScaling,
-  resMultistep,
+  resMultistepAsync,
+  gaussianNoise,
   timestepOf,
 } from "./sampler.js";
 import { type T5Vocab, animaTokenizers, tokenizePrompt } from "./tokenize.js";
@@ -120,35 +121,6 @@ if (latentH % 2 !== 0 || latentW % 2 !== 0) {
     `generate: ${width}x${height} gives a ${latentW}x${latentH} latent, which the DiT's patch size of 2 does not divide. ` +
       `Use a multiple of ${VAE_STRIDE * 2}.`,
   );
-}
-
-/** xorshift128+, so a seed reproduces a run without pulling in a dependency. */
-function gaussianNoise(count: number, seedValue: number): Float32Array {
-  let s0 = (seedValue ^ 0x9e3779b9) >>> 0 || 1;
-  let s1 = (seedValue * 0x85ebca6b + 0xc2b2ae35) >>> 0 || 2;
-  const next = (): number => {
-    let x = s0;
-    const y = s1;
-    s0 = y;
-    x ^= x << 23;
-    x ^= x >>> 17;
-    x ^= y ^ (y >>> 26);
-    s1 = x >>> 0;
-    return ((s0 + s1) >>> 0) / 4294967296;
-  };
-  const out = new Float32Array(count);
-  // Box-Muller. Not torch's Philox, so this does **not** reproduce ComfyUI's
-  // image for a given seed — only this port's own, run to run. Matching torch's
-  // generator is a separate piece of work and would be the only way to compare
-  // images rather than tensors.
-  for (let i = 0; i < count; i += 2) {
-    const u = Math.max(next(), Number.MIN_VALUE);
-    const v = next();
-    const r = Math.sqrt(-2 * Math.log(u));
-    out[i] = r * Math.cos(2 * Math.PI * v);
-    if (i + 1 < count) out[i + 1] = r * Math.sin(2 * Math.PI * v);
-  }
-  return out;
 }
 
 // --- weights ---
@@ -330,33 +302,19 @@ const count = LATENT.channels * shape.T * shape.H * shape.W;
 const x0 = noiseScaling(sigmas[0]!, gaussianNoise(count, seed), null);
 
 let modelCalls = 0;
+let stepStarted = Date.now();
 const sampleStarted = Date.now();
 
 /**
- * `res_multistep` with a denoiser that has to be awaited.
- *
- * The sampler in `sampler.ts` is synchronous because ComfyUI's is, and it is
- * pinned step by step against ComfyUI's on a toy denoiser. A 52-block forward
- * is not synchronous. Making the sampler `async` would mean the thing under
- * test and the thing that runs are different functions, which is how a
- * carefully verified stepper quietly stops being the one in the pipeline.
- *
- * So the verified stepper is used unchanged, and re-run over its own growing
- * prefix: after step `k` the `k + 1` predictions collected so far are replayed
- * through it to get the latent. Its whole state is `old_denoised` and
- * `old_sigma_down`, both functions of that sequence, so the replay reproduces
- * exactly what a streaming implementation would — and it is arithmetic on one
- * latent, sitting next to a forward that takes a second.
+ * `resMultistepAsync` is the verified sync stepper replayed over its own
+ * growing prefix — `sampler.ts` has the reasoning; this file used to carry
+ * the replay by hand (issue #224 moved it, so the page and a cluster run the
+ * same loop).
  */
-async function sampleAsync(): Promise<Float32Array> {
-  const predictions: Float32Array[] = [];
-  let out = x0;
-
-  for (let step = 0; step < sigmas.length - 1; step += 1) {
-    const sigma = sigmas[step]!;
+const sampled = await resMultistepAsync(
+  async (out, sigma, step) => {
+    stepStarted = Date.now();
     const t = timestepOf(sigma);
-    const stepStarted = Date.now();
-
     const forward = async (context: Float32Array): Promise<Float32Array> => {
       modelCalls += 1;
       return animaForwardResident(
@@ -364,37 +322,35 @@ async function sampleAsync(): Promise<Float32Array> {
         { latent: out, ...shape, t, context }, undefined, held,
       );
     };
-
     const cond = await forward(positive);
     const prediction = unconditional ? applyCfg(cond, await forward(unconditional), guidance) : cond;
-    predictions.push(calculateDenoised(sigma, prediction, out));
-
-    let cursor = 0;
-    out = resMultistep(() => predictions[cursor++]!, x0, sigmas.slice(0, step + 2));
-
-    // Per-channel spatial standard deviation, not the tensor's overall one.
-    // A latent that is flat in space but offset channel to channel has a large
-    // overall std and no picture in it — which is exactly the failure this line
-    // exists to make visible while it is still running.
-    const per = out.length / LATENT.channels;
-    const spread: number[] = [];
-    for (let ch = 0; ch < LATENT.channels; ch += 1) {
-      let sum = 0, sq = 0;
-      for (let i = 0; i < per; i += 1) { const v = out[ch * per + i]!; sum += v; sq += v * v; }
-      spread.push(Math.sqrt(Math.max(0, sq / per - (sum / per) ** 2)));
-    }
-    spread.sort((x, y) => x - y);
-    process.stdout.write(
-      `\r  step ${step + 1}/${sigmas.length - 1}  sigma ${sigma.toFixed(4)}  ` +
-        `spread ${spread[spread.length >> 1]!.toFixed(3)}  ` +
-        `${((Date.now() - stepStarted) / 1000).toFixed(2)}s   ` + (process.env.ANIMA_TRACE ? "\n" : ""),
-    );
-  }
-  process.stdout.write("\n");
-  return out;
-}
-
-const sampled = await sampleAsync();
+    return calculateDenoised(sigma, prediction, out);
+  },
+  x0,
+  sigmas,
+  {
+    onStepDone: (step, total, out, sigma) => {
+      // Per-channel spatial standard deviation, not the tensor's overall one.
+      // A latent that is flat in space but offset channel to channel has a large
+      // overall std and no picture in it — which is exactly the failure this line
+      // exists to make visible while it is still running.
+      const per = out.length / LATENT.channels;
+      const spread: number[] = [];
+      for (let ch = 0; ch < LATENT.channels; ch += 1) {
+        let sum = 0, sq = 0;
+        for (let i = 0; i < per; i += 1) { const v = out[ch * per + i]!; sum += v; sq += v * v; }
+        spread.push(Math.sqrt(Math.max(0, sq / per - (sum / per) ** 2)));
+      }
+      spread.sort((x, y) => x - y);
+      process.stdout.write(
+        `\r  step ${step + 1}/${total}  sigma ${sigma.toFixed(4)}  ` +
+          `spread ${spread[spread.length >> 1]!.toFixed(3)}  ` +
+          `${((Date.now() - stepStarted) / 1000).toFixed(2)}s   ` + (process.env.ANIMA_TRACE ? "\n" : ""),
+      );
+    },
+  },
+);
+process.stdout.write("\n");
 const elapsed = (Date.now() - sampleStarted) / 1000;
 console.log(
   `sampled in ${elapsed.toFixed(1)}s — ${modelCalls} model calls, ` +

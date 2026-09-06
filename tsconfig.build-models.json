@@ -1,0 +1,26 @@
+{
+  // The second half of `npm run build`: the model ports and the LLM engines.
+  //
+  // A separate program from `tsconfig.build.json` for one reason — that one
+  // sets `types: []` so an op's reference can never reach for a `GPUBuffer`,
+  // and everything here holds `GPUBuffer`s by design. Widening the guard for
+  // the whole build would lose it where it matters; a second program keeps it
+  // where it is and grants WebGPU's types only to the code that dispatches.
+  // Both emit into the same `dist/`, and the ops both reach are emitted twice
+  // to byte-identical files.
+  //
+  // `DOM` for the Cache API and `navigator.gpu`; `DOM.Iterable` for
+  // `FormData`/`Headers` iteration in the weight loader.
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "types": ["@webgpu/types"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": [
+    "harness/api.ts",
+    "llm/engine-index.ts",
+    "models/anima/index.ts",
+    "models/anima/kernels.ts",
+    "models/anima/fetch-weights.ts"
+  ]
+}

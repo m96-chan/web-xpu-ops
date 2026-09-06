@@ -1,8 +1,8 @@
-import { kernel, params, type BatchProfile, type ResidentDevice, type ResidentOp } from "../harness/index.js";
+import { params, type BatchProfile, type ResidentDevice, type ResidentOp } from "../harness/api.js";
 import { ACTIVATION } from "../ops/activation/index.js";
 import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import type { LlamaConfig } from "./config.js";
-import { MAX_WORKGROUPS_PER_DISPATCH } from "./kernels.js";
+import { MAX_WORKGROUPS_PER_DISPATCH, llmKernels } from "./kernels.js";
 import {
   assertWeightShapesQ8,
   cloneQuantizedLinear,
@@ -456,29 +456,6 @@ function instrumentDevice(device: ResidentDevice, sink: ForwardProfile): Residen
  * doc for the full explanation.
  */
 
-const CODE = {
-  rmsnorm: kernel(new URL("../ops/rmsnorm/index.ts", import.meta.url)),
-  matvecQ8: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8"),
-  // Issue #111: decode-only fused entry points on the same `ops/matvec` op —
-  // see `ops/matvec/wgsl/q8_ffn.wgsl`/`q8_residual.wgsl`'s own docs. Prefill
-  // (`runPrefillResident`) keeps the unfused `matmulQ8`+`activation`+
-  // `elementwise` path deliberately — issue #111's own "スコープ外: プリフィル
-  // 専用最適化" — so these two are read only by `runDecodeStep`'s bind groups.
-  matvecQ8Ffn: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8_ffn"),
-  matvecQ8Residual: kernel(new URL("../ops/matvec/index.ts", import.meta.url), "q8_residual"),
-  rope: kernel(new URL("../ops/rope/index.ts", import.meta.url)),
-  gqaScores: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "scores"),
-  gqaContext: kernel(new URL("../ops/gqa/index.ts", import.meta.url), "context"),
-  activation: kernel(new URL("../ops/activation/index.ts", import.meta.url)),
-  elementwise: kernel(new URL("../ops/elementwise/index.ts", import.meta.url)),
-  // Issue #117's prefill reshape — see `ops/permute/wgsl/kernel.wgsl`'s own doc.
-  permute: kernel(new URL("../ops/permute/index.ts", import.meta.url)),
-  // Issue #128's prefill weight path — reads the packed int8 weight directly,
-  // no separate dequant-transpose pass. See `ops/matmul/reference.ts#matmulQ8`'s
-  // own doc.
-  matmulQ8: kernel(new URL("../ops/matmul/index.ts", import.meta.url), "q8"),
-};
-
 /** `runRope`'s uniform layout (`llm/kernels.ts`): field index 3 is `pos_offset` (u32). Copied, not re-derived — rule 2. */
 const ROPE_POS_OFFSET_BYTE = 3 * 4;
 /** `runGqa`'s scores uniform layout: field index 7 is `query_offset` (i32). */
@@ -789,9 +766,9 @@ function projectMatmulQ8(
 interface SharedResident {
   rmsnormPipeline: GPUComputePipeline;
   matvecPipeline: GPUComputePipeline;
-  /** Issue #111, decode only — see `CODE.matvecQ8Ffn`'s own doc. */
+  /** Issue #111, decode only — see `llmKernels().matvecQ8Ffn`'s own doc. */
   matvecFfnPipeline: GPUComputePipeline;
-  /** Issue #111, decode only — see `CODE.matvecQ8Residual`'s own doc. */
+  /** Issue #111, decode only — see `llmKernels().matvecQ8Residual`'s own doc. */
   matvecResidualPipeline: GPUComputePipeline;
   ropePipeline: GPUComputePipeline;
   gqaScoresPipeline: GPUComputePipeline;
@@ -1063,22 +1040,22 @@ export class LlamaEngineQ8Resident {
       ropePipeline, gqaScoresPipeline, gqaContextPipeline, activationPipeline, elementwisePipeline,
       permutePipeline, matmulQ8Pipeline,
     ] = await Promise.all([
-        device.pipelineFor(CODE.rmsnorm),
-        device.pipelineFor(CODE.matvecQ8),
-        // Issue #111, decode only — see `CODE.matvecQ8Ffn`/`CODE.matvecQ8Residual`'s own doc.
-        device.pipelineFor(CODE.matvecQ8Ffn),
-        device.pipelineFor(CODE.matvecQ8Residual),
-        device.pipelineFor(CODE.rope),
-        device.pipelineFor(CODE.gqaScores),
-        device.pipelineFor(CODE.gqaContext),
-        device.pipelineFor(CODE.activation),
-        device.pipelineFor(CODE.elementwise),
+        device.pipelineFor(llmKernels().rmsnorm),
+        device.pipelineFor(llmKernels().matvecQ8),
+        // Issue #111, decode only — see `llmKernels().matvecQ8Ffn`/`llmKernels().matvecQ8Residual`'s own doc.
+        device.pipelineFor(llmKernels().matvecQ8Ffn),
+        device.pipelineFor(llmKernels().matvecQ8Residual),
+        device.pipelineFor(llmKernels().rope),
+        device.pipelineFor(llmKernels().gqaScores),
+        device.pipelineFor(llmKernels().gqaContext),
+        device.pipelineFor(llmKernels().activation),
+        device.pipelineFor(llmKernels().elementwise),
         // Prefill only (issue #117's resident prefill, `runPrefillResident`
         // below) — pipeline creation does not depend on `N`, only the
         // dispatch workgroup counts and buffer sizes do, so these are built
         // once here alongside decode's, not per `forward()` call.
-        device.pipelineFor(CODE.permute),
-        device.pipelineFor(CODE.matmulQ8),
+        device.pipelineFor(llmKernels().permute),
+        device.pipelineFor(llmKernels().matmulQ8),
       ]);
 
     // f32 activation buffers, sized for the N = 1 decode this class runs —

@@ -15,8 +15,8 @@
  * the layouts are pinned, and a second reading of them is a second chance to
  * get one wrong.
  */
-import type { Runner } from "../../../harness/wgsl.js";
-import { params } from "../../../harness/wgsl.js";
+import type { Runner } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { conv2dOutputSize } from "../../../ops/conv/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";

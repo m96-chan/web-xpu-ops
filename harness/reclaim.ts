@@ -34,7 +34,7 @@
  * drifting — and that file's own doc records what happened the last time two
  * copies of a device answered the same question differently.
  */
-import type { ResidentDevice } from "./resident.js";
+import type { ResidentDevice } from "./api.js";
 
 /**
  * Round trips `reclaim` submits: twice the measured floor.

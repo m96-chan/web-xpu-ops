@@ -43,8 +43,8 @@
  * exactly `hidden_states[k]` for every `k`, which is what
  * `verify-conditioner.ts --layers` needs to be able to name a layer at all.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, flashGrid } from "../../../ops/flash_attention/index.js";

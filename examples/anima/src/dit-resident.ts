@@ -20,8 +20,8 @@
  * way agree with each other and with nothing else.
  */
 import { ropeAxisPositionBuffer } from "../../../ops/rope/index.js";
-import type { BatchProfile, BatchProfileSink, ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { BatchProfile, BatchProfileSink, ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { DitKernels } from "../../zimage/src/dit-gpu.js";
