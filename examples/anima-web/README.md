@@ -59,6 +59,11 @@ a server that ignored ranges would "work" while sending whole files.
 Chrome 151, NVIDIA GeForce RTX 5090, driver 610.57.04, over `server.mjs` on
 loopback.
 
+**Not re-measured since `6a830ea` (2026-08-25).** The command-line forward at
+832x1216 has gone from 8.40 s to 2.22 s a call since then (issue #228,
+`examples/anima/README.md`), and the numbers below predate that; read them as
+an upper bound until a browser run replaces them.
+
 | | |
 | --- | --- |
 | first visit, caching the DiT | 4.68 GB in 2,416 range responses |
