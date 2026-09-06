@@ -16,7 +16,7 @@ import { DEFAULT_WEIGHTS_BASE } from "../../web-common/src/byte-source.js";
 import {
   requireBoundFolder, wireChangeFolder, type GateElements, type GateOptions,
 } from "../../web-common/src/gate.js";
-import { createBrowserResidentDevice } from "../../anima-web/src/browser-resident.js";
+import { createBrowserResidentDevice } from "../../web-common/src/browser-resident.js";
 import { VideoDecoderGpu, denormalise, type VideoDecoderManifest } from "../../h3-video/src/decoder-gpu.js";
 import { videoKernels } from "./kernels-web.js";
 

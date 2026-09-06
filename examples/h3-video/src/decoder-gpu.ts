@@ -39,8 +39,9 @@ import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
 import { params } from "../../../harness/wgsl.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
-import { FLASH_GENERATION, flashGrid } from "../../../ops/flash_attention/index.js";
+import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
 import { matmulQ8Grid } from "../../../ops/matmul/index.js";
+import { evictionPlan } from "./pool.js";
 
 export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry: string }[] = [
   { key: "matmul", op: "matmul", entry: "kernel" },
@@ -53,6 +54,10 @@ export const VIDEO_KERNEL_SOURCES: { key: keyof VideoKernels; op: string; entry:
   { key: "ropeAxes", op: "rope", entry: "axes" },
   { key: "permute", op: "permute", entry: "kernel" },
   { key: "flashAttention", op: "flash_attention", entry: FLASH_GENERATION },
+  // Token-major (#223): `q`/`k`/`v` are already `[seq, heads * dim_head]` here
+  // — see `block()` — so this entry reads that layout directly instead of the
+  // three `swapLeading` copies the head-major entry above needed.
+  { key: "flashAttentionToken", op: "flash_attention", entry: FLASH_TOKEN_ENTRY },
 ];
 
 export interface VideoKernels {
@@ -66,6 +71,7 @@ export interface VideoKernels {
   ropeAxes: string;
   permute: string;
   flashAttention: string;
+  flashAttentionToken: string;
 }
 
 export interface VideoDecoderManifest {
@@ -82,6 +88,12 @@ export interface VideoDecoderManifest {
     rope_theta: number;
     rope_dim_ratio: number;
   };
+  /**
+   * The per-channel statistics that separate the DiT's latent space from this
+   * decoder's. Written by conversions from #212 on; absent from older ones.
+   */
+  latentsMean?: number[];
+  latentsStd?: number[];
   /** `"f32"` or `"q8"` — which layout the weight matrices are in. */
   dtype: string;
   dim: number;
@@ -94,6 +106,8 @@ export interface VideoDecoderManifest {
 }
 
 const WG = 256;
+/** 65,535 everywhere measured — see issue #211. */
+const MAX_WORKGROUPS = 65535;
 /** `ops/matmul`'s tile: `BM = 64`, `BN = 128`, 512 threads. */
 const MM_BM = 64;
 const MM_BN = 128;
@@ -105,6 +119,22 @@ const MM_BN = 128;
  * lets one pool serve every kernel.
  */
 const UNIFORM_BYTES = 128;
+/**
+ * The most a single storage binding may cover, measured on this device.
+ *
+ * Issue #223: `maxBufferSize` here is 1,099 GB and this is **2.147 GB**, so a
+ * buffer can be far larger than any one view of it. Rounded down to a multiple
+ * of 256 so a chunk boundary is always a legal offset.
+ */
+const MAX_BINDING_BYTES = 2_147_483_392;
+
+/**
+ * A binding in a row-chunked dispatch: sliced by row, or bound whole.
+ *
+ * A weight is `whole` -- every chunk reads all of it. An activation is `cols`
+ * wide and its rows are cut with the dispatch.
+ */
+type Part = { buffer: GPUBuffer; cols: number } | { whole: GPUBuffer };
 
 /** A device-side matrix: a buffer and the shape that is live in it. */
 interface Mat {
@@ -135,6 +165,36 @@ export class VideoDecoderGpu {
    * default; `--blocks-per-submit` on `verify-decode.ts` sweeps it.
    */
   blocksPerSubmit = 1;
+
+  /**
+   * Flush **inside** a block once the sequence is longer than this.
+   *
+   * Issue #223, the same knob `examples/h3-dit/src/model-gpu.ts` carries and for
+   * the same reason: a recycled buffer cannot be handed out again until the
+   * pass that read it has been submitted, so the peak falls with the number of
+   * submits and not with the bookkeeping. At 66,432 tokens this decoder held
+   * twenty-eight buffers at `dim` and six at `ffnHidden` between flushes.
+   *
+   * 0, i.e. always -- measured at no cost on both goldens.
+   */
+  splitBlockAboveRows = 0;
+
+  /**
+   * The most the FREE half of the pool (buffers in neither `lent` nor
+   * `quarantine`) is allowed to hold, enforced at the end of `release()`.
+   *
+   * Issue #223, the same knob `examples/h3-dit/src/model-gpu.ts` carries and
+   * for the same reason: the pool only ever grew, so resident memory was the
+   * SUM of every size class's own peak where what a step actually needs at
+   * once is the MAX. See that field's doc comment for the measured table.
+   * 2 GiB keeps most of one stretch's working set warm between blocks while
+   * forcing consecutive stretches to share instead of accumulate.
+   *
+   * Settable, so a measurement can turn eviction off with `Infinity`. Do not
+   * tune this beyond making the run fit — it is a correctness-of-fit change,
+   * not a performance one (rule 8).
+   */
+  maxFreePoolBytes = 2 * 1024 ** 3;
 
   private constructor(
     private readonly device: ResidentDevice,
@@ -228,6 +288,38 @@ export class VideoDecoderGpu {
     return buffer;
   }
 
+  /**
+   * A flat dispatch, tiled into `(x, y)` when one row of workgroups is not
+   * enough.
+   *
+   * 65,535 is the ceiling on every backend measured (#211), which at 256
+   * threads is 16.7 M elements — this decoder passes it at **42 latent
+   * frames**, a seven-second clip, and did it as an invalid *command buffer*
+   * that took every dispatch beside it down with it. Every kernel it dispatches
+   * folds `y` back in from `num_workgroups`, so the host only chooses the
+   * tiling.
+   */
+  /**
+   * The same tiling for a **workgroup-per-row** kernel — the norms, whose grid
+   * is the row count rather than the element count. `ops/rmsnorm` and
+   * `ops/layernorm` fold `y` in uniformly across the workgroup, so their
+   * barriers stay in uniform control flow.
+   */
+  private rowTiles(rows: number): [number, number] {
+    const x = Math.min(rows, MAX_WORKGROUPS);
+    const y = Math.ceil(rows / x);
+    if (y > MAX_WORKGROUPS) throw new Error(`${rows} rows need more grid than two dimensions give — see issue #211`);
+    return [x, y];
+  }
+
+  private tiles(count: number): [number, number] {
+    const wanted = Math.ceil(count / WG);
+    const x = Math.min(wanted, MAX_WORKGROUPS);
+    const y = Math.ceil(wanted / x);
+    if (y > MAX_WORKGROUPS) throw new Error(`${count} elements need ${wanted} workgroups — see issue #211`);
+    return [x, y];
+  }
+
   private take(elements: number): GPUBuffer {
     // Rounded to a multiple of 4 MB rather than to a power of two. The
     // decoder's widths are `dim`, `ffnHidden` and `heads * dim_head` times a
@@ -241,13 +333,57 @@ export class VideoDecoderGpu {
     return buffer;
   }
 
-  private release(keep: GPUBuffer[] = []): void {
+  /**
+   * Hand one buffer back **before** the submit, because it is already dead.
+   *
+   * Issue #223, the same as `examples/h3-dit/src/model-gpu.ts`. At 66,432
+   * tokens this decoder held twenty-eight buffers at `dim` (545 MB each) and
+   * six at `ffnHidden` (2,177 MB) until the flush -- 28.3 GB of the 32.4 GB
+   * that refused. Every one of them is written once, read once, then dead.
+   *
+   * **Held until the submit, not returned to the pool immediately**, and that
+   * distinction was measured rather than reasoned. Handing a buffer straight
+   * back lets a later dispatch in the same pass *write* what an earlier one
+   * still *reads* -- a write-after-read hazard, which Dawn does not barrier
+   * even though it barriers read-after-write. It cost nothing at 2 latent
+   * frames and moved `examples/h3-video`'s twelve-frame golden from 1.753e-1 to
+   * 3.512e+0, 10 wrong pixel levels to 201. The small golden could not see it.
+   *
+   * So `recycle` only takes the buffer out of `lent`; the pool gets it at the
+   * next flush, where the submit is a real barrier. The win is therefore the
+   * *number of flushes*, which is why the block is split at its residual add.
+   * Recycling something still to be read is still a silent wrong answer, so
+   * each call site names the read it comes after.
+   */
+  private readonly quarantine: GPUBuffer[] = [];
+
+  private recycle(buffer: GPUBuffer): void {
+    const at = this.lent.indexOf(buffer);
+    if (at < 0) return;
+    this.lent.splice(at, 1);
+    this.quarantine.push(buffer);
+  }
+
+  /** `recycle` the old tensor and return the new one, for `x = consume(x, f(x))`. */
+  private consume(dead: Mat, made: Mat): Mat {
+    if (dead.buffer !== made.buffer) this.recycle(dead.buffer);
+    return made;
+  }
+
+  /** Returns how many bytes it actually destroyed — 0 when the plan was empty. */
+  private release(keep: GPUBuffer[] = []): number {
     for (const buffer of this.lent) {
       if (keep.includes(buffer)) continue;
       const free = this.pool.get(buffer.size) ?? [];
       free.push(buffer);
       this.pool.set(buffer.size, free);
     }
+    for (const buffer of this.quarantine) {
+      const free = this.pool.get(buffer.size) ?? [];
+      free.push(buffer);
+      this.pool.set(buffer.size, free);
+    }
+    this.quarantine.length = 0;
     this.lent.length = 0;
     this.lent.push(...keep);
     // Uniforms go back to their own pool, kept apart from the storage one:
@@ -257,6 +393,25 @@ export class VideoDecoderGpu {
     // exactly when this runs.
     this.freeUniforms.push(...this.lentUniforms);
     this.lentUniforms.length = 0;
+
+    // Issue #223: bound the free half of the pool now that `lent` and
+    // `quarantine` have both been folded into it -- evicting before either
+    // was drained would plan against sizes that had not yet arrived.
+    const free = [...this.pool.entries()].map(([size, buffers]) => ({ size, count: buffers.length }));
+    const plan = evictionPlan(free, this.maxFreePoolBytes);
+    let evictedBytes = 0;
+    for (const [size, count] of plan) {
+      const buffers = this.pool.get(size);
+      if (!buffers) continue;
+      for (let i = 0; i < count; i++) {
+        const buffer = buffers.pop();
+        if (!buffer) break;
+        buffer.destroy();
+        evictedBytes += size;
+      }
+      if (buffers.length === 0) this.pool.delete(size);
+    }
+    return evictedBytes;
   }
 
   /**
@@ -278,7 +433,13 @@ export class VideoDecoderGpu {
     this.submitMs += performance.now() - at;
     this.dispatches += ops.length;
     ops.length = 0;
-    this.release(keep);
+    const evicted = this.release(keep);
+    // An eviction is bookkeeping until Dawn ticks: a destroyed buffer's VRAM
+    // comes back only after RECLAIM_ROUND_TRIPS submits (issue #213, measured
+    // in harness/verify-reclaim.ts). Without this the run refused a 411 MB
+    // allocation while our own counter said 25 of 32 GB -- the other seven
+    // were destroyed and not yet returned.
+    if (evicted > 0) await this.device.reclaim();
   }
 
   /** Where a decode's wall clock went. Reset at the top of `decode`. */
@@ -326,6 +487,80 @@ export class VideoDecoderGpu {
     ops.push({ kind: "dispatch", pipeline, bindGroup: await this.device.bindGroup(pipeline, buffers), workgroups });
   }
 
+
+  /**
+   * The same dispatch, over row ranges small enough to bind.
+   *
+   * Issue #223. A buffer here may be far larger than a *binding* may be:
+   * `maxBufferSize` on this device is 1,099 GB and
+   * `maxStorageBufferBindingSize` is **2.147 GB**, and the ViT's feed-forward
+   * at 66,432 tokens by 8,192 is 2.18 GB. The whole run reaches the decode and
+   * then refuses, having already spent twenty-two minutes sampling.
+   *
+   * Every operation this is used for is row-wise -- output row `i` reads input
+   * row `i` and the whole weight -- so cutting the rows is arithmetic-preserving
+   * rather than an approximation, and the chunks are dispatched into the same
+   * pass in order.
+   *
+   * The offsets are row boundaries, and a storage binding's offset must be a
+   * multiple of 256 bytes. Every width here (`dim` 2,048, `ffnHidden` 8,192,
+   * `heads * dim_head`) is a multiple of 64 floats, so every row boundary is
+   * aligned -- asserted rather than assumed, because a width that is not would
+   * fail validation at a size nothing smaller reaches.
+   */
+  private async dispatchRowChunks(
+    ops: ResidentOp[],
+    code: string,
+    rows: number,
+    parts: Part[],
+    uniform: (rowCount: number) => Parameters<typeof params>[0],
+    grid: (rowCount: number) => [number] | [number, number] | [number, number, number],
+  ): Promise<void> {
+    const widths = parts.flatMap((p) => ("cols" in p ? [p.cols] : []));
+    const widest = Math.max(...widths, 1);
+    const pipeline = await this.device.pipelineFor(code);
+
+    // **Chunked only when it has to be.** Most of these buffers are nowhere
+    // near the cap -- `post_quant_conv` reads 24 floats a row -- and a whole
+    // binding is one bind group instead of many. It is also the only thing that
+    // works for a width whose row is not a multiple of 256 bytes, which 24
+    // floats is not.
+    if (rows * widest * 4 <= MAX_BINDING_BYTES) {
+      const buffers = parts.map((p) => ("whole" in p ? p.whole : p.buffer));
+      buffers.push(this.uniform(uniform(rows)));
+      ops.push({
+        kind: "dispatch", pipeline,
+        bindGroup: await this.device.bindGroup(pipeline, buffers),
+        workgroups: grid(rows),
+      });
+      return;
+    }
+
+    for (const cols of widths) {
+      if ((cols * 4) % 256 !== 0) {
+        throw new Error(
+          `dispatchRowChunks: ${rows} rows of ${cols} is past this device's ` +
+            `${(MAX_BINDING_BYTES / 1e9).toFixed(2)} GB binding limit and cannot be cut, because a ` +
+            `${cols}-wide row is ${cols * 4} bytes and a storage binding's offset must be a multiple of 256`,
+        );
+      }
+    }
+    const perChunk = Math.max(1, Math.floor(MAX_BINDING_BYTES / (widest * 4)));
+    for (let start = 0; start < rows; start += perChunk) {
+      const count = Math.min(perChunk, rows - start);
+      const slices = parts.map((p) =>
+        "whole" in p
+          ? { buffer: p.whole, offset: 0, size: p.whole.size }
+          : { buffer: p.buffer, offset: start * p.cols * 4, size: count * p.cols * 4 });
+      slices.push({ buffer: this.uniform(uniform(count)), offset: 0, size: UNIFORM_BYTES });
+      ops.push({
+        kind: "dispatch", pipeline,
+        bindGroup: await this.device.bindGroupSliced(pipeline, slices),
+        workgroups: grid(count),
+      });
+    }
+  }
+
   /**
    * `a @ W`, then `+ bias` broadcast over rows.
    *
@@ -337,21 +572,27 @@ export class VideoDecoderGpu {
    */
   private async linear(ops: ResidentOp[], a: Mat, name: string, bias: GPUBuffer | null, N: number): Promise<Mat> {
     const out = this.take(a.rows * N);
+    // Row-chunked throughout. Output row `i` reads input row `i` and the whole
+    // weight, so cutting rows is the same arithmetic in more dispatches --
+    // which is what lets a 2.18 GB activation exist at all (issue #223).
     if (this.manifest.dtype === "q8") {
-      await this.dispatch(ops, this.kernels.matmulQ8, [
-        a.buffer, this.w(name), this.w(`${name}.scale`), out,
-        this.uniform([["u32", a.rows], ["u32", N], ["u32", a.cols]]),
-      ], matmulQ8Grid(a.rows, N));
+      await this.dispatchRowChunks(ops, this.kernels.matmulQ8, a.rows, [
+        { buffer: a.buffer, cols: a.cols }, { whole: this.w(name) }, { whole: this.w(`${name}.scale`) },
+        { buffer: out, cols: N },
+      ], (count) => [["u32", count], ["u32", N], ["u32", a.cols]], (count) => matmulQ8Grid(count, N));
     } else {
-      await this.dispatch(ops, this.kernels.matmul, [a.buffer, this.w(name), out, this.uniform([
-        ["u32", a.rows], ["u32", N], ["u32", a.cols],
-      ])], [Math.ceil(N / MM_BN), Math.ceil(a.rows / MM_BM), 1]);
+      await this.dispatchRowChunks(ops, this.kernels.matmul, a.rows, [
+        { buffer: a.buffer, cols: a.cols }, { whole: this.w(name) }, { buffer: out, cols: N },
+      ], (count) => [["u32", count], ["u32", N], ["u32", a.cols]],
+      (count) => [Math.ceil(N / MM_BN), Math.ceil(count / MM_BM), 1]);
     }
     if (!bias) return { buffer: out, rows: a.rows, cols: N };
     const biased = this.take(a.rows * N);
-    await this.dispatch(ops, this.kernels.rows, [out, bias, biased, this.uniform([
-      ["u32", a.rows], ["u32", N], ["u32", ELEMENTWISE.add],
-    ])], [Math.ceil((a.rows * N) / WG)]);
+    await this.dispatchRowChunks(ops, this.kernels.rows, a.rows, [
+      { buffer: out, cols: N }, { whole: bias }, { buffer: biased, cols: N },
+    ], (count) => [["u32", count], ["u32", N], ["u32", ELEMENTWISE.add]], (count) => this.tiles(count * N));
+    // The un-biased product is read only by the add above.
+    this.recycle(out);
     return { buffer: biased, rows: a.rows, cols: N };
   }
 
@@ -359,23 +600,23 @@ export class VideoDecoderGpu {
     const out = this.take(x.rows * x.cols);
     await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, weight, out, this.uniform([
       ["u32", x.rows], ["u32", x.cols], ["f32", eps], ["u32", groups],
-    ])], [x.rows]);
+    ])], this.rowTiles(x.rows));
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
   private async rows(ops: ResidentOp[], x: Mat, vector: GPUBuffer, kind: number): Promise<Mat> {
     const out = this.take(x.rows * x.cols);
-    await this.dispatch(ops, this.kernels.rows, [x.buffer, vector, out, this.uniform([
-      ["u32", x.rows], ["u32", x.cols], ["u32", kind],
-    ])], [Math.ceil((x.rows * x.cols) / WG)]);
+    await this.dispatchRowChunks(ops, this.kernels.rows, x.rows, [
+      { buffer: x.buffer, cols: x.cols }, { whole: vector }, { buffer: out, cols: x.cols },
+    ], (count) => [["u32", count], ["u32", x.cols], ["u32", kind]], (count) => this.tiles(count * x.cols));
     return { buffer: out, rows: x.rows, cols: x.cols };
   }
 
   private async pointwise(ops: ResidentOp[], a: Mat, b: Mat, kind: number): Promise<Mat> {
     const out = this.take(a.rows * a.cols);
-    await this.dispatch(ops, this.kernels.elementwise, [a.buffer, b.buffer, out, this.uniform([
-      ["u32", a.rows * a.cols], ["u32", kind],
-    ])], [Math.ceil((a.rows * a.cols) / WG)]);
+    await this.dispatchRowChunks(ops, this.kernels.elementwise, a.rows, [
+      { buffer: a.buffer, cols: a.cols }, { buffer: b.buffer, cols: b.cols }, { buffer: out, cols: a.cols },
+    ], (count) => [["u32", count * a.cols], ["u32", kind]], (count) => this.tiles(count * a.cols));
     return { buffer: out, rows: a.rows, cols: a.cols };
   }
 
@@ -384,7 +625,7 @@ export class VideoDecoderGpu {
     const out = this.take(dim0 * dim1 * D);
     await this.dispatch(ops, this.kernels.permute, [x, out, this.uniform([
       ["u32", dim0], ["u32", dim1], ["u32", D],
-    ])], [Math.ceil((dim0 * dim1 * D) / WG)]);
+    ])], this.tiles(dim0 * dim1 * D));
     return out;
   }
 
@@ -399,24 +640,27 @@ export class VideoDecoderGpu {
     let q = await this.linear(ops, normed, `${p}q.weight`, this.w(`${p}q.bias`), width);
     let k = await this.linear(ops, normed, `${p}k.weight`, this.w(`${p}k.bias`), width);
     const v = await this.linear(ops, normed, `${p}v.weight`, this.w(`${p}v.bias`), width);
+    // `normed` fed the three projections and nothing else.
+    this.recycle(normed.buffer);
 
     // QK-norm over each head's channels, with no weights (`qk_norm_affine:
     // false`). `groups` is what makes one dispatch normalise `seq * heads` rows
     // of `dim_head` inside a `[seq, width]` buffer.
-    q = await this.qkNorm(ops, q, seq, c.heads, c.dim_head, c.eps);
-    k = await this.qkNorm(ops, k, seq, c.heads, c.dim_head, c.eps);
+    // Each reads its input once and writes a new buffer, so the input is dead
+    // as soon as the dispatch is recorded. Issue #223.
+    q = this.consume(q, await this.qkNorm(ops, q, seq, c.heads, c.dim_head, c.eps));
+    k = this.consume(k, await this.qkNorm(ops, k, seq, c.heads, c.dim_head, c.eps));
 
-    q = await this.rope(ops, q, seq, c.heads, c.dim_head, positions);
-    k = await this.rope(ops, k, seq, c.heads, c.dim_head, positions);
+    q = this.consume(q, await this.rope(ops, q, seq, c.heads, c.dim_head, positions));
+    k = this.consume(k, await this.rope(ops, k, seq, c.heads, c.dim_head, positions));
 
-    // `[seq, heads, dim_head]` -> `[heads, seq, dim_head]`, which is the layout
-    // `ops/flash_attention` reads.
-    const qh = await this.swapLeading(ops, q.buffer, seq, c.heads, c.dim_head);
-    const kh = await this.swapLeading(ops, k.buffer, seq, c.heads, c.dim_head);
-    const vh = await this.swapLeading(ops, v.buffer, seq, c.heads, c.dim_head);
-
-    const attended = this.take(c.heads * seq * c.dim_head);
-    await this.dispatch(ops, this.kernels.flashAttention, [qh, kh, vh, mask, attended, this.uniform([
+    // `q`, `k` and `v` are already `[seq, heads, dim_head]` — token-major —
+    // which `flashAttentionToken` reads directly. Issue #223: this used to
+    // run three `swapLeading` copies in and one out, four buffers at 549 MB
+    // each at 19,027 rows, which is most of what stopped 512x896 x 120 frames
+    // from fitting in 32 GB.
+    const attended = this.take(seq * c.heads * c.dim_head);
+    await this.dispatch(ops, this.kernels.flashAttentionToken, [q.buffer, k.buffer, v.buffer, mask, attended, this.uniform([
       ["u32", c.heads], ["u32", seq], ["u32", seq], ["u32", c.dim_head], ["u32", c.dim_head],
       ["f32", 1 / Math.sqrt(c.dim_head)],
       // `causal_decoder: false` in the checkpoint's own config -- every token
@@ -424,31 +668,56 @@ export class VideoDecoderGpu {
       ["u32", 0], ["i32", 0], ["u32", 1], ["u32", 1], ["u32", 1],
     ])], flashGrid(seq, c.heads, 1));
 
-    const merged = await this.swapLeading(ops, attended, c.heads, seq, c.dim_head);
+    // q, k and v fed the attention and nothing else. Issue #223.
+    this.recycle(q.buffer);
+    this.recycle(k.buffer);
+    this.recycle(v.buffer);
     const projected = await this.linear(
-      ops, { buffer: merged, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
+      ops, { buffer: attended, rows: seq, cols: width }, `${p}out.weight`, this.w(`${p}out.bias`), dim,
     );
+    this.recycle(attended);
     // LayerScale: a per-channel parameter that multiplies the branch before it
     // is added back. Initialised to zero, so dropping it is a block that starts
     // from scratch every forward.
     const scaled = await this.rows(ops, projected, this.w(`${p}scale1`), ELEMENTWISE.multiply);
+    this.recycle(projected.buffer);
     let hidden = await this.pointwise(ops, x, scaled, ELEMENTWISE.add);
+    this.recycle(scaled.buffer);
+
+    // **The block's halfway point.** Everything above is dead once the residual
+    // has been added and nothing below has been allocated, so this is where the
+    // peak can be cut. It has to be a *submit* rather than bookkeeping: a
+    // recycled buffer only becomes safe to hand out again once the pass that
+    // read it has been submitted (issue #223's write-after-read).
+    if (seq > this.splitBlockAboveRows) await this.flush(ops, [hidden.buffer, positions, mask]);
 
     const normed2 = await this.norm(ops, hidden, this.w(`${p}norm2.weight`), c.eps);
     const gate = await this.linear(ops, normed2, `${p}gate.weight`, this.w(`${p}gate.bias`), ffnHidden);
     const up = await this.linear(ops, normed2, `${p}up.weight`, this.w(`${p}up.bias`), ffnHidden);
+    // `normed2` fed both projections and nothing else.
+    this.recycle(normed2.buffer);
 
     const activated = this.take(seq * ffnHidden);
-    await this.dispatch(ops, this.kernels.activation, [gate.buffer, activated, this.uniform([
-      ["u32", seq * ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1],
-    ])], [Math.ceil((seq * ffnHidden) / WG)]);
+    await this.dispatchRowChunks(ops, this.kernels.activation, seq, [
+      { buffer: gate.buffer, cols: ffnHidden }, { buffer: activated, cols: ffnHidden },
+    ], (count) => [["u32", count * ffnHidden], ["u32", ACTIVATION.silu], ["f32", 1]],
+    (count) => this.tiles(count * ffnHidden));
 
+    // `gate` is read only by the activation above.
+    this.recycle(gate.buffer);
     const gated = await this.pointwise(
       ops, { buffer: activated, rows: seq, cols: ffnHidden }, up, ELEMENTWISE.multiply,
     );
+    this.recycle(activated);
+    this.recycle(up.buffer);
     const ff = await this.linear(ops, gated, `${p}w2.weight`, this.w(`${p}w2.bias`), dim);
+    this.recycle(gated.buffer);
     const scaled2 = await this.rows(ops, ff, this.w(`${p}scale2`), ELEMENTWISE.multiply);
+    this.recycle(ff.buffer);
+    // **`hidden` is not recycled**: the add reads it and what the add writes is
+    // what this returns.
     hidden = await this.pointwise(ops, hidden, scaled2, ELEMENTWISE.add);
+    this.recycle(scaled2.buffer);
     return hidden;
   }
 
@@ -457,7 +726,7 @@ export class VideoDecoderGpu {
     const out = this.take(seq * heads * headDim);
     await this.dispatch(ops, this.kernels.rmsnorm, [x.buffer, this.w("qk.ones"), out, this.uniform([
       ["u32", seq * heads], ["u32", headDim], ["f32", eps], ["u32", 1],
-    ])], [seq * heads]);
+    ])], this.rowTiles(seq * heads));
     return { buffer: out, rows: seq, cols: heads * headDim };
   }
 
@@ -545,7 +814,11 @@ export class VideoDecoderGpu {
     await this.dispatch(ops, this.kernels.layernorm, [
       hidden.buffer, this.w("norm_out.weight"), this.w("norm_out.bias"), normed,
       this.uniform([["u32", seq], ["u32", dim], ["f32", c.eps]]),
-    ], [seq]);
+      // `rowTiles`, not `[seq]`: one workgroup a row and 66,309 rows is past
+      // the 65,535 a dimension allows (issue #211). The kernel already folds
+      // the second dimension; this call site was the one that did not, and it
+      // only shows at a size nothing smaller reaches.
+    ], this.rowTiles(seq));
 
     const patchDim = c.out_channels * c.patch_size_t * c.patch_size * c.patch_size;
     const projected = await this.linear(
@@ -584,7 +857,7 @@ export class VideoDecoderGpu {
     await this.dispatch(ops, this.kernels.ropeAxes, [x.buffer, this.w("rope.axisDims"), positions, out, this.uniform([
       ["u32", seq], ["u32", heads], ["u32", headDim], ["u32", axisDims.length],
       ["f32", this.manifest.config.rope_theta],
-    ])], [Math.ceil((seq * heads * (headDim / 2)) / WG)]);
+    ])], this.tiles(seq * heads * (headDim / 2)));
     return { buffer: out, rows: seq, cols: heads * headDim };
   }
 }
@@ -660,6 +933,40 @@ export function unpackPatches(
 }
 
 /** `x * std + mean`, the ImageNet denormalisation `decode_videos` applies. */
+/**
+ * The DiT's latent, in the space this decoder reads.
+ *
+ * **They are not the same space.** `AutoencoderKLMiniMaxH3`'s own doc: "a
+ * pipeline encodes with `(latent - latents_mean) / latents_std` and decodes
+ * with `latent * latents_std + latents_mean`". A sampler that hands its output
+ * straight to `decode` gets a picture — a blurred one with a grid over it,
+ * which for weeks was read as what int8 costs. It is not: undoing the
+ * normalisation brings back the reflections and the text on the hull.
+ *
+ * Issue #212 found it while wiring `ref2va`, where the *encoder* is a caller
+ * too and the two directions have to agree.
+ */
+export function unnormaliseLatent(latent: Float32Array, manifest: VideoDecoderManifest): Float32Array {
+  const mean = manifest.latentsMean;
+  const std = manifest.latentsStd;
+  if (!mean || !std) {
+    throw new Error(
+      "this conversion carries no latentsMean/latentsStd — re-run convert_decoder.py, " +
+        "or the DiT's output will be decoded in the wrong latent space",
+    );
+  }
+  const channels = mean.length;
+  const per = latent.length / channels;
+  if (!Number.isInteger(per)) {
+    throw new Error(`unnormaliseLatent: ${latent.length} values is not a whole number of ${channels} channels`);
+  }
+  const out = new Float32Array(latent.length);
+  for (let c = 0; c < channels; c += 1) {
+    for (let i = 0; i < per; i += 1) out[c * per + i] = latent[c * per + i]! * std[c]! + mean[c]!;
+  }
+  return out;
+}
+
 export function denormalise(pixels: Float32Array, channels: number, mean: number[], std: number[]): Float32Array {
   const per = pixels.length / channels;
   const out = new Float32Array(pixels.length);

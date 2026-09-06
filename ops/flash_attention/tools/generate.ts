@@ -16,12 +16,24 @@ import { fa2Flash } from "./fa2.wgsl.js";
 import { fa3Flash } from "./fa3.wgsl.js";
 import { FLASH_TILE } from "../index.js";
 
-/** The shipped kernels, keyed by generation. Both are built at `FLASH_TILE`'s shape. */
-export function shippedKernels(): Record<"fa2" | "fa3", string> {
-  const { maxHeadDim, maxValueDim } = FLASH_TILE;
+/**
+ * The shipped kernels, keyed by file name. All three are built at
+ * `FLASH_TILE`'s shape.
+ *
+ * `fa2_token` (#223) is the same `FLASH_TILE` shape with `layout:
+ * "tokenMajor"` — see `FLASH_TOKEN_ENTRY` in `../index.ts` for what reads it
+ * and why. fa3 gets no token variant; `fa3.wgsl.ts`'s header says why not.
+ */
+export function shippedKernels(): Record<"fa2" | "fa3" | "fa2_token", string> {
+  // `maxHeadDim`/`maxValueDim` are not part of `FlashShape` — they are
+  // `fa2Flash`/`fa3Flash`'s separate `maxD`/`maxDv` arguments — so they are
+  // pulled out here rather than spread into the token-major shape below,
+  // which otherwise carries excess properties `fa2Flash` never asked for.
+  const { maxHeadDim, maxValueDim, ...tile } = FLASH_TILE;
   return {
     fa2: fa2Flash(FLASH_TILE, maxHeadDim, maxValueDim),
     fa3: fa3Flash(FLASH_TILE, maxHeadDim, maxValueDim),
+    fa2_token: fa2Flash({ ...tile, layout: "tokenMajor" }, maxHeadDim, maxValueDim),
   };
 }
 

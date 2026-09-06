@@ -23,6 +23,13 @@
 // the index rather than from a second workgroup dimension. D is not assumed to
 // be a multiple of anything, so the column comes from a modulo, not a mask.
 
+// A dispatch wider than one row of workgroups is folded back into one index
+// here rather than by a uniform: `num_workgroups.x` is what the host asked for,
+// so **every existing one-dimensional caller keeps working unchanged** — at
+// `[n]` the y extent is 1 and the second term is 0. The ceiling is 65,535 on
+// every backend measured (#211), and `examples/h3-video`'s decoder passes it at
+// 42 latent frames — a seven-second clip.
+
 struct Params {
   S: u32,
   D: u32,
@@ -37,8 +44,9 @@ struct Params {
 @compute @workgroup_size(256)
 fn main(
   @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) workgroups: vec3<u32>,
 ) {
-  let idx = gid.x;
+  let idx = gid.x + gid.y * workgroups.x * 256u;
   if (idx >= params.S * params.D) {
     return;
   }

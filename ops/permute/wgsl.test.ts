@@ -126,6 +126,44 @@ describe("permute / wgsl", () => {
     });
   }
 
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 is the ceiling on every backend measured (#211), which at 256
+   * threads a workgroup is 16.7 M elements — a video VAE's first level reaches
+   * that on a 256x256 reference with five frames. Tiling it into `(x, y)` only
+   * works if the kernel folds `y` back in, and the fold uses `num_workgroups`
+   * rather than a uniform so that **every existing one-dimensional caller keeps
+   * working unchanged**: at `[n]` the y extent is 1 and `gid.y` is 0.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one index", async (run) => {
+    const dim0 = 300;
+    const dim1 = 7;
+    const D = 129;
+    const total = dim0 * dim1 * D;
+    const tiles = Math.ceil(total / 256);
+    // Deliberately narrow, so most of the work is on rows the old kernel never
+    // reached: with `gid.y` ignored only the first 8 tiles are ever written.
+    const x = 8;
+    const y = Math.ceil(tiles / x);
+    expect(y).toBeGreaterThan(1);
+    const input = distinct(total);
+    await expectAgrees(
+      run,
+      {
+        code,
+        bindings: [
+          { kind: "storage", data: input },
+          { kind: "out", type: "f32", length: total },
+          { kind: "uniform", data: params([["u32", dim0], ["u32", dim1], ["u32", D]]) },
+        ],
+        workgroups: [x, y],
+      },
+      [permute({ input, dim0, dim1, D })],
+      exact,
+    );
+  });
+
   it("rejects an input sized for the wrong dim0/dim1/D", () => {
     expect(() => permute({ input: new Float32Array(5), dim0: 2, dim1: 3, D: 1 })).toThrow(/expected 6 input elements, got 5/);
   });

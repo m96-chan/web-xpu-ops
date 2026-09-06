@@ -1,0 +1,414 @@
+{
+ "source": "transformers Qwen3VLTextModel, random weights",
+ "note": "Not Qwen's checkpoint. Random weights at a tiny geometry; no model licence applies.",
+ "seed": 0,
+ "config": {
+  "vocab_size": 64,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "head_dim": 16,
+  "rms_norm_eps": 1e-06,
+  "attention_bias": false,
+  "hidden_act": "silu",
+  "max_position_embeddings": 128,
+  "rope_theta": 5000000.0,
+  "rope_scaling": {
+   "rope_type": "default",
+   "mrope_section": [
+    4,
+    2,
+    2
+   ],
+   "mrope_interleaved": true,
+   "rope_theta": 5000000.0
+  }
+ },
+ "seq": 7,
+ "positionIds": {
+  "t": [
+   0,
+   1,
+   2,
+   2,
+   2,
+   2,
+   3
+  ],
+  "h": [
+   0,
+   1,
+   0,
+   0,
+   1,
+   1,
+   2
+  ],
+  "w": [
+   0,
+   1,
+   0,
+   1,
+   0,
+   1,
+   2
+  ]
+ },
+ "numHiddenStates": 4,
+ "tensors": [
+  {
+   "name": "embed_tokens.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 0,
+   "count": 2048
+  },
+  {
+   "name": "layers.0.self_attn.q_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 8192,
+   "count": 1024
+  },
+  {
+   "name": "layers.0.self_attn.k_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 12288,
+   "count": 512
+  },
+  {
+   "name": "layers.0.self_attn.v_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 14336,
+   "count": 512
+  },
+  {
+   "name": "layers.0.self_attn.o_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 16384,
+   "count": 1024
+  },
+  {
+   "name": "layers.0.self_attn.q_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 20480,
+   "count": 16
+  },
+  {
+   "name": "layers.0.self_attn.k_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 20544,
+   "count": 16
+  },
+  {
+   "name": "layers.0.mlp.gate_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 20608,
+   "count": 2048
+  },
+  {
+   "name": "layers.0.mlp.up_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 28800,
+   "count": 2048
+  },
+  {
+   "name": "layers.0.mlp.down_proj.weight",
+   "shape": [
+    32,
+    64
+   ],
+   "offset": 36992,
+   "count": 2048
+  },
+  {
+   "name": "layers.0.input_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 45184,
+   "count": 32
+  },
+  {
+   "name": "layers.0.post_attention_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 45312,
+   "count": 32
+  },
+  {
+   "name": "layers.1.self_attn.q_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 45440,
+   "count": 1024
+  },
+  {
+   "name": "layers.1.self_attn.k_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 49536,
+   "count": 512
+  },
+  {
+   "name": "layers.1.self_attn.v_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 51584,
+   "count": 512
+  },
+  {
+   "name": "layers.1.self_attn.o_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 53632,
+   "count": 1024
+  },
+  {
+   "name": "layers.1.self_attn.q_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 57728,
+   "count": 16
+  },
+  {
+   "name": "layers.1.self_attn.k_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 57792,
+   "count": 16
+  },
+  {
+   "name": "layers.1.mlp.gate_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 57856,
+   "count": 2048
+  },
+  {
+   "name": "layers.1.mlp.up_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 66048,
+   "count": 2048
+  },
+  {
+   "name": "layers.1.mlp.down_proj.weight",
+   "shape": [
+    32,
+    64
+   ],
+   "offset": 74240,
+   "count": 2048
+  },
+  {
+   "name": "layers.1.input_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 82432,
+   "count": 32
+  },
+  {
+   "name": "layers.1.post_attention_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 82560,
+   "count": 32
+  },
+  {
+   "name": "layers.2.self_attn.q_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 82688,
+   "count": 1024
+  },
+  {
+   "name": "layers.2.self_attn.k_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 86784,
+   "count": 512
+  },
+  {
+   "name": "layers.2.self_attn.v_proj.weight",
+   "shape": [
+    16,
+    32
+   ],
+   "offset": 88832,
+   "count": 512
+  },
+  {
+   "name": "layers.2.self_attn.o_proj.weight",
+   "shape": [
+    32,
+    32
+   ],
+   "offset": 90880,
+   "count": 1024
+  },
+  {
+   "name": "layers.2.self_attn.q_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 94976,
+   "count": 16
+  },
+  {
+   "name": "layers.2.self_attn.k_norm.weight",
+   "shape": [
+    16
+   ],
+   "offset": 95040,
+   "count": 16
+  },
+  {
+   "name": "layers.2.mlp.gate_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 95104,
+   "count": 2048
+  },
+  {
+   "name": "layers.2.mlp.up_proj.weight",
+   "shape": [
+    64,
+    32
+   ],
+   "offset": 103296,
+   "count": 2048
+  },
+  {
+   "name": "layers.2.mlp.down_proj.weight",
+   "shape": [
+    32,
+    64
+   ],
+   "offset": 111488,
+   "count": 2048
+  },
+  {
+   "name": "layers.2.input_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 119680,
+   "count": 32
+  },
+  {
+   "name": "layers.2.post_attention_layernorm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 119808,
+   "count": 32
+  },
+  {
+   "name": "norm.weight",
+   "shape": [
+    32
+   ],
+   "offset": 119936,
+   "count": 32
+  },
+  {
+   "name": "input.embeds",
+   "shape": [
+    1,
+    7,
+    32
+   ],
+   "offset": 120064,
+   "count": 224
+  },
+  {
+   "name": "output.hidden.0",
+   "shape": [
+    1,
+    7,
+    32
+   ],
+   "offset": 120960,
+   "count": 224
+  },
+  {
+   "name": "output.hidden.1",
+   "shape": [
+    1,
+    7,
+    32
+   ],
+   "offset": 121856,
+   "count": 224
+  },
+  {
+   "name": "output.hidden.2",
+   "shape": [
+    1,
+    7,
+    32
+   ],
+   "offset": 122752,
+   "count": 224
+  },
+  {
+   "name": "output.hidden.3",
+   "shape": [
+    1,
+    7,
+    32
+   ],
+   "offset": 123648,
+   "count": 224
+  }
+ ]
+}

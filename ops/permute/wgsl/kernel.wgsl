@@ -29,6 +29,15 @@
 // under llm/'s own names and already proven correct by every engine test
 // that exercises prefill.
 
+// A dispatch wider than one row of workgroups is folded back into one index
+// here rather than by a uniform: `num_workgroups.x` is what the host asked for,
+// so **every existing one-dimensional caller keeps working unchanged** — at
+// `[n]` the y extent is 1 and `gid.y` is 0. The ceiling is 65,535 workgroups on
+// every backend measured (#211), which at 256 threads is 16.7 M elements, and a
+// video VAE's first level passes that on a 256x256 reference with five frames.
+// `ops/pad` solves the same problem with a `stride_y` uniform; this way needs no
+// caller to change.
+
 struct Params {
   dim0: u32,
   dim1: u32,
@@ -42,13 +51,16 @@ struct Params {
 const WORKGROUP_SIZE: u32 = 256u;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) workgroups: vec3<u32>,
+) {
   // Unlike `ops/gqa`'s kernels (dispatched at an exact `[L, H, B]` so every
   // invocation has real work, rule 1), this dispatch is sized by
   // `ceil(total / WORKGROUP_SIZE)` because `total` is rarely a multiple of
   // it — so a guard is reachable here and has to be tested, not just
   // written (`ops/permute/wgsl.test.ts`'s non-multiple-of-256 case).
-  let idx = gid.x;
+  let idx = gid.x + gid.y * workgroups.x * WORKGROUP_SIZE;
   let total = params.dim0 * params.dim1 * params.D;
   if (idx >= total) {
     return;

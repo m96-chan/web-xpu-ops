@@ -1,5 +1,6 @@
 import { create, globals } from "webgpu";
 import { compilationFailure, type Binding, type Dispatch, type Runner } from "./wgsl.js";
+import { reclaimByRoundTrips } from "./reclaim.js";
 import { bindingTypeMismatch, kernelName, storageElementTypes, type ElementType } from "./binding-types.js";
 
 /**
@@ -188,6 +189,16 @@ export interface ResidentDevice {
    * (intermediate activations, the KV-cache copies) stays device-side.
    */
   batch(ops: ResidentOp[], readback: ResidentReadback[], profile?: BatchProfile): Promise<(Float32Array | Int32Array | Uint32Array)[]>;
+  /**
+   * Wait until the card actually has back what `destroy()` was called on.
+   *
+   * **`destroy()` schedules the freeing; it does not do it.** Dawn releases a
+   * destroyed buffer when it next ticks, and it ticks on GPU work, not on a
+   * timer. A stage that destroys 25 GB and immediately allocates 20 GB gets an
+   * *invalid* buffer back, which does not throw. `harness/reclaim.ts` has the
+   * measurement and the round-trip count. Issue #213.
+   */
+  reclaim(): Promise<void>;
   destroy(): void;
 }
 
@@ -253,6 +264,13 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
    */
   const pipelines = new Map<string, Map<string, GPUComputePipeline>>();
   const modules = new Map<string, GPUShaderModule>();
+  /**
+   * A short name per pipeline, so a dispatch that fails validation can say
+   * *which kernel* rather than only which index in the batch. Taken from the
+   * WGSL's first `fn` — the source is the only identity a pipeline has here,
+   * since `GPUComputePipeline` carries no label through this binding.
+   */
+  const pipelineNames = new WeakMap<GPUComputePipeline, string>();
 
   /**
    * Issue #221: the three things that have to meet for a binding's type to be
@@ -269,6 +287,37 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
 
   /** Bytes handed out, so an allocation failure can say what was already in flight. */
   let allocated = 0;
+  /** Bytes still held: `allocated` minus everything `destroy`ed. */
+  let live = 0;
+  /**
+   * The first allocation that failed, kept until something can raise it.
+   *
+   * `createBuffer` is synchronous and its out-of-memory arrives through an
+   * async error scope, so the failure is always known *after* the caller has
+   * taken the buffer. Everything downstream of an invalid buffer is invalid
+   * too, and reports itself rather than the cause.
+   */
+  let allocationFailure: string | null = null;
+  /**
+   * The error scopes still in flight.
+   *
+   * `popErrorScope` resolves on a later turn, and `createStorageBuffer` is
+   * synchronous because every caller's inner loop is. So the failure is known
+   * *after* the buffer has been handed out and after the dispatches that read
+   * it have been recorded -- checking a flag at the bind group finds it still
+   * unset, which is what the first version of this did. Draining here is the
+   * one place that is both async and downstream of every allocation.
+   */
+  const pendingScopes: Promise<unknown>[] = [];
+  /**
+   * How many buffers of each size were created, so a failure can say where the
+   * bytes went rather than only how many there are.
+   *
+   * "69 GB across 3,080 buffers" on a 32 GB card says the pool is not being
+   * reused; it does not say *which* pool. The histogram does, and it costs a
+   * map increment per allocation.
+   */
+  const sizeHistogram = new Map<number, number>();
 
   function createStorageBuffer(bytes: number, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC): GPUBuffer {
     stats.buffersCreated += 1;
@@ -277,16 +326,59 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // `createBuffer` returns an invalid buffer instead of throwing, and the
     // first thing to notice is `createBindGroup`, which reports a binding index
     // and no size. See the browser runtime's copy of this note.
+    // **Both scopes.** An allocation can fail as out-of-memory *or* as
+    // validation -- a size past `maxBufferSize` or
+    // `maxStorageBufferBindingSize` is the second, and an out-of-memory scope
+    // alone catches none of it. Issue #216 lost a run to exactly that: the OOM
+    // scope was silent and the buffer was invalid anyway.
+    device.pushErrorScope("validation");
     device.pushErrorScope("out-of-memory");
     const buffer = device.createBuffer({ size, usage });
-    void device.popErrorScope().then((error) => {
-      if (!error) return;
-      throw new Error(
-        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
-          `(${(allocated / 1e9).toFixed(2)} GB already allocated, ${stats.buffersCreated} buffers). ${error.message}`,
-      );
-    });
+    // **Remembered, not thrown.** This used to `throw` inside the `then`, which
+    // is a rejection in a detached promise: nobody awaits it, the caller carries
+    // on holding an invalid buffer, and the first thing that notices is a bind
+    // group several dispatches later saying "[Invalid Buffer] is invalid due to
+    // a previous error" with no size and no total. Issue #216 spent two runs on
+    // that message. The scope catches the real cause; this keeps it until
+    // something is in a position to raise it.
+    const note = (kind: string) => (error: GPUError | null) => {
+      if (!error || allocationFailure) return;
+      allocationFailure = describeFailure(kind, error, size);
+    };
+    pendingScopes.push(device.popErrorScope().then(note("out of GPU memory")));
+    pendingScopes.push(device.popErrorScope().then(note("invalid")));
+    const describeFailure = (kind: string, error: GPUError, bytes: number): string =>
+      `${kind}: a ${(bytes / 1e6).toFixed(0)} MB buffer was refused ` +
+      `(${(live / 1e9).toFixed(2)} GB still held, ${(allocated / 1e9).toFixed(2)} GB handed out over the ` +
+      `run across ${stats.buffersCreated} buffers; ` +
+      `this device allows ${(device.limits.maxBufferSize / 1e9).toFixed(2)} GB a buffer and ` +
+      `${(device.limits.maxStorageBufferBindingSize / 1e9).toFixed(2)} GB a storage binding).\n` +
+      "  where the bytes went, largest first:\n" +
+      [...sizeHistogram.entries()]
+        .map(([bytes, count]) => ({ bytes, count, total: bytes * count }))
+        .sort((x, y) => y.total - x.total)
+        .slice(0, 8)
+        .map((e) => `    ${(e.total / 1e9).toFixed(2)} GB — ${e.count} x ${(e.bytes / 1e6).toFixed(0)} MB`)
+        .join("\n") +
+      `\n  ${error.message}`;
     allocated += size;
+    live += size;
+    sizeHistogram.set(size, (sizeHistogram.get(size) ?? 0) + 1);
+    // **`destroy` wrapped, so the number means something.** Without this
+    // `allocated` is cumulative -- it counts the conditioner's 25 GB and the
+    // encoder's, long after both were dropped -- and a failure message built on
+    // it reads as "69 GB on a 32 GB card", which sounds like a leak and is not
+    // one. Issue #216 misread exactly that. `live` is what is still held.
+    const release = buffer.destroy.bind(buffer);
+    let destroyed = false;
+    buffer.destroy = () => {
+      if (!destroyed) {
+        destroyed = true;
+        live -= size;
+        sizeHistogram.set(size, (sizeHistogram.get(size) ?? 1) - 1);
+      }
+      release();
+    };
     return buffer;
   }
 
@@ -370,8 +462,22 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     const entries = pipelines.get(code) ?? new Map<string, GPUComputePipeline>();
     entries.set(entry, pipeline);
     pipelines.set(code, entries);
+    // The WGSL's own first line — every kernel in this repository opens with a
+    // comment naming what it is, and the entry point is `main` in all of them,
+    // so the source header is the only thing that tells them apart.
+    const header = code.split("\n").find((line) => line.trim().length > 0)?.replace(/^\/\/\s*/, "").trim() ?? "";
+    pipelineNames.set(pipeline, `${header.slice(0, 60)}${header.length > 60 ? "…" : ""} [${entry}]`);
     stats.pipelinesCreated += 1;
     return pipeline;
+  }
+
+  /** Waits out every allocation scope and raises the first failure. */
+  async function drainAllocationScopes(): Promise<void> {
+    if (pendingScopes.length > 0) {
+      const waiting = pendingScopes.splice(0, pendingScopes.length);
+      await Promise.all(waiting);
+    }
+    if (allocationFailure) throw new Error(allocationFailure);
   }
 
   async function bindGroupSliced(
@@ -381,6 +487,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     // The sliced path binds a *range* of a buffer, so what was uploaded into
     // the whole of it is not necessarily what this binding reads -- but the
     // element type is the same either way, which is the only thing checked.
+    await drainAllocationScopes();
     const mismatch = bindingMismatch(pipeline, slices.map((slice) => slice.buffer));
     if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
@@ -397,6 +504,7 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
   }
 
   async function bindGroup(pipeline: GPUComputePipeline, buffers: GPUBuffer[]): Promise<GPUBindGroup> {
+    await drainAllocationScopes();
     const mismatch = bindingMismatch(pipeline, buffers);
     if (mismatch) throw new Error(mismatch);
     const t0 = performance.now();
@@ -446,6 +554,22 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     let queryCursor = 0;
     for (const [i, op] of ops.entries()) {
       if (op.kind === "dispatch") {
+        // **A dispatch past the device's grid limit is always a bug**, and
+        // WebGPU reports it as an invalid *command buffer* — so every dispatch
+        // recorded beside it is dropped too and the caller gets plausible
+        // numbers computed from whatever the pool held. Issue #211's failures
+        // all arrived that way. Named here, with the op's index, because by
+        // the time `Submit` complains there is nothing left to point at.
+        const ceiling = device.limits.maxComputeWorkgroupsPerDimension;
+        for (const [axis, count] of op.workgroups.entries()) {
+          if (count > ceiling) {
+            throw new Error(
+              `batch: op ${i} (${pipelineNames.get(op.pipeline) ?? "unnamed"}) dispatches ` +
+                `${op.workgroups.join("x")} workgroups and this device allows ${ceiling} per dimension ` +
+                `(axis ${axis} is ${count}) — see issue #211`,
+            );
+          }
+        }
         const label = profile?.labels ? (profile.labels[i] ?? null) : null;
         // PR #141 review, item 3: gated on `wantsGpuTiming` (device negotiated
         // `timestamp-query` *and* the caller asked for a breakdown), not on
@@ -579,11 +703,13 @@ export async function createResidentDevice(): Promise<ResidentDevice | null> {
     bindGroup,
     bindGroupSliced,
     batch,
+    reclaim: () => reclaimByRoundTrips(batch, createStorageBuffer),
     destroy() {
       device.destroy();
     },
   };
 }
+
 
 /**
  * A `Runner["run"]` built on top of an already-created `ResidentDevice`,

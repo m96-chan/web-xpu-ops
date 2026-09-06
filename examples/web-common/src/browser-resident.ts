@@ -33,6 +33,13 @@ import {
 import type {
   BatchProfile, ResidentDevice, ResidentOp, ResidentReadback,
 } from "../../../harness/resident.js";
+// **A value import, and deliberately from a different file.** `resident.ts`
+// pulls in the native `webgpu` addon at module scope, which is the whole reason
+// this browser copy exists; `reclaim.ts` imports nothing at runtime, so both
+// halves can share the one piece of behaviour neither can afford to get
+// differently. Its doc has the measurement.
+import { reclaimByRoundTrips } from "../../../harness/reclaim.js";
+import { explainFailure, type DeviceLoss } from "./device-lost.js";
 
 export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
   const gpu = (navigator as Navigator & { gpu?: GPU }).gpu;
@@ -71,6 +78,25 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
 
   const stats = { buffersCreated: 0, pipelinesCreated: 0, submits: 0, bindGroupMs: 0, bindGroups: 0 };
   const pipelines = new Map<string, GPUComputePipeline>();
+
+  /**
+   * The reason the device went, kept because **every call after a loss reports
+   * the same thing and none of them reports the cause**.
+   *
+   * `popErrorScope` rejects with `OperationError: Instance dropped in
+   * popErrorScope` for the rest of the page's life, once per buffer, with a
+   * stack pointing at whatever allocation came next. `device.lost` is where the
+   * backend says what it hit, and nothing read it — so a page's first failure
+   * said "Instance dropped" and separating out-of-memory from a refused
+   * pipeline took shrinking the model until the real error fitted in one line.
+   */
+  let loss: DeviceLoss | null = null;
+  void device.lost.then((info) => {
+    loss = { reason: String(info.reason), message: info.message };
+    console.error(`WebGPU device lost (${loss.reason}): ${loss.message || "no message from the backend"}`);
+  });
+  const fail = (error: unknown, doing: string): Error =>
+    explainFailure(error, loss, { allocated, buffers: stats.buffersCreated }, doing);
 
   /**
    * Issue #221, the browser half.
@@ -113,14 +139,22 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     // a size in it.
     device.pushErrorScope("out-of-memory");
     const buffer = device.createBuffer({ size, usage });
-    void device.popErrorScope().then((error) => {
-      if (!error) return;
-      throw new Error(
-        `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
-          `(${(allocated / 1e9).toFixed(2)} GB already allocated by this device, ` +
-          `${stats.buffersCreated} buffers). ${error.message}`,
-      );
-    });
+    void device.popErrorScope().then(
+      (error) => {
+        if (!error) return;
+        throw new Error(
+          `out of GPU memory allocating ${(size / 1e6).toFixed(0)} MB ` +
+            `(${(allocated / 1e9).toFixed(2)} GB already allocated by this device, ` +
+            `${stats.buffersCreated} buffers). ${error.message}`,
+        );
+      },
+      // The **rejection** path, which was not handled: after a loss
+      // `popErrorScope` rejects rather than resolving, and an unhandled
+      // rejection here is the "Instance dropped" a page ends up printing.
+      (rejected: unknown) => {
+        throw fail(rejected, `allocating ${(size / 1e6).toFixed(0)} MB`);
+      },
+    );
     allocated += size;
     return buffer;
   }
@@ -141,7 +175,9 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     if (cached) return cached;
 
     const module = device.createShaderModule({ code });
-    const info = await module.getCompilationInfo();
+    const info = await module.getCompilationInfo().catch((rejected: unknown) => {
+      throw fail(rejected, `compiling the "${entry}" shader`);
+    });
     const errors = info.messages.filter((m) => m.type === "error");
     if (errors.length > 0) {
       throw new Error(`shader compilation failed: ${errors.map((m) => `${m.lineNum}:${m.linePos} ${m.message}`).join("; ")}`);
@@ -151,8 +187,10 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     // exception — `harness/wgsl.ts`'s note on why applies here unchanged.
     device.pushErrorScope("validation");
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: entry } });
-    const invalid = await device.popErrorScope();
-    if (invalid) throw new Error(`pipeline is not valid: ${invalid.message}`);
+    const invalid = await device.popErrorScope().catch((rejected: unknown) => {
+      throw fail(rejected, `building the "${entry}" pipeline`);
+    });
+    if (invalid) throw fail(new Error(`pipeline is not valid: ${invalid.message}`), `building the "${entry}" pipeline`);
 
     declarations.set(pipeline, { kernel: kernelName(code), types: storageElementTypes(code) });
     stats.pipelinesCreated += 1;
@@ -169,8 +207,10 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
-    const invalid = await device.popErrorScope();
-    if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    const invalid = await device.popErrorScope().catch((rejected: unknown) => {
+      throw fail(rejected, "building a bind group");
+    });
+    if (invalid) throw fail(new Error(`bind group is not valid: ${invalid.message}`), "building a bind group");
     stats.bindGroupMs += performance.now() - t0;
     stats.bindGroups += 1;
     return group;
@@ -189,8 +229,10 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
       layout: pipeline.getBindGroupLayout(0),
       entries: slices.map((slice, binding) => ({ binding, resource: slice })),
     });
-    const invalid = await device.popErrorScope();
-    if (invalid) throw new Error(`bind group is not valid: ${invalid.message}`);
+    const invalid = await device.popErrorScope().catch((rejected: unknown) => {
+      throw fail(rejected, "building a sliced bind group");
+    });
+    if (invalid) throw fail(new Error(`bind group is not valid: ${invalid.message}`), "building a sliced bind group");
     stats.bindGroupMs += performance.now() - t0;
     stats.bindGroups += 1;
     return group;
@@ -287,8 +329,10 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     device.pushErrorScope("validation");
     device.queue.submit([encoder.finish()]);
     stats.submits += 1;
-    const invalid = await device.popErrorScope();
-    if (invalid) throw new Error(`batch is not valid: ${invalid.message}`);
+    const invalid = await device.popErrorScope().catch((rejected: unknown) => {
+      throw fail(rejected, "submitting a batch");
+    });
+    if (invalid) throw fail(new Error(`batch is not valid: ${invalid.message}`), "submitting a batch");
 
     const submitT0 = profile ? performance.now() : 0;
     await device.queue.onSubmittedWorkDone();
@@ -335,6 +379,7 @@ export async function createBrowserResidentDevice(): Promise<ResidentDevice> {
     bindGroup,
     bindGroupSliced,
     batch,
+    reclaim: () => reclaimByRoundTrips(batch, createStorageBuffer),
     destroy: () => device.destroy(),
   };
 }

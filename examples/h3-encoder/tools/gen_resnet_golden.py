@@ -28,6 +28,16 @@ import numpy as np
 import torch
 
 # `source/config.json`, stated rather than read.
+# Issue #216. `encode_base` sends a frame stack through `encode_temporal`, not
+# `encode`, and these two numbers are the whole of its geometry: the clip is
+# padded up to a multiple of `clip_length` by repeating its last frame, each
+# chunk is encoded independently, and `token_drop` latent frames come off the
+# end. Transcribed from `Ref2VA/video_vae/config.json`'s `vae_clip_length` and
+# `vae_token_drop`, the same way `CONFIG` below is transcribed from
+# `video_vae/source/config.json` -- so that a checkpoint with different chunking
+# is a diff here rather than a silently well-shaped, wrong tensor.
+CHUNKING = {"clip_length": 17, "token_drop": 3}
+
 CONFIG = {
     "ch": 128,
     "ch_mult": [1, 2, 2, 4, 4, 8],
@@ -245,6 +255,13 @@ def whole_encoder(args) -> int:
         "licence": "MiniMax H3 Community License Agreement — not this repository's, and not redistributed by it",
         "config": CONFIG, "video": [T, H, W],
         "latent": [T // ratio_t, H // ratio, W // ratio],
+        # Issue #216. `encode_base` sends a frame stack through `encode_temporal`,
+        # not `encode`, and these two numbers are the whole of its geometry. Read
+        # from the checkpoint's own config rather than written in: they belong to
+        # this checkpoint, and a default is how the next one gets encoded with the
+        # wrong chunking and returns a well-shaped tensor while doing it.
+        "clipLength": CHUNKING["clip_length"],
+        "tokenDrop": CHUNKING["token_drop"],
         "torch": torch.__version__, "tensors": entries, "elements": offset,
     }, indent=1))
     x.numpy().astype(np.float32).tofile(out / "video.bin")

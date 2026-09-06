@@ -109,6 +109,28 @@ describe("rope / axes / wgsl", () => {
     await expectAgrees(run, oneAxis.dispatch, [oneAxis.expected], TRANSCENDENTAL);
   });
 
+  /**
+   * A dispatch too wide for one row of workgroups.
+   *
+   * 65,535 is the ceiling on every backend measured (#211), and the caller that
+   * found it is `examples/h3-video`'s decoder at 42 latent frames. The fold
+   * reads `num_workgroups` rather than taking a uniform, so every existing
+   * one-dimensional caller keeps working — this one re-dispatches the same
+   * scenario over a deliberately narrow grid.
+   */
+  gpuTest("folds a two-dimensional dispatch back into one pair index", async (run) => {
+    const tiles = zimage.dispatch.workgroups[0];
+    const x = 2;
+    const y = Math.ceil(tiles / x);
+    expect(y).toBeGreaterThan(1);
+    await expectAgrees(
+      run,
+      { ...zimage.dispatch, workgroups: [x, y] },
+      [zimage.expected],
+      TRANSCENDENTAL,
+    );
+  });
+
   gpuTest("copies the tensor when every position is zero", async (run) => {
     const [actual] = await run(identity.dispatch);
     // Bit-exact, not `TRANSCENDENTAL`: `cos(0)` and `sin(0)` are exactly 1 and

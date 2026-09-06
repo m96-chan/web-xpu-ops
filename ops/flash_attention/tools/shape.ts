@@ -12,6 +12,23 @@
 /** Which generation's schedule a kernel uses. See `GENERATIONS` for what each means. */
 export type Generation = "fa2" | "fa3";
 
+/**
+ * How `q`, `k`, `v` and `output` are laid out in global memory.
+ *
+ * `"headMajor"` (the default, and the only layout FA3 ever generates) is
+ * `[B, H, L, D]` — the layout `ops/flash_attention`'s reference and every
+ * caller but two have always used. `"tokenMajor"` is `[B, L, H, D]` — what
+ * `examples/h3-dit` and `examples/h3-video` hold q/k/v in already, so
+ * dispatching against it directly deletes the four `swapLeading` copies each
+ * of them ran per attention call (issue #223).
+ *
+ * Only the four global-memory index expressions differ between the two — see
+ * `parts.ts`'s `qAddress`/`kAddress`/`vAddress`/`outAddress`. Everything a
+ * kernel does with a *staged* tile (scores, softmax, accumulate) reads
+ * workgroup memory and does not know or care which layout filled it.
+ */
+export type Layout = "headMajor" | "tokenMajor";
+
 export interface FlashShape {
   /** Query rows per workgroup — the whole point. */
   bq: number;
@@ -96,6 +113,8 @@ export interface FlashShape {
    * them, and this is the field that tests whether that is the reason.
    */
   stageAddressing: "divide" | "linear";
+  /** See `Layout`. Absent means `"headMajor"`, which is every shape before #223. */
+  layout?: Layout;
 }
 
 /**

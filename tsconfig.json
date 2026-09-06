@@ -3,13 +3,17 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "ESNext.Float16"],
     "types": ["@webgpu/types", "node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["ops", "harness", "llm", "examples/zimage/src",
-    "examples/zimage-vae/src"]
+  "include": [
+    "ops", "harness", "llm",
+    "examples/zimage/src", "examples/zimage-vae/src",
+    "examples/anima/src", "examples/h3-audio/src", "examples/h3-dit/src",
+    "examples/h3-encoder/src", "examples/h3-ref2v/src", "examples/h3-video/src"
+  ]
 }

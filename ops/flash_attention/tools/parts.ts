@@ -12,9 +12,46 @@
  * `fa3.wgsl.ts`. Each fragment takes the expressions it needs to address a
  * staging buffer, because FA3 has two of them and FA2 has one.
  */
-import { sweepsFor, type FlashShape, type Generation } from "./shape.js";
+import { sweepsFor, type FlashShape, type Generation, type Layout } from "./shape.js";
 
 export const MASKED = "-3.402823e+38";
+
+/**
+ * The four global-memory index expressions that differ by `Layout` (#223).
+ * Everything downstream of staging — scores, softmax, accumulate — reads
+ * workgroup memory and is generated identically either way; these are the
+ * only places `q`, `k`, `v` and `output` are addressed.
+ *
+ * Head-major reuses `head`/`k_head`/`v_head`, computed once in `prologue`.
+ * Token-major has no per-(batch,head) offset to hoist — `batch` and `h` are
+ * already loop-invariant workgroup-scope values — so it addresses directly
+ * off them instead.
+ */
+function qAddress(layout: Layout, row: string, d: string): string {
+  return layout === "tokenMajor"
+    ? `((batch * params.L + ${row}) * params.H + h) * params.D + ${d}`
+    : `(head * params.L + ${row}) * params.D + ${d}`;
+}
+
+/** `k_head` (head-major only) is `head * params.S * params.D`. */
+function kAddress(layout: Layout, j: string, d: string): string {
+  return layout === "tokenMajor"
+    ? `((batch * params.S + ${j}) * params.H + h) * params.D + ${d}`
+    : `k_head + ${j} * params.D + ${d}`;
+}
+
+/** `v_head` (head-major only) is `head * params.S * params.Dv`. */
+function vAddress(layout: Layout, j: string, d: string): string {
+  return layout === "tokenMajor"
+    ? `((batch * params.S + ${j}) * params.H + h) * params.Dv + ${d}`
+    : `v_head + ${j} * params.Dv + ${d}`;
+}
+
+function outAddress(layout: Layout, row: string, c: string): string {
+  return layout === "tokenMajor"
+    ? `((batch * params.L + ${row}) * params.H + h) * params.Dv + ${c}`
+    : `(head * params.L + ${row}) * params.Dv + ${c}`;
+}
 
 /**
  * Bindings, constants and workgroup arrays.
@@ -81,6 +118,7 @@ var<workgroup> scorr: array<f32, ${bq}>;
 
 /** Head/batch addressing and the q tile, which is staged once and read every tile. */
 export function prologue(shape: FlashShape, threads: number, maxDv: number): string {
+  const layout = shape.layout ?? "headMajor";
   // How many vec4 a row of D channels takes. Runtime, because one program
   // serves every D up to the one it was generated for.
   const stageQ = shape.scoreReads === "vec4"
@@ -94,7 +132,7 @@ export function prologue(shape: FlashShape, threads: number, maxDv: number): str
     if (row < params.L) {
       for (var c = 0u; c < 4u; c = c + 1u) {
         let d = c0 + c;
-        if (d < params.D) { val[c] = q[(head * params.L + row) * params.D + d]; }
+        if (d < params.D) { val[c] = q[${qAddress(layout, "row", "d")}]; }
       }
     }
     sq[r * ROW + unit] = val;
@@ -103,15 +141,20 @@ export function prologue(shape: FlashShape, threads: number, maxDv: number): str
     let r = t / params.D;
     let d = t % params.D;
     let row = q0 + r;
-    sq[r * ROW + d] = select(0.0, q[(head * params.L + row) * params.D + d], row < params.L);
+    sq[r * ROW + d] = select(0.0, q[${qAddress(layout, "row", "d")}], row < params.L);
   }`;
+  // `head`, `k_head` and `v_head` are head-major-only hoists: token-major has
+  // no per-(batch,head) offset to fold — `batch` and `h` alone address it.
+  const headOffsets = layout === "tokenMajor"
+    ? ""
+    : `  let head = batch * params.H + h;
+  let k_head = head * params.S * params.D;
+  let v_head = head * params.S * params.Dv;
+`;
   return `  let q0 = wg.x * BQ;
   let batch = wg.z;
   let h = wg.y;
-  let head = batch * params.H + h;
-  let k_head = head * params.S * params.D;
-  let v_head = head * params.S * params.Dv;
-
+${headOffsets}
   let mb = select(0u, batch, params.mask_batch > 1u);
   let mh = select(0u, h, params.mask_heads > 1u);
 
@@ -138,9 +181,19 @@ ${stageQ}
  * kernel nobody can read is a kernel nobody can check against the reference.
  */
 export function stageTile(shape: FlashShape, baseExpr: string, bufExpr: string, indent: string): string {
+  const layout = shape.layout ?? "headMajor";
   // `v` stays scalar whatever `k` does: the accumulate walks it by channel
   // across threads, not by row, so there is no group of four to fold.
+  //
   const linear = shape.stageAddressing === "linear";
+  // The contiguous fast path below (`k_at + e` / `v_at + e`) only works
+  // head-major: it exists because `base * D + e == (base + e/D) * D + e%D`,
+  // which needs the row stride to be exactly `D` (`Dv`). Token-major rows are
+  // strided by `H * D` (`H * Dv`), so a token-major shape always takes the
+  // per-row `select` branch below regardless of `stageAddressing` — this
+  // gates only *that* choice, not `linear`'s other use just below (the vec4
+  // row/unit split, which is workgroup-local arithmetic and layout-blind).
+  const addressLinear = linear && layout !== "tokenMajor";
 
   // The vec4 path keeps its division whichever addressing is chosen: `d4n` is
   // `ceil(D / 4)`, so `(e / d4n) * D + (e % d4n) * 4` only collapses to `4 * e`
@@ -157,12 +210,12 @@ ${indent}  var val = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 ${indent}  if (j < params.S) {
 ${indent}    for (var c = 0u; c < 4u; c = c + 1u) {
 ${indent}      let d = c0 + c;
-${indent}      if (d < params.D) { val[c] = k[k_head + j * params.D + d]; }
+${indent}      if (d < params.D) { val[c] = k[${kAddress(layout, "j", "d")}]; }
 ${indent}    }
 ${indent}  }
 ${indent}  sk[(${bufExpr}) * K_STRIDE + row * ROW + unit] = val;
 ${indent}}`
-    : linear
+    : addressLinear
       // Scalar staging divides by `params.D` itself, so the cancellation is
       // exact: `(base + e / D) * D + e % D == base * D + e`.
       ? `${indent}let k_at = k_head + (${baseExpr}) * params.D;
@@ -173,14 +226,14 @@ ${indent}}`
       : `${indent}for (var e = tid; e < TILE_S * params.D; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.D;
 ${indent}  let d = e % params.D;
-${indent}  sk[(${bufExpr}) * K_STRIDE + (e / params.D) * ROW + d] = select(0.0, k[k_head + j * params.D + d], j < params.S);
+${indent}  sk[(${bufExpr}) * K_STRIDE + (e / params.D) * ROW + d] = select(0.0, k[${kAddress(layout, "j", "d")}], j < params.S);
 ${indent}}`;
 
   // `v` is where this matters. `sv` is indexed by the flat `e`, so nothing
   // downstream needs the row or the channel — the division and the modulo exist
   // only to build an address that equals `v_head + base * Dv + e`. The bound
   // check goes with them: `base + e / Dv < S` is `e < (S - base) * Dv`.
-  const stageV = linear
+  const stageV = addressLinear
     ? `${indent}let v_at = v_head + (${baseExpr}) * params.Dv;
 ${indent}let v_live = select(0u, (params.S - (${baseExpr})) * params.Dv, params.S > (${baseExpr}));
 ${indent}for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
@@ -189,7 +242,7 @@ ${indent}}`
     : `${indent}for (var e = tid; e < TILE_S * params.Dv; e = e + THREADS) {
 ${indent}  let j = (${baseExpr}) + e / params.Dv;
 ${indent}  let d = e % params.Dv;
-${indent}  sv[(${bufExpr}) * V_STRIDE + e] = select(0.0, v[v_head + j * params.Dv + d], j < params.S);
+${indent}  sv[(${bufExpr}) * V_STRIDE + e] = select(0.0, v[${vAddress(layout, "j", "d")}], j < params.S);
 ${indent}}`;
 
   return `${indent}// D and Dv can differ; k and v are staged with their own strides rather
@@ -295,7 +348,8 @@ ${indent}}`;
 }
 
 /** The deferred `1 / l`, and the write out. */
-export function epilogue(): string {
+export function epilogue(shape: FlashShape): string {
+  const layout = shape.layout ?? "headMajor";
   return `  workgroupBarrier();
   for (var r = 0u; r < BQ; r = r + 1u) {
     let row = q0 + r;
@@ -303,7 +357,7 @@ export function epilogue(): string {
     let denom = ssum[r];
     var p = 0u;
     for (var c = tid; c < params.Dv; c = c + THREADS) {
-      output[(head * params.L + row) * params.Dv + c] = select(acc[r][p] / denom, 0.0, denom == 0.0);
+      output[${outAddress(layout, "row", "c")}] = select(acc[r][p] / denom, 0.0, denom == 0.0);
       p = p + 1u;
     }
   }`;

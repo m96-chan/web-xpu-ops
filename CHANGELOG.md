@@ -9,6 +9,43 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Fixed
 
+- **Every R2V reference with more than one frame was encoded by a path the model
+  does not use** (issue #216). `examples/h3-encoder` is held to `EncoderFCN3D` +
+  `quant_conv` at 9.537e-6, and that pair is `AutoencoderKLLegacy.encode` —
+  which `encode_base` calls **only for a single image**. A frame stack goes
+  through `encode_temporal`: padded up to a multiple of `clip_length` by
+  repeating its last frame, each 17-frame chunk encoded **on its own** so the
+  causal state restarts, and `token_drop` latent frames off the end.
+
+  Measured on the released weights, the two paths on the same clip:
+
+  | frames | `encode` | `encode_temporal` | rms difference |
+  |---|---|---|---|
+  | 8 | 48x2x2x2 | 48x2x2x2 | 0.0% |
+  | 17 | 48x5x2x2 | 48x2x2x2 | different shape |
+  | 22 | 48x6x2x2 | 48x7x2x2 | different shape |
+  | **48** | 48x12x2x2 | 48x12x2x2 | **17.9%** |
+  | 68 | 48x17x2x2 | 48x17x2x2 | 19.0% |
+  | 85 | 48x22x2x2 | 48x22x2x2 | 21.5% |
+
+  A video reference is 2 to 15 seconds at 24 fps — 48 to 360 frames — so that is
+  the whole of the range. **The shapes coinciding at 48 and 68 is arithmetic,
+  not agreement**, and it is why nothing downstream ever complained. Eight
+  frames agree because the encoder is causal: two latent frames depend only on
+  the first eight pixel frames, and what follows them is exactly what
+  `token_drop` removes — which is why the 8x32x32 golden could not see any of
+  this.
+
+  `encodeConditioning` is the path now, held to `encode_temporal`'s own output
+  at **5.388e-5, 0.0006% of peak** on a 48-frame reference. `clip_length` and
+  `token_drop` come from the manifest and are refused if absent, rather than
+  defaulted to this checkpoint's 17 and 3.
+
+
+- **Anima and Z-Image's resident paths drew one flat colour** (regression from
+  #206). `ropeAxes`' `positions` binding stopped being `array<i32>` and became
+  `array<f32>` when it learned fractional positions; `examples/zimage/src/
+  dit-gpu.ts` was updated in that commit and the two **resident** DiTs were not.
 - **Anima and Z-Image's resident paths drew one flat colour** (issue #217, a
   regression from #206). `ropeAxes`' `positions` binding stopped being
   `array<i32>` and became `array<f32>` when it learned fractional positions;
@@ -23,6 +60,595 @@ Entries record **why** a change was needed. What changed is in the diff.
 
   `ropeAxisPositionBuffer` in `ops/rope` is where the type lives now, with the
   slack the kernel expects, and both resident paths build their buffer with it.
+  Its test asserts the array type, because that is the thing that was wrong.
+
+- **Changing folder to the wrong one stranded the page** (reported from a
+  browser). Pointing Z-Image's folder picker at Anima's folder left it dead with
+  `Uncaught (in promise) Error: the folder "anima-3.8B" has no
+  "model.safetensors.index.json"`, and reloading landed in the same place.
+
+  Three faults, each of which alone would have been survivable:
+
+  - **A receipt was read without asking what the caller needs.** A folder filled
+    for another model carries its own valid receipt, so `readReceipt` said
+    "filled", the fill was skipped, and the page got a folder with none of its
+    files. It takes the plan now: a receipt that does not name every file the
+    caller wants means unfilled, which fills the folder rather than failing
+    after a reload.
+  - **The folder was remembered before it was known to work.** `bindFolder`
+    stored the handle first, so a bad pick became the page's permanent answer.
+    It reads every file out of the new folder first and stores it last.
+  - **Changing folder forgot the folder that worked.** The old rule was "every
+    bind failure forgets", which is right when there is nothing to fall back on
+    and wrong when there is. `gate.test.ts` used to assert the two paths were
+    the same; it asserts they differ, and why.
+
+  And a failure that gets past all of that now lands somewhere a person can see:
+  every page's `void main()` carries a `.catch` that writes the message into the
+  status line instead of the console.
+
+- **Three limits a real reference hit, and one of them was silent**
+  (issues #212, #211). Running R2V on an actual video and image reference — 8
+  frames of 256x448 and a 256x352 still, 1,424 packed rows — found all three:
+
+  - **`qkNorm` dispatched one workgroup per head-row**, so the grid was
+    `seq * heads`. At 56 heads that passes 65,535 at **1,171 tokens**, which is
+    a 256x256 clip with two references. It is split on head-row boundaries now.
+  - **The vision tower never flushed.** Every one of its 27 blocks' buffers
+    stayed lent for the whole tower, which at 2,144 patches is gigabytes beside
+    25.78 GB of weights.
+  - **The per-row norms had the same shape of limit** — one workgroup per row,
+    so `seq * heads` rows. The conditioner's QK norms reach 65,535 at **1,024
+    tokens** at 64 heads and the DiT's at **1,171** at 56, which is any
+    presentation with a video reference in it. Both split on row boundaries
+    now, and both are `headDim` floats wide, so the slices were already
+    aligned.
+  - **`swapLeading` refused instead of tiling.** Its own comment said splitting
+    needed a second grid dimension in `ops/permute`, which #214 added; it tiles
+    now, in the DiT and in the conditioner's tower.
+  - **A dispatch past the grid limit is reported as an invalid *command
+    buffer*.** That takes every dispatch recorded beside it with it, so the run
+    completed — fifteen sampling steps at 91 ms instead of 1,400, and frames
+    written from pool debris. `ResidentDevice.batch` refuses now, naming the op
+    and the kernel, and the kernel is named from its own WGSL header because
+    every entry point here is `main`.
+
+- **R2V takes more than one reference, and takes video** (issue #212).
+  `--reference image:PATH:W:H` and `--reference video:PATH:W:H:FRAMES`,
+  repeatable, in packed order. A video is one vision block per merged frame
+  group with its own timestamp, its rotary clock advances per block, and its
+  latent geometry comes back from the encoder rather than being assumed — the
+  causal temporal compression is on the way. The layout is built *after* the
+  encoder for that reason.
+
+- **The DiT's latent space is not the decoder's, and nothing was converting
+  between them** (issue #212). `AutoencoderKLMiniMaxH3`'s own doc says a
+  pipeline "encodes with `(latent - latents_mean) / latents_std` and decodes
+  with `latent * latents_std + latents_mean`". Every sampler here handed the
+  DiT's output straight to `decode`.
+
+  What came back was a blurred frame with a grid over it, and that was read as
+  what int8 costs. It is not. With the transform, the same latent decodes to a
+  sharp paper boat with reflections in the water and the printed text on its
+  hull legible.
+
+  It surfaced while wiring `ref2va`, where the **encoder** is a caller too and
+  the two directions have to agree — a round-trip through the encoder and the
+  decoder reproduced the picture only in the raw space, while the sampler's
+  output only made sense in the normalised one. Both cannot be true of the same
+  buffer.
+
+  `unnormaliseLatent` lives beside `decode` now, the statistics ride in the
+  decoder manifest so no caller has to find them, and the three callers
+  (`h3-dit`'s sampler, `h3-dit-web`, `h3-ref2v`'s sampler) all use it.
+
+- **`DitGpu` and `VideoDecoderGpu`'s buffer pools only ever grew, so resident
+  memory was the SUM of every size class's own peak where what a step
+  actually needs at once is the MAX** (issue #223). After the token-major
+  kernel change (5d52019) a 19,027-row step still refused at 32.14 GB held,
+  asking for a 1095 MB buffer:
+
+  | resident | count x size | class |
+  |---|---|---|
+  | 12.02 GB | 156 x 77 MB | weights |
+  | 8.02 GB | 208 x 39 MB | weights |
+  | 3.85 GB | 7 x 549 MB | attention-width activations |
+  | 3.28 GB | 3 x 1095 MB | ffn-width activations (a 4th refused) |
+  | 1.64 GB | 4 x 411 MB | hidden-width |
+  | 1.16 GB | 50 x 23 MB | |
+
+  The attention stretch and the feed-forward stretch of a block run one after
+  the other and never need their buffers at the same time, but a free buffer
+  stayed allocated forever, so both stretches' peaks stayed resident at once.
+  A new pure helper, `evictionPlan` (`examples/h3-video/src/pool.ts`, shared
+  by both classes), decides which free buffers to destroy — largest-first,
+  since one big buffer frees as much as fifty small ones — so `release()` can
+  bound the FREE half of the pool to a `maxFreePoolBytes` budget (2 GiB by
+  default, settable, `Infinity` to turn it off). `lent` and `quarantine`
+  buffers are never touched; eviction runs only after both have already been
+  folded into the pool at the flush.
+
+  **The eviction alone was bookkeeping, not memory.** The acceptance run still
+  refused a 411 MB allocation at 25.00 GB held on a 32 GB card — the accounting
+  said 25 GB, the driver still held around 32. `destroy()` only schedules the
+  free; Dawn returns a destroyed buffer's VRAM after `RECLAIM_ROUND_TRIPS`
+  device round trips, not at the destroy call (issue #213,
+  `harness/reclaim.ts`). `release()` now returns the byte count it destroyed,
+  and `flush()` in both classes `await`s `this.device.reclaim()` when that
+  count is greater than zero — and only then, since most flushes at short
+  sequences evict nothing and a round trip is not free.
+
+### Added
+
+- **R2V's generator holds the model to its own specification** (issue #212).
+  Every number in `MiniMaxAI/MiniMax-H3`'s card is a default or a limit in
+  `generate-r2v.ts` now, because every one of them was violated by hand on the
+  first real request and each violation read as a property of the model until
+  the card was read.
+
+  It defaults to **5 seconds at a short edge of 768** — the official `ref2va`
+  request verbatim — derives the canvas from `--aspect`, and refuses, *before*
+  uploading 26 GB: a duration outside 4–15 s, a reference clip outside 2–15 s,
+  more than 15 s or 3 clips of reference video, more than 9 images or 12 files,
+  and a prompt missing any of H3-Context-IR's six rewrite sections.
+  `--out-of-spec` proceeds and names the rule.
+
+  The prompt check is the one with a measurement behind it: everything else
+  held, replacing a six-word prompt with the six sections moved the seam figure
+  from 1.51 to 1.14 — the best of any run — and put the reference's own printed
+  shirt on the subject. H3-Context-IR is hosted and not in the open release, so
+  this cannot build the rewrite; it can refuse to pretend a sentence is one.
+
+  It also says what it cannot do. Five seconds at 768 on a 9:16 canvas is
+  **40,927 packed rows** and the longest this port has been timed at is 4,768,
+  at 12.2 s a step — printed before the wait rather than after it.
+
+- **R2V runs end to end on the GPU** (issue #212). `generate-r2v.ts`: a
+  reference and a prompt in, frames out, over four models one at a time —
+  encoder 0.47 s, conditioner 2.0 s, `transformer_ref` 15 steps at ~1.4 s,
+  decoder 0.65 s, with `reclaim()` at each boundary.
+
+  Held to the model at every joint, and the last one needed a new golden:
+  `t2va` cannot exercise the reference rows, the third noise level, or a vision
+  block tagged video among the text rows, because all three are downstream of
+  `num_condition_video_rows` being nonzero. One forward of `transformer_ref` on
+  a real `ref2va` sequence is **0.68% of peak** on the video velocity and 1.61%
+  on the audio, at four blocks and int8.
+
+  Two things the conversion had to learn. `convert_dit.py --workflow ref2va`
+  evaluates modulation tables for **four** noise levels instead of two — a
+  `t2va` conversion runs fourteen steps and then hands back a bind group whose
+  offset is past the end of its own table. And `maxLevels` comes from the
+  manifest now rather than being the constant 2 it was.
+
+  The anchors are checked rather than assumed: after fifteen steps they differ
+  from what went in by exactly zero, and the run refuses to write frames if not.
+
+  Two apparent faults were measured until they were not. An "inverted tone" was
+  the *prompt* — "warm light" in it, and the correlation with the reference is
+  -0.06, so not a negative of anything. A "colour drift across frames" is not
+  `ref2va`'s: the per-frame chroma of an R2V run and a `t2va` run are the same
+  curve, with troughs exactly at the frames that sit at position 0 of a latent
+  frame. What remains is the DiT's int8, which a reference encoded and decoded
+  straight back does not have and only DiT-produced latents do.
+
+- **The visual VAE encoder on the GPU** (issue #214). `examples/h3-encoder`'s
+  CPU version is a reference and stays one — it is a single-threaded loop over
+  `ops/conv`'s scalar `conv3d` and takes **120.5 s on an 8x32x32 clip**, which
+  is not something R2V can do once per dropped reference.
+
+  Held to the same golden the CPU one is held to — `EncoderFCN3D` and
+  `quant_conv`, the **model's own output**, never the other port:
+
+  | | 8x32x32 | worst against the model |
+  | --- | --- | --- |
+  | `encoder.ts` (CPU) | 120.5 s | 2.432e-5 |
+  | `encoder-gpu.ts` | **0.20 s** | **9.537e-6** |
+
+  At the geometry R2V actually uses, RTX 5090 / Dawn / f32 weights, 236
+  dispatches: **0.47 s** for one 256x256 still, 1.47 s for five frames, 5.30 s
+  for twenty-one.
+
+  **No new kernel** — `conv3d`, `pad`, `group_norm`, `activation`,
+  `elementwise` and `permute` cover it, which was checked against the four the
+  CPU version calls before any of it was written.
+
+- **`permute`, `activation` and `elementwise` accept a two-dimensional
+  dispatch** (issue #214). One row of workgroups runs out at 65,535, which at
+  256 threads is 16.7 M elements — the encoder's first level passes it on a
+  256x256 reference at five frames, and the guard that caught it was an
+  exception rather than a wrong picture.
+
+  The fold reads `num_workgroups.x` instead of taking a new uniform, so **every
+  existing one-dimensional caller keeps working unchanged**: at `[n]` the y
+  extent is 1 and `gid.y` is 0. `ops/pad` solves the same problem with a
+  `stride_y` uniform and needed its callers to know.
+
+- **`ResidentDevice.reclaim()`** (issue #213). `destroy()` schedules the freeing
+  of a buffer's memory; it does not do it. Dawn releases on its next tick and
+  **ticks on GPU work, not on a timer** — so a stage that destroys 25 GB and
+  immediately allocates 20 GB gets an *invalid* buffer back, which does not
+  throw. `examples/h3-dit/src/generate.ts` ran its two phases as separate
+  processes because of this, having measured process exit as the only reliable
+  release; `examples/h3-ref2v-web` needs three stages in one browser tab, which
+  has no process to exit.
+
+  Measured on an RTX 5090 (32 GB, Dawn/Vulkan), 25.78 GB destroyed and 20.66 GB
+  asked for: nothing works (3 of 3 fail), `setTimeout` up to 2 s works at no
+  delay, one submit-and-readback is *marginal* (1 of 3 failed), two or more
+  worked 8 times out of 8. `reclaim()` submits four.
+
+  **Judged by a readback, not by an error flag.** An out-of-memory
+  `createBuffer` reports asynchronously, and two earlier versions of that
+  measurement read their own staleness instead of the card — one called every
+  stage a success, the other reported a 2.08 GB ceiling that was a leftover
+  rejection from the round before. `harness/verify-reclaim.ts` runs the four
+  stages and has a `--without` half that must fail; it does, at the second
+  stage.
+
+  `generate.ts --phase both` calls it now, and the entry says what that is
+  worth: at 256x256 over 22 frames the two models are 23.1 GB and fit at once,
+  so **removing the call changes nothing there**. It is load-bearing at the
+  geometry where they do not fit.
+
+- **R2V's conditioner converts, runs on the GPU, and reproduces the model**
+  (issue #212). **25.78 GB** of int8 in 86 s — 0.61 GB of vision tower, 50 text
+  layers, no `lm_head` and no layers 50..63. 76 tokens in 2.0 s over 8,182
+  dispatches.
+
+  Held to `hidden_states[50]` of the released Qwen3-VL-32B on a real
+  presentation, **as a median over rows** rather than as one worst element:
+  **1.12%** on the text rows and **3.00%** on the visual ones against the same
+  weights round-tripped through this converter's own int8, 2.02% and 4.27%
+  against them in bf16.
+
+  Three real bugs, and the third is why the first two were hard to see:
+
+  - **The deepstack add aliased one buffer as read and read-write inside a
+    compute pass.** WebGPU refuses that, so the command buffer was invalid and
+    the output was whatever the pool held — reported as "100.46% of peak",
+    which is not a number.
+  - **The fused `qkv` was un-interleaved with a copy per token per block** —
+    20,736 for one 256x256 reference. The converter splits it into three now,
+    as `examples/h3-video` splits `to_qkv`.
+  - **The stack ran one layer too many.** `hidden_states[50]` is the *input* to
+    layer 50: `transformers` records hidden states from a forward hook on the
+    decoder layer, so state `k` is layer `k - 1`'s output. The conversion kept
+    layer 50 and the forward evaluated it — 0.49 GB and a whole layer of
+    arithmetic past the answer. `verify-conditioner.ts` refuses to compare a
+    conversion whose layer count disagrees with the golden's now.
+
+  **A last number cannot see any of that**, because this stack's last rows are
+  massive activations: from layer 43 a few visual tokens grow by a factor of a
+  hundred, so worst-over-peak reads ~96% whether the port is right or wrong. It
+  moved by 0.01 points when the extra layer was removed; the median row moved
+  from 24.9% to 1.12%. `verify-conditioner.ts` reports rows, split by kind.
+
+  **Which tokens become massive is a near-tie, and int8 rounding flips it.**
+  `gen_real_conditioner_golden.py --quantised` runs the released weights through
+  this converter's own quantisation inside `transformers`, and the reference
+  then picks the same row this port picks. Without that second reference the
+  flip reads as an 88%-of-peak port bug; with it, it is the model's own
+  sensitivity, recorded and not fixed.
+
+  **A vision token does not sit at `t = h = w = index`.** A vision block gets a
+  2-D grid and the clock advances by `max(h, w) / merge`, the block's longer
+  side, not by its token count. `qwen3vlPositionGrid` builds it and
+  `verify-conditioner.ts` refuses to run if it disagrees with `get_rope_index`'s
+  own output.
+
+- **R2V's image processor and its browser page** (issue #212).
+  `examples/h3-ref2v/src/processor.ts` reproduces
+  `Qwen2VLImageProcessor` **exactly** — worst difference **0**, once the two f32
+  roundings upstream does were matched rather than collapsed into one.
+  `smartResize`'s banker's rounding, its two different clamp rules (`floor`
+  above the pixel ceiling, `ceil` below the floor), the temporal repeat of a
+  still image, and the merge-block patchify. Ten mutations, all caught.
+
+  **The resize itself is not ported**, and that is stated rather than hidden:
+  upstream resamples with PIL's bicubic and a browser has `drawImage`. What that
+  costs is unmeasured.
+
+  **The tokenizer was already in this repository.** `llm/tokenizer-bpe.ts` is
+  Qwen's byte-level BPE with its vocabulary committed, and it reproduces **all
+  fourteen** text segments H3's own tokenizer produced plus all four vision
+  token ids — measured in `examples/h3-ref2v/src/tokenizer.test.ts`, not
+  assumed.
+
+  `examples/h3-ref2v-web` takes dropped images and video, patchifies them,
+  assembles and tokenises the presentation, and builds the packed sequence —
+  every step held to the model. **It does not generate**: the conditioner and
+  the vision tower have CPU references and no GPU path, and no converter has
+  written a `conditioner.q8.bin`. The page says which of the three models is
+  missing rather than failing vaguely.
+
+- **Qwen3-VL's vision tower** (issue #212). Held to `transformers`' own
+  `Qwen3VLVisionModel` at **1.192e-7** on the tower's output and **7.451e-9** on
+  the pooled vision tokens and every deepstack feature. Committed fixture,
+  random weights, 399 KB.
+
+  **`ops/conv`'s `conv3d` is the patch embedding** — a `Conv3d` whose kernel
+  equals its stride and its input — so #201's op has a second caller. Nothing
+  else new either: `layernorm` (with bias), `attention`, `matmul`, `activation`,
+  `elementwise`, and `ropeAxes` for the two-axis rotation.
+
+  Tokens are in **merge-block order**, the position embedding is **bilinearly
+  interpolated** from a learned 48x48 table with #211's `torch.linspace`
+  deciding the taps, the blocks' MLP is `gelu_pytorch_tanh` while the mergers
+  use the **exact** GELU, and the final merger normalises *before* the shuffle
+  while the deepstack mergers normalise *after*.
+
+  **The sweep caught six of ten, and the tolerance was why.** The bounds were
+  `2e-5` against an achieved `1.192e-7` — 170x too loose — and both GELU swaps
+  walked through. They are `3e-7` and `3e-8` now, measured values times a small
+  factor, with the mutation's own effect recorded beside them: swapping the
+  blocks' MLP moves the output to 6.109e-7, which is why the bound is not a
+  round 1e-6.
+
+- **Qwen3-VL's text decoder** (issue #212). `examples/h3-ref2v`'s conditioner
+  stack, held to `transformers`' own `Qwen3VLTextModel` at **3.576e-7** across
+  every hidden state, on a **committed** fixture — random weights at a tiny
+  geometry, 122 KB, no model licence.
+
+  **No new kernel.** `ops/gqa` takes the 64-query-over-8-key/value grouping,
+  `ops/rmsnorm` takes the layer norms and the per-head QK norms, and
+  `ops/rope`'s `ropeAxes` takes M-RoPE — through **64 axes of two channels**,
+  where `theta ** 0` is exactly 1 so the frequency can be folded into the
+  position (which is what #206's fractional positions were for), plus a channel
+  permutation applied to Q, K **and** the per-head norm weights.
+
+  **`mrope_section` does not name three contiguous blocks.**
+  `apply_interleaved_mrope` overwrites two *strided* slices of an all-time
+  array, so channel `c` is on axis `c % 3` while `c < 3 * section[1]` and on
+  time after. The chunked reading is what the field name suggests, produces a
+  working model, and is wrong — as is a per-axis frequency sweep, since every
+  channel keeps the frequency its **global** index gives it.
+
+  **The last hidden state carries the final norm.** `output_hidden_states=True`
+  returns `n + 1` entries whose last is `last_hidden_state`, so a port that
+  appends its raw last layer output matches every earlier entry and misses that
+  one by 0.53. It does not change what H3 reads — `hidden_states[50]` of 64 is
+  an ordinary layer input — which is exactly why it could have gone unnoticed.
+
+  Ten mutations, all caught.
+
+- **R2V's transformer converts with no new code** (issue #212).
+  `transformer_ref/` is a second 66.28 GB partition and *is* different weights —
+  measured at **2.0–2.2%** mean relative difference across the stack, a
+  fine-tune of the same base — but its config is **identical to
+  `transformer/`'s, field for field**. So `examples/h3-dit`'s `convert_dit.py`
+  and `model-gpu.ts` serve it unchanged: 20.08 GB resident in 96 s, held to the
+  model's own output at four blocks at **0.96%** of peak on video against the
+  `t2va` partition's 0.84%.
+
+  The fifty-block check is not run yet — it needs 20.66 GB and the card was
+  holding 27.1.
+
+- **R2V's presentation** (issue #212). How a `ref2va` request is announced to
+  the conditioner: `"<Picture i>: "`, `"<Audio j>: "`, `"<Video k>: "`, numbered
+  **per modality**, each followed by a vision block of pad tokens — which is
+  what produces the text tags the layout takes, because a vision block's rows
+  are tagged **video** while sitting among the text rows. A video that carries
+  sound is announced `<Audio>` **before** `<Video>`, and gets one timestamped
+  block per merged frame group.
+
+  **The timestamp is rendered with Python's round-half-to-even, and the tie is
+  not where it looks.** The mean of a 2 fps pair is exactly `0.25`, which
+  renders `"0.2"` where `toFixed(1)` gives `"0.3"`. But detecting the tie by
+  multiplying by ten is also wrong: `0.15` is really `0.1499999999999999944…`
+  and renders `"0.1"`, while `0.15 * 10` rounds to exactly `1.5` and reads as a
+  tie. The tie is detected on `toFixed(20)` — the exact decimal expansion —
+  and the bug was found by a fixture case at 30 fps, not by reasoning.
+
+  The fixture carries the token ids **and a map from each text segment to its
+  ids**, so the assembly is held to upstream without a BPE implementation in
+  the way.
+
+- **R2V's packed layout** (issue #212). `examples/h3-ref2v`: MiniMax-H3's
+  `ref2va` sequence, `[text | reference blocks | target audio | target video]`,
+  held to `build_ref2va_packed_sequence` exactly on a committed fixture.
+
+  What makes it more than an ordering is that **the references advance a shared
+  rotary clock** — where the generated video sits depends on how many
+  references came before it and how long each was. An image takes **one** slot,
+  not a latent frame's `5/3`; a video's soundtrack is packed **before** its
+  video rows, sharing their origin; a video advances the clock by
+  `max(audioLatents, videoSpan)`; and that span is summed **sequentially**,
+  which is deliberately not how the `t2va` keyframe anchor sums the same
+  series — the two differ in the last ulp from 16 latent frames onwards and
+  upstream keeps both.
+
+  **The first mutation sweep caught seven of ten, and all three survivors were
+  the fixture's fault.** No case had a soundtrack longer than its own video, so
+  the `max` never chose the audio; every reference shared a canvas with the
+  target, so pinning a soundtrack to the wrong width grid was invisible; and
+  the tag assignment order genuinely cannot matter, since the three index sets
+  are disjoint. Three cases were added and the unobservable mutation was
+  replaced by one that is — which found a real gap: the port was filling in
+  `TEXT_TAG` for every text row, and `text_token_tags` is an argument precisely
+  because **a reference's vision block sits among the text rows and is tagged
+  video**.
+
+- **Flat dispatches are split to fit the device's grid** (issue #211). One
+  thread per element and `ceil(n / 256)` workgroups runs out of grid at
+  **16,776,960 elements** — 65,535 workgroups, which Dawn Node and Chrome both
+  report and neither raises when asked. A 14,336-wide feed-forward reaches it
+  at **1,170 rows**.
+
+  A 22-frame 256x256 clip is 538 packed rows and fits. **576x320 is 1,350 and
+  does not**, which is the second size anybody picks, and it arrived as
+  `Dispatch workgroup count X (72240) exceeds max compute workgroups per
+  dimension (65535)` after 24.49 GB had been uploaded.
+
+  Split on **row** boundaries, not element ones: `ops/elementwise`'s rows entry
+  recovers its column with `idx % D`, so a chunk starting mid-row would read
+  the wrong scalar for every element of it — a well-formed tensor, quietly
+  wrong. Chunks are rounded to keep every slice 256-byte aligned.
+
+  Held to the model's own output through a lowered ceiling: **223 dispatches
+  unchunked, 231 chunked, the same worst element to four digits.**
+
+  `swapLeading`'s transpose is the one that cannot be split — it writes
+  strided, so a slice of the input has no slice of the output to land in. It
+  runs out at **2,340 tokens**, past every size the page offers, and refuses
+  with that number rather than letting `batch is not valid` arrive from inside
+  a command buffer.
+
+  This resolves the ambiguity #211 opened with: a **headed** Chrome allows
+  `workgroup_size(512)` and a headless one does not, so `examples/zimage-web`'s
+  record of running in a browser and this page's refusal are both true of their
+  own adapters.
+
+- **A lost WebGPU device says why now** (issue #211). Once a device is lost,
+  **every later call reports the same thing**: `popErrorScope` rejects with
+  `OperationError: Instance dropped in popErrorScope`, once per buffer, with a
+  stack pointing at whatever allocation came next rather than at the fault.
+  `device.lost` — where the backend says what it actually hit — was never read
+  by `createBrowserResidentDevice`.
+
+  Every error scope in the browser device now handles its **rejection** path as
+  well as its resolution, and reports the loss reason plus how much had been
+  allocated across how many buffers. `examples/web-common/src/device-lost.ts`
+  is the wording, tested without a GPU: an unknown cause is replaced, an
+  unresolved loss says it has not said why yet, and an error that *is* the
+  fault — a refused pipeline — survives intact.
+
+  **The page reads the adapter's limits before it uploads anything.** The first
+  run spent 21 s on 23 GB and then printed `Instance dropped` five times; the
+  cause was one number, `maxComputeWorkgroupSizeX = 256` against
+  `ops/matmul`'s 512, readable in the first second. It now refuses in that
+  first second and prints all five limits.
+
+- **A browser page that generates video** (issue #210).
+  `examples/h3-dit-web`: a prompt, a size, a step count and a seed in; the DiT
+  samples and the VAE decodes, both on WebGPU, and the frames play on a canvas.
+
+  **It uploads and it does not yet run.** 23.10 GB in 20.9 s, prompts and step
+  counts populated, and then the first generation fails with
+  `Entry-point uses workgroup_size(512, 1, 1) that exceeds the maximum allowed
+  (256, 256, 64)`. The adapter a **headless** Chrome 151 hands out reports
+  `maxComputeWorkgroupSizeX = 256`, and `ops/matmul`'s two entry points declare
+  512. Issue #211, with the four limits measured.
+
+  **Whether that is headless Chrome or every Chrome is unresolved, and it
+  matters**: `examples/zimage-web` dispatches the same kernel and is recorded as
+  running end to end in a browser, which cannot both be true of one device. No
+  X display was reachable from where this was measured, so it was not settled
+  rather than guessed. `examples/h3-video-web`'s "the in-browser decode is
+  unmeasured" is consistent with nobody having run it either.
+
+  `?serve=<base>` reads the weights over HTTP instead of from a picked folder —
+  not a convenience: `showDirectoryPicker` needs a user gesture and a native
+  dialog, so a headless browser cannot otherwise reach the page's work, which is
+  exactly why these pages keep ending "unmeasured".
+
+  The page reports what it **uploaded**, not what the device took. WebGPU
+  exposes no way to ask, and `nvidia-smi` never moved while the page had
+  uploaded 23.10 GB.
+
+- **The 50-layer DiT runs on the GPU** (issue #210). `examples/h3-dit`'s
+  `model-gpu.ts` plus `tools/convert_dit.py`: **20.08 GB** of int8 resident,
+  one step over 42 rows in 2,078 ms (RTX 5090, driver 610.57.04, Dawn
+  `webgpu@0.4.0`), of which 6 ms is queue time and **1,611 ms is host-side
+  recording**. No new kernel.
+
+  **20.08 GB, not 33.12.** `adaln_proj` is 13.01 G of the checkpoint's 33.12 G
+  parameters — **39.3%** — and it projects `temb`, a *two-row* tensor whose
+  value depends only on the timestep. The converter evaluates the modulation
+  tables instead of shipping the weights, which costs 0.58 GB of tables for 16
+  steps and means a conversion runs only the step counts it was given.
+
+  **What int8 costs, at one block, as a percentage of the golden's peak**:
+  0.55% for bf16 activations against f32 with *no quantisation at all*, **0.88%
+  for this port**, and 7.59% for int8 weights inside torch's own bf16 pipeline.
+  The port sits just above the floor its bf16 golden can resolve. At fifty
+  blocks the port is 13.80% and torch's own int8 round-trip is 47.49% — most of
+  the gap is precision rather than the port, but the split is **not measured**,
+  because an f32 fifty-block reference is 132 GB.
+
+  The rope call was written from memory rather than from
+  `ops/rope/wgsl/axes.wgsl` — bindings swapped, a four-field uniform against a
+  five-field struct — and since every binding is `array<f32>`, there was no
+  validation error, just NaN fifty blocks later. **The comparison reported
+  "worst 0.000e+0" on wholly-NaN output**, because `Math.abs(NaN - x) > worst`
+  is false; it counts non-finite values now and refuses before reporting.
+
+- **MiniMax-H3's packed sequence layout** (issue #210). The transformer builds
+  none of it: row order, modality tags, per-row noise levels and the `(t, h, w)`
+  rotary grid all arrive as arguments, so every one is a free choice and **not
+  one of them changes a shape**. Ported from
+  `diffusers.modular_pipelines.minimax_h3`, fixture committed.
+
+  Six conventions, none guessable: video rows **frame-major then row-major**; a
+  spatial grid that is **aspect-normalised** and scaled by 32; built with
+  **`np.linspace(endpoint=False)`**, not `torch.linspace`; latent frames spaced
+  **`5/3 * (1, 4, 4, 4, 4)`** because the VAE's first latent covers one pixel
+  frame and the rest four; **the media clock starting after the text**, so
+  prompt length moves the video; audio rows **channel-major**, with no height,
+  pinned to the two extremes of the width grid.
+
+  The fixture carries a **square** canvas as well as a wide and a tall one. On a
+  square canvas the aspect normalisation is the identity, so squares alone
+  would pass with it deleted.
+
+  `resolveCanvasSize` needs Python's **banker's rounding**, and that is not
+  pedantry: the default 720p canvas asks for `round(720 / 32) = round(22.5)`,
+  which is 22 in Python and 23 in JavaScript, so half-up generates at **736**
+  pixels where the model wants 704 — and nothing downstream would object.
+
+  Eleven mutations, all caught.
+
+- **MiniMax-H3's sampling schedule** (issue #210). Rectified flow with an
+  exponential shift, ported from `MiniMaxH3Scheduler`. Four conventions decided
+  by upstream rather than by this port, each of which yields a *video* rather
+  than an error when it is wrong: **`t = 1 - sigma` and `t = 1` is clean** (the
+  reverse of the DDPM convention every other schedule here uses); the terminal
+  sigma gets **no model evaluation**, so `n` grid points drive `n - 1` forwards;
+  `step` recovers its sigma from the **timestep**, not the grid, because
+  `1 - (1 - sigma)` is not an exact f32 round trip below 0.5; and `eta` is **0**
+  despite the reference class being named "euler ancestral".
+
+  The sigma grid matches torch **exactly, every element**, which took three
+  details that were measured rather than reasoned about: `torch.linspace`
+  rounds its step to f32 *first*, counts the second half **down from the end**,
+  and computes each element as one **fused** multiply-add. Naive
+  `1 - i / (n - 1)` disagrees at 4 of 50 points and rounding the product first
+  disagrees at a different 4 — one f32 ulp each time, which no sampler would
+  ever look wrong for, and which changes which timesteps the transformer is
+  conditioned on.
+
+  Both shipped shifts are covered — 12.0 for video, 3.0 for audio — and the
+  fixture is committed, because a schedule is arithmetic and carries no
+  weights. `unique_consecutive` is exercised at 1,000,000 grid points, where a
+  shift of 12 collapses 42,208 of them; **no realistic step count reaches that
+  branch**, which is how a port drops it and nobody notices.
+
+- **The whole DiT forward, with a golden that lives in this repository**
+  (issue #210). `examples/h3-dit` held **one block** to diffusers'
+  implementation and recorded that "the rest is a loop". It is not: around the
+  fifty blocks sit one packed sequence built from three separately-projected
+  modalities, a two-block text refiner with **no rotary**, an AdaLN table
+  addressed per row, a `norm_out` that modulates per row with **shift first**,
+  and two heads that run over every row before the modality's rows are
+  selected. Each returns a well-formed tensor when it is wrong.
+
+  Held to `MiniMaxH3Transformer3DModel` at **1.490e-7** on the video velocity
+  and 1.192e-7 on the audio, against an f64 golden.
+
+  **The fixture is committed and CI runs it.** It is 155 KB because the golden
+  is generated at upstream's own tester geometry — hidden 24, two layers — with
+  **random weights**, so it is not MiniMax's checkpoint and carries none of its
+  licence. Nothing structural depends on the weights being trained, and ten
+  mutations confirm it: the refiner skipped (1.6e-2), the AdaLN table addressed
+  without its modality (2.7e-2), `norm_out`'s shift and scale swapped
+  (5.99e-1), the timestep embedding not flipped to cos-first (7.4e-2), and six
+  more.
+
+  **Two of the ten are only caught because both outputs are compared.**
+  Modulating `norm_out` from table row 0 leaves the video output
+  bit-identical — every video row is at timestep 0 — and moves the audio by
+  2.6e-2; dropping the video head's bias does the reverse. A test that checked
+  one head would have passed either.
   Its test asserts the array type, because a test that only checked the values
   passed the whole time.
 
@@ -53,8 +679,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   Each page's `main()` also catches now, so a start-up failure reaches the
   status line instead of being an unhandled rejection under a page that looks
   like it is still loading.
-
-### Added
 
 - **The type a buffer is uploaded with is now checked against the type the
   kernel declared** (issue #221, out of #217). `ropeAxes`' `positions` binding
@@ -177,8 +801,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   (4.386e-6 at 70 tokens, 4.889e-6 at 1,039, 5.560e-6 at 4,111), the text
   encoder (7.993e-7), the sampler's schedule (exact), the VAE decoder (1.629e-5
   at 1024). Measured conditions are in the example's README, with the image.
-
-### Added
 
 - **`conv3d`** (issue #200). MiniMax-H3's visual VAE compresses time as well as
   space — `temporal_downsample_factors [1,2,2,1,1,1]`, 4x — so every convolution
@@ -385,6 +1007,36 @@ Entries record **why** a change was needed. What changed is in the diff.
 
 ### Changed
 
+- **`ops/flash_attention` can read `q`/`k`/`v` token-major, and the DiT and the
+  video decoder now dispatch it that way** (issue #223). The kernel only ever
+  read head-major `[B, H, L, D]`, but `examples/h3-dit`'s `attention()` and
+  `examples/h3-video`'s decoder `block()` hold q/k/v token-major —
+  `[seq, heads * headDim]` — because every other op in both forwards does, so
+  each attention call ran three `swapLeading` copies in and one out to convert.
+  At 19,027 rows those four buffers are 549 MB each, roughly 2 GB, which is
+  what stood between a 512x896 x 120-frame generation and a 32 GB card:
+  **31.9 GB held at the refusal, and the four swap outputs are exactly the
+  remainder.**
+
+  `ops/flash_attention/tools/generate.ts` now also emits
+  `wgsl/fa2_token.wgsl` — the same shape, the same staged-tile arithmetic
+  (scores, softmax, accumulate untouched), only the four global-memory index
+  expressions changed. `ops/flash_attention/wgsl.test.ts` holds it to two
+  things: the usual tolerance against this op's own reference, and **bit-exact
+  agreement with the head-major kernel** on the same logical tensors — the
+  staging loops land the same values in the same slots in the same order
+  either way, so the arithmetic that follows cannot tell which layout fed it,
+  and a `===` per element is the right bar rather than a tolerance. fa3 gets
+  no token variant; it is not the generation `FLASH_GENERATION` selects.
+
+  Both callers' `attention()`/`block()` dispatch `flashAttentionToken`
+  directly on `q.buffer`/`k.buffer`/`v.buffer` now and the four `swapLeading`
+  calls are gone. **Bit-identical**, confirmed against the real-content
+  goldens: the DiT forward stays `video velocity: worst 1.394e+0` /
+  `relative to peak: video 7.38%, audio 3.47%`, and the decoder stays
+  `worst 3.606e-2` (synthetic latent) and `worst 1.753e-1` (12x16x16 real
+  latent) — none of those numbers moved by a digit.
+
 - **`ropeAxes` takes fractional positions** (issue #200). Z-Image indexes tokens
   by their grid coordinate, so its positions are whole numbers and the binding
   was `i32`. MiniMax-H3's visual VAE normalises each axis to `(-1, 1)` —
@@ -404,8 +1056,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   permutation converts one to the other **in the weights**, as `permuteForRope`
   does for Anima — and `rope_dim_ratio: 0.75` is covered by a fourth axis pinned
   at position 0, which is the identity. Worst element **2.384e-7**.
-
-### Changed
 
 - **The browser `ResidentDevice` lives in one place** (issue #200).
   `anima-web` and `zimage-web` each had a copy, and they had already drifted:
@@ -435,8 +1085,6 @@ Entries record **why** a change was needed. What changed is in the diff.
 
   The addressing is a swept field rather than a rewrite, so #198 can re-decide
   it on hardware that is not this one.
-
-### Fixed
 
 - **The Anima demo re-read weights it already had on the GPU, once per forward**
   (issue #186). A 40-step generation at 832x1216 goes from **347.4 s to
@@ -630,8 +1278,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   straight back in. One forward went from 20.2 s to 0.17 s once the weights are
   resident — against 990 s for the CPU reference.
 
-### Changed
-
 - `harness/wgsl.ts` and `harness/resident.ts` request the adapter's own limits
   rather than a fixed 512 MiB. That constant was why the VAE could not decode at
   1024: Dawn's error said the adapter supports 1 TiB and that it had to be asked
@@ -653,8 +1299,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   own implementation before being wired to the next — one block at the shipped
   width (8.72e-8), the full DiT forward (4.386e-6), the text encoder
   (7.993e-7), the sampler's schedule (exact), and generation end to end.
-
-### Changed
 
 - The DiT's GPU path reads packed q8 weights through `ops/matmul`'s `q8` entry
   instead of `ops/dequant_transpose` followed by `matmul`. The dequantised
@@ -720,8 +1364,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   one silently changes every id and no test written against this module alone
   would notice.
 
-### Fixed
-
 - The GPU tests stop dying for no stated reason. `harness/wgsl.ts` and
   `harness/resident.ts` now keep the `GPU` instance and its adapter reachable
   for as long as the device they produced, because the Dawn Node binding does
@@ -751,8 +1393,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   this repository had accumulated instead was three weeks of symptom
   descriptions and workarounds — splitting test files (#68), retrying, and
   treating the whole class as "Dawn flake".
-
-### Added
 
 - `ops/axpy` (issue #152): `out[i] = y[i] + a * x[i]` with a **scalar** `a`,
   in two entry points — `kernel` (out-of-place) and `inplace` (`y[i] += a *
@@ -1098,8 +1738,6 @@ Entries record **why** a change was needed. What changed is in the diff.
   diff ~1.2e-7 for prefill logits, matching the pre-existing float32
   rounding noise this fixture's tolerance was already sized for, not a new
   source of error.
-
-### Changed
 
 - `LlamaEngineQ8Resident.runPrefillResident` no longer re-packs and
   re-uploads every projection's int8 weight on every `forward()` call —

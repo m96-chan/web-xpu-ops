@@ -303,7 +303,15 @@ const cfg: AnimaConfig = {
     w: c.rope_w_extrapolation_ratio,
   },
 };
-const device = await createResidentDevice();
+const created = await createResidentDevice();
+if (!created) {
+  console.error("anima generate: no adapter");
+  process.exit(2);
+}
+// Bound again after the guard so the narrowing reaches the closures below —
+// `forward` is called long after this line and TypeScript will not carry a
+// nullable through it.
+const device = created;
 const held = new Map<string, GPUBuffer>();
 // The self-attention rope permutation, which the DiT expects and which the
 // adapter's weights above must *not* get. See `withRopePermutation`.
