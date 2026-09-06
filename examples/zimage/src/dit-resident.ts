@@ -27,8 +27,8 @@
  * nothing else.
  */
 import { ropeAxisPositionBuffer } from "../../../ops/rope/index.js";
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { DitConfig, DitInput } from "./dit.js";

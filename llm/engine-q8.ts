@@ -1,4 +1,4 @@
-import type { Runner } from "../harness/index.js";
+import type { Runner } from "../harness/api.js";
 import { ACTIVATION } from "../ops/activation/index.js";
 import { ELEMENTWISE } from "../ops/elementwise/index.js";
 import type { LlamaConfig } from "./config.js";

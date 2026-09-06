@@ -37,8 +37,14 @@ import { SentencePieceTokenizer, type TokenizerVocab } from "../../../llm/tokeni
 import { loadWeightsQ8FromUrl } from "../../../llm/browser-weights.js";
 import type { LlamaConfig } from "../../../llm/config.js";
 import type { LlamaWeightsQ8 } from "../../../llm/weights-q8.js";
-import { createBrowserRunner } from "./browser-runtime.js";
+import { registerKernelSources } from "../../../harness/api.js";
+import { createBrowserRunner, WGSL_TABLE } from "./browser-runtime.js";
 import { createBrowserResidentDevice } from "./browser-resident-runtime.js";
+
+// The WGSL this bundle inlined, handed to `llm/kernels.ts` before anything
+// dispatches. Until issue #224 an esbuild plugin swapped the whole harness
+// for `browser-runtime.ts` to get the same effect; the registry replaces it.
+registerKernelSources(WGSL_TABLE);
 
 // ---------------------------------------------------------------------------
 // Prompt format and system prompt: copied verbatim from

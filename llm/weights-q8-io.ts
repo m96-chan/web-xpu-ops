@@ -33,6 +33,17 @@ export interface NormWeightManifestEntry {
 export type WeightManifestEntry = QuantWeightManifestEntry | NormWeightManifestEntry;
 
 /** The `config` object both converter scripts write into their manifest, before `maxSeqLen` (a loader concern, not a conversion one) is added. */
+/**
+ * A converted checkpoint, loaded: the config its manifest describes and the
+ * weights built from its blobs. Defined here rather than in
+ * `real-model-weights.ts` (its Node loader) so the browser loader and the
+ * published `llm/engine` barrel can name the type without importing `node:fs`.
+ */
+export interface LoadedRealModelQ8 {
+  config: LlamaConfig;
+  weights: LlamaWeightsQ8;
+}
+
 export interface WeightManifestConfig {
   numLayers: number;
   hiddenSize: number;

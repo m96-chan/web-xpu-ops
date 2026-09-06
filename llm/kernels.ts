@@ -1,4 +1,4 @@
-import { kernel, params, type Runner } from "../harness/index.js";
+import { opKernel, params, type Runner } from "../harness/api.js";
 import type { ActivationKind } from "../ops/activation/index.js";
 import type { ElementwiseKind } from "../ops/elementwise/index.js";
 import { matmulGrid } from "../ops/matmul/index.js";
@@ -24,29 +24,67 @@ import { matmulGrid } from "../ops/matmul/index.js";
  * exists to *exercise* those guards, not because a caller needs to supply it.
  */
 
-function opKernel(op: string, entry = "kernel"): string {
-  return kernel(new URL(`../ops/${op}/index.ts`, import.meta.url), entry);
+/**
+ * Every WGSL entry point the LLM engines dispatch — `LlamaEngine`,
+ * `LlamaEngineQ8` and `LlamaEngineQ8Resident` together — as `(op, entry)`
+ * pairs under the key the code below reads them by.
+ *
+ * One list, because it is read three ways: `llmKernels()` builds the table
+ * the dispatch helpers index; a browser host reads it to know which
+ * `ops/<op>/wgsl/<entry>.wgsl` files to bundle and hand to
+ * `registerKernelSources`; and `kernels.browser-parity.test.ts` holds the
+ * demo's static import table to exactly this set. Before issue #224 the set
+ * lived as two tables in two files and a third copy in the demo, kept equal
+ * by a test that parsed all three as text.
+ */
+export const LLM_KERNEL_SOURCES = [
+  { key: "gather", op: "gather", entry: "kernel" },
+  { key: "rmsnorm", op: "rmsnorm", entry: "kernel" },
+  { key: "matvec", op: "matvec", entry: "kernel" },
+  { key: "matvecQ8", op: "matvec", entry: "q8" },
+  // Issue #111's decode-only fused entry points — read by
+  // `LlamaEngineQ8Resident.runDecodeStep`'s bind groups and nothing else.
+  { key: "matvecQ8Ffn", op: "matvec", entry: "q8_ffn" },
+  { key: "matvecQ8Residual", op: "matvec", entry: "q8_residual" },
+  { key: "matmul", op: "matmul", entry: "kernel" },
+  // Issue #128's prefill weight path — the packed int8 weight read directly.
+  { key: "matmulQ8", op: "matmul", entry: "q8" },
+  { key: "rope", op: "rope", entry: "kernel" },
+  { key: "gqaScores", op: "gqa", entry: "scores" },
+  { key: "gqaContext", op: "gqa", entry: "context" },
+  { key: "activation", op: "activation", entry: "kernel" },
+  { key: "elementwise", op: "elementwise", entry: "kernel" },
+  // Issue #117's GPU-resident prefill reshape — see `ops/permute/reference.ts`'s
+  // doc for why a pure reshape has an `ops/` directory of its own.
+  { key: "permute", op: "permute", entry: "kernel" },
+  // Issue #117's prefill weight prep — see `ops/dequant_transpose/reference.ts`'s doc.
+  { key: "dequantTranspose", op: "dequant_transpose", entry: "kernel" },
+] as const satisfies readonly { key: string; op: string; entry: string }[];
+
+export type LlmKernelKey = (typeof LLM_KERNEL_SOURCES)[number]["key"];
+export type LlmKernels = Record<LlmKernelKey, string>;
+
+let table: LlmKernels | null = null;
+
+/**
+ * The WGSL, by key, resolved through `registerKernelSources` on first use.
+ *
+ * Lazy on purpose: a module-scope table would run at import, before a browser
+ * had any chance to register what it bundled, and would then be an
+ * import-order bug that only shows in a page.
+ */
+export function llmKernels(): LlmKernels {
+  if (table) return table;
+  const built = {} as LlmKernels;
+  for (const { key, op, entry } of LLM_KERNEL_SOURCES) built[key] = opKernel(op, entry);
+  table = built;
+  return built;
 }
 
-const CODE = {
-  gather: opKernel("gather"),
-  rmsnorm: opKernel("rmsnorm"),
-  matvec: opKernel("matvec"),
-  matvecQ8: opKernel("matvec", "q8"),
-  matmul: opKernel("matmul"),
-  rope: opKernel("rope"),
-  gqaScores: opKernel("gqa", "scores"),
-  gqaContext: opKernel("gqa", "context"),
-  activation: opKernel("activation"),
-  elementwise: opKernel("elementwise"),
-  // Issue #117's GPU-resident prefill reshape — see `ops/permute/reference.ts`'s
-  // doc for why a pure reshape has an `ops/` directory of its own (the
-  // browser bundle's `opNameFromUrl` requires the `ops/<name>/index.ts`
-  // shape for every kernel it resolves, not just the ones with arithmetic).
-  permute: opKernel("permute"),
-  // Issue #117's prefill weight prep — see `ops/dequant_transpose/reference.ts`'s doc.
-  dequantTranspose: opKernel("dequant_transpose"),
-};
+/** Drops the memoised table so a re-registration is observed — tests only. */
+export function resetLlmKernels(): void {
+  table = null;
+}
 
 const asF32 = (x: Float32Array | Int32Array | Uint32Array): Float32Array => x as Float32Array;
 
@@ -61,7 +99,7 @@ export interface GatherArgs {
 export async function runGather(run: Runner["run"], { table, indices, rows, D }: GatherArgs): Promise<Float32Array> {
   const N = indices.length;
   const [out] = await run({
-    code: CODE.gather,
+    code: llmKernels().gather,
     bindings: [
       { kind: "storage", data: table },
       { kind: "storage", data: indices },
@@ -88,7 +126,7 @@ export async function runRmsNorm(
   { input, weight, N, D, eps, groups = 1 }: RmsNormArgs,
 ): Promise<Float32Array> {
   const [out] = await run({
-    code: CODE.rmsnorm,
+    code: llmKernels().rmsnorm,
     bindings: [
       { kind: "storage", data: input },
       { kind: "storage", data: weight },
@@ -162,7 +200,7 @@ export interface MatVecArgs {
 export async function runMatVec(run: Runner["run"], { matrix, vector, M, K }: MatVecArgs): Promise<Float32Array> {
   return dispatchRowsChunked(M, async (rowStart, rowCount) => {
     const [out] = await run({
-      code: CODE.matvec,
+      code: llmKernels().matvec,
       bindings: [
         { kind: "storage", data: matrix.subarray(rowStart * K, (rowStart + rowCount) * K) },
         { kind: "storage", data: vector },
@@ -197,7 +235,7 @@ export async function runMatVecQ8(run: Runner["run"], { weight, scale, vector, M
   const wordsPerRow = Math.ceil(K / 4);
   return dispatchRowsChunked(M, async (rowStart, rowCount) => {
     const [out] = await run({
-      code: CODE.matvecQ8,
+      code: llmKernels().matvecQ8,
       bindings: [
         { kind: "storage", data: weight.subarray(rowStart * wordsPerRow, (rowStart + rowCount) * wordsPerRow) },
         { kind: "storage", data: scale.subarray(rowStart, rowStart + rowCount) },
@@ -223,7 +261,7 @@ export interface MatMulArgs {
 
 export async function runMatMul(run: Runner["run"], { a, b, M, N, K }: MatMulArgs): Promise<Float32Array> {
   const [out] = await run({
-    code: CODE.matmul,
+    code: llmKernels().matmul,
     bindings: [
       { kind: "storage", data: a },
       { kind: "storage", data: b },
@@ -260,7 +298,7 @@ export interface RopeArgs {
 export async function runRope(run: Runner["run"], { input, N, numHeads, headDim, posOffset, thetaBase }: RopeArgs): Promise<Float32Array> {
   const totalPairs = (N * numHeads * headDim) / 2;
   const [out] = await run({
-    code: CODE.rope,
+    code: llmKernels().rope,
     bindings: [
       { kind: "storage", data: input },
       { kind: "storage", data: new Float32Array(2) },
@@ -360,7 +398,7 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
   const mask = new Float32Array(B * S);
 
   const [probs] = await run({
-    code: CODE.gqaScores,
+    code: llmKernels().gqaScores,
     bindings: [
       { kind: "storage", data: q },
       { kind: "storage", data: k },
@@ -388,7 +426,7 @@ export async function runGqa(run: Runner["run"], args: GqaArgs): Promise<Float32
   });
 
   const [output] = await run({
-    code: CODE.gqaContext,
+    code: llmKernels().gqaContext,
     bindings: [
       { kind: "storage", data: asF32(probs!) },
       { kind: "storage", data: v },
@@ -409,7 +447,7 @@ export interface ActivationArgs {
 export async function runActivation(run: Runner["run"], { input, kind, alpha = 1 }: ActivationArgs): Promise<Float32Array> {
   const N = input.length;
   const [out] = await run({
-    code: CODE.activation,
+    code: llmKernels().activation,
     bindings: [
       { kind: "storage", data: input },
       { kind: "out", type: "f32", length: N },
@@ -439,7 +477,7 @@ export interface PermuteArgs {
 export async function runPermute(run: Runner["run"], { input, dim0, dim1, D }: PermuteArgs): Promise<Float32Array> {
   const total = dim0 * dim1 * D;
   const [out] = await run({
-    code: CODE.permute,
+    code: llmKernels().permute,
     bindings: [
       { kind: "storage", data: input },
       { kind: "out", type: "f32", length: total },
@@ -472,7 +510,7 @@ export interface DequantTransposeArgs {
  */
 export async function runDequantTranspose(run: Runner["run"], { weight, scale, outFeatures, inFeatures }: DequantTransposeArgs): Promise<Float32Array> {
   const [out] = await run({
-    code: CODE.dequantTranspose,
+    code: llmKernels().dequantTranspose,
     bindings: [
       { kind: "storage", data: weight },
       { kind: "storage", data: scale },
@@ -493,7 +531,7 @@ export interface ElementwiseArgs {
 export async function runElementwise(run: Runner["run"], { a, b, kind }: ElementwiseArgs): Promise<Float32Array> {
   const N = a.length;
   const [out] = await run({
-    code: CODE.elementwise,
+    code: llmKernels().elementwise,
     bindings: [
       { kind: "storage", data: a },
       { kind: "storage", data: b },

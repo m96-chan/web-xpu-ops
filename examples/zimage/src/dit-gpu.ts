@@ -36,8 +36,8 @@
  * any resolution this can run.
  */
 import { FLASH_GENERATION } from "../../../ops/flash_attention/index.js";
-import type { Runner } from "../../../harness/wgsl.js";
-import { params } from "../../../harness/wgsl.js";
+import type { Runner } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import type { DitConfig, DitInput, DitTrace, WeightSource } from "./dit.js";
