@@ -38,8 +38,8 @@
  * is zero, so in particular no causal frames. Padding them would change the
  * length.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { encodeConditioning, type Moments } from "./conditioning.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";

@@ -35,8 +35,8 @@
  * The runs are derived from the indices rather than assumed, so a layout with
  * conditioning rows in it still works — it just costs more dispatches.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { ACTIVATION } from "../../../ops/activation/index.js";
 import { ELEMENTWISE } from "../../../ops/elementwise/index.js";
 import { FLASH_GENERATION, FLASH_TOKEN_ENTRY, flashGrid } from "../../../ops/flash_attention/index.js";
