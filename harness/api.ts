@@ -305,6 +305,17 @@ export function resetKernelSources(): void {
 }
 
 /**
+ * What is registered right now, so a test can put it back.
+ *
+ * The registry is process-wide and Node registers on importing the harness
+ * barrel; a test that resets it and walks away leaves every later file in the
+ * same process unable to find a shader. Save, replace, restore.
+ */
+export function registeredKernelSources(): KernelResolver | null {
+  return resolver;
+}
+
+/**
  * The WGSL for one op's entry point.
  *
  * Throws, naming the op and the entry, rather than returning `undefined`: an

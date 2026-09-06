@@ -25,8 +25,8 @@
  * played, and `ops/activation` has no clamp — adding one to run it on the
  * device would be a kernel for nothing.
  */
-import type { ResidentDevice, ResidentOp } from "../../../harness/resident.js";
-import { params } from "../../../harness/wgsl.js";
+import type { ResidentDevice, ResidentOp } from "../../../harness/api.js";
+import { params } from "../../../harness/api.js";
 import { amplePadding, type AudioVaeManifest, type AudioVaeWeights } from "./decoder.js";
 
 /** The WGSL each stage needs, read by `kernels-node.ts` or fetched by the page. */

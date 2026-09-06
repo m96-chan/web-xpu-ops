@@ -11,10 +11,15 @@
  * an error that names what is missing rather than an `undefined` that compiles
  * as an empty shader.
  */
-import { afterEach, describe, expect, it } from "vitest";
-import { kernelFromUrl, opKernel, registerKernelSources, resetKernelSources } from "./api.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { kernelFromUrl, opKernel, registeredKernelSources, registerKernelSources, resetKernelSources } from "./api.js";
 
-afterEach(() => resetKernelSources());
+// Process-wide state, and `harness/index.ts` registers Node's file reader on
+// import — which another file in the same process may already have done. Each
+// test starts empty and ends with whatever was there before it.
+const before = registeredKernelSources();
+beforeEach(() => resetKernelSources());
+afterEach(() => (before ? registerKernelSources(before) : resetKernelSources()));
 
 describe("kernel-source registry", () => {
   it("has nothing registered until something registers", () => {

@@ -12,7 +12,7 @@
  */
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
-import { registerKernelSources, resetKernelSources } from "../harness/api.js";
+import { registeredKernelSources, registerKernelSources, resetKernelSources } from "../harness/api.js";
 import { LLM_KERNEL_SOURCES, llmKernels, resetLlmKernels } from "./kernels.js";
 
 interface OpTable {
@@ -46,8 +46,12 @@ const sorted = (table: OpTable): Record<string, string[]> =>
   Object.fromEntries(Object.keys(table).sort().map((op) => [op, [...table[op]!].sort()]));
 
 describe("LLM_KERNEL_SOURCES <-> examples/llm-demo browser-runtime WGSL_TABLE", () => {
+  // Restore rather than reset: the registry is process-wide and a later file
+  // in the same process expects Node's file reader to still be there.
+  const before = registeredKernelSources();
   afterEach(() => {
-    resetKernelSources();
+    if (before) registerKernelSources(before);
+    else resetKernelSources();
     resetLlmKernels();
   });
 
